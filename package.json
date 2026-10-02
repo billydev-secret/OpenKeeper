@@ -3,9 +3,9 @@
   "private": true,
   "devDependencies": {
     "axe-core": "4.13.0",
-    "eslint": "8.57.1",
-    "stylelint": "16.14.1",
-    "stylelint-config-standard": "37.0.0"
+    "eslint": "10.11.0",
+    "stylelint": "17.15.0",
+    "stylelint-config-standard": "40.0.0"
   },
   "eslintConfig": {
     "env": {
