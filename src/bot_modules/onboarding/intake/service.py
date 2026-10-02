@@ -1,0 +1,1303 @@
+"""Intake cards — per-newcomer welcome-procedure tracker.
+
+When a member joins, a card posts to greeter chat (see
+``docs/plans/intake-cards.md``) with the intake procedure as a checklist. The
+card is a passive tracker: welcomers keep greeting, asking the question lists,
+and running ``/grant`` exactly as before, and the card watches:
+
+* **auto steps** tick from event hooks — ``greeted`` (a greeter or mod
+  mentions the newcomer in the *greeting* channel, see
+  :func:`greet_channel_id` — not the channel the cards post to),
+  ``verified`` (verification signalled either way it is done here, see
+  :func:`verification_signalled`), ``role_gained`` (the member gains the
+  step's configured role, whether via ``/grant`` or a manual add);
+* **manual steps** (the SFW/NSFW question phases) are buttons on the card;
+* **grant steps** carry a role and render a *Grant* button: a greeter or mod
+  presses it and the bot adds that role (see :func:`grant_step_state`). A
+  role given any other way ticks the step like ``role_gained``;
+* **step codes** tick one step from a greeter/mod message carrying that
+  step's own configured phrase — any channel. Each canned message in the
+  procedure reference can carry its own code, so pasting it ticks the step
+  it belongs to without anyone touching the card;
+* **completion** is the guild-wide code appearing in a greeter/mod message
+  that mentions the newcomer — any channel. Unticked steps are stamped
+  *skipped*, never blocking.
+
+A card also **completes itself the moment its last step ticks** (see
+:func:`autocomplete_if_finished`): a fully ticked checklist is a finished
+intake, and waiting for the code to be posted is what left every finished
+card sitting in the queue forever. The code still closes a *part*-done card,
+which is the only thing it is now needed for.
+
+"Mentions the newcomer" includes **replying** to one of their messages: the
+reply's target author is folded into the mention set at the cog boundary, so
+a canned reply works without hand-editing an @ into the text.
+
+**Two stages** (``docs/plans/intake-two-stage.md``): the join card is stage
+1. A Level 5 Grant press opens a stage 2 card with its own step list
+(:func:`advance_to_stage2`), closing any still-open stage 1 card as
+``advanced`` first, so a member never holds more than one open card.
+
+Cards close only on completion (the code, or the last step ticking),
+Dismiss, advancing to stage 2, or the member leaving / being banned —
+never by timeout. A background loop nudges a stale card once.
+
+This module owns the durable ledger (``intake_cards`` +
+``intake_card_steps``, migration 115), config parsing, and the pure gating
+logic; the Discord embed + persistent buttons live in ``intake_views``. The
+message hot path uses :func:`is_watched` for an O(1) filter before touching
+the DB (same pattern as ``promotion_review_service``).
+
+Ships dark: nothing happens until ``intake_enabled`` is set and a channel
+resolves (``intake_channel_id``, falling back to ``greeter_chat_channel_id``).
+That is where cards *post*; where greeting is *watched* is a separate
+resolution — see :func:`greet_channel_id`.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from bot_modules.core.db_utils import get_config_int, get_config_value, open_db, parse_bool
+
+ENABLED_KEY = "intake_enabled"
+CHANNEL_KEY = "intake_channel_id"
+FALLBACK_CHANNEL_KEY = "greeter_chat_channel_id"
+WELCOME_CHANNEL_KEY = "welcome_channel_id"
+GREETER_ROLE_KEY = "greeter_role_id"
+VERIFIED_ROLE_KEY = "intake_verified_role_id"
+STEPS_KEY = "intake_steps"
+STAGE2_ENABLED_KEY = "intake_stage2_enabled"
+STAGE2_STEPS_KEY = "intake_stage2_steps"
+STAGE2_OPTIN_ROLE_KEY = "intake_stage2_optin_role_id"
+CODE_KEY = "intake_completion_code"
+STALE_HOURS_KEY = "intake_stale_hours"
+
+AUTO_GREETED = "greeted"
+AUTO_VERIFIED = "verified"
+AUTO_ROLE_GAINED = "role_gained"
+AUTO_GRANT = "grant"
+AUTO_KINDS = ("", AUTO_GREETED, AUTO_VERIFIED, AUTO_ROLE_GAINED, AUTO_GRANT)
+#: Step kinds that name a role, and tick when the member gains it.
+ROLE_KINDS = (AUTO_ROLE_GAINED, AUTO_GRANT)
+#: The built-in first line of every Stage 2 card: ticked by the Level 5
+#: approval that opens the card, naming the mod. Not in AUTO_KINDS — it is
+#: never configured, has no button and nothing re-ticks it.
+AUTO_APPROVED = "approved"
+APPROVED_STEP = "promotion_approved"
+#: The built-in Give role line: greeters unlock NSFW from the card, not the
+#: mod's Level 5 press (Ben, 2026-10-01).
+NSFW_GRANT_STEP = "nsfw_access"
+
+STAGE_JOIN = 1
+STAGE_LEVEL5 = 2
+STAGES = (STAGE_JOIN, STAGE_LEVEL5)
+
+RESOLUTION_COMPLETED = "completed"
+RESOLUTION_DISMISSED = "dismissed"
+RESOLUTION_LEFT = "left"
+RESOLUTION_BANNED = "banned"
+RESOLUTION_ADVANCED = "advanced"
+
+DEFAULT_STALE_HOURS = 24.0
+
+#: ``done_by`` for steps ticked by event hooks rather than a person.
+AUTO_ACTOR = 0
+
+
+# ---------------------------------------------------------------------------
+# Step configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StepDef:
+    """One configured checklist step (``auto_kind`` '' = manual button).
+
+    ``code`` is an optional free-text phrase that ticks this step when a
+    greeter or mod posts it (see :func:`evaluate_message`) — the point being
+    that each canned message in the procedure reference can carry its own
+    code, so pasting it ticks the step it corresponds to. Empty = no code.
+    """
+
+    key: str
+    label: str
+    auto_kind: str = ""
+    auto_role_id: int = 0
+    code: str = ""
+
+
+# The two role steps default to MANUAL: a role_gained step with no
+# configured role id can never auto-tick and gets no button either (auto
+# steps are filtered from the view) — an untickable dead step. They become
+# role_gained the moment the admin saves the step editor with real roles
+# (the dashboard requires a role for role_gained steps).
+DEFAULT_STEPS: tuple[StepDef, ...] = (
+    StepDef("greeted", "Greeted", AUTO_GREETED),
+    StepDef("verified", "Verified", AUTO_VERIFIED),
+    StepDef("member_role", "Member role granted"),
+    StepDef("sfw_questions", "SFW questions asked"),
+    StepDef("nsfw_role", "NSFW access granted"),
+    StepDef("nsfw_questions", "NSFW questions asked"),
+)
+
+# Stage 2's NSFW grant is built in (stage2_lead_steps, 2026-10-01), so the
+# configurable default is just the closing step.
+DEFAULT_STAGE2_STEPS: tuple[StepDef, ...] = (
+    StepDef("questions_finished", "Questions finished"),
+)
+
+
+def parse_steps(
+    raw: str, default: tuple[StepDef, ...] = DEFAULT_STEPS
+) -> list[StepDef]:
+    """Parse a step-list JSON config (``intake_steps`` or
+    ``intake_stage2_steps``) into step definitions.
+
+    Expected shape: ``[{"key": ..., "label": ..., "auto": ..., "role_id": ...,
+    "code": ...}]`` with ``auto``/``role_id``/``code`` optional (configs
+    written before step codes existed simply have no ``code`` key). Malformed
+    JSON, a non-list, or a list
+    that yields no valid entries falls back to ``default``; invalid
+    or duplicate-key entries are dropped individually so one bad row doesn't
+    nuke the rest of the procedure.
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return list(default)
+    if not isinstance(data, list):
+        return list(default)
+    steps: list[StepDef] = []
+    seen: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        auto = str(entry.get("auto") or "").strip()
+        if not key or not label or key in seen or auto not in AUTO_KINDS:
+            continue
+        try:
+            role_id = int(entry.get("role_id") or 0)
+        except (TypeError, ValueError):
+            role_id = 0
+        code = str(entry.get("code") or "").strip()
+        seen.add(key)
+        steps.append(StepDef(key, label, auto, role_id, code))
+    return steps if steps else list(default)
+
+
+def step_config(
+    conn: sqlite3.Connection, guild_id: int, stage: int = STAGE_JOIN
+) -> list[StepDef]:
+    if stage == STAGE_LEVEL5:
+        return parse_steps(
+            get_config_value(conn, STAGE2_STEPS_KEY, "", guild_id),
+            DEFAULT_STAGE2_STEPS,
+        )
+    return parse_steps(get_config_value(conn, STEPS_KEY, "", guild_id))
+
+
+def coded_step_keys(
+    conn: sqlite3.Connection, guild_id: int, stage: int = STAGE_JOIN
+) -> frozenset[str]:
+    """Keys of the stage's steps that a code ticks — the ones the card draws
+    without a button (Ben, 2026-09-30: "We don't need a SFW questions
+    finished button, it's automatic").
+
+    Read from the *live* config like :func:`evaluate_message`'s matching,
+    not the card's snapshot: the code is how the step ticks, so giving a
+    step a code takes its button off every open card at the next render,
+    and clearing the code brings it back.
+    """
+    return frozenset(s.key for s in step_config(conn, guild_id, stage) if s.code)
+
+
+def step_takes_a_press(
+    conn: sqlite3.Connection, guild_id: int, stage: int, step: sqlite3.Row
+) -> bool:
+    """True when a Done/Undo press may change ``step``: manual, and no code.
+
+    An auto step ticks itself and a coded step ticks from the greeter's
+    canned message, so a button for either presses nothing. Such a button
+    exists: a card drawn before an admin gave the step its code, or before
+    coded steps lost their buttons, keeps it until the card next redraws.
+    The press is refused here rather than trusted to the card's buttons,
+    so a stale button can neither tick a step the code owns nor pay for it.
+    """
+    if str(step["auto_kind"]):
+        return False
+    return str(step["step_key"]) not in coded_step_keys(conn, guild_id, stage)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+def intake_channel_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    """The channel cards post to; falls back to the greeter chat channel."""
+    explicit = get_config_int(conn, CHANNEL_KEY, guild_id)
+    if explicit > 0:
+        return explicit
+    return get_config_int(conn, FALLBACK_CHANNEL_KEY, guild_id)
+
+
+def greet_channel_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    """Where a greeting counts — the channel newcomers are *talked to* in.
+
+    Deliberately not the card channel: cards post to a greeter-facing
+    noticeboard while the welcome itself happens where the member landed, so
+    watching the card channel meant ``greeted`` could never tick. Greeter chat
+    wins when set (a room dedicated to handling arrivals), else the welcome
+    channel; 0 means no channel qualifies and nothing greets.
+    """
+    explicit = get_config_int(conn, FALLBACK_CHANNEL_KEY, guild_id)
+    if explicit > 0:
+        return explicit
+    return get_config_int(conn, WELCOME_CHANNEL_KEY, guild_id)
+
+
+def is_enabled(conn: sqlite3.Connection, guild_id: int) -> bool:
+    """True once intake is switched on **and** a card channel resolves."""
+    if not parse_bool(get_config_value(conn, ENABLED_KEY, "0", guild_id)):
+        return False
+    return intake_channel_id(conn, guild_id) > 0
+
+
+def stage2_enabled(conn: sqlite3.Connection, guild_id: int) -> bool:
+    """True when a Level 5 Grant press should open a stage 2 card.
+
+    Needs intake itself on too: the stage 2 card lives in the same channel
+    and every tick path already bails while intake is dark.
+    """
+    if not parse_bool(get_config_value(conn, STAGE2_ENABLED_KEY, "0", guild_id)):
+        return False
+    return is_enabled(conn, guild_id)
+
+
+def stage2_optin_role_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    """Role a member must hold for Level 5 to open Stage 2; 0 = everyone."""
+    return get_config_int(conn, STAGE2_OPTIN_ROLE_KEY, guild_id)
+
+
+OPTIN_OPEN = "open"
+OPTIN_NOT_OPTED_IN = "not_opted_in"
+OPTIN_ROLE_MISSING = "role_missing"
+
+
+def stage2_optin_verdict(
+    optin_role_id: int, member_role_ids: set[int], role_exists: bool
+) -> str:
+    """May a Level 5 Grant open this member's Stage 2 card?
+
+    Stage 2 is the NSFW pass, so it opens only for a member who opted in —
+    the role Discord Onboarding hands out (Ben, 2026-09-28). Unset (0) is
+    the old behaviour: every Grant opens it. A configured role that no
+    longer exists **fails closed**: the dial says "only opted-in members",
+    and a deleted role must not quietly widen that to everyone. Checked at
+    the Grant press only; opting in later opens nothing retroactively.
+    """
+    if optin_role_id <= 0:
+        return OPTIN_OPEN
+    if not role_exists:
+        return OPTIN_ROLE_MISSING
+    return OPTIN_OPEN if optin_role_id in member_role_ids else OPTIN_NOT_OPTED_IN
+
+
+# What a Level 5 approval press did about Stage 2. The press reports it back
+# to the mod, because a skip used to be silent: on 2026-09-30 a Grant gave
+# access, opened nothing, and only "Access granted." said anything at all.
+# Since 2026-10-01 the press grants nothing itself while Stage 2 is on — the
+# greeters unlock NSFW from the card — so every outcome but "opened" means
+# nothing changed for the member.
+STAGE2_OPENED = "opened"
+STAGE2_DARK = "dark"
+STAGE2_ALREADY_OPEN = "already_open"
+STAGE2_NOT_OPTED_IN = OPTIN_NOT_OPTED_IN
+STAGE2_ROLE_MISSING = OPTIN_ROLE_MISSING
+STAGE2_NO_CHANNEL = "no_channel"
+STAGE2_NO_GRANT = "no_grant"
+STAGE2_FAILED = "failed"
+
+_NOT_OPENED = "Nothing granted. Stage 2 couldn't open: "
+_STAGE2_REPLIES = {
+    STAGE2_OPENED: (
+        "Approved. Stage 2 card opened for the greeters, and they'll unlock "
+        "NSFW from it."
+    ),
+    STAGE2_ALREADY_OPEN: "Nothing new: their Stage 2 card is already open.",
+    STAGE2_NOT_OPTED_IN: _NOT_OPENED + "they don't have the NSFW opt-in role.",
+    STAGE2_ROLE_MISSING: (
+        _NOT_OPENED + "the opt-in role is gone. Fix it on the Intake Cards panel."
+    ),
+    STAGE2_NO_CHANNEL: (
+        _NOT_OPENED + "the card channel is gone. Fix it on the Intake Cards panel."
+    ),
+    STAGE2_NO_GRANT: (
+        _NOT_OPENED + "no grant role is set, so greeters would have nothing to "
+        "unlock. Set one on the dashboard."
+    ),
+    STAGE2_FAILED: (
+        _NOT_OPENED + "the card couldn't be posted (see the bot log). Press again "
+        "to retry."
+    ),
+}
+
+
+def stage2_press_reply(outcome: str) -> str:
+    """The approval press's ephemeral reply, given what Stage 2 did.
+
+    ``dark`` has no reply here: with Stage 2 off the press grants the role
+    itself, as it always did, and answers from that.
+    """
+    return _STAGE2_REPLIES.get(outcome, _NOT_OPENED + "unexpected outcome.")
+
+
+def greeter_role_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    return get_config_int(conn, GREETER_ROLE_KEY, guild_id)
+
+
+def verified_role_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    """Role a verification bot *grants* on success; 0 = not configured."""
+    return get_config_int(conn, VERIFIED_ROLE_KEY, guild_id)
+
+
+def verification_signalled(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    gained_role_ids: list[int],
+    unverified_removed: bool,
+) -> bool:
+    """Did this role update mean "this member passed the gate"?
+
+    Verification wears two shapes in the wild and both must tick the step:
+    our own gate *strips* ``unverified_role_id``, while a third-party
+    verifier (Double Counter) *grants* a role instead. Watching only the
+    removal left the step dead on guilds using the second shape.
+    """
+    if unverified_removed:
+        return True
+    role_id = verified_role_id(conn, guild_id)
+    return role_id > 0 and role_id in gained_role_ids
+
+
+def completion_code(conn: sqlite3.Connection, guild_id: int) -> str:
+    """The code phrase that completes a card; empty = code detection off."""
+    return str(get_config_value(conn, CODE_KEY, "", guild_id)).strip()
+
+
+def stale_hours(conn: sqlite3.Connection, guild_id: int) -> float:
+    raw = get_config_value(conn, STALE_HOURS_KEY, "", guild_id)
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_STALE_HOURS
+    return hours if hours > 0 else DEFAULT_STALE_HOURS
+
+
+def code_matches(content: str, code: str) -> bool:
+    """Case-insensitive containment; an empty code never matches."""
+    return bool(code) and code.lower() in content.lower()
+
+
+def reply_target_id(message: object) -> int:
+    """Author id of the message ``message`` replies to, or 0.
+
+    Lives here rather than in ``intake_views`` so the message hot path in
+    ``events_cog`` can widen its pre-filter without importing the view
+    layer. Duck-typed (``getattr`` all the way down) to keep this module
+    free of ``discord`` imports.
+
+    Why it's needed: Discord only puts the reply target in
+    ``message.mentions`` when the reply pings them. A greeter whose reply
+    ping is off still means "this is addressed to you", so intake reads the
+    reference directly. ``resolved`` is a ``DeletedReferencedMessage`` when
+    the target is gone — that has no ``author``, hence the second getattr.
+    """
+    ref = getattr(message, "reference", None)
+    resolved = getattr(ref, "resolved", None)
+    author = getattr(resolved, "author", None)
+    author_id = getattr(author, "id", None)
+    return int(author_id) if author_id is not None else 0
+
+
+#: How the guild-wide completion code names itself in a clash message.
+COMPLETION_CODE_LABEL = "the completion code"
+
+Coded = tuple[str, str]  # (owner_label, code)
+
+
+def code_conflict(codes: list[Coded]) -> tuple[Coded, Coded] | None:
+    """First pair of codes where one contains the other, case-insensitively.
+
+    Matching is containment, so a code that sits inside another one always
+    fires alongside it — posting "DK-SFW-DONE" would tick both it and a
+    "DK-SFW" step, silently. Worse when the container is the *completion*
+    code: pasting one step's canned message would close the card and stamp
+    every remaining step skipped.
+
+    Takes and returns ``(owner_label, code)`` pairs, ordered
+    ``(container, contained)``. The codes ride along because step labels
+    aren't unique — two steps sharing a label would otherwise produce a
+    self-referential message. Empty codes never match anything.
+    """
+    live = [pair for pair in codes if pair[1]]
+    for i, a in enumerate(live):
+        for b in live[i + 1:]:
+            if a[1].lower() in b[1].lower():
+                return b, a
+            if b[1].lower() in a[1].lower():
+                return a, b
+    return None
+
+
+def config_code_conflict(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    completion: str | None = None,
+    steps: list[StepDef] | None = None,
+    stage2_steps: list[StepDef] | None = None,
+) -> tuple[Coded, Coded] | None:
+    """:func:`code_conflict` across both stages' step codes + completion code.
+
+    Both stages are checked together because a code is matched against
+    whichever card the member holds, and the completion code closes either:
+    a stage 2 code that contains the completion code would close a stage 2
+    card the moment its first canned message is pasted.
+
+    Either side may be overridden with the value a pending save is about to
+    write; whatever isn't overridden is read from storage. That matters
+    because the two are writable independently — a completion-code-only save
+    still has to be checked against the *stored* step codes, or the clash
+    walks in through the side door.
+    """
+    code = completion if completion is not None else completion_code(conn, guild_id)
+    defs = steps if steps is not None else step_config(conn, guild_id)
+    defs2 = (
+        stage2_steps
+        if stage2_steps is not None
+        else step_config(conn, guild_id, STAGE_LEVEL5)
+    )
+    pairs: list[Coded] = [(s.label, s.code) for s in defs]
+    pairs.extend((f"Stage 2: {s.label}", s.code) for s in defs2)
+    pairs.append((COMPLETION_CODE_LABEL, code.strip()))
+    return code_conflict(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Card ledger
+# ---------------------------------------------------------------------------
+
+
+def stage2_lead_steps(
+    configured: Sequence[StepDef], grant_role_id: int
+) -> list[StepDef]:
+    """The built-in lines a Stage 2 card opens with, ahead of its config.
+
+    *Promotion approved* always — the card exists only because a mod
+    approved, so it opens ticked by them. *NSFW access* is a Give role step
+    for ``grant_role_id`` (the Level 5 grant role), so greeters can unlock
+    NSFW from the card; left off when no grant role is set, or when the
+    configured list already grants that role, so the card never shows it
+    twice.
+    """
+    lead = [StepDef(APPROVED_STEP, "Promotion approved", AUTO_APPROVED)]
+    already = any(
+        s.auto_kind == AUTO_GRANT and s.auto_role_id == grant_role_id for s in configured
+    )
+    if grant_role_id > 0 and not already:
+        lead.append(StepDef(NSFW_GRANT_STEP, "NSFW access", AUTO_GRANT, grant_role_id))
+    return lead
+
+
+def stage2_grants_a_role(lead: Sequence[StepDef], configured: Sequence[StepDef]) -> bool:
+    """Can a greeter unlock anything from this Stage 2 card?"""
+    return any(
+        s.auto_kind == AUTO_GRANT and s.auto_role_id > 0 for s in (*lead, *configured)
+    )
+
+
+def _with_lead(lead: Sequence[StepDef], configured: Sequence[StepDef]) -> list[StepDef]:
+    """``lead`` then ``configured``, dropping a configured step whose key a lead
+    line already holds. A dashboard step labelled "NSFW access" slugs to the
+    built-in key, and two rows sharing a key would tick (and button) together.
+    """
+    taken = {s.key for s in lead}
+    return [*lead, *(s for s in configured if s.key not in taken)]
+
+
+def create_card(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    created_at: float,
+    stage: int = STAGE_JOIN,
+    opened_by: int = 0,
+    lead_steps: Sequence[StepDef] = (),
+) -> int | None:
+    """Open a card and snapshot that stage's configured steps onto it.
+
+    ``lead_steps`` go first (:func:`stage2_lead_steps`); an ``approved`` one
+    is stored ticked by ``opened_by`` at ``created_at``. Returns the new card
+    id, or ``None`` if the member already has an open card (the partial
+    unique index rejects the insert) — a rejoin while the old card is still
+    open keeps that card rather than spawning a second.
+    """
+    try:
+        cursor = conn.execute(
+            "INSERT INTO intake_cards "
+            "(guild_id, user_id, channel_id, message_id, created_at, stage, opened_by) "
+            "VALUES (?, ?, 0, 0, ?, ?, ?)",
+            (guild_id, user_id, created_at, stage, opened_by),
+        )
+    except sqlite3.IntegrityError:
+        return None
+    card_id = int(cursor.lastrowid or 0)
+    conn.executemany(
+        "INSERT INTO intake_card_steps "
+        "(card_id, position, step_key, label, auto_kind, auto_role_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (card_id, pos, s.key, s.label, s.auto_kind, s.auto_role_id)
+            for pos, s in enumerate(_with_lead(lead_steps, step_config(conn, guild_id, stage)))
+        ],
+    )
+    # Ticked by insert, not by a press, so it pays nobody.
+    conn.execute(
+        "UPDATE intake_card_steps SET done_at = ?, done_by = ? "
+        "WHERE card_id = ? AND auto_kind = ?",
+        (created_at, opened_by, card_id, AUTO_APPROVED),
+    )
+    return card_id
+
+
+def card_stage(card: sqlite3.Row) -> int:
+    return int(card["stage"] or STAGE_JOIN)
+
+
+def card_opener(card: sqlite3.Row) -> int:
+    """The Level 5 approver who opened a Stage 2 card; 0 on a join card."""
+    return int(card["opened_by"] or 0)
+
+
+def advance_to_stage2(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    approver_id: int,
+    at: float,
+    grant_role_id: int = 0,
+) -> tuple[sqlite3.Row | None, int | None]:
+    """Open a member's stage 2 card after a Level 5 approval press.
+
+    The card leads with :func:`stage2_lead_steps` for ``grant_role_id``.
+
+    Returns ``(closed_join_card, new_card_id)``. A still-open stage 1 card
+    closes first as ``advanced``, its unticked steps stamped skipped and the
+    approver recorded as the closer: the member is past the join stage, and a
+    forgotten join card left open would sit in the queue and keep nudging.
+    That also keeps the one-open-card-per-member invariant every hook relies
+    on. ``new_card_id`` is ``None`` when the member already holds an open
+    stage 2 card (a second press), and nothing is closed then.
+    """
+    closed = None
+    open_card = get_open_card(conn, guild_id, user_id)
+    if open_card is not None:
+        if card_stage(open_card) == STAGE_LEVEL5:
+            return None, None
+        conn.execute(
+            "UPDATE intake_card_steps SET skipped = 1 "
+            "WHERE card_id = ? AND done_at IS NULL",
+            (int(open_card["id"]),),
+        )
+        resolve_card(conn, int(open_card["id"]), approver_id, at, RESOLUTION_ADVANCED)
+        closed = open_card
+    lead = stage2_lead_steps(step_config(conn, guild_id, STAGE_LEVEL5), grant_role_id)
+    return closed, create_card(
+        conn, guild_id, user_id, at, STAGE_LEVEL5, opened_by=approver_id, lead_steps=lead
+    )
+
+
+def get_card(conn: sqlite3.Connection, card_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM intake_cards WHERE id = ?", (card_id,)
+    ).fetchone()
+
+
+def get_open_card(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM intake_cards "
+        "WHERE guild_id = ? AND user_id = ? AND resolved_at IS NULL",
+        (guild_id, user_id),
+    ).fetchone()
+
+
+def set_card_message(
+    conn: sqlite3.Connection, card_id: int, channel_id: int, message_id: int
+) -> None:
+    """Attach the posted message's location to a freshly created card."""
+    conn.execute(
+        "UPDATE intake_cards SET channel_id = ?, message_id = ? WHERE id = ?",
+        (channel_id, message_id, card_id),
+    )
+
+
+def delete_card(conn: sqlite3.Connection, card_id: int) -> None:
+    """Roll back a created card whose post never made it to Discord."""
+    conn.execute("DELETE FROM intake_card_steps WHERE card_id = ?", (card_id,))
+    conn.execute("DELETE FROM intake_cards WHERE id = ?", (card_id,))
+
+
+def resolve_card(
+    conn: sqlite3.Connection,
+    card_id: int,
+    resolved_by: int,
+    resolved_at: float,
+    resolution: str,
+) -> int:
+    """Close an open card; returns rows updated (0 if already resolved)."""
+    cursor = conn.execute(
+        "UPDATE intake_cards "
+        "SET resolved_at = ?, resolved_by = ?, resolution = ? "
+        "WHERE id = ? AND resolved_at IS NULL",
+        (resolved_at, resolved_by, resolution, card_id),
+    )
+    return cursor.rowcount
+
+
+def close_for_member(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    resolution: str,
+    resolved_by: int,
+    resolved_at: float,
+) -> sqlite3.Row | None:
+    """Close a member's open card (leave/ban paths); returns it, or ``None``.
+
+    The returned row is the pre-close snapshot so the caller still has the
+    card's message location to edit.
+    """
+    card = get_open_card(conn, guild_id, user_id)
+    if card is None:
+        return None
+    resolve_card(conn, int(card["id"]), resolved_by, resolved_at, resolution)
+    return card
+
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+
+
+def steps_for(conn: sqlite3.Connection, card_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM intake_card_steps WHERE card_id = ? ORDER BY position",
+        (card_id,),
+    ).fetchall()
+
+
+def set_step_state(
+    conn: sqlite3.Connection,
+    card_id: int,
+    step_key: str,
+    *,
+    done: bool,
+    actor_id: int,
+    at: float,
+) -> bool:
+    """Tick (or untick) one step; returns whether anything changed.
+
+    Ticking only lands on an un-done step and unticking only on a done one,
+    so a double-click race can't overwrite who originally ticked it.
+    """
+    if done:
+        cursor = conn.execute(
+            "UPDATE intake_card_steps SET done_at = ?, done_by = ? "
+            "WHERE card_id = ? AND step_key = ? AND done_at IS NULL",
+            (at, actor_id, card_id, step_key),
+        )
+    else:
+        cursor = conn.execute(
+            "UPDATE intake_card_steps SET done_at = NULL, done_by = NULL "
+            "WHERE card_id = ? AND step_key = ? AND done_at IS NOT NULL",
+            (card_id, step_key),
+        )
+    return cursor.rowcount > 0
+
+
+def auto_tick(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    kind: str,
+    at: float,
+    *,
+    role_id: int = 0,
+    actor_id: int = AUTO_ACTOR,
+) -> tuple[sqlite3.Row | None, list[str]]:
+    """Tick the open card's un-done auto steps matching ``kind``.
+
+    ``role_gained`` also ticks ``grant`` steps (a grant step's role landing
+    by hand, or via ``/grant``, is the step done), and both match on
+    ``role_id``. Returns the open
+    card (``None`` if the member has no card — the common case, callers just
+    bail) and the step keys that actually ticked, so the caller knows whether
+    the card message needs a re-render.
+    """
+    card = get_open_card(conn, guild_id, user_id)
+    if card is None:
+        return None, []
+    if kind == AUTO_ROLE_GAINED:
+        rows = conn.execute(
+            "SELECT step_key FROM intake_card_steps "
+            "WHERE card_id = ? AND auto_kind IN (?, ?) AND done_at IS NULL "
+            "AND auto_role_id = ? AND auto_role_id > 0",
+            (int(card["id"]), *ROLE_KINDS, role_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT step_key FROM intake_card_steps "
+            "WHERE card_id = ? AND auto_kind = ? AND done_at IS NULL",
+            (int(card["id"]), kind),
+        ).fetchall()
+    ticked = []
+    for row in rows:
+        key = str(row["step_key"])
+        if set_step_state(
+            conn, int(card["id"]), key, done=True, actor_id=actor_id, at=at
+        ):
+            ticked.append(key)
+    return card, ticked
+
+
+GRANT_OK = "ok"
+GRANT_CLOSED = "closed"
+GRANT_NOT_GRANT = "not_grant"
+GRANT_DONE = "done"
+
+
+def grant_step_state(
+    conn: sqlite3.Connection, card_id: int, step_key: str
+) -> tuple[str, sqlite3.Row | None, sqlite3.Row | None]:
+    """May a Grant button on this card grant this step's role right now?
+
+    Returns ``(status, card, step)``. ``closed`` covers a resolved or deleted
+    card and an unknown step; ``not_grant`` a step that isn't a grant step
+    with a role (buttons are only built for those, so this means a stale
+    button); ``done`` a step already ticked, so the role is already on the
+    member or was already handed over. The press never reaches any role but
+    the step's own ``auto_role_id``.
+    """
+    card = get_card(conn, card_id)
+    if card is None or card["resolved_at"] is not None:
+        return GRANT_CLOSED, None, None
+    step = next((s for s in steps_for(conn, card_id) if s["step_key"] == step_key), None)
+    if step is None:
+        return GRANT_CLOSED, card, None
+    if str(step["auto_kind"]) != AUTO_GRANT or int(step["auto_role_id"] or 0) <= 0:
+        return GRANT_NOT_GRANT, card, step
+    if step["done_at"] is not None:
+        return GRANT_DONE, card, step
+    return GRANT_OK, card, step
+
+
+def claim_grant_tick(
+    conn: sqlite3.Connection, card_id: int, step_key: str, actor_id: int, at: float
+) -> bool:
+    """Credit a grant step to the person who pressed Grant; True if credited.
+
+    The role landing fires the gateway's role-update hook too, which may tick
+    the step as ``auto`` before the press gets back from Discord. Crediting
+    must still land on the presser, so an auto tick is overwritten (keeping
+    its time). A step a *person* already ticked is left alone.
+    """
+    cursor = conn.execute(
+        "UPDATE intake_card_steps SET done_at = COALESCE(done_at, ?), done_by = ? "
+        "WHERE card_id = ? AND step_key = ? "
+        "AND (done_at IS NULL OR COALESCE(done_by, 0) = 0)",
+        (at, actor_id, card_id, step_key),
+    )
+    return cursor.rowcount > 0
+
+
+def count_progress(steps: list[sqlite3.Row]) -> tuple[int, int]:
+    """(done, total) for the progress bar; skipped steps don't count as done."""
+    done = sum(1 for s in steps if s["done_at"] is not None and not s["skipped"])
+    return done, len(steps)
+
+
+# ---------------------------------------------------------------------------
+# Completion
+# ---------------------------------------------------------------------------
+
+
+def complete_card(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    completed_by: int,
+    at: float,
+) -> tuple[sqlite3.Row, list[str]] | None:
+    """Complete a member's open card (the completion code was posted).
+
+    Stamps every still-unticked step as *skipped* (the code always wins —
+    shortcuts surface in analytics instead of blocking), closes the card with
+    the code's poster as the welcomer of record, and returns the pre-close
+    card row plus the skipped step keys. ``None`` if there's no open card.
+    """
+    card = get_open_card(conn, guild_id, user_id)
+    if card is None:
+        return None
+    card_id = int(card["id"])
+    skipped = [
+        str(r["step_key"])
+        for r in conn.execute(
+            "SELECT step_key FROM intake_card_steps "
+            "WHERE card_id = ? AND done_at IS NULL ORDER BY position",
+            (card_id,),
+        ).fetchall()
+    ]
+    conn.execute(
+        "UPDATE intake_card_steps SET skipped = 1 "
+        "WHERE card_id = ? AND done_at IS NULL",
+        (card_id,),
+    )
+    resolve_card(conn, card_id, completed_by, at, RESOLUTION_COMPLETED)
+    return card, skipped
+
+
+def finished_open_cards(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[sqlite3.Row]:
+    """Open cards whose every step is already ticked — done, still queued.
+
+    The backlog counterpart to :func:`autocomplete_if_finished`: cards that
+    finished before auto-completion existed (or while the bot was down) never
+    get a tick to close them, so the nudge loop sweeps them instead.
+    """
+    return conn.execute(
+        "SELECT * FROM intake_cards c WHERE c.guild_id = ? AND c.resolved_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM intake_card_steps s WHERE s.card_id = c.id) "
+        "AND NOT EXISTS (SELECT 1 FROM intake_card_steps s "
+        "WHERE s.card_id = c.id AND s.done_at IS NULL) "
+        "ORDER BY c.created_at",
+        (guild_id,),
+    ).fetchall()
+
+
+def autocomplete_if_finished(
+    conn: sqlite3.Connection, card_id: int, *, actor_id: int = AUTO_ACTOR
+) -> tuple[sqlite3.Row, int] | None:
+    """Close a card the moment its last step ticks; ``None`` if it isn't done.
+
+    Ticking every step *is* finishing the intake, so the card closes itself
+    rather than waiting for someone to post the completion code — which is
+    what left every finished card sitting in the queue, and both
+    completion-keyed report panels permanently empty.
+
+    Closes at the **last step's own tick time**, not "now": for a live tick
+    those are the same instant, and for a card the sweep picks up later it
+    keeps time-to-complete honest instead of charging it the backlog's age.
+
+    The welcomer of record is ``actor_id`` when a person did the final tick,
+    otherwise the last human to tick anything on the card — an auto step
+    (``AUTO_ACTOR``) landing last must not credit the closure to nobody and
+    drop the card out of the per-welcomer counts. Returns the pre-close card
+    row plus that welcomer id (0 when no human ever ticked).
+    """
+    card = get_card(conn, card_id)
+    if card is None or card["resolved_at"] is not None:
+        return None
+    steps = steps_for(conn, card_id)
+    if not steps or any(s["done_at"] is None for s in steps):
+        return None
+    finished_at = max(float(s["done_at"]) for s in steps)
+    welcomer = actor_id if actor_id != AUTO_ACTOR else 0
+    if not welcomer:
+        humans = [s for s in steps if (s["done_by"] or 0) > 0]
+        if humans:
+            welcomer = int(max(humans, key=lambda s: float(s["done_at"]))["done_by"])
+    resolve_card(conn, card_id, welcomer, finished_at, RESOLUTION_COMPLETED)
+    return card, welcomer
+
+
+ACTION_GREET = "greet"
+ACTION_COMPLETE = "complete"
+ACTION_STEP = "step"
+
+
+def evaluate_message(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    channel_id: int,
+    content: str,
+    mentioned_ids: list[int],
+    author_is_greeter: bool,
+    author_is_mod: bool,
+) -> list[tuple[str, int, str]]:
+    """What a message means for intake: ``(action, newcomer_id, step_key)``.
+
+    ``step_key`` is only meaningful for :data:`ACTION_STEP`; the others carry
+    ``""``. For each mentioned member with an open card:
+
+    * :data:`ACTION_COMPLETE` — the message carries the guild-wide completion
+      code and comes from a greeter or mod; any channel. Wins over everything
+      else (the card is closing anyway).
+    * :data:`ACTION_STEP` — the message carries a step's own code, from a
+      greeter or mod, any channel. One action per matching step, so a message
+      may tick several. Unlike completion this doesn't close the card.
+    * :data:`ACTION_GREET` — a greeter or mod mentioned them in the greeting
+      channel (see :func:`greet_channel_id` — where newcomers are talked to,
+      *not* where the cards post). Can co-occur with a step code: the greeting
+      message is allowed to carry one.
+
+    ``mentioned_ids`` is what the caller resolved as "this message addresses
+    them" — real @mentions **plus** the author of a replied-to message, so a
+    canned reply lands without hand-editing an @ into it.
+
+    Step codes are matched against the *live* step config of the **card's
+    stage** rather than the card's snapshot: a code is a lookup phrase, not per-card state, so an
+    admin fixing a typo in a code shouldn't leave in-flight cards unmatchable.
+    A code whose step isn't on this card simply ticks nothing.
+
+    Pure decision logic so the whole matrix is unit-testable; the caller
+    supplies the Discord-side facts (roles, mentions) as primitives.
+    """
+    if not mentioned_ids or not is_enabled(conn, guild_id):
+        return []
+    privileged = author_is_greeter or author_is_mod
+    if not privileged:
+        return []
+    completes = code_matches(content, completion_code(conn, guild_id))
+    coded_keys: dict[int, list[str]] = {}
+    if not completes:
+        coded_keys = {
+            stage: [
+                s.key
+                for s in step_config(conn, guild_id, stage)
+                if code_matches(content, s.code)
+            ]
+            for stage in STAGES
+        }
+    greet_channel = greet_channel_id(conn, guild_id)
+    greets = greet_channel > 0 and channel_id == greet_channel
+    if not completes and not any(coded_keys.values()) and not greets:
+        return []
+    actions: list[tuple[str, int, str]] = []
+    for uid in dict.fromkeys(mentioned_ids):  # dedupe, keep order
+        card = get_open_card(conn, guild_id, uid)
+        if card is None:
+            continue
+        if completes:
+            actions.append((ACTION_COMPLETE, uid, ""))
+            continue
+        if greets:
+            actions.append((ACTION_GREET, uid, ""))
+        actions.extend(
+            (ACTION_STEP, uid, key) for key in coded_keys.get(card_stage(card), [])
+        )
+    return actions
+
+
+def inviter_for(conn: sqlite3.Connection, guild_id: int, invitee_id: int) -> int | None:
+    """Who invited this member, if invite attribution caught the join."""
+    row = conn.execute(
+        "SELECT inviter_id FROM invite_edges WHERE guild_id = ? AND invitee_id = ?",
+        (guild_id, invitee_id),
+    ).fetchone()
+    return int(row["inviter_id"]) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Stale-card nudges
+# ---------------------------------------------------------------------------
+
+
+def stale_cards(
+    conn: sqlite3.Connection, guild_id: int, now: float
+) -> list[sqlite3.Row]:
+    """Open, never-nudged cards with no progress for ``intake_stale_hours``.
+
+    "No progress" means no step has ticked within the window — any tick
+    resets the clock, so an intake that's moving (however slowly) is never
+    nudged, only one that's sitting.
+
+    A card whose every step is done or skipped is excluded: it's complete
+    and merely awaiting closure, and the nudge asks greeters to pick work
+    up — pinging them about an intake with nothing left to do teaches them
+    to ignore the ping. (A stepless card still nudges; nothing was done.)
+    """
+    cutoff = now - stale_hours(conn, guild_id) * 3600.0
+    return conn.execute(
+        "SELECT c.* FROM intake_cards c "
+        "LEFT JOIN intake_card_steps s ON s.card_id = c.id "
+        "WHERE c.guild_id = ? AND c.resolved_at IS NULL AND c.nudged_at IS NULL "
+        "GROUP BY c.id "
+        "HAVING COALESCE(MAX(s.done_at), c.created_at) <= ? "
+        "AND (COUNT(s.id) = 0 OR SUM(CASE WHEN s.done_at IS NULL "
+        "AND s.skipped = 0 THEN 1 ELSE 0 END) > 0)",
+        (guild_id, cutoff),
+    ).fetchall()
+
+
+def mark_nudged(conn: sqlite3.Connection, card_id: int, at: float) -> None:
+    conn.execute(
+        "UPDATE intake_cards SET nudged_at = ? WHERE id = ?", (at, card_id)
+    )
+
+
+#: Presence of a card's member, as the nudge sweep can determine it.
+PRESENCE_IN = "in"
+PRESENCE_SCREENING = "screening"
+PRESENCE_GONE = "gone"
+PRESENCE_UNKNOWN = "unknown"
+
+NUDGE_SEND = "send"
+NUDGE_SKIP = "skip"
+NUDGE_CLOSE_LEFT = "close_left"
+
+
+def nudge_action(presence: str) -> str:
+    """What the stale sweep should do with a card, given its member's state.
+
+    A stale card only means the *checklist* hasn't moved; whether a greeter
+    can move it depends on the member actually being in the server:
+
+    ``screening`` — they joined but never accepted membership screening, so
+    they hold no roles and can neither see nor post anywhere. Nothing a
+    greeter does reaches them, so skip **without** stamping ``nudged_at``:
+    the card stays nudge-eligible and pings the moment they accept and are
+    genuinely stuck, the only moment the ping is worth a greeter's attention.
+
+    ``gone`` — they left while nothing was watching (a leave during downtime
+    never reaches ``on_member_remove``), so the card is an orphan. Close it
+    as ``left``, the resolution the live hook would have written.
+
+    ``unknown`` — Discord wouldn't say. Skip unstamped and re-decide next
+    tick rather than pinging about a member we can't place.
+    """
+    if presence == PRESENCE_IN:
+        return NUDGE_SEND
+    if presence == PRESENCE_GONE:
+        return NUDGE_CLOSE_LEFT
+    return NUDGE_SKIP
+
+
+# ---------------------------------------------------------------------------
+# Reports (dashboard analytics)
+# ---------------------------------------------------------------------------
+
+
+def _display_name(conn: sqlite3.Connection, guild_id: int, user_id: int) -> str:
+    row = conn.execute(
+        "SELECT display_name, username FROM known_users "
+        "WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if row is None:
+        return str(user_id)
+    return str(row["display_name"] or row["username"] or user_id)
+
+
+def report_open_cards(conn: sqlite3.Connection, guild_id: int) -> list[dict]:
+    """The live queue: every open card with its progress, oldest first."""
+    cards = conn.execute(
+        "SELECT * FROM intake_cards "
+        "WHERE guild_id = ? AND resolved_at IS NULL ORDER BY created_at",
+        (guild_id,),
+    ).fetchall()
+    out = []
+    for c in cards:
+        steps = steps_for(conn, int(c["id"]))
+        done, total = count_progress(steps)
+        out.append(
+            {
+                "user_id": int(c["user_id"]),
+                "user_name": _display_name(conn, guild_id, int(c["user_id"])),
+                "stage": card_stage(c),
+                "created_at": float(c["created_at"]),
+                "nudged": c["nudged_at"] is not None,
+                "done": done,
+                "total": total,
+                "pending": [
+                    str(s["label"]) for s in steps if s["done_at"] is None
+                ],
+            }
+        )
+    return out
+
+
+def report_outcomes(
+    conn: sqlite3.Connection, guild_id: int, since_ts: float
+) -> dict:
+    """Resolution counts + completion-time stats for cards created since."""
+    rows = conn.execute(
+        "SELECT resolution, resolved_at, created_at FROM intake_cards "
+        "WHERE guild_id = ? AND resolved_at IS NOT NULL AND created_at >= ?",
+        (guild_id, since_ts),
+    ).fetchall()
+    counts: dict[str, int] = {}
+    durations: list[float] = []
+    for r in rows:
+        resolution = str(r["resolution"] or "")
+        counts[resolution] = counts.get(resolution, 0) + 1
+        if resolution == RESOLUTION_COMPLETED:
+            durations.append(float(r["resolved_at"]) - float(r["created_at"]))
+    durations.sort()
+    n = len(durations)
+    median = (
+        (durations[n // 2] if n % 2 else (durations[n // 2 - 1] + durations[n // 2]) / 2)
+        if n
+        else 0.0
+    )
+    return {
+        "resolved": len(rows),
+        "counts": counts,
+        "mean_seconds": (sum(durations) / n) if n else 0.0,
+        "median_seconds": median,
+    }
+
+
+def report_welcomers(
+    conn: sqlite3.Connection, guild_id: int, since_ts: float
+) -> list[dict]:
+    """Per-welcomer activity: completions owned + manual steps ticked."""
+    stats: dict[int, dict] = {}
+
+    def _bucket(uid: int) -> dict:
+        return stats.setdefault(
+            uid,
+            {
+                "user_id": uid,
+                "user_name": _display_name(conn, guild_id, uid),
+                "completions": 0,
+                "ticks": 0,
+            },
+        )
+
+    for r in conn.execute(
+        "SELECT resolved_by, COUNT(*) AS n FROM intake_cards "
+        "WHERE guild_id = ? AND resolution = ? AND created_at >= ? "
+        "GROUP BY resolved_by",
+        (guild_id, RESOLUTION_COMPLETED, since_ts),
+    ).fetchall():
+        if r["resolved_by"]:
+            _bucket(int(r["resolved_by"]))["completions"] = int(r["n"])
+    for r in conn.execute(
+        "SELECT s.done_by, COUNT(*) AS n FROM intake_card_steps s "
+        "JOIN intake_cards c ON c.id = s.card_id "
+        "WHERE c.guild_id = ? AND c.created_at >= ? "
+        "AND s.done_by IS NOT NULL AND s.done_by > 0 "
+        "GROUP BY s.done_by",
+        (guild_id, since_ts),
+    ).fetchall():
+        _bucket(int(r["done_by"]))["ticks"] = int(r["n"])
+    return sorted(
+        stats.values(), key=lambda w: (-w["completions"], -w["ticks"], w["user_id"])
+    )
+
+
+def report_skipped_steps(
+    conn: sqlite3.Connection, guild_id: int, since_ts: float
+) -> list[dict]:
+    """How often each step was skipped on completed cards — the procedure's
+    own feedback about which parts the team doesn't actually run."""
+    rows = conn.execute(
+        "SELECT s.step_key, s.label, COUNT(*) AS appeared, "
+        "SUM(s.skipped) AS skipped FROM intake_card_steps s "
+        "JOIN intake_cards c ON c.id = s.card_id "
+        "WHERE c.guild_id = ? AND c.resolution = ? AND c.created_at >= ? "
+        "GROUP BY s.step_key, s.label ORDER BY MIN(s.position)",
+        (guild_id, RESOLUTION_COMPLETED, since_ts),
+    ).fetchall()
+    return [
+        {
+            "key": str(r["step_key"]),
+            "label": str(r["label"]),
+            "appeared": int(r["appeared"]),
+            "skipped": int(r["skipped"] or 0),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# In-memory watch registry — the message hot-path accelerator
+# ---------------------------------------------------------------------------
+#
+# on_message fires constantly; greet detection and code detection only matter
+# for messages that mention a member with an open card. We keep a per-guild
+# set of those member ids so the hot path is a set-membership test per
+# mention. Seeded at startup (warm), fed by card creation, drained on close.
+# A stale positive is harmless: the DB re-check finds no open card and bails.
+
+
+_watch: dict[int, set[int]] = {}
+_lock = threading.Lock()
+
+
+def open_card_user_ids(conn: sqlite3.Connection, guild_id: int) -> set[int]:
+    return {
+        int(r["user_id"])
+        for r in conn.execute(
+            "SELECT user_id FROM intake_cards "
+            "WHERE guild_id = ? AND resolved_at IS NULL",
+            (guild_id,),
+        ).fetchall()
+    }
+
+
+def warm(db_path, guild_ids) -> None:
+    """Seed the watch registry at startup with every open card, enabled or
+    not.
+
+    Deliberately NOT filtered on :func:`is_enabled`: the hooks re-check
+    config for behavior that should pause while disabled (greet/code/role
+    ticks), but open cards must keep closing on leave/ban — and resume
+    ticking after a re-enable — even across a disable → restart → enable
+    cycle. Filtering here stranded such cards as zombies.
+    """
+    with open_db(db_path) as conn:
+        seeded: dict[int, set[int]] = {}
+        for gid in guild_ids:
+            ids = open_card_user_ids(conn, gid)
+            if ids:
+                seeded[gid] = ids
+    with _lock:
+        _watch.clear()
+        _watch.update(seeded)
+
+
+def is_watched(guild_id: int, user_id: int) -> bool:
+    """O(1) hot-path test: does this member (maybe) have an open card?"""
+    bucket = _watch.get(guild_id)
+    return bucket is not None and user_id in bucket
+
+
+def add_watched(guild_id: int, user_id: int) -> None:
+    with _lock:
+        _watch.setdefault(guild_id, set()).add(user_id)
+
+
+def discard(guild_id: int, user_id: int) -> None:
+    """Drop a member from the watch set once their card closes."""
+    with _lock:
+        bucket = _watch.get(guild_id)
+        if bucket is not None:
+            bucket.discard(user_id)
+
+
+def _reset_watch_for_tests() -> None:
+    with _lock:
+        _watch.clear()

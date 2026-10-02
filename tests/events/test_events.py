@@ -1,0 +1,2215 @@
+"""Tests for Discord event handlers."""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncio
+import sqlite3
+
+import discord
+import pytest
+from discord import app_commands
+
+from bot_modules.events.cog import EventsCog, _collect_backfill_channels, _on_tree_error
+from bot_modules.core.db_utils import open_db
+from bot_modules.core.xp_system import DEFAULT_XP_SETTINGS
+from bot_modules.onboarding.welcome.service import DEFAULT_ARRIVAL_MESSAGE
+from bot_modules.economy.logic import local_day_for
+from bot_modules.economy.quests_service import create_quest, set_quest_active
+from bot_modules.economy.service import (
+    DmDelivery,
+    get_balance,
+    save_econ_settings,
+)
+from tests.db_template import migrated_db
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def _make_bot() -> MagicMock:
+    bot = MagicMock()
+    bot.tree = MagicMock()
+    bot.user = MagicMock()
+    bot.user.id = 1
+    bot.get_guild = MagicMock(return_value=None)
+    bot.guilds = []
+    # events_cog conditionally awaits bot.games_db.fetchall()
+    bot.games_db = AsyncMock()
+    bot.games_db.fetchall = AsyncMock(return_value=[])
+    return bot
+
+
+def _make_ctx(**kwargs) -> MagicMock:
+    ctx = MagicMock()
+    ctx.bypass_role_ids = kwargs.get("bypass_role_ids", set())
+    ctx.xp_excluded_channel_ids = kwargs.get("xp_excluded_channel_ids", set())
+    ctx.xp_pair_states = kwargs.get("xp_pair_states", {})
+    ctx.level_5_role_id = kwargs.get("level_5_role_id", 0)
+    ctx.level_up_log_channel_id = kwargs.get("level_up_log_channel_id", 0)
+    ctx.level_5_log_channel_id = kwargs.get("level_5_log_channel_id", 0)
+    ctx.guild_id = kwargs.get("guild_id", 1)
+    ctx.db_path = MagicMock()
+    ctx.open_db = MagicMock()
+    mock_conn = MagicMock()
+    ctx.open_db.return_value.__enter__ = MagicMock(return_value=mock_conn)
+    ctx.open_db.return_value.__exit__ = MagicMock(return_value=False)
+    # on_message and reaction handlers read config via ctx.guild_config(gid);
+    # return a stub carrying the same per-guild values the test passed in.
+    _stub = _StubGuildConfig(
+        bypass_role_ids=kwargs.get("bypass_role_ids", set()),
+        recorded_bot_user_ids=kwargs.get("recorded_bot_user_ids", set()),
+        xp_excluded_channel_ids=kwargs.get("xp_excluded_channel_ids", set()),
+        level_5_role_id=kwargs.get("level_5_role_id", 0),
+        level_5_log_channel_id=kwargs.get("level_5_log_channel_id", 0),
+        level_up_log_channel_id=kwargs.get("level_up_log_channel_id", 0),
+    )
+    ctx.guild_config = MagicMock(return_value=_stub)
+    return ctx
+
+
+def _make_message(*, is_bot: bool = False, guild: Any = MagicMock(), channel_id: int = 10, author_id: int = 50, message_id: int = 1000) -> MagicMock:
+    msg = MagicMock(spec=discord.Message)
+    author = MagicMock(spec=discord.Member)
+    author.bot = is_bot
+    author.id = author_id
+    author.display_name = f"user-{author_id}"
+    msg.author = author
+    msg.guild = guild
+    msg.id = message_id
+    channel = MagicMock()
+    channel.id = channel_id
+    msg.channel = channel
+    msg.content = ""
+    msg.system_content = ""
+    msg.mentions = []
+    msg.embeds = []
+    msg.attachments = []
+    msg.reference = None
+    msg.type = discord.MessageType.default
+    msg.created_at = MagicMock()
+    msg.created_at.timestamp = MagicMock(return_value=1_000_000.0)
+    return msg
+
+
+def _make_interaction() -> MagicMock:
+    ix = MagicMock(spec=discord.Interaction)
+    ix.response.is_done = MagicMock(return_value=False)
+    ix.response.send_message = AsyncMock()
+    ix.guild_id = 1
+    ix.user = MagicMock()
+    ix.user.id = 100
+    return ix
+
+
+# ── on_message ────────────────────────────────────────────────────────
+
+@pytest.fixture
+def cog():
+    _bot = _make_bot()
+    _bot.ctx = _make_ctx()
+    return EventsCog(_bot)
+
+
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_bot_message_ignored(mock_spoiler, mock_award, mock_activity, cog):
+    mock_spoiler.return_value = False
+    await cog.on_message(_make_message(is_bot=True))
+    mock_activity.assert_not_called()
+    mock_award.assert_not_called()
+
+
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_dm_message_ignored(mock_spoiler, mock_award, mock_activity, cog):
+    mock_spoiler.return_value = False
+    await cog.on_message(_make_message(guild=None))
+    mock_activity.assert_not_called()
+    mock_award.assert_not_called()
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_spoiler_violation_stops_processing(mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, cog):
+    mock_spoiler.return_value = True
+    await cog.on_message(_make_message())
+    mock_activity.assert_not_called()
+    mock_award.assert_not_called()
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_normal_message_records_activity(mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, cog):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    await cog.on_message(_make_message())
+    mock_activity.assert_called_once()
+
+
+def _greeting_watch_cog() -> EventsCog:
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            greeting_watch_enabled=True, greeting_watch_channel_ids={10}
+        )
+    )
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    return EventsCog(_bot)
+
+
+@patch("bot_modules.events.cog.record_greeting")
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_greeting_watch_records_room_greeting(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, mock_record_greeting
+):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=10, message_id=2001)
+    msg.content = "hey all"
+    msg.reference = None
+    await _greeting_watch_cog().on_message(msg)
+    mock_record_greeting.assert_called_once()
+
+
+@patch("bot_modules.events.cog.record_greeting")
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_greeting_watch_skips_reply_that_opens_with_hello_token(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, mock_record_greeting
+):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=10, message_id=2002)
+    msg.content = "hey, no worries!"
+    msg.reference = SimpleNamespace(message_id=1999, resolved=None)
+    await _greeting_watch_cog().on_message(msg)
+    mock_record_greeting.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@patch("bot_modules.events.cog.acknowledge_greetings")
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_greeting_watch_mention_acknowledges_at_ingest(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, mock_ack,
+    enabled,
+):
+    """A mention hands its human targets to acknowledge_greetings, only while
+    the feature is on — bots never count as the greeter being answered."""
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=10, message_id=2003)
+    msg.content = "welcome back"
+    msg.mentions = [SimpleNamespace(id=77, bot=False), SimpleNamespace(id=88, bot=True)]
+    cog = _greeting_watch_cog()
+    if not enabled:
+        cog.bot.ctx.guild_config.return_value.greeting_watch_enabled = False
+    await cog.on_message(msg)
+    if enabled:
+        mock_ack.assert_called_once()
+        assert mock_ack.call_args.args[4] == (77,)
+    else:
+        mock_ack.assert_not_called()
+
+
+@patch("bot_modules.onboarding.intake.views.handle_intake_message", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.intake_svc.is_watched", return_value=True)
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_intake_sees_a_reply_with_no_mention(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level,
+    mock_watched, mock_intake, cog,
+):
+    # Wiring guard: a reply with its ping suppressed isn't in message.mentions
+    # at all, so a pre-filter that only looked there dropped every canned
+    # reply before intake's own logic ever ran.
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=10, message_id=2003)
+    msg.mentions = []
+    msg.reference = SimpleNamespace(
+        message_id=1999, resolved=SimpleNamespace(author=SimpleNamespace(id=77))
+    )
+    await cog.on_message(msg)
+    assert 77 in [c.args[1] for c in mock_watched.call_args_list]
+    mock_intake.assert_awaited_once()
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.track_auto_delete_message")
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=True)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_message_tracked_when_rule_exists(mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_track, mock_level, cog):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    await cog.on_message(_make_message(channel_id=10, message_id=999))
+    mock_track.assert_called_once()
+    args = mock_track.call_args[0]
+    assert args[2] == 10
+    assert args[3] == 999
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_xp_award_triggers_level_progress(mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level, cog):
+    mock_spoiler.return_value = False
+    award_result = MagicMock()
+    mock_award.return_value = award_result
+    msg = _make_message()
+    msg.author = MagicMock(spec=discord.Member)
+    msg.author.bot = False
+    msg.author.id = 50
+    await cog.on_message(msg)
+    mock_level.assert_awaited_once()
+
+
+@patch("bot_modules.events.cog.store_message")
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_system_message_is_recorded_without_text_activity_or_xp(mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_store, cog):
+    msg = _make_message()
+    msg.content = ""
+    msg.system_content = "friedchips just showed up!"
+    msg.type = discord.MessageType.new_member
+    await cog.on_message(msg)
+    mock_spoiler.assert_not_awaited()
+    mock_activity.assert_not_called()
+    mock_award.assert_not_awaited()
+    mock_store.assert_called_once()
+    # The row is metadata only: nothing that could carry the system text.
+    assert "content" not in mock_store.call_args.kwargs
+
+
+# ── on_ready ──────────────────────────────────────────────────────────
+
+@patch("bot_modules.events.cog.asyncio.create_task")
+async def test_on_ready_does_not_spawn_duplicate_backfill_task(mock_create_task):
+    ctx = _make_ctx()
+    bot = _make_bot()
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    running_task = MagicMock()
+    running_task.done.return_value = False
+
+    def _capture_task(coro):
+        coro.close()
+        return running_task
+
+    mock_create_task.side_effect = _capture_task
+    await cog.on_ready()
+    await cog.on_ready()
+    mock_create_task.assert_called_once()
+
+
+# ── on_raw_message_delete ─────────────────────────────────────────────
+
+@patch("bot_modules.events.cog.remove_tracked_auto_delete_message")
+async def test_no_guild_id_ignored_on_delete(mock_remove):
+    ctx = _make_ctx()
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    payload = MagicMock(spec=discord.RawMessageDeleteEvent)
+    payload.guild_id = None
+    await cog.on_raw_message_delete(payload)
+    mock_remove.assert_not_called()
+
+
+def _ctx_with_archive(monkeypatch, *, message_ids=(999,)):
+    """A ctx whose open_db yields a real archive holding ``message_ids``.
+
+    The delete listeners now write, so a MagicMock connection isn't enough —
+    the flag has to be readable back.
+    """
+    import contextlib
+    import sqlite3
+
+    from bot_modules.shared.message_store import init_message_tables, store_message
+
+    # check_same_thread=False: the listeners do the write in asyncio.to_thread.
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    init_message_tables(conn)
+    for mid in message_ids:
+        store_message(
+            conn,
+            message_id=mid,
+            guild_id=1,
+            channel_id=10,
+            author_id=50,
+            reply_to_id=None,
+            ts=1_000,
+            mention_ids=[],
+        )
+
+    ctx = _make_ctx()
+
+    @contextlib.contextmanager
+    def _open_db():
+        yield conn
+
+    ctx.open_db = _open_db
+    return ctx, conn
+
+
+@patch("bot_modules.events.cog.remove_tracked_auto_delete_message")
+async def test_with_guild_id_clears_auto_delete_tracking(mock_remove, monkeypatch):
+    """Auto-delete tracking is per-message bookkeeping and is cleared."""
+    ctx, _conn = _ctx_with_archive(monkeypatch)
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    payload = MagicMock(spec=discord.RawMessageDeleteEvent)
+    payload.guild_id = 1
+    payload.channel_id = 10
+    payload.message_id = 999
+    await cog.on_raw_message_delete(payload)
+    mock_remove.assert_called_once_with(ctx.db_path, 1, 10, 999)
+
+
+async def test_delete_flags_the_row_but_keeps_the_archive(monkeypatch):
+    """The metadata row stays permanent through a Discord delete, but the
+    deletion is *recorded*, so mod surfaces stop offering a deep link to a
+    message that is gone."""
+    from bot_modules.shared.message_store import DELETE_SOURCE_DISCORD
+
+    ctx, conn = _ctx_with_archive(monkeypatch)
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    payload = MagicMock(spec=discord.RawMessageDeleteEvent)
+    payload.guild_id = 1
+    payload.channel_id = 10
+    payload.message_id = 999
+    with patch("bot_modules.events.cog.remove_tracked_auto_delete_message"):
+        await cog.on_raw_message_delete(payload)
+
+    row = conn.execute(
+        "SELECT author_id, deleted_at, deleted_source FROM messages WHERE message_id = 999"
+    ).fetchone()
+    assert row is not None, "the metadata row must survive the deletion"
+    assert row["deleted_at"] is not None
+    # Discord's raw payload names no actor, so this is the unattributed source.
+    assert row["deleted_source"] == DELETE_SOURCE_DISCORD
+
+
+# ── on_raw_bulk_message_delete ────────────────────────────────────────
+
+@patch("bot_modules.events.cog.remove_tracked_auto_delete_messages")
+async def test_no_guild_id_ignored_on_bulk_delete(mock_remove):
+    ctx = _make_ctx()
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    payload = MagicMock(spec=discord.RawBulkMessageDeleteEvent)
+    payload.guild_id = None
+    await cog.on_raw_bulk_message_delete(payload)
+    mock_remove.assert_not_called()
+
+
+@patch("bot_modules.events.cog.remove_tracked_auto_delete_messages")
+async def test_with_guild_id_clears_bulk_auto_delete_tracking(mock_remove, monkeypatch):
+    """Same as the single-delete case: clear tracking, flag every row in the
+    batch, and leave the metadata rows in place."""
+    from bot_modules.shared.message_store import DELETE_SOURCE_DISCORD
+
+    ctx, conn = _ctx_with_archive(monkeypatch, message_ids=(100, 101, 102))
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    payload = MagicMock(spec=discord.RawBulkMessageDeleteEvent)
+    payload.guild_id = 1
+    payload.channel_id = 10
+    payload.message_ids = {100, 101, 102}
+    await cog.on_raw_bulk_message_delete(payload)
+    mock_remove.assert_called_once_with(ctx.db_path, 1, 10, {100, 101, 102})
+
+    rows = conn.execute(
+        "SELECT deleted_source FROM messages ORDER BY message_id"
+    ).fetchall()
+    assert [r["deleted_source"] for r in rows] == [DELETE_SOURCE_DISCORD] * 3
+
+
+# ── on_raw_reaction_add ───────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    ("enabled", "channel_id", "is_bot", "acked"),
+    [
+        pytest.param(True, 10, False, True, id="member-reacts-in-watched-channel"),
+        pytest.param(True, 11, False, False, id="unwatched-channel"),
+        pytest.param(False, 10, False, False, id="feature-off"),
+        pytest.param(True, 10, True, False, id="bot-reaction"),
+    ],
+)
+@patch("bot_modules.events.cog.acknowledge_by_reaction")
+@patch("bot_modules.events.cog.award_image_reaction_xp", new_callable=AsyncMock)
+async def test_greeting_watch_reaction_acknowledges_at_ingest(
+    mock_award, mock_ack, enabled, channel_id, is_bot, acked
+):
+    """A member's reaction in a watched channel is offered to Greeting Watch
+    as an answer; the service decides whether it landed on a pending hello."""
+    mock_award.return_value = None
+    cog = _greeting_watch_cog()
+    cog.bot.ctx.guild_config.return_value.greeting_watch_enabled = enabled
+    payload = MagicMock(spec=discord.RawReactionActionEvent)
+    payload.guild_id, payload.channel_id = 1, channel_id
+    payload.message_id, payload.user_id = 2003, 77
+    payload.member = SimpleNamespace(bot=is_bot)
+    await cog.on_raw_reaction_add(payload)
+    if acked:
+        assert mock_ack.call_args.args[1:] == (1, 2003, 77)
+    else:
+        mock_ack.assert_not_called()
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.award_image_reaction_xp", new_callable=AsyncMock)
+async def test_no_award_no_level_progress(mock_award, mock_level):
+    ctx = _make_ctx()
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    mock_award.return_value = None
+    payload = MagicMock(spec=discord.RawReactionActionEvent)
+    await cog.on_raw_reaction_add(payload)
+    mock_level.assert_not_awaited()
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.award_image_reaction_xp", new_callable=AsyncMock)
+async def test_award_triggers_level_progress(mock_award, mock_level):
+    ctx = _make_ctx()
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    member = MagicMock(spec=discord.Member)
+    award_result = MagicMock()
+    mock_award.return_value = (member, award_result)
+    payload = MagicMock(spec=discord.RawReactionActionEvent)
+    await cog.on_raw_reaction_add(payload)
+    mock_level.assert_awaited_once()
+    args, _ = mock_level.call_args
+    assert args[0] == member
+    assert args[1] == award_result
+    assert args[2] == "image_reaction"
+
+
+# ── _collect_backfill_channels ────────────────────────────────────────
+
+def _make_channel(spec, channel_id: int, *, can_read: bool = True) -> MagicMock:
+    ch = MagicMock(spec=spec)
+    ch.id = channel_id
+    perms = MagicMock()
+    perms.read_message_history = can_read
+    ch.permissions_for = MagicMock(return_value=perms)
+    return ch
+
+
+def _empty_async_iter():
+    async def _gen():
+        if False:
+            yield None
+    return _gen()
+
+
+async def test_collect_backfill_includes_forum_voice_stage():
+    """Forum threads, voice channels, and stage channels must be indexed.
+
+    Regression: forum posts were never backfilled because the loop only
+    walked guild.text_channels, so /delete_me silently missed them.
+    """
+    text = _make_channel(discord.TextChannel, 1)
+    text.threads = []
+    text.archived_threads = MagicMock(return_value=_empty_async_iter())
+
+    forum_thread_active = _make_channel(discord.Thread, 200)
+    forum_thread_archived = _make_channel(discord.Thread, 201)
+    forum = _make_channel(discord.ForumChannel, 100)
+    forum.threads = [forum_thread_active]
+
+    async def _archived_forum(**_kwargs):
+        yield forum_thread_archived
+    forum.archived_threads = _archived_forum
+
+    voice = _make_channel(discord.VoiceChannel, 300)
+    stage = _make_channel(discord.StageChannel, 400)
+
+    guild = MagicMock(spec=discord.Guild)
+    guild.text_channels = [text]
+    guild.forums = [forum]
+    guild.voice_channels = [voice]
+    guild.stage_channels = [stage]
+
+    me = MagicMock(spec=discord.Member)
+    result = await _collect_backfill_channels(guild, me)
+
+    ids = {c.id for c in result}
+    assert {1, 200, 201, 300, 400}.issubset(ids), (
+        f"missing channels in backfill: got {ids}"
+    )
+    # Forum channel itself must NOT be in the list — it has no .history()
+    assert 100 not in ids
+
+
+async def test_collect_backfill_skips_unreadable_channels():
+    text = _make_channel(discord.TextChannel, 1, can_read=False)
+    text.threads = []
+    text.archived_threads = MagicMock(return_value=_empty_async_iter())
+    forum = _make_channel(discord.ForumChannel, 2, can_read=False)
+    forum.threads = []
+
+    async def _archived_forum(**_kwargs):
+        if False:
+            yield None
+    forum.archived_threads = _archived_forum
+
+    voice = _make_channel(discord.VoiceChannel, 3, can_read=False)
+    stage = _make_channel(discord.StageChannel, 4, can_read=False)
+
+    guild = MagicMock(spec=discord.Guild)
+    guild.text_channels = [text]
+    guild.forums = [forum]
+    guild.voice_channels = [voice]
+    guild.stage_channels = [stage]
+
+    me = MagicMock(spec=discord.Member)
+    result = await _collect_backfill_channels(guild, me)
+    assert result == []
+
+
+# ── on_app_command_error ──────────────────────────────────────────────
+
+async def test_command_not_found_sends_ephemeral():
+    ix = _make_interaction()
+    error = app_commands.CommandNotFound("unknown_cmd", [])
+    await _on_tree_error(ix, error)
+    ix.response.send_message.assert_awaited_once()
+    assert ix.response.send_message.call_args[1]["ephemeral"] is True
+    assert "out of date" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_command_not_found_skipped_if_response_done():
+    ix = _make_interaction()
+    ix.response.is_done.return_value = True
+    error = app_commands.CommandNotFound("cmd", [])
+    await _on_tree_error(ix, error)
+    ix.response.send_message.assert_not_awaited()
+
+
+async def test_generic_error_sends_failure_message():
+    ix = _make_interaction()
+    error = app_commands.AppCommandError("something broke")
+    await _on_tree_error(ix, error)
+    ix.response.send_message.assert_awaited_once()
+    assert ix.response.send_message.call_args[1]["ephemeral"] is True
+    assert "failed" in ix.response.send_message.call_args[0][0].lower()
+
+
+# ── on_member_join / on_member_remove per-guild config ────────────────
+# Regression bait for the prelaunch P0 fix: welcome/leave/greeter channels
+# must be read from ``ctx.guild_config(member.guild.id)``, not the home-guild
+# flat fields on ctx. A 2nd guild that hasn't configured welcome must NOT
+# inherit the home guild's settings via the legacy fallback.
+
+
+class _StubGuildConfig:
+    def __init__(
+        self,
+        *,
+        welcome_channel_id: int = 0,
+        welcome_message: str = "",
+        welcome_ping_role_id: int = 0,
+        welcome_ping_member: bool = False,
+        welcome_trigger: str = "join",
+        unverified_role_id: int = 0,
+        greeter_chat_channel_id: int = 0,
+        greeter_arrival_message: str = DEFAULT_ARRIVAL_MESSAGE,
+        leave_channel_id: int = 0,
+        leave_message: str = "",
+        bypass_role_ids: Any = None,
+        recorded_bot_user_ids: Any = None,
+        xp_excluded_channel_ids: Any = None,
+        level_5_role_id: int = 0,
+        level_5_log_channel_id: int = 0,
+        level_up_log_channel_id: int = 0,
+        grant_roles: Any = None,
+        promotion_review_grant_role_id: int = 0,
+        xp_settings: Any = DEFAULT_XP_SETTINGS,
+        auto_role_ids: Any = None,
+        greeting_watch_enabled: bool = False,
+        greeting_watch_channel_ids: Any = None,
+        greeting_watch_window_minutes: int = 10,
+        greeting_watch_extra_words: tuple = (),
+    ):
+        self.welcome_channel_id = welcome_channel_id
+        self.welcome_message = welcome_message
+        self.welcome_ping_role_id = welcome_ping_role_id
+        self.welcome_ping_member = welcome_ping_member
+        self.welcome_trigger = welcome_trigger
+        self.unverified_role_id = unverified_role_id
+        self.greeter_chat_channel_id = greeter_chat_channel_id
+        self.greeter_arrival_message = greeter_arrival_message
+        self.leave_channel_id = leave_channel_id
+        self.leave_message = leave_message
+        self.bypass_role_ids = (
+            frozenset() if bypass_role_ids is None else frozenset(bypass_role_ids)
+        )
+        self.recorded_bot_user_ids = (
+            frozenset() if recorded_bot_user_ids is None else frozenset(recorded_bot_user_ids)
+        )
+        self.xp_excluded_channel_ids = (
+            frozenset() if xp_excluded_channel_ids is None else frozenset(xp_excluded_channel_ids)
+        )
+        self.level_5_role_id = level_5_role_id
+        self.level_5_log_channel_id = level_5_log_channel_id
+        self.level_up_log_channel_id = level_up_log_channel_id
+        self.grant_roles = {} if grant_roles is None else grant_roles
+        self.promotion_review_grant_role_id = promotion_review_grant_role_id
+        self.xp_settings = xp_settings
+        self.auto_role_ids = (
+            frozenset() if auto_role_ids is None else frozenset(auto_role_ids)
+        )
+        self.greeting_watch_enabled = greeting_watch_enabled
+        self.greeting_watch_channel_ids = (
+            frozenset()
+            if greeting_watch_channel_ids is None
+            else frozenset(greeting_watch_channel_ids)
+        )
+        self.greeting_watch_window_minutes = greeting_watch_window_minutes
+        self.greeting_watch_extra_words = tuple(greeting_watch_extra_words)
+
+
+def _make_member(*, guild_id: int = 1, member_id: int = 100, is_bot: bool = False) -> MagicMock:
+    member = MagicMock(spec=discord.Member)
+    member.id = member_id
+    member.bot = is_bot
+    member.display_name = f"user-{member_id}"
+    member.mention = f"<@{member_id}>"
+    guild = MagicMock()
+    guild.id = guild_id
+    guild.name = f"guild-{guild_id}"
+    member.guild = guild
+    member.created_at = MagicMock()
+    member.created_at.timestamp = MagicMock(return_value=1_000_000.0)
+    member.__str__ = MagicMock(return_value=f"user-{member_id}#0001")
+    return member
+
+
+def _patch_join_deps():
+    """Patch the side-effectful imports inside on_member_join."""
+    return [
+        patch("bot_modules.events.cog.check_jail_rejoin", new_callable=AsyncMock),
+        patch(
+            "bot_modules.events.cog.reapply_on_join",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch("bot_modules.events.cog.upsert_known_user"),
+        patch("bot_modules.events.cog.record_member_event"),
+        patch(
+            "bot_modules.events.cog.detect_inviter",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        ),
+        patch("bot_modules.events.cog.build_welcome_embed", return_value="<embed>"),
+        # Provisioning @Welcome Ping is proven in test_role_provision_logic;
+        # here the cog is glue, so the provisioner stands in as "no role", the
+        # answer for a guild whose admin stored "(none)". A test that wants the
+        # provisioned case patches this with its own return value.
+        patch(
+            "bot_modules.events.cog.ensure_config_role",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "bot_modules.core.branding.resolve_accent_color",
+            new_callable=AsyncMock,
+            return_value=discord.Color.blurple(),
+        ),
+    ]
+
+
+def _patch_leave_deps():
+    return [
+        patch("bot_modules.events.cog.mark_member_left"),
+        patch("bot_modules.events.cog.record_member_event"),
+        patch("bot_modules.events.cog.build_leave_embed", return_value="<embed>"),
+        patch(
+            "bot_modules.core.branding.resolve_accent_color",
+            new_callable=AsyncMock,
+            return_value=discord.Color.blurple(),
+        ),
+    ]
+
+
+async def test_on_member_join_uses_per_guild_welcome_channel():
+    """Welcome channel comes from cfg, not from ctx flat fields."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    # ctx flat fields would point to a DIFFERENT channel; the cog must ignore them.
+    ctx.welcome_channel_id = 999
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(welcome_channel_id=42, welcome_message="hi"),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member(guild_id=7)
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    ctx.guild_config.assert_called_with(7)  # per-guild lookup
+    member.guild.get_channel.assert_any_call(42)  # NOT 999
+    welcome_channel.send.assert_awaited_once()
+
+
+async def test_on_member_join_skips_welcome_when_channel_unset():
+    """Empty guild_config (e.g. unconfigured 2nd guild) → no welcome message sent."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.welcome_channel_id = 999  # home guild has one; this guild does not
+    ctx.guild_config = MagicMock(return_value=_StubGuildConfig())  # all zeros
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    member = _make_member(guild_id=20)
+    member.guild.get_channel = MagicMock(return_value=MagicMock(spec=discord.TextChannel))
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    # get_channel was never asked about welcome_channel_id=0
+    for call in member.guild.get_channel.call_args_list:
+        assert call.args[0] != 999  # home guild's channel must NOT be used
+
+
+async def test_on_member_join_includes_ping_role_when_set():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(welcome_channel_id=42, welcome_ping_role_id=88),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    sent_kwargs = welcome_channel.send.call_args.kwargs
+    assert sent_kwargs["content"] == "<@&88>"
+
+
+async def test_on_member_join_omits_ping_when_role_unset():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(welcome_channel_id=42, welcome_ping_role_id=0),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    sent_kwargs = welcome_channel.send.call_args.kwargs
+    assert sent_kwargs["content"] is None
+
+
+async def test_on_member_join_pings_member_when_enabled():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            welcome_channel_id=42,
+            welcome_ping_role_id=88,
+            welcome_ping_member=True,
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    sent_kwargs = welcome_channel.send.call_args.kwargs
+    # Role ping and the member mention both ride in the content so the join
+    # actually notifies the new member (mentions inside the embed do not).
+    assert sent_kwargs["content"] == f"<@&88> {member.mention}"
+
+
+async def test_on_member_join_pings_only_member_without_role():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            welcome_channel_id=42,
+            welcome_ping_role_id=0,
+            welcome_ping_member=True,
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    sent_kwargs = welcome_channel.send.call_args.kwargs
+    assert sent_kwargs["content"] == member.mention
+
+
+async def test_on_member_join_sends_greeter_ping():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(greeter_chat_channel_id=77),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    greeter_channel = MagicMock(spec=discord.TextChannel)
+    greeter_channel.send = AsyncMock()
+    member = _make_member(member_id=500)
+    member.guild.get_channel = MagicMock(return_value=greeter_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    # One wiring assertion: the line *and* the allow-list that lets it ping.
+    # The bot suppresses mentions by default, so an arrival line sent without
+    # allowed_mentions renders the @here and notifies nobody.
+    greeter_channel.send.assert_awaited_once()
+    assert greeter_channel.send.await_args.args[0] == "@here - <@500> has arrived"
+    allowed = greeter_channel.send.await_args.kwargs["allowed_mentions"]
+    assert allowed.everyone is True                      # the admin's @here
+    assert [o.id for o in allowed.users] == [500]        # the newcomer
+
+
+async def test_on_member_join_honours_a_custom_arrival_line():
+    """The line is a per-guild dial now — copy and ping come from config."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            greeter_chat_channel_id=77,
+            greeter_arrival_message="{member_name} just walked in",
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    greeter_channel = MagicMock(spec=discord.TextChannel)
+    greeter_channel.send = AsyncMock()
+    member = _make_member(member_id=500)
+    member.guild.get_channel = MagicMock(return_value=greeter_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    sent = greeter_channel.send.await_args.args[0]
+    assert "@here" not in sent
+    assert sent == f"{member.display_name} just walked in"
+
+
+async def test_on_member_join_posts_nothing_when_arrival_line_cleared():
+    """An empty arrival line is the off switch, not an empty message."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            greeter_chat_channel_id=77, greeter_arrival_message="",
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    greeter_channel = MagicMock(spec=discord.TextChannel)
+    greeter_channel.send = AsyncMock()
+    member = _make_member(member_id=500)
+    member.guild.get_channel = MagicMock(return_value=greeter_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        await cog.on_member_join(member)
+
+    greeter_channel.send.assert_not_awaited()
+
+
+class _AutoRole:
+    """Enough of discord.Role for core.role_safety's checks (position-ordered
+    like the real thing, since role_block_reason compares it to the bot's)."""
+
+    def __init__(
+        self, role_id: int, position: int = 0, *, elevated: bool = False, managed: bool = False
+    ) -> None:
+        self.id = role_id
+        self.name = f"auto-{role_id}"
+        self.position = position
+        self.managed = managed
+        self.permissions = (
+            discord.Permissions(manage_messages=True) if elevated else discord.Permissions.none()
+        )
+
+    def is_default(self) -> bool:
+        return False
+
+    def __ge__(self, other: "_AutoRole") -> bool:
+        return self.position >= other.position
+
+
+def _auto_role(role_id: int, *, elevated: bool = False, managed: bool = False) -> _AutoRole:
+    # Below the bot's top_role (position 10) unless it's the bot's own role.
+    return _AutoRole(role_id, position=1, elevated=elevated, managed=managed)
+
+
+async def test_on_member_join_auto_role_assigns_a_plain_role():
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(return_value=_StubGuildConfig(auto_role_ids={91}))
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    role = _auto_role(91)
+    member = _make_member()
+    member.guild.get_role = MagicMock(return_value=role)
+    member.guild.me = SimpleNamespace(top_role=_AutoRole(1, position=10))
+    member.roles = []
+    member.add_roles = AsyncMock()
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            mock = stack.enter_context(p)
+            if p.attribute == "check_jail_rejoin":
+                mock.return_value = False
+        await cog.on_member_join(member)
+
+    member.add_roles.assert_awaited_once_with(role, reason="auto-role on join")
+
+
+async def test_on_member_join_a_break_rejoiner_gets_no_auto_role():
+    """Someone who left mid-break and came back inside the settle window gets
+    the break re-applied and nothing else — the jailed-rejoiner guard."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(return_value=_StubGuildConfig(auto_role_ids={91}))
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    member = _make_member()
+    member.guild.get_role = MagicMock(return_value=_auto_role(91))
+    member.guild.me = SimpleNamespace(top_role=_AutoRole(1, position=10))
+    member.roles = []
+    member.add_roles = AsyncMock()
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            mock = stack.enter_context(p)
+            if p.attribute == "check_jail_rejoin":
+                mock.return_value = False
+            if p.attribute == "reapply_on_join":
+                mock.return_value = True
+        await cog.on_member_join(member)
+
+    member.add_roles.assert_not_awaited()
+
+
+async def test_on_member_join_auto_role_refuses_an_elevated_role():
+    """The auto-role list is config: a dial pointed at a mod-level role must
+    not hand it to every newcomer (2026-09-14 role-safety fix)."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(return_value=_StubGuildConfig(auto_role_ids={92}))
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    role = _auto_role(92, elevated=True)
+    member = _make_member()
+    member.guild.get_role = MagicMock(return_value=role)
+    member.guild.me = SimpleNamespace(top_role=_AutoRole(1, position=10))
+    member.roles = []
+    member.add_roles = AsyncMock()
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            mock = stack.enter_context(p)
+            if p.attribute == "check_jail_rejoin":
+                mock.return_value = False
+        await cog.on_member_join(member)
+
+    member.add_roles.assert_not_awaited()
+
+
+def _role(role_id: int, name: str) -> MagicMock:
+    role = MagicMock()
+    role.id = role_id
+    role.name = name
+    return role
+
+
+async def test_on_member_update_verified_fires_without_bio():
+    """Stripping the unverified role fires the welcome with no bio required.
+
+    Regression guard: DoubleCounter lifts the gate by removing the unverified
+    role; the welcome must fire on that alone, independent of any bio.
+    """
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            welcome_channel_id=42,
+            welcome_trigger="verified",
+            unverified_role_id=555,
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+    cog._send_welcome = AsyncMock()
+
+    member_role = _role(900, "Member")
+    before = _make_member(guild_id=7)
+    before.roles = [_role(555, "Unverified"), member_role]
+    after = _make_member(guild_id=7)
+    after.roles = [member_role]  # unverified role stripped
+
+    with patch("bot_modules.events.cog.log_role_event"):
+        await cog.on_member_update(before, after)
+
+    cog._send_welcome.assert_awaited_once()
+    assert cog._send_welcome.call_args.args[0] is after
+
+
+async def test_on_member_update_verified_skips_when_unverified_role_kept():
+    """No welcome while the unverified role is still present."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            welcome_channel_id=42,
+            welcome_trigger="verified",
+            unverified_role_id=555,
+        ),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+    cog._send_welcome = AsyncMock()
+
+    unverified = _role(555, "Unverified")
+    before = _make_member(guild_id=7)
+    before.roles = [unverified]
+    after = _make_member(guild_id=7)
+    after.roles = [unverified, _role(900, "Member")]  # gained a role, gate intact
+
+    with patch("bot_modules.events.cog.log_role_event"):
+        await cog.on_member_update(before, after)
+
+    cog._send_welcome.assert_not_awaited()
+
+
+_NSFW_GRANT_ROLES = {"nsfw": {"role_id": 555}}
+
+
+@pytest.mark.parametrize(
+    ("grant_roles", "before_ids", "after_ids", "expected"),
+    [
+        # The bug was that /grant never told the card, so its "Spicy access"
+        # field stayed ❌ forever. expected is None ⇒ no refresh at all.
+        pytest.param(_NSFW_GRANT_ROLES, [900], [900, 555], True, id="granted"),
+        pytest.param(_NSFW_GRANT_ROLES, [555], [], False, id="revoked"),
+        pytest.param(_NSFW_GRANT_ROLES, [555], [555, 901], None, id="unrelated-role"),
+        pytest.param({}, [], [555], None, id="nsfw-role-unset"),
+    ],
+)
+async def test_on_member_update_level_5_card_refresh(
+    grant_roles, before_ids, after_ids, expected
+):
+    """Wiring: the nsfw role landing by any path reaches the card refresh."""
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(grant_roles=grant_roles),
+    )
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+
+    before = _make_member(guild_id=7)
+    before.roles = [_role(rid, f"R{rid}") for rid in before_ids]
+    after = _make_member(guild_id=7)
+    after.roles = [_role(rid, f"R{rid}") for rid in after_ids]
+
+    refresh = AsyncMock()
+    with (
+        patch("bot_modules.events.cog.log_role_event"),
+        patch(
+            "bot_modules.xp.promotion_review_views.refresh_level_5_cards", refresh
+        ),
+    ):
+        await cog.on_member_update(before, after)
+        # The refresh is detached (create_task) so it can't delay or be skipped
+        # by the rest of the listener — let the loop run it.
+        await asyncio.sleep(0)
+
+    if expected is None:
+        refresh.assert_not_awaited()
+        return
+    refresh.assert_awaited_once()
+    assert refresh.await_args.args[1] is after
+    assert refresh.await_args.args[2] is expected  # has_nsfw
+
+
+async def test_on_member_update_card_refresh_survives_a_welcome_failure():
+    """Nothing replays a missed refresh, so earlier work blowing up mustn't skip it."""
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(
+            grant_roles=_NSFW_GRANT_ROLES,
+            welcome_channel_id=42,
+            welcome_trigger="verified",
+            unverified_role_id=901,
+        ),
+    )
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    cog = EventsCog(_bot)
+    cog._send_welcome = AsyncMock(side_effect=sqlite3.OperationalError("locked"))
+
+    # One edit both strips the unverified role and adds the NSFW role.
+    before = _make_member(guild_id=7)
+    before.roles = [_role(901, "Unverified")]
+    after = _make_member(guild_id=7)
+    after.roles = [_role(555, "Spicy")]
+
+    refresh = AsyncMock()
+    with (
+        patch("bot_modules.events.cog.log_role_event"),
+        patch(
+            "bot_modules.xp.promotion_review_views.refresh_level_5_cards", refresh
+        ),
+    ):
+        with pytest.raises(sqlite3.OperationalError):
+            await cog.on_member_update(before, after)
+        await asyncio.sleep(0)
+
+    refresh.assert_awaited_once()
+    assert refresh.await_args.args[2] is True
+
+
+async def test_on_member_remove_uses_per_guild_leave_channel():
+    """Leave channel comes from cfg, not ctx flat fields."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.leave_channel_id = 999  # home guild
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(leave_channel_id=44, leave_message="bye"),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    leave_channel = MagicMock(spec=discord.TextChannel)
+    leave_channel.send = AsyncMock()
+    member = _make_member(guild_id=7)
+    member.guild.get_channel = MagicMock(return_value=leave_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_leave_deps():
+            stack.enter_context(p)
+        await cog.on_member_remove(member)
+
+    ctx.guild_config.assert_called_with(7)
+    member.guild.get_channel.assert_called_with(44)  # NOT 999
+    leave_channel.send.assert_awaited_once()
+
+
+async def test_on_member_remove_skips_when_channel_unset():
+    """No leave channel configured → no message sent; channel lookup not attempted."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.leave_channel_id = 999  # home guild has one
+    ctx.guild_config = MagicMock(return_value=_StubGuildConfig(leave_channel_id=0))
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    member = _make_member(guild_id=20)
+    member.guild.get_channel = MagicMock()
+
+    with ExitStack() as stack:
+        for p in _patch_leave_deps():
+            stack.enter_context(p)
+        await cog.on_member_remove(member)
+
+    member.guild.get_channel.assert_not_called()
+
+
+# ── economy: text login + QOTD hooks in _process_economy_message ──────────
+
+ECON_GUILD = 4242
+ECON_USER = 77
+ECON_CHANNEL = 88
+
+
+@pytest.fixture
+def econ_db(tmp_path):
+    db_path = tmp_path / "econ.db"
+    migrated_db(db_path)
+    return db_path
+
+
+def _dm_mock(surface: str = "dm") -> AsyncMock:
+    """A patched ``deliver_econ_dm`` that reports a real delivery.
+
+    The digest stores the sent message so it can edit the card in place, so a
+    bare AsyncMock (whose ``.surface`` is a MagicMock) would silently take the
+    "nothing was sent" branch and leave these tests exercising less than they
+    look like they do.
+    """
+    message = MagicMock(spec=discord.Message)
+    message.id = 90001
+    message.channel = MagicMock(id=90002)
+    return AsyncMock(
+        return_value=DmDelivery(surface, message if surface == "dm" else None)
+    )
+
+
+def _econ_cog(econ_db) -> EventsCog:
+    ctx: Any = SimpleNamespace(db_path=econ_db, open_db=lambda: open_db(econ_db))
+    _bot = _make_bot()
+    _bot.ctx = ctx
+    return EventsCog(_bot)
+
+
+def _enable_econ(econ_db, **overrides) -> None:
+    values: dict[str, object] = {"enabled": True}
+    values.update(overrides)
+    with open_db(econ_db) as conn:
+        save_econ_settings(conn, ECON_GUILD, values)
+
+
+def _seed_streak(
+    econ_db, *, streak: int, last_login_day: str, last_grace_day=None, shields=0
+) -> None:
+    with open_db(econ_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO econ_streaks
+                (guild_id, user_id, current_streak, longest_streak,
+                 last_login_day, last_grace_day, shields)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ECON_GUILD, ECON_USER, streak, streak, last_login_day,
+                last_grace_day, shields,
+            ),
+        )
+
+
+def _econ_message(
+    *,
+    booster: bool = False,
+    user_id: int = ECON_USER,
+    message_id: int | None = None,
+    reply_to: int | None = None,
+    content: str = "",
+    role_mentions: tuple[int, ...] = (),
+    admin: bool = False,
+    manager_role_id: int | None = None,
+    nsfw: bool = False,
+) -> MagicMock:
+    msg = MagicMock(spec=discord.Message)
+    guild = MagicMock()
+    guild.id = ECON_GUILD
+    msg.guild = guild
+    author = MagicMock(spec=discord.Member)
+    author.id = user_id
+    author.premium_since = object() if booster else None
+    author.guild_permissions = SimpleNamespace(administrator=admin)
+    author.roles = (
+        [SimpleNamespace(id=manager_role_id)] if manager_role_id is not None else []
+    )
+    msg.author = author
+    channel = MagicMock()
+    channel.id = ECON_CHANNEL
+    # Discord's own age gate, read by is_age_gated_channel; a bare MagicMock
+    # would answer every is_nsfw() truthily.
+    channel.is_nsfw = MagicMock(return_value=nsfw)
+    channel.category = None
+    msg.channel = channel
+    if message_id is not None:
+        msg.id = message_id
+    msg.content = content
+    msg.role_mentions = [SimpleNamespace(id=r) for r in role_mentions]
+    # Default to "not a reply" — a bare MagicMock reference would read as a
+    # reply to a mock message id and reach the QOTD lookup as a non-integer.
+    msg.reference = (
+        SimpleNamespace(message_id=reply_to, resolved=None)
+        if reply_to is not None
+        else None
+    )
+    return msg
+
+
+def _seed_qotd(econ_db, *, message_id: int, local_day: str | None = None) -> None:
+    with open_db(econ_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO econ_qotd
+                (guild_id, channel_id, message_id, question, posted_by, local_day, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ECON_GUILD, ECON_CHANNEL, message_id, "Q?", 1, local_day or _today(), 0.0),
+        )
+
+
+def _days_ago(n: int) -> str:
+    import time as _t
+
+    return local_day_for(_t.time() - n * 86400, 0.0)
+
+
+def _today() -> str:
+    import time as _t
+
+    return local_day_for(_t.time(), 0.0)
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_disabled_is_noop(mock_dm, econ_db):
+    cog = _econ_cog(econ_db)  # economy left disabled
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_not_awaited()
+    with open_db(econ_db) as conn:
+        rows = conn.execute("SELECT COUNT(*) c FROM econ_logins").fetchone()
+    assert rows["c"] == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_first_login_dms_daily_digest(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    # Every login now DMs a streak + quest digest (opt-in gated by
+    # deliver_econ_dm's require_game_role, mocked out here).
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    assert "day" in (embed.description or "").lower()
+    # The payout amount carries the currency emoji, not a bare number.
+    assert "🪙" in (embed.description or "")
+    with open_db(econ_db) as conn:
+        assert get_balance(conn, ECON_GUILD, ECON_USER) > 0
+        row = conn.execute(
+            "SELECT current_streak FROM econ_streaks WHERE guild_id=? AND user_id=?",
+            (ECON_GUILD, ECON_USER),
+        ).fetchone()
+    assert row["current_streak"] == 1
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_repeat_same_day_no_second_login(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    with open_db(econ_db) as conn:
+        first = get_balance(conn, ECON_GUILD, ECON_USER)
+    await cog._process_economy_message(_econ_message())
+    with open_db(econ_db) as conn:
+        second = get_balance(conn, ECON_GUILD, ECON_USER)
+    assert first == second  # process_login returns None on the same local day
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_milestone_dms(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    _seed_streak(econ_db, streak=6, last_login_day=_days_ago(1))
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    assert any("milestone" in f.name.lower() for f in embed.fields)
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_grace_dms(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    # Missed exactly one day, no grace used in the window → grace bridges it.
+    _seed_streak(econ_db, streak=4, last_login_day=_days_ago(2))
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    assert any("saved" in f.name.lower() for f in embed.fields)
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_shield_consumed_dms_shield_copy(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    # One missed day, but grace was burned inside the rolling window — only
+    # the held shield saves the streak, and the digest must say so.
+    _seed_streak(
+        econ_db, streak=4, last_login_day=_days_ago(2),
+        last_grace_day=_days_ago(4), shields=1,
+    )
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    saved = next(f for f in embed.fields if "saved" in f.name.lower())
+    assert "shield" in saved.value.lower()
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT current_streak, shields FROM econ_streaks "
+            "WHERE guild_id=? AND user_id=?",
+            (ECON_GUILD, ECON_USER),
+        ).fetchone()
+    assert row["current_streak"] == 5  # streak survived
+    assert row["shields"] == 0  # shield burned
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_grace_plus_shield_two_day_save(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    # Two missed days: grace + shield burn together, one combined callout.
+    _seed_streak(econ_db, streak=6, last_login_day=_days_ago(3), shields=1)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    embed = mock_dm.await_args.kwargs["embed"]
+    saved = next(f for f in embed.fields if "saved" in f.name.lower())
+    assert "two missed days" in saved.value.lower()
+    assert sum(1 for f in embed.fields if "saved" in f.name.lower()) == 1
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_reset_below_three_omits_reset_field(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    # A short 2-day streak that breaks (3-day gap) resets — too trivial to
+    # call out with its own field, but the daily digest still DMs.
+    _seed_streak(econ_db, streak=2, last_login_day=_days_ago(3))
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    assert not any("reset" in f.name.lower() for f in embed.fields)
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT current_streak FROM econ_streaks WHERE guild_id=? AND user_id=?",
+            (ECON_GUILD, ECON_USER),
+        ).fetchone()
+    assert row["current_streak"] == 1  # it did reset, just no dedicated field
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_reset_at_three_plus_dms(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    # A meaningful streak (>=3) that breaks earns a "streak reset" DM.
+    _seed_streak(econ_db, streak=8, last_login_day=_days_ago(4))
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    assert any("reset" in f.name.lower() for f in embed.fields)
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_login_digest_never_falls_back_to_the_bank_channel(
+    mock_dm, econ_db
+):
+    """The digest is DM-or-nothing: closed DMs must not put a member's streak
+    and quest progress in a public channel. Asserted at the wiring because the
+    drop itself is deliver_econ_dm's, and tested there."""
+    _enable_econ(econ_db)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    assert mock_dm.await_args.kwargs["public_fallback"] is False
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_login_digest_records_the_card_it_sent(mock_dm, econ_db):
+    """The wiring assertion: sending the digest is what creates the handle the
+    hourly refresh edits. Everything the refresh then does is tested in
+    test_login_card_service.py."""
+    _enable_econ(econ_db)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT * FROM econ_login_digest_cards WHERE guild_id=? AND user_id=?",
+            (ECON_GUILD, ECON_USER),
+        ).fetchone()
+    assert row is not None
+    assert int(row["message_id"]) == 90001
+    assert int(row["dm_channel_id"]) == 90002
+
+
+@patch(
+    "bot_modules.events.cog.deliver_econ_dm",
+    new_callable=lambda: _dm_mock("dropped"),
+)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_login_digest_records_nothing_when_nothing_was_sent(
+    mock_dm, econ_db
+):
+    """A muted or non-opted-in member is reported as handled with no message.
+    Storing a handle there would have the sweep editing a message that does
+    not exist."""
+    _enable_econ(econ_db)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    with open_db(econ_db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM econ_login_digest_cards"
+        ).fetchone()["c"]
+    assert count == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_login_digest_records_no_card_when_the_dial_is_off(
+    mock_dm, econ_db
+):
+    """Off means the DM is still sent — it just stays the snapshot it was."""
+    _enable_econ(econ_db, login_card_live_updates=False)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    with open_db(econ_db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM econ_login_digest_cards"
+        ).fetchone()["c"]
+    assert count == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_login_dm_includes_quest_recap(mock_dm, econ_db):
+    _enable_econ(econ_db)
+    with open_db(econ_db) as conn:
+        quest_id = create_quest(
+            conn,
+            ECON_GUILD,
+            title="Say hello",
+            description="Chat a bit today.",
+            qtype="daily",
+            reward=25,
+            signoff=0,
+            criteria="",
+            starts_at=None,
+            ends_at=None,
+            rotate_tag="",
+            community_target=None,
+            created_by=None,
+        )
+        set_quest_active(conn, ECON_GUILD, quest_id, True)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    mock_dm.assert_awaited_once()
+    embed = mock_dm.await_args.kwargs["embed"]
+    quest_field = next(f for f in embed.fields if "quest" in f.name.lower())
+    assert "Say hello" in quest_field.value
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_reward_once_per_member(mock_dm, econ_db):
+    _enable_econ(econ_db, reward_qotd=10)
+    _seed_qotd(econ_db, message_id=999)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message(reply_to=999))
+    with open_db(econ_db) as conn:
+        rewarded = conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"]
+    assert rewarded == 1
+    # A second reply to the same question must not re-reward it.
+    await cog._process_economy_message(_econ_message(reply_to=999))
+    with open_db(econ_db) as conn:
+        rewarded2 = conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"]
+    assert rewarded2 == 1
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_plain_message_earns_nothing(mock_dm, econ_db):
+    """Talking in the channel isn't answering — only a reply pays."""
+    _enable_econ(econ_db, reward_qotd=10)
+    _seed_qotd(econ_db, message_id=999)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message())
+    with open_db(econ_db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"] == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_stale_question_earns_nothing(mock_dm, econ_db):
+    """Yesterday's question is closed — replying to it late can't be farmed."""
+    _enable_econ(econ_db, reward_qotd=10)
+    _seed_qotd(econ_db, message_id=999, local_day=_days_ago(1))
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(_econ_message(reply_to=999))
+    with open_db(econ_db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"] == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_mod_tag_opens_the_question(mock_dm, econ_db):
+    _enable_econ(econ_db, reward_qotd=10, qotd_ping_role_id=77)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(
+        _econ_message(
+            message_id=555,
+            content="<@&77> what's your comfort food?",
+            role_mentions=(77,),
+            admin=True,
+        )
+    )
+    with open_db(econ_db) as conn:
+        row = conn.execute("SELECT message_id, question, local_day FROM econ_qotd").fetchone()
+    assert row is not None
+    assert row["message_id"] == 555
+    assert row["question"] == "what's your comfort food?"
+    assert row["local_day"] == _today()
+    # …and a member replying to it gets paid.
+    await cog._process_economy_message(_econ_message(user_id=ECON_USER + 1, reply_to=555))
+    with open_db(econ_db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"] == 1
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_tag_from_non_mod_opens_nothing(mock_dm, econ_db):
+    """The manager gate is the security boundary — anyone can type the tag."""
+    _enable_econ(econ_db, reward_qotd=10, qotd_ping_role_id=77)
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(
+        _econ_message(message_id=555, content="<@&77> free coins?", role_mentions=(77,))
+    )
+    with open_db(econ_db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM econ_qotd").fetchone()["c"] == 0
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_qotd_tag_registers_once(mock_dm, econ_db):
+    """An edit/retry replaying the same message must not open a second QOTD."""
+    _enable_econ(econ_db, reward_qotd=10, qotd_ping_role_id=77)
+    cog = _econ_cog(econ_db)
+    msg = _econ_message(
+        message_id=555, content="<@&77> question?", role_mentions=(77,), admin=True
+    )
+    await cog._process_economy_message(msg)
+    await cog._process_economy_message(msg)
+    with open_db(econ_db) as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM econ_qotd").fetchone()["c"] == 1
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+@pytest.mark.parametrize(
+    "nsfw, roles, kind",
+    [
+        pytest.param(True, (78,), "spicy", id="spicy-in-age-gated"),
+        pytest.param(False, (78,), None, id="spicy-outside-age-gate-registers-nothing"),
+        pytest.param(True, (77, 78), "spicy", id="both-tags-age-gated-is-spicy"),
+        pytest.param(False, (77, 78), "qotd", id="both-tags-elsewhere-is-regular"),
+        pytest.param(True, (77,), "qotd", id="regular-in-age-gated-stays-regular"),
+    ],
+)
+async def test_econ_spicy_qotd_tag(mock_dm, econ_db, nsfw, roles, kind):
+    """The spicy role registers only where Discord age-gates the channel,
+    pays the same reward, and signs off only its own chore."""
+    import time as _t
+
+    from bot_modules.todo.recurring_service import create_recurring, has_open_instance
+
+    _enable_econ(econ_db, reward_qotd=10, qotd_ping_role_id=77, qotd_spicy_role_id=78)
+    with open_db(econ_db) as conn:
+        chores = {
+            trigger: create_recurring(
+                conn, ECON_GUILD, task=f"Do a {trigger}", recurrence="daily",
+                time_of_day=0, auto_complete=trigger, created_by=1, now_ts=_t.time(),
+            )
+            for trigger in ("qotd", "spicy_qotd")
+        }
+        assert all(has_open_instance(conn, rid) for rid in chores.values())
+    cog = _econ_cog(econ_db)
+    await cog._process_economy_message(
+        _econ_message(
+            message_id=555,
+            content=" ".join(f"<@&{r}>" for r in roles) + " a question",
+            role_mentions=roles,
+            admin=True,
+            nsfw=nsfw,
+        )
+    )
+    await cog._process_economy_message(
+        _econ_message(user_id=ECON_USER + 1, reply_to=555, nsfw=nsfw)
+    )
+    with open_db(econ_db) as conn:
+        row = conn.execute("SELECT kind, question FROM econ_qotd").fetchone()
+        paid = conn.execute("SELECT COUNT(*) c FROM econ_qotd_rewards").fetchone()["c"]
+        still_open = {t for t, rid in chores.items() if has_open_instance(conn, rid)}
+    if kind is None:
+        assert row is None
+        assert paid == 0
+        assert still_open == {"qotd", "spicy_qotd"}
+        return
+    assert row["kind"] == kind
+    assert row["question"] == "a question"
+    assert paid == 1
+    ticked = "spicy_qotd" if kind == "spicy" else "qotd"
+    assert still_open == {"qotd", "spicy_qotd"} - {ticked}
+
+
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_econ_hook_failure_never_breaks_on_message(
+    mock_spoiler, mock_award, mock_track, mock_activity, mock_level, cog
+):
+    """A raising economy branch must be swallowed so message/XP processing survives."""
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    with patch.object(
+        EventsCog,
+        "_process_economy_message",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ) as mock_econ:
+        # Should not raise despite the economy hook blowing up.
+        await cog.on_message(_make_message())
+    mock_econ.assert_awaited_once()
+    mock_activity.assert_called_once()  # normal processing still completed
+
+
+# ── economy: greeting_answered + birthday_wish community kinds ────────────
+
+
+def _community_message(**kwargs):
+    """An _econ_message whose channel survives the SQL-facing kind detectors
+    (a bare MagicMock parent_id can't be bound as a query parameter)."""
+    msg = _econ_message(**kwargs)
+    msg.channel.parent_id = None
+    return msg
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_greeting_answered_fires_on_mention_of_pending_greeter(
+    mock_dm, econ_db
+):
+    from bot_modules.onboarding.greeting_watch.service import record_greeting
+
+    _enable_econ(econ_db)
+    greeter = 501
+    with open_db(econ_db) as conn:
+        record_greeting(
+            conn, ECON_GUILD, 9001, ECON_CHANNEL, greeter, created_ts=0
+        )
+    msg = _community_message(message_id=1)
+    msg.mentions = [SimpleNamespace(id=greeter, bot=False)]
+    await _econ_cog(econ_db)._process_economy_message(msg)
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM econ_kind_activity WHERE guild_id = ? "
+            "AND user_id = ? AND kind = 'greeting_answered'",
+            (ECON_GUILD, ECON_USER),
+        ).fetchone()
+    assert row is not None
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_greeting_answered_skips_resolved_greeting(mock_dm, econ_db):
+    from bot_modules.onboarding.greeting_watch.service import (
+        mark_resolved,
+        record_greeting,
+    )
+
+    _enable_econ(econ_db)
+    greeter = 501
+    with open_db(econ_db) as conn:
+        record_greeting(
+            conn, ECON_GUILD, 9001, ECON_CHANNEL, greeter, created_ts=0
+        )
+        mark_resolved(conn, ECON_GUILD, 9001, "unanswered", now_ts=1)
+    msg = _community_message(message_id=1)
+    msg.mentions = [SimpleNamespace(id=greeter, bot=False)]
+    await _econ_cog(econ_db)._process_economy_message(msg)
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM econ_kind_activity WHERE kind = 'greeting_answered'"
+        ).fetchone()
+    assert row is None
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_birthday_wish_targeted_and_phrase_paths(mock_dm, econ_db):
+    from bot_modules.birthday.service import mark_announced, upsert_birthday
+
+    _enable_econ(econ_db)
+    bday_member = 502
+    with open_db(econ_db) as conn:
+        upsert_birthday(conn, ECON_GUILD, bday_member, 1, 1, bday_member)
+        mark_announced(conn, ECON_GUILD, bday_member, _today())
+
+    # Targeted path: mentioning the announced birthday member fires with the
+    # member-keyed occurrence.
+    msg = _community_message(message_id=1)
+    msg.mentions = [SimpleNamespace(id=bday_member, bot=False)]
+    await _econ_cog(econ_db)._process_economy_message(msg)
+
+    # Phrase path: a bare "happy birthday!!" with no target fires day-keyed.
+    other_wisher = 503
+    msg2 = _community_message(
+        message_id=2, user_id=other_wisher, content="happy birthday!! 🎂"
+    )
+    await _econ_cog(econ_db)._process_economy_message(msg2)
+
+    with open_db(econ_db) as conn:
+        fired_for = {
+            int(r["user_id"])
+            for r in conn.execute(
+                "SELECT user_id FROM econ_kind_activity "
+                "WHERE guild_id = ? AND kind = 'birthday_wish'",
+                (ECON_GUILD,),
+            )
+        }
+    assert fired_for == {ECON_USER, other_wisher}
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_birthday_wish_never_fires_for_the_birthday_member(
+    mock_dm, econ_db
+):
+    # The only announced birthday is the author's own: neither the phrase nor
+    # a (self-filtered) mention can turn their birthday into their own quest.
+    from bot_modules.birthday.service import mark_announced, upsert_birthday
+
+    _enable_econ(econ_db)
+    with open_db(econ_db) as conn:
+        upsert_birthday(conn, ECON_GUILD, ECON_USER, 1, 1, ECON_USER)
+        mark_announced(conn, ECON_GUILD, ECON_USER, _today())
+    msg = _community_message(message_id=1, content="happy birthday to me!")
+    await _econ_cog(econ_db)._process_economy_message(msg)
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM econ_kind_activity WHERE kind = 'birthday_wish'"
+        ).fetchone()
+    assert row is None
+
+
+@patch("bot_modules.events.cog.deliver_econ_dm", new_callable=_dm_mock)
+@patch(
+    "bot_modules.core.branding.resolve_accent_color",
+    new=AsyncMock(return_value=discord.Color(0x123456)),
+)
+async def test_econ_birthday_wish_needs_an_announcement(mock_dm, econ_db):
+    # A set-but-never-announced (quiet) birthday is not quest bait.
+    from bot_modules.birthday.service import upsert_birthday
+
+    _enable_econ(econ_db)
+    quiet = 504
+    with open_db(econ_db) as conn:
+        upsert_birthday(conn, ECON_GUILD, quiet, 1, 1, quiet)
+    msg = _community_message(message_id=1, content="happy birthday!")
+    msg.mentions = [SimpleNamespace(id=quiet, bot=False)]
+    await _econ_cog(econ_db)._process_economy_message(msg)
+    with open_db(econ_db) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM econ_kind_activity WHERE kind = 'birthday_wish'"
+        ).fetchone()
+    assert row is None
+
+
+# ── Thread parentage recorded at ingest ───────────────────────────────
+#
+# Wiring guard. The stored channel_id of a message posted in a thread is the
+# thread's own, and nothing else distinguishes it afterwards — so if the cog
+# stops handing the parent to the channel registry, the analytics quietly go
+# back to listing threads as channels (todo #91, services/channel_rollup).
+
+def _thread_channel(*, channel_id: int, parent_id: int) -> MagicMock:
+    ch = MagicMock(spec=discord.Thread)
+    ch.id = channel_id
+    ch.name = "a thread"
+    ch.parent_id = parent_id
+    return ch
+
+
+def _text_channel(*, channel_id: int) -> MagicMock:
+    # spec'd to TextChannel precisely because it has no parent_id — an
+    # unspecced MagicMock would answer every attribute and read as a thread.
+    ch = MagicMock(spec=discord.TextChannel)
+    ch.id = channel_id
+    ch.name = "general"
+    return ch
+
+
+@patch("bot_modules.events.cog.upsert_known_channel")
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_a_thread_message_records_its_parent_channel(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level,
+    mock_upsert, cog,
+):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=777)
+    msg.channel = _thread_channel(channel_id=777, parent_id=10)
+
+    await cog.on_message(msg)
+
+    kwargs = [c.kwargs for c in mock_upsert.call_args_list if c.kwargs.get("channel_id") == 777]
+    assert kwargs, "the thread was never recorded in the channel registry"
+    assert all(k["parent_id"] == 10 and k["is_thread"] is True for k in kwargs)
+
+
+@patch("bot_modules.events.cog.upsert_known_channel")
+@patch("bot_modules.events.cog.handle_level_progress", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.record_member_activity")
+@patch("bot_modules.events.cog.should_track_auto_delete_message", return_value=False)
+@patch("bot_modules.events.cog.award_message_xp", new_callable=AsyncMock)
+@patch("bot_modules.events.cog.enforce_spoiler_requirement", new_callable=AsyncMock)
+async def test_a_channel_message_records_no_parent(
+    mock_spoiler, mock_award, mock_rule_exists, mock_activity, mock_level,
+    mock_upsert, cog,
+):
+    mock_spoiler.return_value = False
+    mock_award.return_value = None
+    msg = _make_message(channel_id=10)
+    msg.channel = _text_channel(channel_id=10)
+
+    await cog.on_message(msg)
+
+    kwargs = [c.kwargs for c in mock_upsert.call_args_list if c.kwargs.get("channel_id") == 10]
+    assert kwargs
+    assert all(k["parent_id"] is None and k["is_thread"] is False for k in kwargs)
+
+
+async def test_on_member_join_pings_a_provisioned_welcome_role():
+    """A guild that never set a welcome ping role gets one made, and the
+    welcome pings it — the cog has to use what the provisioner hands back
+    rather than the (still empty) cached config value."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(welcome_channel_id=42, welcome_ping_role_id=0),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    made = MagicMock(spec=discord.Role)
+    made.id = 4321
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "bot_modules.events.cog.ensure_config_role",
+                new_callable=AsyncMock,
+                return_value=made,
+            )
+        )
+        await cog.on_member_join(member)
+
+    assert welcome_channel.send.call_args.kwargs["content"] == "<@&4321>"
+
+
+async def test_on_member_join_skips_provisioning_when_a_role_is_configured():
+    """The configured path must not hit the provisioner at all — it runs on
+    every join, and the cached snapshot already has the answer."""
+    bot = _make_bot()
+    ctx = _make_ctx()
+    ctx.guild_config = MagicMock(
+        return_value=_StubGuildConfig(welcome_channel_id=42, welcome_ping_role_id=88),
+    )
+    bot.ctx = ctx
+    cog = EventsCog(bot)
+
+    welcome_channel = MagicMock(spec=discord.TextChannel)
+    welcome_channel.send = AsyncMock()
+    member = _make_member()
+    member.guild.get_channel = MagicMock(return_value=welcome_channel)
+
+    with ExitStack() as stack:
+        for p in _patch_join_deps():
+            stack.enter_context(p)
+        provisioner = stack.enter_context(
+            patch(
+                "bot_modules.events.cog.ensure_config_role",
+                new_callable=AsyncMock,
+                return_value=None,
+            )
+        )
+        await cog.on_member_join(member)
+
+    provisioner.assert_not_awaited()
+    assert welcome_channel.send.call_args.kwargs["content"] == "<@&88>"

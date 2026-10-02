@@ -1,0 +1,440 @@
+# Server Install & Deployment Guide
+
+A step-by-step guide for installing **dungeon-keeper (dk)** on a Linux server
+for production use. Setting up a development copy on your own machine (your
+own bot, a test server, an empty database) is [dev_setup.md](dev_setup.md);
+it shares sections 2–3 with this guide and then diverges.
+
+> **Install from the lock, not the package:** `pyproject.toml` lists the
+> direct dependencies with loose floors, so `pip install -e .` alone resolves
+> whatever is newest that day. Install the pinned set first,
+> `pip install -r requirements/base.lock`, so this host matches CI and prod.
+
+---
+
+## 1. Prerequisites
+
+| Requirement | Notes |
+|-------------|-------|
+| **Python 3.14.x** | Prod runs 3.14.6; CI and pyright are pinned to 3.14 too (`.python-version`). If a native wheel (`mediapipe`, `nudenet`/onnxruntime, `llama-cpp-python`) is missing for a brand-new Python, `build-essential` is the fallback. |
+| **git** | To clone the repo. |
+| **build toolchain** | `build-essential` (gcc/g++/make) as a fallback if a native wheel isn't available for your platform. |
+| **Java 17+** | **Optional**: only for the music cog (Lavalink). Skip if you don't need music. |
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y python3.14 python3.14-venv python3.14-dev git build-essential
+# Optional, music only:
+sudo apt install -y openjdk-17-jre-headless
+```
+
+---
+
+## 2. Clone and create a virtualenv
+
+```bash
+git clone https://github.com/billydev-secret/OpenKeeper.git dungeon-keeper
+cd dungeon-keeper
+
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+---
+
+## 3. Install dependencies
+
+```bash
+# Runtime libraries, fully pinned (compiled by uv from pyproject.toml):
+pip install -r requirements/base.lock
+
+# Then install the package itself (provides `python -m dungeonkeeper`):
+pip install --no-deps -e .
+```
+
+`pyproject.toml` holds the human-edited direct dependencies (loose `>=`
+floors): `[project] dependencies` for the runtime set and
+`[dependency-groups]` for `dev`, `mcp` and `local-llm`. `requirements/*.lock`
+is what actually gets installed. After editing a list, recompile its lock
+(all four commands sit in a comment at the top of `[project]`); the two you
+will need most:
+
+```bash
+uv pip compile pyproject.toml             -o requirements/base.lock --universal -p 3.14
+uv pip compile pyproject.toml --group dev -o requirements/dev.lock  --universal -p 3.14
+```
+
+> For development/testing tooling (ruff, pytest, pyright, etc.) use
+> `pip install -r requirements/dev.lock` instead (it includes the runtime set).
+
+### Assets you supply
+
+The public repository ships no `assets/` directory: the fonts, quote-card
+borders, logo, panel art and Mahjong tile images in the maintainers' tree are
+their server's own branding. The bot imports and starts without the
+directory; the features below read it when they draw. Create `assets/` at
+the repo root and fill what you use:
+
+| Path | Read by | Without it |
+|---|---|---|
+| `assets/fonts/<Face>-Regular.ttf` for Arimo, Bebas Neue, Belleza, Caveat, Inter, Liberation Serif, Oswald, Playfair Display (all OFL 1.1, free from Google Fonts) | quote cards and `/banner` (`shared/quote_renderer.py`) | a quote card raises on the missing file |
+| `assets/fonts/ThughtRegular.ttf`, `ThughtBlack.ttf` — any faces you license, under these names | hub and lobby titles (`panels/title_service.py`), the quote renderer's default face, the Poppy word cloud | titles draw in Pillow's default face; the quote renderer falls back to its next face; the word-cloud preset refuses to render |
+| `assets/border.png`, `assets/midnightbordertransparent.png` | the two bundled quote-card frames | those two picker choices fail to render; a guild's own uploaded frame works |
+| `assets/panel_art/lobby_sprig.png` | the leaf beside a game-lobby title | the title draws without it |
+| `assets/tile_emoji/mm_*.png` | Meadow Mahjong's emoji set | generate with `python scripts/make_tile_emoji.py`, then register with `scripts/register_tile_emoji.py` (`tile_emoji.json` holds the maintainers' application-emoji ids; registration rewrites it for yours) |
+
+---
+
+## 4. Create the Discord application
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+   → **New Application**.
+2. **Bot** tab → **Add Bot** → copy the **token** (this is `DISCORD_TOKEN_PROD`).
+3. Under **Privileged Gateway Intents**, enable **all three**. The bot requires
+   them and will fail to start correctly without them:
+   - ✅ **Presence Intent**
+   - ✅ **Server Members Intent**
+   - ✅ **Message Content Intent**
+4. **Invite the bot.** Once it's running you can just use the `/invite` command,
+   which generates a link with the exact least-privilege permission set the bot
+   needs. For the first install, use **OAuth2 → URL Generator** with scopes
+   `bot` + `applications.commands` and tick these permissions (the same set
+   `/invite` requests):
+   - Manage Roles, Manage Channels, Manage Nicknames, Manage Messages
+   - Manage Threads, Create Public Threads, Send Messages in Threads
+   - Move Members, Connect, Speak _(Voice Control + music)_
+   - View Channels, Send Messages, Embed Links, Attach Files,
+     Read Message History, Add Reactions, Use External Emojis
+
+   Administrator also works but is **not required**: the bot never bans, kicks,
+   or times members out (jail is role/channel-overwrite based), so grant the
+   scoped set above rather than Administrator. Open the generated URL and invite
+   the bot to your server.
+5. Get your **guild (server) ID**: Discord → User Settings → Advanced → enable
+   Developer Mode, then right-click your server → **Copy Server ID**.
+
+---
+
+## 5. Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` for production. Minimum required:
+
+```ini
+BOT_ENV=prod
+
+DISCORD_TOKEN_PROD=your_prod_bot_token_here
+GUILD_ID_PROD=123456789012345678
+DB_PATH_PROD=dungeonkeeper.db
+AUDIT_CHANNEL_PROD=          # channel ID for audit logs (optional but recommended)
+
+# Strongly recommended safety guard — the bot exits on startup if the
+# connected bot user ID doesn't match (prevents running with the wrong token):
+EXPECTED_BOT_ID_PROD=your_bot_user_id
+```
+
+Leave the dev, dashboard, music, and beta-tools blocks commented out unless you
+need them (see sections 8–9).
+
+---
+
+## 6. First run
+
+Database migrations apply **automatically** on startup; there is no separate
+migrate step. Just run:
+
+```bash
+python -m dungeonkeeper
+```
+
+On first boot the bot applies all migrations, syncs slash commands globally
+(production mode), and connects. Configure it from the **web dashboard**: open
+**Config → Moderation & Privacy** and set the mod and admin roles, the jail and ticket
+categories, and the log and transcript channels. (A `/setup` wizard walked
+through the same six settings until 2026-07-28; it was removed once every one
+of them had a home on that page.)
+
+Stop with `Ctrl+C`. The SQLite database is written to `DB_PATH_PROD`
+(`dungeonkeeper.db` by default) in the working directory.
+
+### Bootstrap config keys
+
+Runtime configuration is stored in the database (`config` and `config_ids`
+tables), not in `.env`, and nearly all of it is set from the dashboard once the
+bot is running. The keys below are the bootstrap set, the handful worth knowing
+by name because they gate the first useful behavior:
+
+| Key | Description |
+|-----|-------------|
+| `guild_id` | Home guild ID (falls back to `GUILD_ID` in the environment) |
+| `mod_channel_id` | Channel for moderation notifications |
+| `greeter_role_id` | Greeter role (also pinged by intake cards) |
+| `xp_level_5_role_id` | Role granted at XP level 5 |
+| `xp_level_5_log_channel_id` | Channel for level-5 milestone announcements |
+| `xp_level_up_log_channel_id` | Channel for all level-up announcements |
+
+`config_ids` holds the list-valued settings, in buckets:
+`bypass_role_ids` (exempt from the spoiler guard, which covers every channel
+Discord marks NSFW),
+`xp_grant_allowed_user_ids`, and `xp_excluded_channel_ids`.
+
+Dev vs production command sync is **not** a config row: it is the
+`--debug` flag on `python -m dungeonkeeper`. With it, commands sync to
+`guild_id` only (which must be set, or the sync is skipped with a warning);
+without it they sync globally, which is what production wants.
+
+Role grants are **not** configured through flat keys; they live in `grant_roles`
+rows managed from the dashboard, and legacy keys are migrated on startup (see
+[role_grant_spec.md](specs/role_grant_spec.md)).
+
+---
+
+## 7. Run as a service (systemd)
+
+The canonical unit is tracked in the repo at
+[`deploy/dungeon-keeper.service`](../deploy/dungeon-keeper.service) (see also
+`deploy/README.md` and `deploy/discord-bots.target`). It carries the full
+production config (`PartOf=discord-bots.target`, `Environment=PYTHONPATH`,
+`TimeoutStartSec=180`, and a systemd hardening block), so **install it from
+`deploy/` rather than hand-writing a unit** (adjust `User` and paths; the
+current prod box uses `User=<user>` and `/home/<user>/discord-bots/dungeon-keeper`).
+The heart of it is just:
+
+```ini
+ExecStart=/home/<user>/discord-bots/dungeon-keeper/.venv/bin/python -m dungeonkeeper
+Restart=on-failure
+# .env is loaded automatically by the app; no EnvironmentFile needed.
+```
+
+```bash
+sudo cp deploy/dungeon-keeper.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dungeon-keeper
+sudo systemctl status dungeon-keeper
+journalctl -u dungeon-keeper -f      # live logs
+```
+
+### Watchdog (down-alert DMs)
+
+A second, independent service polls the bot's unit and DMs the owner on
+Discord when it goes down (and again on recovery). It is stdlib-only and runs
+on the **system** python3, so a broken venv or bad deploy can't take it out.
+
+```bash
+sudo cp deploy/dungeon-keeper-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dungeon-keeper-watchdog
+```
+
+Configuration comes from `.env`: it DMs `WATCHDOG_USER_ID` (falling back to
+`SUPPORT_USER_ID`) using the bot token; `WATCHDOG_UNIT` and
+`WATCHDOG_POLL_SECONDS` override the defaults (`dungeon-keeper.service`, 30s).
+
+Verify DM delivery end-to-end with:
+
+```bash
+python scripts/watchdog.py --test    # sends a one-off test DM and exits
+```
+
+---
+
+## 8. Optional — Music (Lavalink + Spotify)
+
+The music cog runs Lavalink as a child process and requires **Java 17+**.
+
+1. Download Lavalink + plugins (one-time, idempotent):
+   ```bash
+   python scripts/setup_lavalink.py
+   ```
+2. Create a Spotify app at <https://developer.spotify.com/dashboard>
+   (Client Credentials flow, no redirect URI). Copy the Client ID and Secret.
+3. Uncomment and fill the music block in `.env`:
+   ```ini
+   SPOTIFY_CLIENT_ID=...
+   SPOTIFY_CLIENT_SECRET=...
+   LAVALINK_PASSWORD=<random>
+   LAVALINK_HOST=127.0.0.1
+   LAVALINK_PORT=2333
+   LAVALINK_HEAP_MB=512
+   ```
+
+Lavalink starts automatically when the cog loads. If it fails, the rest of the
+bot keeps running and music commands report "Music is currently unavailable."
+
+---
+
+## 9. Optional — Web dashboard
+
+An opt-in analytics/admin dashboard. Uncomment in `.env`:
+
+```ini
+DASHBOARD_ENABLED=1
+DASHBOARD_HOST=127.0.0.1
+DASHBOARD_PORT=8080
+```
+
+**Reference deployment (what prod actually runs):** the dashboard binds
+**loopback-only** (`DASHBOARD_HOST=127.0.0.1`, port 8080) and is published to
+the internet through a **cloudflared tunnel**: Cloudflare terminates TLS and
+forwards to `http://127.0.0.1:8080`, so no port is ever exposed on the box.
+Discord OAuth handles login, with `DASHBOARD_BASE_URL` set to the public
+tunnel hostname. A classic reverse proxy (nginx/Caddy) terminating TLS also
+works in place of the tunnel.
+
+**Auth fails closed.** The dashboard refuses to start unless auth is explicitly
+configured one of two ways:
+
+- **Discord OAuth (public):** set `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`,
+  `SESSION_SECRET` (`python -c "import secrets; print(secrets.token_urlsafe(32))"`),
+  and `DASHBOARD_BASE_URL`, add the `/callback` redirect URI in the Developer
+  Portal, and front it with a reverse proxy (nginx/Caddy) terminating TLS.
+  **`SESSION_SECRET` is strength-checked at boot** (since 2026-08-06): under 32
+  characters, or fewer than 8 distinct characters, and the server refuses to
+  start with a message naming the generator command. Forging a session cookie
+  yields a full admin session, so a guessable secret fails closed like a
+  missing one. The `token_urlsafe(32)` recipe above produces 43 characters and
+  passes.
+- **Open LAN mode (no login):** set `DASHBOARD_OPEN_AUTH=1`. This serves a
+  **full-admin, no-auth** dashboard and is forced to a loopback bind. It must be
+  an explicit choice; a missing OAuth secret no longer silently falls back to
+  it, so a dropped env var can't publish an admin-to-everyone dashboard.
+
+> **Never expose open-LAN mode (`DASHBOARD_OPEN_AUTH=1`) to the internet**. It
+> has no auth, and a tunnel (e.g. cloudflared) bridging the loopback bind to the
+> public internet would expose full admin to everyone.
+
+### What the session cookie holds, and what it doesn't
+
+`dk_session` is signed with `SESSION_SECRET` but **not encrypted**, so anything
+inside it is readable by whoever holds the cookie. It carries the user id,
+display name, avatar URL, the mutual-guild list, the active guild, and a
+snapshot of the user's permission bits. It does **not** carry the Discord
+OAuth access token: nothing read it back, and a bearer token in a readable
+cookie is a liability with no upside.
+
+- **Permissions are re-resolved live** from the bot's guild-member cache on
+  every request, so a Discord demotion takes effect immediately. The stored
+  bits are only a fallback for when that cache can't answer: the startup
+  window, a guild the bot was kicked from, or standalone mode.
+- **Those stored bits are guild-scoped.** The session records which guild they
+  were captured in (`perms_guild_id`); the fallback applies them only while
+  that guild is the active one, and switching servers re-captures them for the
+  target guild (or clears them if the member can't be resolved). A cookie can
+  never carry one server's admin rights into another. Sessions minted before
+  this field existed are unqualified and get **no** permissions on the fallback
+  path, so those users re-login once, which only matters in standalone mode.
+- **Logout is server-side.** `/logout` bumps a per-user session generation
+  (stored in `config` under `session_gen:<user_id>`, so it survives a restart)
+  and every cookie minted before that generation is refused. Deleting the
+  cookie alone would have left a captured copy valid until it expired.
+  Logging back in mints a cookie at the new generation.
+  **It fails closed.** If the generation can't be read (a locked or broken
+  database), every check that needs it refuses: the request gets a 401, a
+  login redirects to `/login?error=session_failed` without minting a cookie,
+  and a logout still clears the browser's cookie but writes no generation it
+  couldn't derive from the stored one. A failed read is never cached, so
+  access returns as soon as the database answers. Until 2026-09-27 a failed
+  read counted as generation 0 and was cached for the life of the process,
+  which let every revoked cookie back in
+  (`tests/web/test_web_session_generation_fail_closed.py`).
+- **A session expires 7 days idle, or 30 days after login, whichever comes
+  first** (`SESSION_IDLE_MAX_AGE`, `SESSION_MAX_AGE` in `auth.py`). The
+  cookie's signing time is the idle clock: `_SessionRestamp` in `server.py`
+  re-signs a live cookie at most hourly, and never on a response that sets or
+  clears the cookie itself (login, logout, guild switch). The login time rides
+  in the payload as `iat` and never moves, so neither a re-stamp nor a guild
+  switch (which re-signs too) extends the cap. Before 2026-09-26 the only
+  limit was 30 days on the signing time, which a guild switch reset. A cookie
+  minted before `iat` existed takes its signing time as its login time.
+- **CSRF** rests on `SameSite=Lax` plus an `Origin`/`Referer` check on
+  `POST`/`PUT`/`PATCH`/`DELETE`. The check is deliberately permissive when
+  neither header is present (curl, scripts, the test client; none of which
+  carry an ambient cookie to forge with); a header that *is* present and points
+  at another host is a 403. `DASHBOARD_BASE_URL` and any
+  `DASHBOARD_RETURN_TO_URLS` hosts count as our own.
+
+---
+
+## 10. Optional — LLM backend (LAN GPU server)
+
+AI features run a GGUF model **in-process on CPU by default** (calls are
+serialised behind one shared model). The production architecture instead
+offloads inference to a llama.cpp **`llama-server` on a LAN GPU box**, which
+frees the bot host and lets calls run concurrently. Configure in `.env`
+(see the `LLM backend` block in `.env.example`):
+
+```ini
+LLAMA_SERVER_URL=http://192.0.2.50:8080   # empty = in-process CPU fallback
+LLAMA_SERVER_TIMEOUT=120                    # per-request timeout, seconds
+LLAMA_SERVER_ALLOW_PUBLIC=0                 # keep 0: private/loopback URLs only
+```
+
+`LLAMA_SERVER_URL` must be a private/loopback address; a public URL is refused
+(the bot falls back to in-process) unless `LLAMA_SERVER_ALLOW_PUBLIC=1`. Leave
+that off unless you fully control the network path.
+
+---
+
+## 11. Backups & maintenance
+
+- **Database**: everything lives in the single SQLite file at `DB_PATH_PROD`.
+  A background DB-backup loop runs in-process, writing beside the DB to
+  `backups/` (or `var/backups/` once the runtime data has been gathered under
+  `var/`; see `disaster_recovery_runbook.md` § Runtime data layout), but you should also snapshot the
+  file on a schedule (`sqlite3 dungeonkeeper.db ".backup backup.db"` or stop the
+  service and copy the file).
+- **Updating:**
+  ```bash
+  sudo systemctl stop dungeon-keeper
+  git pull
+  source .venv/bin/activate
+  pip install -r requirements/base.lock && pip install --no-deps -e .
+  sudo systemctl start dungeon-keeper   # migrations re-apply automatically
+  ```
+  On boot the bot force-moves the `deployed` git tag to the running commit,
+  so `git describe --always deployed` always answers "what's live" (the boot
+  log warns loudly if the working tree was dirty).
+- **Logs**: `log.txt` in the checkout is wiped on every boot by design
+  (`src/dungeonkeeper/__main__.py`) and rotates at ~2MB, so it only ever holds
+  the current run. journald retains the stream copy: `journalctl -u
+  dungeon-keeper` is the durable history for anything before the last restart.
+- **QA card recovery**: a feature's card is posted once, by `/dk-ship`
+  teardown, from every `Testing:` section the branch merged. It is missed when a
+  session ships with `--keep` (teardown never runs) or is torn down by hand.
+  Merges post nothing by design, and commits made in a worktree post nothing
+  either (no `.env` there). Recover a card manually from the prod checkout:
+  ```bash
+  python scripts/post_testing_docs.py --branch <name> --dry-run   # preview
+  python scripts/post_testing_docs.py --branch <name>             # post it
+  ```
+  `--commit <sha>` does the same for a single commit that landed straight on
+  main. Only `--branch` is idempotent: it posts nothing when a card already
+  covers everything the branch merged. Re-running `--commit` on the same sha
+  reuses the DB row but posts a *second* Discord card, orphaning the first.
+- **Handy maintenance scripts** (all in `scripts/`):
+  - `refresh_dev_db.py --no-fixtures`: rebuild the dev DB from prod without
+    seeding fixture data.
+  - `recompute_xp.py --commit`: recompute member XP from the event ledger
+    (dry-run by default; `--commit` writes).
+  - `diff_db.py [BACKUP] [WORKING]`: compare a backup DB against the working
+    DB.
+  - `economy_tuning_report.py --baseline` / `--save-baseline`: economy health
+    report against a saved baseline snapshot.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `ModuleNotFoundError` for discord/fastapi/etc. on a fresh install | The pinned set was never installed. Run `pip install -r requirements/base.lock` (section 3). |
+| Bot connects but sees no message content / can't read members | Privileged intents not enabled in the Developer Portal (section 4, step 3). |
+| Bot exits immediately on startup citing wrong bot ID | `EXPECTED_BOT_ID_PROD` doesn't match the token's bot user. Fix the token or the ID. |
+| `pip install` fails building mediapipe / onnxruntime / llama-cpp-python | Install `build-essential` (gcc/g++/make) so the sdist can compile, then retry. |
+| Music commands say "currently unavailable" | Java 17+ missing, or `setup_lavalink.py` not run, or Lavalink env vars unset (section 8). |

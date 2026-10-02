@@ -1,0 +1,476 @@
+"""Tests for bot_modules.inactive.apply and .store — the destructive core.
+
+The sweep's *selection* is covered by test_inactive_logic.py. This file covers
+the part where roles actually get stripped and given back: the snapshot/strip in
+``apply_inactive``, the restore in ``reactivate_member``, and the DB round-trip
+in ``store`` that carries ``stored_roles`` between them. A bug here is silent,
+permanent role loss, so the round-trip is asserted end to end.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+
+from bot_modules.core.app_context import AppContext
+from bot_modules.inactive.apply import (
+    apply_inactive,
+    check_inactive_preconditions,
+    ensure_inactive_role,
+    reactivate_member,
+)
+from bot_modules.inactive.store import (
+    active_inactive_user_ids,
+    add_sweep_exemption,
+    create_inactive,
+    get_active_inactive,
+    list_sweep_exemptions,
+    reactivate_inactive,
+    remove_sweep_exemption,
+    sweep_exempt_user_ids,
+)
+from tests.db_template import migrated_db
+
+INACTIVE_ROLE_ID = 555
+
+
+# ── Fixtures ────────────────────────────────────────────────────────
+
+
+def _make_ctx(db_path, *, guild_id: int = 100) -> AppContext:
+    migrated_db(db_path)
+    return AppContext(
+        bot=MagicMock(),
+        log=logging.getLogger("test"),
+        db_path=db_path,
+        guild_id=guild_id,
+        debug=True,
+    )
+
+
+def _role(role_id: int, *, managed: bool = False) -> MagicMock:
+    r = MagicMock(spec=discord.Role)
+    r.id = role_id
+    r.managed = managed
+    r.name = f"role{role_id}"
+    return r
+
+
+def _member(
+    member_id: int,
+    *,
+    is_bot: bool = False,
+    admin: bool = False,
+    manage_guild: bool = False,
+    role_ids: tuple[int, ...] = (),
+) -> MagicMock:
+    m = MagicMock(spec=discord.Member)
+    m.id = member_id
+    m.bot = is_bot
+    m.name = f"u{member_id}"
+    m.display_name = m.name
+    m.mention = f"<@{member_id}>"
+    perms = MagicMock()
+    perms.administrator = admin
+    perms.manage_guild = manage_guild
+    m.guild_permissions = perms
+    # A real Member always carries its guild; the mod check reads it.
+    m.guild = MagicMock(spec=discord.Guild, id=100)
+    m.roles = [_role(rid) for rid in role_ids]
+    m.remove_roles = AsyncMock()
+    m.add_roles = AsyncMock()
+    m.send = AsyncMock()
+    return m
+
+
+def _guild(*, guild_id: int = 100, members: list | None = None) -> MagicMock:
+    members = members or []
+    by_id = {m.id: m for m in members}
+    g = MagicMock(spec=discord.Guild)
+    g.id = guild_id
+    g.name = "Test Guild"
+    g.get_member = MagicMock(side_effect=lambda uid: by_id.get(int(uid)))
+    default_role = _role(0)
+    g.default_role = default_role
+    # The @Inactive role already exists so ensure_inactive_role short-circuits
+    # (no create_role / channel iteration needed in these tests).
+    inactive_role = _role(INACTIVE_ROLE_ID)
+    g.roles = [default_role, inactive_role, _role(11), _role(12), _role(13)]
+    g.get_role = MagicMock(side_effect=lambda rid: {r.id: r for r in g.roles}.get(rid))
+    g.get_channel = MagicMock(return_value=None)
+    g.create_role = AsyncMock()
+    g.me = _member(99)
+    return g
+
+
+def _configure_inactive_role(ctx: AppContext, guild_id: int) -> None:
+    ctx.set_config_value("inactive_role_id", str(INACTIVE_ROLE_ID), guild_id)
+
+
+# ── Preconditions ────────────────────────────────────────────────────
+
+
+def test_precheck_rejects_bot(tmp_path):
+    ctx = _make_ctx(tmp_path / "a.db")
+    guild = _guild()
+    result = check_inactive_preconditions(ctx, guild, _member(1, is_bot=True), _member(2))
+    assert result is not None and result.error_kind == "bot_target"
+
+
+def test_precheck_rejects_self(tmp_path):
+    ctx = _make_ctx(tmp_path / "b.db")
+    me = _member(5)
+    result = check_inactive_preconditions(ctx, _guild(), me, me)
+    assert result is not None and result.error_kind == "self_target"
+
+
+def test_precheck_rejects_admin_target(tmp_path):
+    ctx = _make_ctx(tmp_path / "c.db")
+    result = check_inactive_preconditions(ctx, _guild(), _member(5, admin=True), _member(2))
+    assert result is not None and result.error_kind == "admin_target"
+
+
+def test_precheck_rejects_mod_target_for_non_admin(tmp_path):
+    ctx = _make_ctx(tmp_path / "d.db")
+    target = _member(5, manage_guild=True)  # mod via manage_guild
+    result = check_inactive_preconditions(ctx, _guild(), target, _member(2))
+    assert result is not None and result.error_kind == "mod_target"
+
+
+def test_precheck_rejects_already_inactive(tmp_path):
+    ctx = _make_ctx(tmp_path / "e.db")
+    guild = _guild()
+    with ctx.open_db() as conn:
+        create_inactive(
+            conn, guild_id=guild.id, user_id=5, moderator_id=2,
+            reason="", stored_roles=[11], source="command",
+        )
+    result = check_inactive_preconditions(ctx, guild, _member(5), _member(2))
+    assert result is not None and result.error_kind == "already_inactive"
+
+
+def test_precheck_rejects_exempt_target(tmp_path):
+    """An exemption is absolute — it has to stop a targeted /inactive mark too.
+
+    The sweeps skip exempt members via the exclusion set, but that path never
+    runs for a moderator naming one member, so the guard lives here as well.
+    """
+    ctx = _make_ctx(tmp_path / "e2.db")
+    guild = _guild()
+    with ctx.open_db() as conn:
+        add_sweep_exemption(conn, guild_id=guild.id, user_id=5, added_by=2)
+    result = check_inactive_preconditions(ctx, guild, _member(5), _member(2))
+    assert result is not None and result.error_kind == "exempt_target"
+
+
+def test_precheck_allows_target_exempt_in_another_guild(tmp_path):
+    """Exemptions are per-guild — one guild's must not shield another's member."""
+    ctx = _make_ctx(tmp_path / "e3.db")
+    guild = _guild()
+    with ctx.open_db() as conn:
+        add_sweep_exemption(conn, guild_id=guild.id + 1, user_id=5, added_by=2)
+    assert check_inactive_preconditions(ctx, guild, _member(5), _member(2)) is None
+
+
+def test_lifting_exemption_restores_markability(tmp_path):
+    ctx = _make_ctx(tmp_path / "e4.db")
+    guild = _guild()
+    with ctx.open_db() as conn:
+        add_sweep_exemption(conn, guild_id=guild.id, user_id=5, added_by=2)
+        assert remove_sweep_exemption(conn, guild.id, 5) is True
+        # Lifting a non-exemption reports it rather than pretending it worked.
+        assert remove_sweep_exemption(conn, guild.id, 5) is False
+    assert check_inactive_preconditions(ctx, guild, _member(5), _member(2)) is None
+
+
+def test_exemption_add_is_idempotent(tmp_path):
+    ctx = _make_ctx(tmp_path / "e5.db")
+    with ctx.open_db() as conn:
+        add_sweep_exemption(conn, guild_id=100, user_id=5, added_by=2)
+        add_sweep_exemption(conn, guild_id=100, user_id=5, added_by=3)
+        assert sweep_exempt_user_ids(conn, 100) == {5}
+        assert [r["added_by"] for r in list_sweep_exemptions(conn, 100)] == [3]
+
+
+def test_precheck_ok_returns_none(tmp_path):
+    ctx = _make_ctx(tmp_path / "f.db")
+    assert check_inactive_preconditions(ctx, _guild(), _member(5, role_ids=(11,)), _member(2)) is None
+
+
+# ── apply_inactive: snapshot + strip ─────────────────────────────────
+
+
+async def test_apply_snapshots_and_strips_roles(tmp_path):
+    ctx = _make_ctx(tmp_path / "g.db")
+    _configure_inactive_role(ctx, 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11, 12, 13))
+    mod = _member(2)
+
+    outcome = await apply_inactive(ctx, guild, target, mod, reason="idle")
+    assert outcome.ok
+
+    # Real roles stripped, @Inactive added.
+    stripped = {r.id for r in target.remove_roles.call_args.args}
+    assert stripped == {11, 12, 13}
+    assert target.add_roles.call_args.args[0].id == INACTIVE_ROLE_ID
+
+    # Snapshot persisted (excludes @everyone and the Inactive role).
+    with ctx.open_db() as conn:
+        row = get_active_inactive(conn, 100, 5)
+    assert row is not None
+    assert json.loads(row["stored_roles"]) == [11, 12, 13]
+
+
+async def test_apply_absorbs_an_open_break(tmp_path):
+    """Mod action wins: the inactive hold takes the break's saved roles, drops
+    the break roles, and the break row goes in the same write."""
+    from bot_modules.breaks.store import BREAK_ROLE_KEY, create_break, get_break
+    from bot_modules.core.db_utils import set_config_value
+
+    ctx = _make_ctx(tmp_path / "brk.db")
+    _configure_inactive_role(ctx, 100)
+    with ctx.open_db() as conn:
+        set_config_value(conn, BREAK_ROLE_KEY, "90", 100)
+        create_break(conn, guild_id=100, user_id=5, stored_roles=[11, 12], swapped_spicy=False)
+    target = _member(5, role_ids=(90, 13))  # on a break, plus a role gained since
+
+    outcome = await apply_inactive(ctx, _guild(), target, _member(2), reason="idle")
+    assert outcome.ok
+
+    with ctx.open_db() as conn:
+        row = get_active_inactive(conn, 100, 5)
+        assert get_break(conn, 100, 5) is None
+    assert json.loads(row["stored_roles"]) == [11, 12, 13]
+
+
+async def test_apply_does_not_dm_the_member(tmp_path):
+    """Being swept is deliberately silent — no DM on the way in.
+
+    The DM was removed 2026-09-09: it read as an eviction notice, and the
+    auto-sweep sent it unprompted. The inactive channel's standing panel is the
+    explanation. This test fails if the DM is ever put back.
+    """
+    ctx = _make_ctx(tmp_path / "nodm.db")
+    _configure_inactive_role(ctx, 100)
+    ctx.set_config_value("inactive_channel_id", "777", 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11, 12))
+    mod = _member(2)
+
+    outcome = await apply_inactive(ctx, guild, target, mod, reason="idle")
+    assert outcome.ok
+    target.send.assert_not_awaited()
+
+
+async def test_reactivate_does_not_dm_the_member(tmp_path):
+    """Nor on the way out — the restored roles are the notification."""
+    ctx = _make_ctx(tmp_path / "nodm2.db")
+    _configure_inactive_role(ctx, 100)
+    ctx.set_config_value("inactive_channel_id", "777", 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11, 12))
+    mod = _member(2)
+
+    await apply_inactive(ctx, guild, target, mod)
+    target.roles = [guild.default_role, guild.get_role(INACTIVE_ROLE_ID)]
+
+    msg = await reactivate_member(ctx, guild, target, reason="back", actor=mod)
+    assert msg.startswith("✅")
+    target.send.assert_not_awaited()
+
+
+async def test_audit_cards_name_members_never_mention_them(tmp_path, monkeypatch):
+    """Both mod-log cards render display names. An embed ``<@id>`` resolves
+    from the reading mod's cache and shows digits for a member they never saw."""
+    import bot_modules.inactive.apply as inactive_apply
+
+    posted: list[discord.Embed] = []
+
+    async def _capture(_ctx, _guild, embed):
+        posted.append(embed)
+
+    monkeypatch.setattr(inactive_apply, "_post_inactive_audit", _capture)
+    ctx = _make_ctx(tmp_path / "names.db")
+    _configure_inactive_role(ctx, 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11,))
+    mod = _member(2)
+
+    await apply_inactive(ctx, guild, target, mod)
+    target.roles = [guild.default_role, guild.get_role(INACTIVE_ROLE_ID)]
+    await reactivate_member(ctx, guild, target, actor=mod)
+
+    assert [e.description for e in posted] == ["u5 moved by u2", "u5 reactivated by u2"]
+
+
+async def test_apply_survives_transient_role_create_error(tmp_path):
+    """A 5xx/rate-limit while creating @Inactive must not escape as an exception.
+
+    ``ensure_inactive_role`` used to catch only ``discord.Forbidden``, so a
+    transient ``HTTPException`` aborted the whole mark unhandled.
+    """
+    ctx = _make_ctx(tmp_path / "g2.db")  # no inactive_role_id configured
+    guild = _guild()
+    guild.get_role = MagicMock(return_value=None)
+    guild.create_role = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(), "server error")
+    )
+
+    outcome = await apply_inactive(ctx, guild, _member(5, role_ids=(11,)), _member(2))
+    assert not outcome.ok and outcome.error_kind == "no_role_perms"
+
+
+async def test_ensure_role_survives_transient_overwrite_error(tmp_path):
+    """A transient failure writing one channel overwrite is skipped, not fatal."""
+    ctx = _make_ctx(tmp_path / "g3.db")
+    guild = _guild()
+    guild.get_role = MagicMock(return_value=None)
+    new_role = _role(INACTIVE_ROLE_ID)
+    guild.create_role = AsyncMock(return_value=new_role)
+    bad = MagicMock()
+    bad.id = 700
+    bad.set_permissions = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(), "server error")
+    )
+    guild.channels = [bad]
+
+    role = await ensure_inactive_role(ctx, guild)
+    assert role is new_role
+
+
+async def test_apply_is_idempotent(tmp_path):
+    ctx = _make_ctx(tmp_path / "h.db")
+    _configure_inactive_role(ctx, 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11,))
+    first = await apply_inactive(ctx, guild, target, _member(2))
+    assert first.ok
+    second = await apply_inactive(ctx, guild, target, _member(2))
+    assert not second.ok and second.error_kind == "already_inactive"
+
+
+# ── Round-trip: apply then reactivate restores the exact role set ────
+
+
+async def test_roundtrip_restores_exact_roles(tmp_path):
+    ctx = _make_ctx(tmp_path / "i.db")
+    _configure_inactive_role(ctx, 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11, 12, 13))
+    mod = _member(2)
+
+    await apply_inactive(ctx, guild, target, mod)
+
+    # Simulate Discord state after the strip: member now holds only @Inactive.
+    target.roles = [guild.default_role, guild.get_role(INACTIVE_ROLE_ID)]
+
+    msg = await reactivate_member(ctx, guild, target, reason="back", actor=mod)
+    assert msg.startswith("✅")
+
+    restored = {r.id for r in target.add_roles.call_args.args}
+    assert restored == {11, 12, 13}
+    assert target.remove_roles.call_args.args[0].id == INACTIVE_ROLE_ID
+
+    # Row flipped to reactivated; no longer active.
+    with ctx.open_db() as conn:
+        assert get_active_inactive(conn, 100, 5) is None
+
+
+async def test_reactivate_notes_deleted_roles(tmp_path):
+    ctx = _make_ctx(tmp_path / "j.db")
+    _configure_inactive_role(ctx, 100)
+    guild = _guild()
+    target = _member(5, role_ids=(11, 999))  # 999 will be "deleted" (not in guild.roles)
+    await apply_inactive(ctx, guild, target, _member(2))
+    target.roles = [guild.default_role, guild.get_role(INACTIVE_ROLE_ID)]
+
+    msg = await reactivate_member(ctx, guild, target, reason="back")
+    # Only role 11 still exists; 999 is missing.
+    restored = {r.id for r in target.add_roles.call_args.args}
+    assert restored == {11}
+    assert "Could not restore" in msg
+
+
+async def test_reactivate_when_not_inactive(tmp_path):
+    ctx = _make_ctx(tmp_path / "k.db")
+    guild = _guild()
+    msg = await reactivate_member(ctx, guild, _member(5), reason="x")
+    assert "not currently in the inactive channel" in msg
+
+
+# ── store round-trip ─────────────────────────────────────────────────
+
+
+def test_store_lifecycle(tmp_path):
+    ctx = _make_ctx(tmp_path / "l.db")
+    with ctx.open_db() as conn:
+        iid = create_inactive(
+            conn, guild_id=100, user_id=5, moderator_id=2,
+            reason="idle", stored_roles=[11, 12], source="auto",
+        )
+        assert active_inactive_user_ids(conn, 100) == {5}
+        row = get_active_inactive(conn, 100, 5)
+        assert row is not None and row["source"] == "auto"
+        assert json.loads(row["stored_roles"]) == [11, 12]
+
+        assert reactivate_inactive(conn, iid, reason="back") is True
+        assert active_inactive_user_ids(conn, 100) == set()
+        assert get_active_inactive(conn, 100, 5) is None
+        # Second reactivate is a no-op (already not active).
+        assert reactivate_inactive(conn, iid, reason="again") is False
+
+
+async def test_ensure_role_does_not_announce_a_deletion_for_an_inherited_id(
+    tmp_path,
+):
+    """An id inherited from the legacy ``guild_id = 0`` row is not a deletion.
+
+    Same defect the jail had: the dial was read *with* the legacy fallback and
+    then provisioned directly, so a guild that has no row of its own resolved
+    the home guild's role id, found nothing, and got told a role it never had
+    had been deleted — in its mod channel and its audit log.
+    """
+    from bot_modules.core.db_utils import open_db
+
+    ctx = _make_ctx(tmp_path / "inherit.db")
+    guild = _guild()
+    guild.get_role = MagicMock(return_value=None)
+    guild.channels = []
+    new_role = _role(INACTIVE_ROLE_ID)
+    guild.create_role = AsyncMock(return_value=new_role)
+    with open_db(ctx.db_path) as conn:
+        from bot_modules.core.db_utils import set_config_value
+
+        set_config_value(conn, "inactive_role_id", "424242", 0)
+        conn.commit()
+
+    role = await ensure_inactive_role(ctx, guild)
+
+    assert role is new_role
+    with open_db(ctx.db_path) as conn:
+        rows = conn.execute(
+            "SELECT action FROM audit_log WHERE action = ?",
+            ("feature_role_recreated",),
+        ).fetchall()
+    assert rows == []
+
+
+async def test_ensure_role_records_provenance(tmp_path):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.core.role_provenance import read_role_provenance
+
+    ctx = _make_ctx(tmp_path / "prov.db")
+    guild = _guild()
+    guild.get_role = MagicMock(return_value=None)
+    guild.channels = []
+    guild.create_role = AsyncMock(return_value=_role(INACTIVE_ROLE_ID))
+
+    await ensure_inactive_role(ctx, guild)
+
+    with open_db(ctx.db_path) as conn:
+        prov = read_role_provenance(conn, guild.id)
+    assert prov["inactive_role_id"].origin == "created"

@@ -1,0 +1,447 @@
+"""Whisper cog — DB query layer (sync sqlite3)."""
+from __future__ import annotations
+
+import sqlite3
+import time
+
+from bot_modules.core.db_utils import get_config_value, set_config_value
+from bot_modules.whisper.models import (
+    Whisper,
+    WhisperConfig,
+    WhisperGuess,
+    WhisperReply,
+    WhisperState,
+)
+
+_CONFIG_DEFAULTS: dict[str, str] = {
+    "whisper_role_id": "0",
+    "whisper_channel_id": "0",
+    "whisper_log_channel_id": "0",
+    "whisper_launcher_message_id": "0",
+    "whisper_launcher_channel_id": "0",
+    "whisper_sender_feedback": "0",
+    "whisper_cooldown_seconds": "30",
+    "whisper_hourly_cap_per_target": "5",
+    "whisper_guesses_per_whisper": "3",
+}
+
+
+def get_whisper_config(conn: sqlite3.Connection, guild_id: int) -> WhisperConfig:
+    def _get(key: str) -> str:
+        return get_config_value(conn, key, _CONFIG_DEFAULTS[key], guild_id)
+
+    return WhisperConfig(
+        guild_id=guild_id,
+        role_id=int(_get("whisper_role_id") or 0),
+        channel_id=int(_get("whisper_channel_id") or 0),
+        log_channel_id=int(_get("whisper_log_channel_id") or 0),
+        launcher_message_id=int(_get("whisper_launcher_message_id") or 0),
+        launcher_channel_id=int(_get("whisper_launcher_channel_id") or 0),
+        sender_feedback=_get("whisper_sender_feedback") == "1",
+        cooldown_seconds=int(_get("whisper_cooldown_seconds") or 30),
+        hourly_cap_per_target=int(_get("whisper_hourly_cap_per_target") or 5),
+        guesses_per_whisper=int(_get("whisper_guesses_per_whisper") or 3),
+    )
+
+
+def set_whisper_config_value(
+    conn: sqlite3.Connection, guild_id: int, key: str, value: str
+) -> None:
+    """key is the full config key, e.g. 'whisper_channel_id'."""
+    set_config_value(conn, key, value, guild_id)
+
+
+def set_whisper_launcher_ids(
+    conn: sqlite3.Connection, guild_id: int, channel_id: int, message_id: int
+) -> None:
+    """Record where the launcher is. ``(0, 0)`` means "not posted"."""
+    set_config_value(conn, "whisper_launcher_channel_id", str(channel_id), guild_id)
+    set_config_value(conn, "whisper_launcher_message_id", str(message_id), guild_id)
+
+
+def backfill_whisper_launcher_channel(conn: sqlite3.Connection, guild_id: int) -> bool:
+    """Pin a legacy launcher to the channel it was posted in.
+
+    ``whisper_launcher_channel_id`` arrived without a migration and is only
+    written when the placer reposts, so a launcher that was already at the
+    bottom of the feed kept a message id with no channel. Run at boot — and
+    only at boot — the feed channel is where that launcher lives; after a
+    repoint it is not, which is exactly why the placer needs the real channel
+    stored. Returns whether anything was written; a no-op the second time.
+    """
+    cfg = get_whisper_config(conn, guild_id)
+    if not cfg.launcher_message_id or cfg.launcher_channel_id or not cfg.channel_id:
+        return False
+    set_whisper_launcher_ids(conn, guild_id, cfg.channel_id, cfg.launcher_message_id)
+    return True
+
+
+def whisper_launcher_guilds(conn: sqlite3.Connection) -> set[int]:
+    """Guilds with a Whisper channel set — the only ones whose messages can
+    move a launcher. Published to ``core.sticky`` so the ``on_message``
+    listener rejects every other guild with a set lookup, not a DB read."""
+    rows = conn.execute(
+        "SELECT guild_id FROM config WHERE key = 'whisper_channel_id'"
+        " AND value NOT IN ('', '0')"
+    ).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _row_to_whisper(row: sqlite3.Row) -> Whisper:
+    return Whisper(
+        id=row["id"],
+        guild_id=row["guild_id"],
+        sender_id=row["sender_id"],
+        target_id=row["target_id"],
+        message=row["message"],
+        created_at=row["created_at"],
+        state=row["state"],
+        solved=bool(row["solved"]),
+        exposed=bool(row["exposed"]),
+        guesses_left=row["guesses_left"],
+        channel_msg_id=row["channel_msg_id"],
+        dm_msg_id=row["dm_msg_id"],
+        deleted_at=row["deleted_at"],
+    )
+
+
+def insert_whisper(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    sender_id: int,
+    target_id: int,
+    message: str,
+    guesses_left: int = 3,
+) -> int:
+    """Store a whisper, seeding its guess allowance.
+
+    ``guesses_left`` is written per whisper rather than read at guess time, so
+    a mid-flight change to the guild's dial can never take a guess away from
+    someone who was already promised it.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO whispers
+            (guild_id, sender_id, target_id, message, created_at, guesses_left)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (guild_id, sender_id, target_id, message, time.time(),
+         max(1, int(guesses_left))),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_whisper(conn: sqlite3.Connection, whisper_id: int) -> Whisper | None:
+    row = conn.execute(
+        "SELECT * FROM whispers WHERE id = ?", (whisper_id,)
+    ).fetchone()
+    return _row_to_whisper(row) if row else None
+
+
+def delete_whisper(conn: sqlite3.Connection, whisper_id: int) -> None:
+    conn.execute("DELETE FROM whispers WHERE id = ?", (whisper_id,))
+
+
+def set_whisper_message_ids(
+    conn: sqlite3.Connection,
+    whisper_id: int,
+    *,
+    channel_msg_id: int,
+    dm_msg_id: int,
+) -> None:
+    conn.execute(
+        "UPDATE whispers SET channel_msg_id = ?, dm_msg_id = ? WHERE id = ?",
+        (channel_msg_id, dm_msg_id, whisper_id),
+    )
+
+
+def update_whisper_state(
+    conn: sqlite3.Connection, whisper_id: int, new_state: WhisperState
+) -> None:
+    conn.execute(
+        "UPDATE whispers SET state = ? WHERE id = ?", (new_state, whisper_id)
+    )
+
+
+def _row_to_guess(row: sqlite3.Row) -> WhisperGuess:
+    return WhisperGuess(
+        id=row["id"],
+        whisper_id=row["whisper_id"],
+        guessed_id=row["guessed_id"],
+        correct=bool(row["correct"]),
+        created_at=row["created_at"],
+    )
+
+
+def insert_guess(
+    conn: sqlite3.Connection,
+    *,
+    whisper_id: int,
+    guessed_id: int,
+    correct: bool,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO whisper_guesses (whisper_id, guessed_id, correct, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (whisper_id, guessed_id, int(correct), time.time()),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def list_guesses(conn: sqlite3.Connection, *, whisper_id: int) -> list[WhisperGuess]:
+    rows = conn.execute(
+        "SELECT * FROM whisper_guesses WHERE whisper_id = ? ORDER BY created_at",
+        (whisper_id,),
+    ).fetchall()
+    return [_row_to_guess(r) for r in rows]
+
+
+def try_consume_guess(conn: sqlite3.Connection, whisper_id: int) -> bool:
+    """Atomically decrement guesses_left; returns True if succeeded (>0 attempts remained and not yet solved)."""
+    cur = conn.execute(
+        "UPDATE whispers SET guesses_left = guesses_left - 1 WHERE id = ? AND guesses_left > 0 AND solved = 0",
+        (whisper_id,),
+    )
+    return cur.rowcount == 1
+
+
+def mark_solved(conn: sqlite3.Connection, whisper_id: int) -> None:
+    conn.execute("UPDATE whispers SET solved = 1 WHERE id = ?", (whisper_id,))
+
+
+def list_received(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    target_id: int,
+    state: WhisperState,
+) -> list[Whisper]:
+    """Active (non-deleted) whispers received by target_id with this state."""
+    rows = conn.execute(
+        """
+        SELECT * FROM whispers
+        WHERE guild_id = ? AND target_id = ? AND state = ? AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        """,
+        (guild_id, target_id, state),
+    ).fetchall()
+    return [_row_to_whisper(r) for r in rows]
+
+
+def list_received_in_states(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    target_id: int,
+    states: list[WhisperState],
+) -> list[Whisper]:
+    """Active (non-deleted) whispers received by target_id whose state is in states."""
+    if not states:
+        return []
+    placeholders = ",".join("?" * len(states))
+    rows = conn.execute(
+        f"""
+        SELECT * FROM whispers
+        WHERE guild_id = ? AND target_id = ? AND state IN ({placeholders})
+              AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        """,
+        (guild_id, target_id, *states),
+    ).fetchall()
+    return [_row_to_whisper(r) for r in rows]
+
+
+def list_sent(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    sender_id: int,
+) -> list[Whisper]:
+    """All whispers sent by sender_id (including target-deleted; sender sees their own copy)."""
+    rows = conn.execute(
+        """
+        SELECT * FROM whispers
+        WHERE guild_id = ? AND sender_id = ?
+        ORDER BY created_at DESC
+        """,
+        (guild_id, sender_id),
+    ).fetchall()
+    return [_row_to_whisper(r) for r in rows]
+
+
+def soft_delete_whisper(
+    conn: sqlite3.Connection, whisper_id: int, *, now: float | None = None
+) -> None:
+    """Mark whisper as soft-deleted (target removed from inbox). No-op if already deleted."""
+    ts = now if now is not None else time.time()
+    conn.execute(
+        "UPDATE whispers SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        (ts, whisper_id),
+    )
+
+
+def count_replies(conn: sqlite3.Connection, whisper_id: int) -> int:
+    """Count replies for a whisper (drives the one-reply cap)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM whisper_replies WHERE whisper_id = ?",
+        (whisper_id,),
+    ).fetchone()
+    return int(row["c"])
+
+
+def _row_to_reply(row: sqlite3.Row) -> WhisperReply:
+    return WhisperReply(
+        id=row["id"],
+        whisper_id=row["whisper_id"],
+        from_user_id=row["from_user_id"],
+        to_user_id=row["to_user_id"],
+        content=row["content"],
+        created_at=row["created_at"],
+    )
+
+
+def insert_reply(
+    conn: sqlite3.Connection,
+    *,
+    whisper_id: int,
+    from_user_id: int,
+    to_user_id: int,
+    content: str,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO whisper_replies
+            (whisper_id, from_user_id, to_user_id, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (whisper_id, from_user_id, to_user_id, content, time.time()),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_reply(conn: sqlite3.Connection, reply_id: int) -> WhisperReply | None:
+    row = conn.execute(
+        "SELECT * FROM whisper_replies WHERE id = ?", (reply_id,)
+    ).fetchone()
+    return _row_to_reply(row) if row else None
+
+
+def delete_reply(conn: sqlite3.Connection, reply_id: int) -> None:
+    conn.execute("DELETE FROM whisper_replies WHERE id = ?", (reply_id,))
+
+
+def insert_report(
+    conn: sqlite3.Connection,
+    *,
+    whisper_id: int,
+    reporter_id: int,
+    reason: str,
+) -> bool:
+    """Insert a report; returns True if inserted, False if duplicate (same reporter)."""
+    try:
+        conn.execute(
+            "INSERT INTO whisper_reports (whisper_id, reporter_id, reason, created_at) VALUES (?, ?, ?, ?)",
+            (whisper_id, reporter_id, reason, time.time()),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def insert_reply_report(
+    conn: sqlite3.Connection,
+    *,
+    reply_id: int,
+    reporter_id: int,
+    reason: str,
+) -> bool:
+    """Insert a reply report; returns True if inserted, False if duplicate."""
+    try:
+        conn.execute(
+            "INSERT INTO whisper_reply_reports (reply_id, reporter_id, reason, created_at) VALUES (?, ?, ?, ?)",
+            (reply_id, reporter_id, reason, time.time()),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def list_replies_for_whisper(
+    conn: sqlite3.Connection, *, whisper_id: int
+) -> list[WhisperReply]:
+    rows = conn.execute(
+        "SELECT * FROM whisper_replies WHERE whisper_id = ? ORDER BY created_at",
+        (whisper_id,),
+    ).fetchall()
+    return [_row_to_reply(r) for r in rows]
+
+
+def forget_member(conn: sqlite3.Connection, *, guild_id: int, user_id: int) -> None:
+    """Delete every whisper *user_id* sent or received in *guild_id*.
+
+    The one deletion engine behind two surfaces: the member's own
+    ``/mydata`` → Whisper history button, and ``privacy_service.purge_user_data``
+    for an operator erasure. It used to live in ``whisper_cog`` as the
+    private ``_do_forget_user``, wired only to the retired ``/whisper
+    forget-me`` command, which
+    meant an operator erasure reached no whisper at all while the member could
+    clear the lot themselves (bug #222, item 3).
+
+    What survives, deliberately, on Art 17(3)(e) rights of others: reports
+    *this* member filed on somebody else's whisper, and guess rows recording
+    that someone guessed them on a third party's whisper. Those rows are about
+    another member's message, so they are not this member's to erase. See
+    ``docs/data_register.md`` (whispers family) and ``docs/specs/whisper_spec.md``.
+
+    Caller owns the transaction, and **every child row is deleted here rather
+    than left to the cascade**. The schema does cascade guesses, replies and
+    reports off a deleted whisper, but only with ``PRAGMA foreign_keys = ON``,
+    and ``purge_user_data`` runs on a connection that makes no such promise
+    (the pragma is a no-op inside a transaction, so it cannot set it either).
+    Relying on the cascade there would strand exactly the rows this function
+    exists to remove.
+    """
+    # Replies the member wrote or received on THIS guild's whispers, and every
+    # reply under a whisper that is about to go. whisper_replies has no guild
+    # column of its own, so the parent is the only thing that attributes them.
+    # True orphans (parent already gone, no guild left to attribute them to)
+    # are swept regardless of guild — deleting stranded rows is the
+    # privacy-safe direction. Prod runs more than one guild, and an unscoped
+    # delete here once destroyed the member's reply history in every OTHER
+    # guild too (2026-08 review, whisper A1).
+    #
+    # Expressed as subqueries rather than a resolved id list: a heavy whisperer
+    # would otherwise need chunking against SQLite's bound-variable cap.
+    doomed_whispers = (
+        "SELECT id FROM whispers WHERE guild_id = ? AND (sender_id = ? OR target_id = ?)"
+    )
+    doomed_params = (guild_id, user_id, user_id)
+    doomed_replies = f"""
+        SELECT id FROM whisper_replies
+         WHERE whisper_id IN ({doomed_whispers})
+            OR ((from_user_id = ? OR to_user_id = ?)
+                AND (whisper_id IN (SELECT id FROM whispers WHERE guild_id = ?)
+                     OR whisper_id NOT IN (SELECT id FROM whispers)))
+    """
+    reply_params = (*doomed_params, user_id, user_id, guild_id)
+
+    # Reply reports first: they hang off the replies, which hang off the
+    # whispers, so the order is leaf-upward and safe with foreign keys either
+    # on or off.
+    conn.execute(
+        f"DELETE FROM whisper_reply_reports WHERE reply_id IN ({doomed_replies})",
+        reply_params,
+    )
+    conn.execute(f"DELETE FROM whisper_replies WHERE id IN ({doomed_replies})", reply_params)
+    for child in ("whisper_guesses", "whisper_reports"):
+        conn.execute(
+            f"DELETE FROM {child} WHERE whisper_id IN ({doomed_whispers})",
+            doomed_params,
+        )
+    conn.execute(
+        "DELETE FROM whispers WHERE guild_id = ? AND (sender_id = ? OR target_id = ?)",
+        doomed_params,
+    )

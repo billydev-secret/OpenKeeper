@@ -1,0 +1,403 @@
+"""Tests for /api/bot-roles — the roster, and its three narrow writes.
+
+The state machine itself is covered pure in
+``tests/roles/test_role_roster_service.py``; what only the route can prove is that it
+reads each family of dial the way the feature that owns it reads it, that
+snowflakes leave as strings, and that the three writes refuse everything they
+are supposed to refuse — which is most of the safety in this feature.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.core.db_utils import open_db, set_config_value
+
+# Above 2^53: JS Number would mangle it.
+BIG_ROLE_ID = 987654321098765432
+
+
+def _auth_member():
+    m = MagicMock()
+    m.id = 1
+    m.bot = False
+    m.guild_permissions = MagicMock(value=0x8, administrator=True)
+    m.display_name = "tester"
+    default_role = MagicMock(id=0)
+    default_role.is_default = MagicMock(return_value=True)
+    m.roles = [default_role]
+    return m
+
+
+def _role(rid, name, *, position=5, managed=False, members=0, permissions=None):
+    r = MagicMock()
+    r.id = rid
+    r.name = name
+    r.position = position
+    r.managed = managed
+    r.permissions = permissions or discord.Permissions.none()
+    r.members = [MagicMock() for _ in range(members)]
+    return r
+
+
+def _attach(fake_ctx, *, roles=(), bot_top=50, manage_roles=True, features=()):
+    member = _auth_member()
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.roles = list(roles)
+    by_id = {r.id: r for r in roles}
+    guild.get_role = MagicMock(side_effect=by_id.get)
+    guild.get_member = MagicMock(
+        side_effect=lambda uid: member if int(uid) == 1 else None
+    )
+    guild.features = list(features)
+    guild.me = MagicMock()
+    guild.me.id = 42
+    guild.me.top_role = MagicMock(position=bot_top)
+    guild.me.guild_permissions = MagicMock(
+        manage_roles=manage_roles, manage_guild=True
+    )
+    guild.create_role = AsyncMock(
+        side_effect=lambda name, **kw: _role(BIG_ROLE_ID, name, position=1)
+    )
+    bot = MagicMock()
+    bot.get_guild = MagicMock(
+        side_effect=lambda gid: guild if gid == fake_ctx.guild_id else None
+    )
+    fake_ctx.bot = bot
+    return guild
+
+
+def _by_key(body):
+    return {r["key"]: r for r in body["roles"]}
+
+
+# ── reading ──────────────────────────────────────────────────────────
+
+
+def test_the_roster_lists_every_managed_role(authed_client, fake_ctx):
+    """The whole point of the page: the nine roles features make on their own
+    were unlistable before this, so a missing one was invisible until it
+    failed."""
+    from bot_modules.shared import feature_roles as fr
+
+    _attach(fake_ctx)
+    body = authed_client.get("/api/bot-roles").json()
+
+    assert set(_by_key(body)) == {e.key for e in fr.MANAGED_ROLES}
+
+
+def test_ids_leave_as_strings(authed_client, fake_ctx):
+    _attach(fake_ctx, roles=[_role(BIG_ROLE_ID, "Welcome Ping")])
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_ping_role_id", str(BIG_ROLE_ID),
+                         fake_ctx.guild_id)
+        conn.commit()
+
+    card = _by_key(authed_client.get("/api/bot-roles").json())["welcome_ping_role_id"]
+    assert card["role_id"] == str(BIG_ROLE_ID)
+
+
+def test_an_inherited_dial_is_not_reported_as_a_deletion(authed_client, fake_ctx):
+    """The live prod shape: `jailed_role_id` set at guild_id = 0 with guilds
+    holding no row of their own."""
+    _attach(fake_ctx)
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "jailed_role_id", "5000", 0)
+        conn.commit()
+
+    card = _by_key(authed_client.get("/api/bot-roles").json())["jailed_role_id"]
+    assert card["state"] == "inherited"
+
+
+def test_a_role_above_the_bot_is_out_of_reach_only_when_handed_out(
+    authed_client, fake_ctx
+):
+    high_jail = _role(700, "Jailed", position=90)
+    high_ping = _role(701, "Welcome Ping", position=91)
+    _attach(fake_ctx, roles=[high_jail, high_ping], bot_top=10)
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "jailed_role_id", "700", fake_ctx.guild_id)
+        set_config_value(conn, "welcome_ping_role_id", "701", fake_ctx.guild_id)
+        conn.commit()
+
+    cards = _by_key(authed_client.get("/api/bot-roles").json())
+    assert cards["jailed_role_id"]["state"] == "out_of_reach"
+    # Mentioning needs no hierarchy — a warning here would be crying wolf.
+    assert cards["welcome_ping_role_id"]["state"] == "in_use"
+
+
+def test_the_state_endpoint_answers_only_the_keys_a_panel_owns(
+    authed_client, fake_ctx
+):
+    _attach(fake_ctx)
+    body = authed_client.get(
+        "/api/bot-roles/state?keys=welcome_ping_role_id"
+    ).json()
+    assert [r["key"] for r in body["roles"]] == ["welcome_ping_role_id"]
+
+
+def test_a_create_on_offer_dial_is_never_reported_as_turned_off(
+    authed_client, fake_ctx
+):
+    """A stored "0" on `guess_role_id` is a whole-form save, not a decision.
+
+    The Guess Who panel sends `role_id: picker.getValue() || "0"` on EVERY
+    save, so a 0 lands there whenever an unrelated field is changed — which is
+    exactly why Discord Onboarding refuses to read it as a preference and
+    creates the role anyway. This page reading it the other way put
+    '"(none)" — so I won't make one' in the state line directly under the hint
+    telling the admin that offering it in onboarding WILL make it.
+    """
+    _attach(fake_ctx)
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "guess_role_id", "0", fake_ctx.guild_id)
+        set_config_value(
+            conn, "voice_master_spectator_gate_role_id", "0", fake_ctx.guild_id
+        )
+        # An ordinary ping dial's "(none)" is still a decision, and must be.
+        set_config_value(conn, "welcome_ping_role_id", "0", fake_ctx.guild_id)
+        conn.commit()
+
+    cards = _by_key(authed_client.get("/api/bot-roles").json())
+    assert cards["guess_role_id"]["state"] == "offer_first"
+    assert cards["voice_master_spectator_gate_role_id"]["state"] == "offer_first"
+    assert cards["welcome_ping_role_id"]["state"] == "turned_off"
+
+
+def test_the_roster_does_not_promise_to_adopt_a_role_it_could_never_grant(
+    authed_client, fake_ctx
+):
+    """A @Jailed above the bot gets a twin made lower down, not adopted.
+
+    The provisioner (`adoptable_role_ids`) skips it; the page used to say "I'll
+    use that one rather than making a second" about it, and the second one
+    appeared anyway.
+    """
+    _attach(fake_ctx, roles=[_role(700, "Jailed", position=90)], bot_top=10)
+
+    card = _by_key(authed_client.get("/api/bot-roles").json())["jailed_role_id"]
+    assert card["state"] == "not_made"
+    assert any("can't use it" in n for n in card["notes"])
+
+
+# ── create ───────────────────────────────────────────────────────────
+
+
+def test_create_makes_the_role_and_records_that_it_did(authed_client, fake_ctx):
+    from bot_modules.core.role_provenance import read_role_provenance
+
+    _attach(fake_ctx)
+    res = authed_client.post("/api/bot-roles/create",
+                             json={"key": "welcome_ping_role_id"})
+    assert res.status_code == 200
+    assert res.json()["role_id"] == str(BIG_ROLE_ID)
+    with open_db(fake_ctx.db_path) as conn:
+        prov = read_role_provenance(conn, fake_ctx.guild_id)
+    assert prov["welcome_ping_role_id"].origin == "created"
+
+
+def test_create_refuses_a_create_on_offer_dial(authed_client, fake_ctx):
+    """Billy's condition for reopening these two dials, enforced.
+
+    Making @Guess Who from here without offering it to anybody is exactly the
+    empty-role failure that kept the dial out of the registry: the game would
+    read as configured and refuse every member.
+    """
+    guild = _attach(fake_ctx)
+    res = authed_client.post("/api/bot-roles/create", json={"key": "guess_role_id"})
+
+    assert res.status_code == 422
+    assert "offer" in res.json()["detail"].lower()
+    guild.create_role.assert_not_awaited()
+
+
+def test_create_refuses_a_role_another_feature_owns(authed_client, fake_ctx):
+    _attach(fake_ctx)
+    res = authed_client.post("/api/bot-roles/create",
+                             json={"key": "wellness_role_id"})
+    assert res.status_code == 422
+
+
+def test_create_refuses_an_unknown_key(authed_client, fake_ctx):
+    _attach(fake_ctx)
+    assert authed_client.post(
+        "/api/bot-roles/create", json={"key": "mod_role_ids"}
+    ).status_code == 404
+
+
+# ── adopt ────────────────────────────────────────────────────────────
+
+
+def test_adopt_points_the_dial_and_records_the_adoption(authed_client, fake_ctx):
+    from bot_modules.core.db_utils import get_config_value
+    from bot_modules.core.role_provenance import read_role_provenance
+
+    _attach(fake_ctx, roles=[_role(600, "Announcements", position=3)])
+    res = authed_client.post(
+        "/api/bot-roles/adopt",
+        json={"key": "welcome_ping_role_id", "role_id": "600"},
+    )
+
+    assert res.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(
+            conn, "welcome_ping_role_id", "0", fake_ctx.guild_id
+        ) == "600"
+        assert read_role_provenance(
+            conn, fake_ctx.guild_id
+        )["welcome_ping_role_id"].origin == "adopted"
+
+
+def test_adopt_refuses_an_integration_managed_role(authed_client, fake_ctx):
+    _attach(fake_ctx, roles=[_role(600, "Server Booster", managed=True)])
+    res = authed_client.post(
+        "/api/bot-roles/adopt",
+        json={"key": "welcome_ping_role_id", "role_id": "600"},
+    )
+    assert res.status_code == 422
+
+
+def test_adopt_refuses_a_role_the_bot_could_never_grant(authed_client, fake_ctx):
+    """The hierarchy check the provisioner never had. Storing this id would
+    make every jail fail at add_roles with an error about a role the admin
+    never chose."""
+    _attach(fake_ctx, roles=[_role(600, "Warden", position=90)], bot_top=10)
+    res = authed_client.post(
+        "/api/bot-roles/adopt", json={"key": "jailed_role_id", "role_id": "600"},
+    )
+    assert res.status_code == 422
+    assert "above my own role" in res.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("key", "status"),
+    [
+        # The jail hands its role to a member: a moderator-level one is refused.
+        pytest.param("jailed_role_id", 422, id="assigning-dial"),
+        # A ping role is only mentioned, so its permissions give nobody anything.
+        pytest.param("welcome_ping_role_id", 200, id="mention-only-dial"),
+    ],
+)
+def test_adopt_refuses_an_elevated_role_only_where_it_is_handed_out(
+    authed_client, fake_ctx, key, status
+):
+    staff = _role(600, "STAFF", position=3,
+                  permissions=discord.Permissions(manage_messages=True))
+    _attach(fake_ctx, roles=[staff])
+    res = authed_client.post("/api/bot-roles/adopt", json={"key": key, "role_id": "600"})
+    assert res.status_code == status
+    if status == 422:
+        assert "moderator-level permissions" in res.json()["detail"]
+
+
+def test_adopt_allows_a_high_role_for_a_dial_the_bot_only_mentions(
+    authed_client, fake_ctx
+):
+    _attach(fake_ctx, roles=[_role(600, "Announcements", position=90)], bot_top=10)
+    res = authed_client.post(
+        "/api/bot-roles/adopt",
+        json={"key": "welcome_ping_role_id", "role_id": "600"},
+    )
+    assert res.status_code == 200
+
+
+# ── stop ─────────────────────────────────────────────────────────────
+
+
+def test_stop_unpoints_the_dial_and_never_deletes_the_role(
+    authed_client, fake_ctx
+):
+    """"Stop managing" means stop pointing at it (Billy, 2026-09-03).
+
+    Provenance would make a delete button safe to offer, which is not the same
+    as wanting one — so the role stays in the server and everybody holding it
+    keeps it.
+    """
+    from bot_modules.core.db_utils import get_config_value
+    from bot_modules.core.role_provenance import read_role_provenance
+
+    role = _role(600, "Welcome Ping", position=3)
+    role.delete = AsyncMock()
+    _attach(fake_ctx, roles=[role])
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_ping_role_id", "600", fake_ctx.guild_id)
+        conn.commit()
+
+    assert authed_client.post(
+        "/api/bot-roles/stop", json={"key": "welcome_ping_role_id"}
+    ).status_code == 200
+
+    role.delete.assert_not_awaited()
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(
+            conn, "welcome_ping_role_id", "0", fake_ctx.guild_id
+        ) == "0"
+        assert "welcome_ping_role_id" not in read_role_provenance(
+            conn, fake_ctx.guild_id
+        )
+
+
+@pytest.mark.parametrize("action", ["adopt", "stop"])
+def test_repointing_the_break_role_retires_the_old_one(authed_client, fake_ctx, action):
+    """Members on a break still wear the old role; Take a Break must keep
+    recognising it (breaks.store.retire_on_dial_change)."""
+    from bot_modules.breaks.store import read_retired_role_ids
+
+    _attach(fake_ctx, roles=[_role(600, "Resting", position=3)])
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "break_role_id", "590", fake_ctx.guild_id)
+        conn.commit()
+    body = {"key": "break_role_id"} | ({"role_id": "600"} if action == "adopt" else {})
+    assert authed_client.post(f"/api/bot-roles/{action}", json=body).status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert read_retired_role_ids(conn, fake_ctx.guild_id) == {590}
+
+
+def test_a_stopped_dial_then_reads_as_deliberately_off(authed_client, fake_ctx):
+    """The stored "0" has to be the same "0" the provisioner honours, or
+    "stop managing" would be undone by the feature's next run."""
+    _attach(fake_ctx, roles=[_role(600, "Welcome Ping", position=3)])
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_ping_role_id", "600", fake_ctx.guild_id)
+        conn.commit()
+    authed_client.post("/api/bot-roles/stop", json={"key": "welcome_ping_role_id"})
+
+    card = _by_key(authed_client.get("/api/bot-roles").json())["welcome_ping_role_id"]
+    assert card["state"] == "turned_off"
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected"),
+    [
+        pytest.param("/api/bot-roles/adopt",
+                     {"key": "welcome_ping_role_id", "role_id": "600"}, 600, id="adopt"),
+        pytest.param("/api/bot-roles/stop", {"key": "welcome_ping_role_id"}, 0, id="stop"),
+    ],
+)
+def test_a_write_reaches_the_bots_cached_config(
+    authed_client, fake_ctx, path, body, expected
+):
+    """`welcome_ping_role_id` is one of the keys GuildConfig caches, and the
+    dashboard shares the bot's context. Without the invalidation the welcome
+    post kept pinging the old role until a restart."""
+    _attach(fake_ctx, roles=[_role(600, "Welcome Ping", position=3)])
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_ping_role_id", "599", fake_ctx.guild_id)
+        conn.commit()
+    assert fake_ctx.guild_config(fake_ctx.guild_id).welcome_ping_role_id == 599
+
+    assert authed_client.post(path, json=body).status_code == 200
+
+    assert fake_ctx.guild_config(fake_ctx.guild_id).welcome_ping_role_id == expected
+
+
+def test_stop_refuses_a_dial_with_no_coherent_off(authed_client, fake_ctx):
+    """A jail with no role is not a jail; switching it off would break the
+    feature with nothing to show that had happened."""
+    _attach(fake_ctx)
+    res = authed_client.post("/api/bot-roles/stop", json={"key": "jailed_role_id"})
+    assert res.status_code == 422

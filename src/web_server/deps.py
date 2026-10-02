@@ -1,0 +1,289 @@
+"""FastAPI dependency-injection factories for the dashboard."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
+
+from fastapi import Depends, HTTPException, Request, status
+
+from web_server.auth import AuthBackend, AuthenticatedUser
+
+T = TypeVar("T")
+
+_log = logging.getLogger("dungeonkeeper.web.cache")
+
+# Refusals land with the other auth lines (auth.py's blocked-origin warnings)
+# rather than under the report cache this module's other logger names.
+_authz_log = logging.getLogger("dungeonkeeper.web.auth")
+
+
+def _refuse(
+    request: Request,
+    *,
+    user: AuthenticatedUser | None = None,
+    need: str = "",
+) -> HTTPException:
+    """Build the refusal to raise, logging it once at warning level.
+
+    Every dependency below refused in silence, so a misconfigured role — the
+    games editor role pointing at a deleted role, a guild whose staff roles
+    were never set — was indistinguishable from nobody visiting the page. The
+    admin sees "Insufficient permissions" and the operator sees nothing at all.
+
+    Returns rather than raises so the call site still reads ``raise``, which
+    keeps the control flow obvious to a reader and to the type checker.
+    """
+    if user is None:
+        _authz_log.warning(
+            "401 %s %s — no valid session", request.method, request.url.path
+        )
+        return HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
+        )
+    _authz_log.warning(
+        "403 %s %s — user %s holds {%s}, needs %s",
+        request.method,
+        request.url.path,
+        user.user_id,
+        ", ".join(sorted(user.perms)) or "no permissions",
+        need or "elevated permissions",
+    )
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+    )
+
+
+# ── Report cache ────────────────────────────────────────────────────────
+
+_report_cache: dict[str, tuple[float, str, int, object]] = {}
+# key → (expires_at, report_name, guild_id, result)
+_DEFAULT_TTL = 3600  # seconds (1 hour — batch warmer refreshes on the same cadence)
+_CACHE_MAX_ENTRIES = 2048
+
+
+def _make_cache_key(name: str, guild_id: int, params: dict) -> str:
+    """Build a deterministic cache key from endpoint name + params."""
+    raw = json.dumps({"n": name, "g": guild_id, **params}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _evict_expired(now: float) -> None:
+    expired = [k for k, (exp, *_) in _report_cache.items() if exp <= now]
+    for k in expired:
+        _report_cache.pop(k, None)
+
+
+async def cached_run_query(
+    name: str,
+    guild_id: int,
+    params: dict,
+    fn: Callable[..., T],
+    ttl: int = _DEFAULT_TTL,
+) -> T:
+    """Like ``run_query`` but returns a cached result if one exists and is fresh.
+
+    *name* is a short label for the report (e.g. ``"xp-leaderboard"``).
+    *params* is a dict of the query-specific parameters used for cache keying.
+    """
+    key = _make_cache_key(name, guild_id, params)
+    now = time.monotonic()
+
+    hit = _report_cache.get(key)
+    if hit is not None:
+        expires_at, _name, _guild_id, result = hit
+        if now < expires_at:
+            _log.debug("cache HIT  %s (ttl %.0fs remaining)", name, expires_at - now)
+            return result  # type: ignore[return-value]
+
+    result = await asyncio.to_thread(fn)
+    if len(_report_cache) >= _CACHE_MAX_ENTRIES:
+        _evict_expired(now)
+        # Still over cap after pruning expired? Drop the oldest-expiring entries.
+        if len(_report_cache) >= _CACHE_MAX_ENTRIES:
+            overflow = len(_report_cache) - _CACHE_MAX_ENTRIES + 1
+            for k, _v in sorted(_report_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+                _report_cache.pop(k, None)
+    _report_cache[key] = (now + ttl, name, guild_id, result)
+    _log.debug("cache MISS %s (stored for %ds)", name, ttl)
+    return result  # type: ignore[return-value]
+
+
+def invalidate_report_cache(
+    name: str | None = None, guild_id: int | None = None
+) -> int:
+    """Drop cached entries. With no args, clears everything.
+
+    Returns the number of entries removed.
+    """
+    if name is None and guild_id is None:
+        count = len(_report_cache)
+        _report_cache.clear()
+        return count
+
+    to_remove = [
+        key
+        for key, (_ts, entry_name, entry_guild_id, _result) in _report_cache.items()
+        if (name is None or entry_name == name)
+        and (guild_id is None or entry_guild_id == guild_id)
+    ]
+    for key in to_remove:
+        _report_cache.pop(key, None)
+    return len(to_remove)
+
+
+def store_report_result(
+    name: str, guild_id: int, params: dict, result: object, ttl: int = _DEFAULT_TTL
+) -> None:
+    """Write a pre-computed result directly into the report cache.
+
+    Used by the batch warmer in ``dungeonkeeper.py`` to populate the cache
+    proactively so dashboard page loads are always instant.
+    """
+    key = _make_cache_key(name, guild_id, params)
+    _report_cache[key] = (time.monotonic() + ttl, name, guild_id, result)
+
+
+def get_ctx(request: Request):
+    """Return the shared ``AppContext`` stashed on the FastAPI app."""
+    return request.app.state.ctx
+
+
+def get_active_guild_id(request: Request) -> int:
+    """Return the active guild_id from the user's session cookie.
+
+    Falls back to ``ctx.guild_id`` for OpenAuth (LAN mode) or sessions
+    created before multi-guild support was added.
+    """
+    from web_server.auth import SESSION_COOKIE, DiscordOAuthAuth
+
+    auth = request.app.state.auth
+    if not isinstance(auth, DiscordOAuthAuth):
+        return request.app.state.ctx.guild_id
+
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if cookie:
+        session = auth.read_session(cookie)
+        if session and "guild_id" in session:
+            return int(session["guild_id"])
+    return request.app.state.ctx.guild_id
+
+
+def get_auth(request: Request) -> AuthBackend:
+    return request.app.state.auth
+
+
+async def run_query(fn: Callable[..., T], *args, **kwargs) -> T:
+    """Run a blocking DB-touching function off the event loop.
+
+    Usage::
+
+        def _q():
+            with ctx.open_db() as conn:
+                return reports_data.get_xp_leaderboard_data(conn, ...)
+        data = await run_query(_q)
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def require_game_host(
+    request: Request,
+    auth: AuthBackend = Depends(get_auth),
+) -> AuthenticatedUser:
+    """Allow admins OR holders of the configured game-host role."""
+    user = await auth.authenticate(request)
+    if user is None:
+        raise _refuse(request)
+    if "admin" in user.perms:
+        return user
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            row = conn.execute(
+                "SELECT role_id FROM games_editor_role WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+            return int(row["role_id"]) if row else None
+
+    host_role_id = await run_query(_q)
+    if host_role_id and host_role_id in user.role_ids:
+        return user
+    raise _refuse(request, user=user, need="admin or the games editor role")
+
+
+async def require_economy_manager(
+    request: Request,
+    auth: AuthBackend = Depends(get_auth),
+) -> AuthenticatedUser:
+    """Allow admins OR holders of the configured economy manager role."""
+    from bot_modules.economy.service import load_econ_settings
+
+    user = await auth.authenticate(request)
+    if user is None:
+        raise _refuse(request)
+    if "admin" in user.perms:
+        return user
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            return load_econ_settings(conn, guild_id).manager_role_id
+
+    manager_role_id = await run_query(_q)
+    if manager_role_id and manager_role_id in user.role_ids:
+        return user
+    raise _refuse(request, user=user, need="admin or the economy manager role")
+
+
+async def require_survivor_host(
+    request: Request,
+    auth: AuthBackend = Depends(get_auth),
+) -> AuthenticatedUser:
+    """Allow admins OR the members named as Survivor hosts for this guild.
+
+    Hosts are a member list, not a role (survivor_spec.md §3.4): an admin
+    adds them by name on the Survivor panel."""
+    from bot_modules.survivor.service import is_host
+
+    user = await auth.authenticate(request)
+    if user is None:
+        raise _refuse(request)
+    if "admin" in user.perms:
+        return user
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            return is_host(conn, guild_id, int(user.user_id))
+
+    if await run_query(_q):
+        return user
+    raise _refuse(request, user=user, need="admin or a named Survivor host")
+
+
+def require_perms(required: set[str]) -> Callable[..., Awaitable[AuthenticatedUser]]:
+    """Return a FastAPI dependency that enforces ``required`` permissions."""
+    required_frozen = frozenset(required)
+
+    async def _dep(
+        request: Request,
+        auth: AuthBackend = Depends(get_auth),
+    ) -> AuthenticatedUser:
+        user = await auth.authenticate(request)
+        if user is None:
+            raise _refuse(request)
+        if not required_frozen.issubset(user.perms):
+            raise _refuse(
+                request, user=user, need="{" + ", ".join(sorted(required_frozen)) + "}"
+            )
+        return user
+
+    return _dep

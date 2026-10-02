@@ -1,0 +1,531 @@
+"""Tests for the extracted Never Have I Ever pure-logic module and its cog.
+
+Covers ``bot_modules/games/nhie/logic.py`` (vote toggle, round-end lives
+accounting, winner detection, payload codecs) and the cog glue that needs
+no Discord. The Components V2 cards are covered in
+``test_games_nhie_layouts.py``.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from bot_modules.games.nhie.logic import (
+    DEFAULT_LIVES,
+    MAX_QUEUED_STATEMENTS,
+    apply_round_lives,
+    apply_vote,
+    bump_guilt_scores,
+    encode_round_state,
+    find_winner,
+    payload_to_round_state,
+    queue_statement,
+)
+
+
+# ── apply_vote ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "queued, text, expected_result, expected_len",
+    [
+        pytest.param([], "  gone skydiving ", 1, 1, id="appends-stripped"),
+        pytest.param(["a"] * 14, "one more", 15, 15, id="fills-to-cap"),
+        pytest.param(["a"] * 15, "too many", None, 15, id="refused-at-cap"),
+        pytest.param([], "   ", None, 0, id="blank-ignored"),
+    ],
+)
+def test_queue_statement_caps_the_pose_queue(queued, text, expected_result, expected_len):
+    """vote-games-62: the NHIE pose queue was the one uncapped queue of the
+    three round games; it now holds 15 like WYR's and MLT's."""
+    assert queue_statement(queued, text) == expected_result
+    assert len(queued) == expected_len
+
+
+def test_queue_statement_cap_matches_the_sibling_games():
+    import bot_modules.games.mlt.cog as mlt_cog
+    import bot_modules.games.wyr.cog as wyr_cog
+
+    assert MAX_QUEUED_STATEMENTS == mlt_cog._MAX_QUEUED_PROMPTS == wyr_cog._MAX_QUEUED_QUESTIONS
+
+
+def test_apply_vote_adds_new_guilty_voter():
+    guilty: list[int] = []
+    innocent: list[int] = []
+    lives: dict[int, int] = {}
+    changed = apply_vote(guilty, innocent, lives, 42, "guilty", max_lives=3)
+    assert changed is False
+    assert guilty == [42]
+    assert innocent == []
+    # Lazy registration in lives tracker
+    assert lives == {42: 3}
+
+
+def test_apply_vote_adds_new_innocent_voter():
+    guilty: list[int] = []
+    innocent: list[int] = []
+    lives: dict[int, int] = {}
+    changed = apply_vote(guilty, innocent, lives, 42, "innocent", max_lives=3)
+    assert changed is False
+    assert innocent == [42]
+    assert guilty == []
+    assert lives == {42: 3}
+
+
+def test_apply_vote_switching_sides_returns_changed_true():
+    """User on the innocent list votes guilty — they move and the flag fires."""
+    guilty: list[int] = []
+    innocent: list[int] = [42]
+    lives: dict[int, int] = {42: 3}
+    changed = apply_vote(guilty, innocent, lives, 42, "guilty", max_lives=3)
+    assert changed is True
+    assert guilty == [42]
+    assert innocent == []
+
+
+def test_apply_vote_idempotent_re_press_is_noop():
+    """Pressing the same vote twice doesn't duplicate the entry."""
+    guilty: list[int] = [42]
+    innocent: list[int] = []
+    lives: dict[int, int] = {42: 3}
+    changed = apply_vote(guilty, innocent, lives, 42, "guilty", max_lives=3)
+    assert changed is False
+    assert guilty == [42]
+    assert innocent == []
+    # Lives untouched — still 3
+    assert lives == {42: 3}
+
+
+def test_apply_vote_does_not_overwrite_existing_lives():
+    """A vote from an already-tracked user must NOT reset their HP."""
+    guilty: list[int] = []
+    innocent: list[int] = []
+    lives: dict[int, int] = {42: 1}
+    apply_vote(guilty, innocent, lives, 42, "guilty", max_lives=3)
+    assert lives[42] == 1
+
+
+def test_apply_vote_skips_lives_registration_when_max_lives_zero():
+    """max_lives=0 means no elimination mode — don't track lives."""
+    guilty: list[int] = []
+    innocent: list[int] = []
+    lives: dict[int, int] = {}
+    apply_vote(guilty, innocent, lives, 42, "guilty", max_lives=0)
+    assert lives == {}
+    assert guilty == [42]
+
+
+# ── apply_round_lives ────────────────────────────────────────────────
+
+
+def test_apply_round_lives_decrements_guilty_voters():
+    lives = {1: 3, 2: 3}
+    eliminated: set[int] = set()
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[1], innocent=[2], max_lives=3
+    )
+    assert lives == {1: 2, 2: 3}
+    assert eliminated == set()
+    assert newly == []
+
+
+def test_apply_round_lives_eliminates_at_zero():
+    lives = {1: 1}
+    eliminated: set[int] = set()
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[1], innocent=[], max_lives=3
+    )
+    assert lives == {1: 0}
+    assert eliminated == {1}
+    assert newly == [1]
+
+
+def test_apply_round_lives_skips_already_eliminated():
+    """A player still in `eliminated` doesn't lose another heart."""
+    lives = {1: 0}
+    eliminated: set[int] = {1}
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[1], innocent=[], max_lives=3
+    )
+    assert lives == {1: 0}
+    assert newly == []
+
+
+def test_apply_round_lives_registers_untracked_guilty_with_full_bar_first():
+    """First-time guilty voter is registered at max_lives, THEN decremented."""
+    lives: dict[int, int] = {}
+    eliminated: set[int] = set()
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[42], innocent=[], max_lives=3
+    )
+    assert lives == {42: 2}
+    assert newly == []
+
+
+def test_apply_round_lives_registers_untracked_innocent_voters():
+    """The easy-to-miss case: innocent voters who never voted before get
+    added to the lives tracker so they render in "Still Standing"."""
+    lives: dict[int, int] = {}
+    eliminated: set[int] = set()
+    apply_round_lives(
+        lives, eliminated, guilty=[], innocent=[99], max_lives=3
+    )
+    assert lives == {99: 3}
+
+
+def test_apply_round_lives_does_not_register_innocent_already_eliminated():
+    lives = {99: 0}
+    eliminated: set[int] = {99}
+    apply_round_lives(
+        lives, eliminated, guilty=[], innocent=[99], max_lives=3
+    )
+    assert lives == {99: 0}
+
+
+def test_apply_round_lives_noop_when_max_lives_zero():
+    lives: dict[int, int] = {}
+    eliminated: set[int] = set()
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[1, 2], innocent=[3], max_lives=0
+    )
+    assert lives == {}
+    assert eliminated == set()
+    assert newly == []
+
+
+def test_apply_round_lives_multiple_eliminations_one_round():
+    lives = {1: 1, 2: 1, 3: 3}
+    eliminated: set[int] = set()
+    newly = apply_round_lives(
+        lives, eliminated, guilty=[1, 2], innocent=[3], max_lives=3
+    )
+    assert eliminated == {1, 2}
+    assert set(newly) == {1, 2}
+    assert lives[3] == 3
+
+
+# ── find_winner ──────────────────────────────────────────────────────
+
+
+def test_find_winner_continue_when_empty_lives():
+    """Empty lives dict — game just started, no one's been tracked yet."""
+    status, uid = find_winner({}, set())
+    assert status == "continue"
+    assert uid is None
+
+
+def test_find_winner_continue_when_two_alive():
+    status, uid = find_winner({1: 2, 2: 1}, set())
+    assert status == "continue"
+    assert uid is None
+
+
+def test_find_winner_picks_last_alive():
+    status, uid = find_winner({1: 0, 2: 2}, {1})
+    assert status == "winner"
+    assert uid == 2
+
+
+def test_find_winner_picks_last_alive_without_elim_set():
+    """A player with hp=0 but not yet in `eliminated` is still dead for
+    winner-detection (the `hp > 0` test holds them out)."""
+    status, uid = find_winner({1: 0, 2: 2}, set())
+    assert status == "winner"
+    assert uid == 2
+
+
+# vote-games-51: a round in which exactly one member voted used to crown that
+# member "last one standing" and pay them. A winner needs a game: at least two
+# players ever registered (``lives`` never drops a row, so it is the max
+# roster) and at least one elimination.
+@pytest.mark.parametrize(
+    ("lives", "eliminated"),
+    [
+        pytest.param({1: 3}, set(), id="one-voter"),
+        pytest.param({1: 0}, {1}, id="one-voter-eliminated-themselves"),
+        pytest.param({1: 3, 2: 2}, set(), id="two-voters-no-elimination"),
+        pytest.param({1: 2}, set(), id="one-voter-after-a-guilty-round"),
+    ],
+)
+def test_find_winner_continues_until_two_players_and_an_elimination(lives, eliminated):
+    assert find_winner(lives, eliminated) == ("continue", None)
+
+
+def test_find_winner_all_eliminated():
+    status, uid = find_winner({1: 0, 2: 0}, {1, 2})
+    assert status == "all_eliminated"
+    assert uid is None
+
+
+# ── bump_guilt_scores ────────────────────────────────────────────────
+
+
+def test_bump_guilt_scores_increments_per_user():
+    scores: dict[str, int] = {}
+    bump_guilt_scores(scores, [1, 2, 1])
+    assert scores == {"1": 2, "2": 1}
+
+
+def test_bump_guilt_scores_preserves_existing():
+    scores = {"1": 5}
+    bump_guilt_scores(scores, [1])
+    assert scores == {"1": 6}
+
+
+def test_bump_guilt_scores_empty_guilty_list_noop():
+    scores = {"1": 5}
+    bump_guilt_scores(scores, [])
+    assert scores == {"1": 5}
+
+
+# ── payload_to_round_state / encode_round_state ──────────────────────
+
+
+def test_payload_to_round_state_decodes_string_keys():
+    payload = {
+        "lives": {"1": 3, "2": 1},
+        "eliminated": ["3"],
+        "max_lives": 5,
+    }
+    lives, elim, max_lives = payload_to_round_state(payload)
+    assert lives == {1: 3, 2: 1}
+    assert elim == {3}
+    assert max_lives == 5
+
+
+def test_payload_to_round_state_defaults_when_missing():
+    lives, elim, max_lives = payload_to_round_state({})
+    assert lives == {}
+    assert elim == set()
+    assert max_lives == DEFAULT_LIVES
+
+
+def test_encode_round_state_round_trip():
+    lives, elim = encode_round_state({1: 3, 2: 1}, {3})
+    assert lives == {"1": 3, "2": 1}
+    assert sorted(elim) == ["3"]
+
+
+def test_codec_round_trip_preserves_state():
+    """Encode then decode returns the same typed state."""
+    original_lives = {1: 3, 7: 2}
+    original_elim = {99}
+    enc_lives, enc_elim = encode_round_state(original_lives, original_elim)
+    payload = {"lives": enc_lives, "eliminated": enc_elim, "max_lives": 3}
+    decoded_lives, decoded_elim, _ = payload_to_round_state(payload)
+    assert decoded_lives == original_lives
+    assert decoded_elim == original_elim
+
+
+# ── sanity / integration ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("vote_kind", ["guilty", "innocent"])
+def test_apply_vote_two_users_independent(vote_kind):
+    guilty: list[int] = []
+    innocent: list[int] = []
+    lives: dict[int, int] = {}
+    apply_vote(guilty, innocent, lives, 1, vote_kind, max_lives=3)
+    apply_vote(guilty, innocent, lives, 2, vote_kind, max_lives=3)
+    if vote_kind == "guilty":
+        assert sorted(guilty) == [1, 2]
+    else:
+        assert sorted(innocent) == [1, 2]
+    assert lives == {1: 3, 2: 3}
+
+
+def test_full_round_flow_winner_emerges():
+    """Simulate two rounds: both users guilty each round at 2 lives.
+    After round 2, user 1's flagged guilty twice should die first
+    while user 2 still has at least one heart — except both are
+    guilty in lockstep here, so both die at the same round."""
+    lives: dict[int, int] = {1: 2, 2: 2}
+    eliminated: set[int] = set()
+    apply_round_lives(lives, eliminated, guilty=[1, 2], innocent=[], max_lives=2)
+    # Both at 1 hp, still alive
+    status, _ = find_winner(lives, eliminated)
+    assert status == "continue"
+    apply_round_lives(lives, eliminated, guilty=[1, 2], innocent=[], max_lives=2)
+    status, uid = find_winner(lives, eliminated)
+    assert status == "all_eliminated"
+    assert uid is None
+
+
+def test_full_round_flow_single_winner():
+    """User 1 votes innocent each round; user 2 votes guilty each round
+    until eliminated."""
+    lives: dict[int, int] = {}
+    eliminated: set[int] = set()
+    # Round 1
+    apply_round_lives(lives, eliminated, guilty=[2], innocent=[1], max_lives=2)
+    # User 1 now registered at 2, user 2 at 1
+    assert lives[1] == 2
+    assert lives[2] == 1
+    # Round 2
+    apply_round_lives(lives, eliminated, guilty=[2], innocent=[1], max_lives=2)
+    status, uid = find_winner(lives, eliminated)
+    assert status == "winner"
+    assert uid == 1
+
+
+# ── economy roster enrichment (Stage 2 faucet) ──────────────────────
+
+from types import SimpleNamespace  # noqa: E402
+
+import discord  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+import bot_modules.games.nhie.cog as nhie_cog  # noqa: E402
+from bot_modules.games.utils.game_manager import (  # noqa: E402
+    create_game,
+    get_active_game_by_id,
+    get_game_payload,
+)
+from bot_modules.games.db import GamesDb  # noqa: E402
+from tests.fakes import FakeGuild  # noqa: E402
+
+
+class _SpyBot:
+    def __init__(self, db_path) -> None:
+        self.games_db = GamesDb(db_path)
+        self.active_views: dict = {}
+        self.ctx = SimpleNamespace(db_path=db_path)
+
+    def get_cog(self, name):
+        return None
+
+
+async def test_advance_winner_pays_survivors_and_eliminated(monkeypatch, sync_db_path):
+    """The guiltiest winner may be an eliminated player, so the roster must be
+    everyone who played (survivors + eliminated), not just survivors."""
+    spy = AsyncMock()
+    monkeypatch.setattr(nhie_cog, "end_game", spy)
+    bot = _SpyBot(sync_db_path)
+    payload = {
+        "rounds": {"1": {}},
+        "lives": {"1": 1, "2": 1},
+        "eliminated": [],
+        "guilt_scores": {},
+        "max_lives": 1,
+    }
+    gid = await create_game(bot.games_db, 100, 1, "nhie", payload=payload)
+    bot.active_views[gid] = object()
+    cog = nhie_cog.NHIECog(bot)  # type: ignore[arg-type]
+    guild = FakeGuild(id=9001)
+    channel = SimpleNamespace(id=100, guild=guild, send=AsyncMock())
+    view = cog._build_round_view(
+        game_id=gid, host_id=1, host_name="Host", round_num=1, channel=channel,
+        guild=guild, statement="X", lives={1: 1, 2: 1}, eliminated=set(),
+        max_lives=1, interaction=None,
+    )
+    view.guilty = [1]     # player 1 admits guilt -> loses last life -> eliminated
+    view.innocent = [2]   # player 2 survives -> winner
+    await view.advance_callback(SimpleNamespace(edit=AsyncMock()))
+    call = spy.await_args
+    assert call is not None and spy.await_count == 1
+    # Eliminated guiltiest (1) is included alongside survivor (2).
+    assert sorted(call.kwargs["player_ids"]) == [1, 2]
+    assert call.kwargs["bot"] is bot
+
+
+def _ids(view) -> list[str]:
+    return [i.custom_id for i in view.walk_children() if getattr(i, "custom_id", None)]
+
+
+def _view_text(view) -> str:
+    return "\n".join(
+        i.content for i in view.walk_children() if isinstance(i, discord.ui.TextDisplay)
+    )
+
+
+def _channel(guild=None):
+    return SimpleNamespace(
+        id=100, name="games", guild=guild,
+        send=AsyncMock(return_value=SimpleNamespace(id=555, edit=AsyncMock())),
+    )
+
+
+async def test_run_round_empty_bank_opens_a_waiting_round(monkeypatch, sync_db_path):
+    """vote-games-50: NHIE used to end with a bare end_game (nobody paid, no
+    recap) when the bank ran dry; now the round waits for a posed statement."""
+    monkeypatch.setattr(nhie_cog, "get_nhie_statement", AsyncMock(return_value=None))
+    bot = _SpyBot(sync_db_path)
+    gid = await create_game(bot.games_db, 100, 1, "nhie", payload={"rounds": {}, "lives": {}, "eliminated": [], "max_lives": 3})
+    cog = nhie_cog.NHIECog(bot)  # type: ignore[arg-type]
+    channel = _channel()
+    await cog._run_round(None, gid, 1, "Host", 1, channel, None)
+
+    view = bot.active_views[gid]
+    assert view.waiting is True
+    assert _ids(view) == ["nhie_htp", "nhie_pose"]
+    assert await get_active_game_by_id(bot.games_db, gid) is not None
+    await view.begin_round("gone skydiving", SimpleNamespace(id=555, edit=AsyncMock()))
+    assert view.waiting is False
+    assert _ids(view) == ["nhie_htp", "nhie_guilty", "nhie_innocent", "nhie_pose"]
+    payload = await get_game_payload(bot.games_db, gid)
+    assert payload["rounds"]["1"]["stmt"] == "gone skydiving"
+
+
+async def test_votes_are_persisted_on_every_press(sync_db_path):
+    """vote-games-58: guilty/innocent reach the payload on the press, not on Next."""
+    bot = _SpyBot(sync_db_path)
+    gid = await create_game(
+        bot.games_db, 100, 1, "nhie",
+        payload={"rounds": {"1": {"guilty": [], "innocent": [], "stmt": "x"}}, "lives": {}, "eliminated": [], "max_lives": 3},
+    )
+    cog = nhie_cog.NHIECog(bot)  # type: ignore[arg-type]
+    view = cog._build_round_view(
+        game_id=gid, host_id=1, host_name="Host", round_num=1, channel=_channel(), guild=None,
+        statement="x", lives={}, eliminated=set(), max_lives=3,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=7, display_name="U7", roles=[]), guild=None, guild_id=None,
+        channel=SimpleNamespace(id=100, name="games", guild=None),
+        message=SimpleNamespace(id=555, edit=AsyncMock()),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+    )
+    await view.vote_guilty(interaction)  # type: ignore[arg-type]
+    payload = await get_game_payload(bot.games_db, gid)
+    assert payload["rounds"]["1"]["guilty"] == [7]
+
+
+async def test_end_game_posts_the_guilt_board_and_pays_everyone_who_played(monkeypatch, sync_db_path):
+    """vote-games-52 / discovery-3: NHIE's only ending was elimination. The
+    host's End Game (and the round cap, and /games end) post the guilt board
+    and pay the whole room — lives tracker plus every voter, so a lives:0
+    game pays too."""
+    spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(nhie_cog, "end_game", spy)
+    bot = _SpyBot(sync_db_path)
+    payload = {
+        "rounds": {"1": {"guilty": [1], "innocent": [2], "stmt": "x"}, "2": {"guilty": [], "innocent": [], "stmt": "y"}},
+        "lives": {"1": 2, "2": 3}, "eliminated": [], "guilt_scores": {"1": 1}, "max_lives": 3,
+    }
+    gid = await create_game(bot.games_db, 100, 1, "nhie", payload=payload)
+    cog = nhie_cog.NHIECog(bot)  # type: ignore[arg-type]
+    channel = _channel()
+    view = cog._build_round_view(
+        game_id=gid, host_id=1, host_name="Host", round_num=2, channel=channel, guild=None,
+        statement="y", lives={1: 2, 2: 3}, eliminated=set(), max_lives=3,
+    )
+    bot.active_views[gid] = view
+    view.guilty, view.innocent = [2], [9]  # 9 votes for the first time this round
+    message = SimpleNamespace(id=555, edit=AsyncMock())
+
+    assert view.finish_callback is not None
+    await view.finish_callback(message, "ended")
+
+    assert _ids(view) == [], "a closed round carries no controls"
+    recap = _view_text(channel.send.await_args.kwargs["view"])
+    assert "Game Over" in recap
+    assert "guilt board" in recap
+    assert "2 guilty votes" not in recap  # 1 has one, 2 now has one
+    call = spy.await_args
+    assert call is not None and spy.await_count == 1
+    assert call.kwargs["player_ids"] == [1, 2, 9]
+    assert call.kwargs["bot"] is bot
+    assert call.kwargs["reason"] == "ended"
+    # The last round was resolved before the archive: guilt bumped, a heart lost.
+    assert call.kwargs["payload"]["guilt_scores"] == {"1": 1, "2": 1}
+    assert call.kwargs["payload"]["lives"]["2"] == 2
+    assert gid not in bot.active_views

@@ -1,0 +1,638 @@
+"""End-to-end panel-format AMA flow driven through fake Discord objects.
+
+The pure helpers and embed builders are unit-tested elsewhere; this
+module exercises the interactive glue that nothing else touches:
+Volunteer -> _begin_ask -> AskTargetSelect.callback -> modal on_submit.
+It uses lightweight fakes plus stubbed branding/audit so the flow runs
+without a live gateway or the branding DB.
+"""
+
+import json
+from unittest.mock import MagicMock
+
+import discord
+import pytest
+
+import bot_modules.games.ama.cog as ama_mod
+from bot_modules.core import branding
+from bot_modules.games.ama.cog import (
+    STALE_HOT_SEAT_TEXT,
+    STALE_PANEL_TEXT,
+    SUBMITTED_FOR_REVIEW_TEXT,
+    AMACog,
+    AskQuestionModal,
+    AskTargetSelect,
+    ScreenedQuestionView,
+)
+from bot_modules.no_contact import service as no_contact_service
+from bot_modules.games.db import GamesDb
+
+pytestmark = pytest.mark.usefixtures("stub_no_contact")
+
+
+
+
+# ── Fakes ────────────────────────────────────────────────────────────
+
+
+class FakeResponse:
+    def __init__(self):
+        self.messages: list[tuple] = []
+        self.modals: list = []
+        self.edits: list[dict] = []
+        self.deferred = False
+
+    async def send_message(self, content=None, **kwargs):
+        self.messages.append((content, kwargs))
+
+    async def send_modal(self, modal):
+        self.modals.append(modal)
+
+    async def defer(self, *args, **kwargs):
+        self.deferred = True
+
+    async def edit_message(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+class FakeMessage:
+    def __init__(self, mid: int, guild):
+        self.id = mid
+        self.guild = guild
+        self.jump_url = "http://discord/x"
+        self.edits: list[dict] = []
+        self.embeds: list = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+        if kwargs.get("embed") is not None:
+            self.embeds = [kwargs["embed"]]
+
+    async def delete(self):
+        pass
+
+
+def FakeMember(uid: int, name: str):
+    # A spec'd mock so production's `isinstance(user, discord.Member)` guards
+    # pass, while still letting us pin id/display_name/mention.
+    m = MagicMock(spec=discord.Member)
+    m.id = uid
+    m.display_name = name
+    m.mention = f"<@{uid}>"
+    return m
+
+
+class FakeGuild:
+    def __init__(self, members):
+        self.id = 900
+        self._members = {m.id: m for m in members}
+        self.roles: list = []
+        self.me = None
+
+    def get_member(self, uid):
+        return self._members.get(uid)
+
+
+class FakeChannel:
+    def __init__(self, guild):
+        self.id = 4242
+        self.name = "games"
+        self.guild = guild
+        self.mention = "#games"
+        self.sends: list[tuple] = []
+        self._next_id = 9000
+
+    async def send(self, content=None, **kwargs):
+        self._next_id += 1
+        msg = FakeMessage(self._next_id, self.guild)
+        self.sends.append((content, kwargs, msg))
+        return msg
+
+
+class FakeCtx:
+    db_path = "unused-branding-db"
+
+
+class FakeBot:
+    def __init__(self, db: GamesDb):
+        self.games_db = db
+        self.active_views: dict = {}
+        self.game_launchers: dict = {}
+        self.ctx = FakeCtx()
+
+    def get_cog(self, name):
+        return None
+
+
+class FakeFollowup:
+    def __init__(self):
+        self.messages: list[tuple] = []
+
+    async def send(self, content=None, **kwargs):
+        self.messages.append((content, kwargs))
+
+
+class FakeInteraction:
+    def __init__(self, user, channel, guild, client):
+        self.user = user
+        self.channel = channel
+        self.guild = guild
+        self.client = client
+        self.message = None
+        self.response = FakeResponse()
+        self.followup = FakeFollowup()
+
+
+@pytest.fixture
+def stub_branding(monkeypatch):
+    async def _accent(_db_path, _guild):
+        return discord.Color(0x5865F2)
+
+    async def _audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(branding, "resolve_accent_color", _accent)
+    monkeypatch.setattr(ama_mod, "audit_anonymous", _audit)
+
+
+async def test_panel_flow_volunteer_ask_and_post(sync_db_path, stub_branding):
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+
+    host = FakeMember(1, "Host")
+    panelist = FakeMember(2, "Panelist")
+    other = FakeMember(4, "Other")
+    asker = FakeMember(3, "Asker")
+    guild = FakeGuild([host, panelist, other, asker])
+    channel = FakeChannel(guild)
+
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": "unfiltered", "format": "panel"},
+    )
+    assert game_id is not None
+    view = bot.active_views[game_id]
+
+    # 1. Two panelists volunteer -> both join the panel roster.
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+    await view._handle_volunteer(FakeInteraction(other, channel, guild, bot))
+    assert view.panel == [panelist.id, other.id]
+
+    # 2. Asker opens the ask flow -> gets a dropdown of panelists.
+    ask_inter = FakeInteraction(asker, channel, guild, bot)
+    await view._begin_ask(ask_inter)
+    assert ask_inter.response.messages, "ask flow posted nothing"
+    ask_view = ask_inter.response.messages[-1][1]["view"]
+    select = next(c for c in ask_view.children if isinstance(c, AskTargetSelect))
+    assert [o.value for o in select.options] == [str(panelist.id), str(other.id)]
+
+    # 3. Asker picks the panelist from the dropdown -> a question modal opens.
+    select._values = [str(panelist.id)]  # discord fills this from the submitted interaction
+    pick_inter = FakeInteraction(asker, channel, guild, bot)
+    await select.callback(pick_inter)
+    assert pick_inter.response.modals, "selecting a panelist opened no modal"
+    modal = pick_inter.response.modals[-1]
+    assert isinstance(modal, AskQuestionModal)
+    assert modal.target_id == panelist.id
+
+    # 4. Asker submits the question -> it posts to the channel, aimed at the panelist.
+    modal.question._value = "What's your favorite color?"
+    submit_inter = FakeInteraction(asker, channel, guild, bot)
+    await modal.on_submit(submit_inter)
+
+    # A question card went to the channel, naming and pinging the panelist.
+    posted = _question_cards_for(channel, panelist)
+    assert posted, "no question card aimed at the panelist"
+    _, kwargs, _ = posted[-1]
+    assert "embed" not in kwargs and "content" not in kwargs
+
+    # Payload records the question, directed at the panelist, marked approved.
+    row = await db.fetchone(
+        "SELECT payload FROM games_active_games WHERE game_id = ?", (game_id,)
+    )
+    payload = json.loads(row["payload"])
+    questions = payload["questions"]
+    assert len(questions) == 1
+    assert questions[0]["hot_seat_id"] == panelist.id
+    assert questions[0]["asker_id"] == asker.id
+    assert questions[0]["status"] == "approved"
+
+
+async def test_panel_ask_rejected_when_target_left(sync_db_path, stub_branding):
+    # A panelist who leaves between dropdown-open and submit can't be asked.
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+
+    host = FakeMember(1, "Host")
+    panelist = FakeMember(2, "Panelist")
+    asker = FakeMember(3, "Asker")
+    guild = FakeGuild([host, panelist, asker])
+    channel = FakeChannel(guild)
+
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": "unfiltered", "format": "panel"},
+    )
+    view = bot.active_views[game_id]
+
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+    # Panelist leaves the panel (second tap).
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+    assert view.panel == []
+
+    # A stale modal captured the panelist as target; submitting must be rejected
+    # and post nothing.
+    modal = AskQuestionModal(game_id, db, channel, "unfiltered", host.id, panelist.id, view)
+    modal.question._value = "late question"
+    submit_inter = FakeInteraction(asker, channel, guild, bot)
+    await modal.on_submit(submit_inter)
+
+    assert submit_inter.response.messages, "expected a rejection message"
+    reject_text = submit_inter.response.messages[-1][0]
+    assert "left the panel" in reject_text
+    assert not _question_cards_for(channel, panelist)
+
+
+def _card_text(view) -> str:
+    return "\n".join(
+        i.content for i in view.walk_children() if isinstance(i, discord.ui.TextDisplay)
+    )
+
+
+def _question_cards_for(channel, member):
+    """The question cards posted for *member*: a V2 card names its target in
+    its body (the ping the embed carried in ``content=``), and the send
+    allow-lists exactly that member."""
+    return [
+        s for s in channel.sends
+        if isinstance(v := s[1].get("view"), discord.ui.LayoutView)
+        and member.mention in _card_text(v)
+        and [u.id for u in s[1]["allowed_mentions"].users] == [member.id]
+    ]
+
+
+async def test_ask_records_an_audit_row_pointing_at_the_posted_message(sync_db_path):
+    """The one piece of glue the service tests can't reach.
+
+    The audit write was deliberately moved to *after* the question posts so the
+    row carries the message pointer the dashboard joins against for content —
+    audit before the send and every AMA row would have a null message_id and no
+    recoverable text. Deliberately does not stub audit_anonymous.
+    """
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.shared.anon_audit_service import list_events
+
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    bot.ctx.db_path = sync_db_path  # type: ignore[attr-defined]
+    cog = AMACog(bot)  # type: ignore[arg-type]
+
+    host = FakeMember(1, "Host")
+    panelist = FakeMember(2, "Panelist")
+    asker = FakeMember(3, "Asker")
+    guild = FakeGuild([host, panelist, asker])
+    channel = FakeChannel(guild)
+
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=guild.id, options={"mode": "unfiltered", "format": "panel"},
+    )
+    view = bot.active_views[game_id]
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+
+    modal = AskQuestionModal(game_id, db, channel, "unfiltered", host.id, panelist.id, view)
+    modal.question._value = "an anonymous question"
+    await modal.on_submit(FakeInteraction(asker, channel, guild, bot))
+
+    posted = _question_cards_for(channel, panelist)[-1]
+    posted_msg_id = posted[2].id
+
+    with open_db(sync_db_path) as conn:
+        (entry,) = list_events(conn, guild.id, feature="ama")
+
+    assert entry.event == "question_asked"
+    assert entry.actor_id == asker.id, "the audit must name the real asker"
+    assert entry.target_id == panelist.id
+    assert entry.message_id == posted_msg_id, "row must point at the posted message"
+    assert entry.game_id == game_id
+
+
+# ── ReplyModal: the asker's DM points at the answer ───────────────────
+
+
+async def test_reply_dm_links_the_answered_card(sync_db_path, stub_branding, monkeypatch):
+    """The answer DM must carry a jump link, not just the channel mention.
+
+    The one piece of glue this covers is the cog handing the just-edited Q&A
+    card's ``jump_url`` to the embed builder — the embed's own two branches
+    are unit-tested in ``test_games_ama_logic``.
+    """
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    bot.ctx.db_path = sync_db_path  # type: ignore[assignment]  # the batch queue lives in the main DB
+    cog = AMACog(bot)  # type: ignore[arg-type]
+
+    host = FakeMember(1, "Host")
+    asker = FakeMember(3, "Asker")
+    guild = FakeGuild([host, asker])
+    channel = FakeChannel(guild)
+
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": "unfiltered", "format": "traditional"},
+    )
+    assert game_id is not None
+    payload = await ama_mod.get_game_payload(db, game_id)
+    payload["questions"] = [
+        {"text": "Q?", "asker_id": asker.id, "hot_seat_id": host.id, "status": "approved"}
+    ]
+    await ama_mod.update_game_payload(db, game_id, payload)
+
+    monkeypatch.setattr(
+        ama_mod.no_contact_service, "is_no_contact", lambda *_a, **_kw: False
+    )
+    sent: list = []
+
+    async def _capture_dm(_member, **kwargs):
+        sent.append(kwargs.get("layout"))
+        return True
+
+    monkeypatch.setattr(ama_mod, "send_branded_dm", _capture_dm)
+
+    async def _no_trigger(*_a, **_kw):
+        return None
+
+    from bot_modules.economy import game_rewards
+
+    monkeypatch.setattr(game_rewards, "fire_member_trigger", _no_trigger)
+
+    modal = ama_mod.ReplyModal(
+        game_id, db, question_idx=0, asker_id=asker.id, ama_view=None, question_text="Q?"
+    )
+    modal.reply._value = "Because I like it."
+    inter = FakeInteraction(host, channel, guild, bot)
+    inter.message = FakeMessage(777, guild)
+    inter.message.jump_url = "https://discord.com/channels/900/4242/777"
+    await modal.on_submit(inter)
+
+    # The DM is batched: the modal queues it, and dm_batch hands the batch to
+    # the cog's handler once the window has passed.
+    assert not sent, "the answer DM went out without waiting for its batch"
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.dm.batch.store import claim_due
+
+    with open_db(sync_db_path) as conn:
+        batches = claim_due(conn, now=10**12)
+    assert len(batches) == 1
+    (row,) = batches[0]
+    assert (row.user_id, row.group_key, row.actor_id, row.ref_id) == (
+        asker.id, channel.id, host.id, 777,
+    )
+    await ama_mod._deliver_answer_batch(bot, guild, asker, batches[0])  # type: ignore[arg-type]
+    assert sent, "the asker got no DM"
+    description = _card_text(sent[-1])
+    assert f"/channels/{guild.id}/{channel.id}/777" in description
+    assert f"<#{channel.id}>" in description
+
+
+
+# ── small panels: no click tax (social-prompt-34) ──────────────────────
+
+
+async def _panel_game(sync_db_path, members):
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+    guild = FakeGuild(members)
+    channel = FakeChannel(guild)
+    game_id = await cog.launch(
+        channel=channel, host_id=members[0].id, host_name=members[0].display_name,
+        guild_id=99, options={"mode": "unfiltered", "format": "panel"},
+    )
+    assert game_id is not None
+    return bot, guild, channel, bot.active_views[game_id]
+
+
+async def test_one_other_panelist_opens_the_modal_directly(sync_db_path, stub_branding):
+    """A dropdown listing exactly one name is three interactions for nothing."""
+    host, panelist, asker = FakeMember(1, "Host"), FakeMember(2, "P"), FakeMember(3, "A")
+    bot, guild, channel, view = await _panel_game(sync_db_path, [host, panelist, asker])
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+
+    inter = FakeInteraction(asker, channel, guild, bot)
+    await view._begin_ask(inter)
+
+    assert not inter.response.messages, "no dropdown for a single candidate"
+    (modal,) = inter.response.modals
+    assert isinstance(modal, AskQuestionModal) and modal.target_id == panelist.id
+
+
+async def test_the_picker_never_offers_the_presser_themselves(sync_db_path, stub_branding):
+    """Two panelists, one of them asking: the only candidate is the *other*
+    one, so the modal opens straight at them; alone on the panel, there is
+    nobody to ask."""
+    host, a, b = FakeMember(1, "Host"), FakeMember(2, "A"), FakeMember(3, "B")
+    bot, guild, channel, view = await _panel_game(sync_db_path, [host, a, b])
+    await view._handle_volunteer(FakeInteraction(a, channel, guild, bot))
+
+    alone = FakeInteraction(a, channel, guild, bot)
+    await view._begin_ask(alone)
+    assert not alone.response.modals
+    assert "only one on the panel" in alone.response.messages[-1][0]
+
+    await view._handle_volunteer(FakeInteraction(b, channel, guild, bot))
+    inter = FakeInteraction(a, channel, guild, bot)
+    await view._begin_ask(inter)
+    (modal,) = inter.response.modals
+    assert modal.target_id == b.id
+
+
+# ── no-contact gate (social-prompt-47) ────────────────────────────────
+# The cog conftest stubs the gate to "not blocked"; these patch it back on so
+# each branch of the byte-identical impersonation is actually asserted.
+
+
+def _blocked(monkeypatch, *, partner_ids=()):
+    monkeypatch.setattr(no_contact_service, "check_and_record", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        no_contact_service, "no_contact_partners", MagicMock(return_value=set(partner_ids))
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "game_format", "expected"),
+    [
+        pytest.param("screened", "panel", SUBMITTED_FOR_REVIEW_TEXT, id="screened-fakes-success"),
+        pytest.param("unfiltered", "panel", STALE_PANEL_TEXT, id="unfiltered-panel-stale-target"),
+        pytest.param("unfiltered", "hot_seat", STALE_HOT_SEAT_TEXT, id="unfiltered-hot-seat-stale-target"),
+    ],
+)
+async def test_blocked_pair_gets_the_ordinary_reply_and_posts_nothing(
+    sync_db_path, stub_branding, monkeypatch, mode, game_format, expected,
+):
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+    host, target, asker = FakeMember(1, "Host"), FakeMember(2, "T"), FakeMember(3, "A")
+    guild = FakeGuild([host, target, asker])
+    channel = FakeChannel(guild)
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": mode, "format": game_format},
+    )
+    view = bot.active_views[game_id]
+    if game_format == "panel":
+        view.panel = [target.id]
+    else:
+        view.hot_seat_id = target.id
+    sent_before = len(channel.sends)
+    dm = MagicMock()
+    monkeypatch.setattr(ama_mod, "send_branded_dm", dm)
+    _blocked(monkeypatch)
+
+    modal = AskQuestionModal(game_id, db, channel, mode, host.id, target.id, view)
+    modal.question._value = "blocked question"
+    inter = FakeInteraction(asker, channel, guild, bot)
+    await modal.on_submit(inter)
+
+    assert inter.response.messages[-1][0] == expected
+    assert inter.response.messages[-1][1] == {"ephemeral": True}
+    assert len(channel.sends) == sent_before, "nothing may reach the channel"
+    dm.assert_not_called()
+    payload = await ama_mod.get_game_payload(db, game_id)
+    assert payload["questions"] == [], "a refused question is never stored"
+
+
+async def test_approval_time_block_drops_the_question_and_tells_the_host_it_posted(
+    sync_db_path, stub_branding, monkeypatch,
+):
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+    host, target, asker = FakeMember(1, "Host"), FakeMember(2, "T"), FakeMember(3, "A")
+    guild = FakeGuild([host, target, asker])
+    channel = FakeChannel(guild)
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": "screened", "format": "hot_seat"},
+    )
+    view = bot.active_views[game_id]
+    view.hot_seat_id = target.id
+    _blocked(monkeypatch)
+    sent_before = len(channel.sends)
+
+    approve_view = ScreenedQuestionView(game_id, "q?", 0, db, channel, target.id, asker.id, view)
+    inter = FakeInteraction(host, channel, guild, bot)
+    await approve_view.approve(inter)  # type: ignore[arg-type]
+
+    assert "✅ Question approved." in _card_text(inter.response.edits[-1]["view"])
+    assert len(channel.sends) == sent_before
+
+
+async def test_the_picker_drops_no_contact_partners(sync_db_path, stub_branding, monkeypatch):
+    host, a, b, asker = FakeMember(1, "Host"), FakeMember(2, "A"), FakeMember(3, "B"), FakeMember(4, "Q")
+    bot, guild, channel, view = await _panel_game(sync_db_path, [host, a, b, asker])
+    view.panel = [a.id, b.id]
+    monkeypatch.setattr(
+        no_contact_service, "no_contact_partners", MagicMock(return_value={a.id})
+    )
+
+    inter = FakeInteraction(asker, channel, guild, bot)
+    await view._begin_ask(inter)
+
+    # Only B is left, so the modal opens straight at B — A is never listed.
+    (modal,) = inter.response.modals
+    assert modal.target_id == b.id
+
+    # Both partners blocked: the refusal that makes no checkable claim.
+    monkeypatch.setattr(
+        no_contact_service, "no_contact_partners", MagicMock(return_value={a.id, b.id})
+    )
+    inter = FakeInteraction(asker, channel, guild, bot)
+    await view._begin_ask(inter)
+    assert not inter.response.modals
+    assert inter.response.messages[-1][0] == "❌ You can't ask a question in this round."
+
+
+# ── A question card that never reaches the channel ────────────────────
+
+
+async def test_a_question_card_that_never_posts_is_not_left_pending(
+    sync_db_path, stub_branding, monkeypatch
+):
+    """The one wiring assertion for the rollback: the glue itself was wrong.
+
+    ``build_question_entry`` has to be appended *before* the send — the card's
+    buttons carry the entry's index, and the index does not exist until the
+    append. So a send that fails leaves a "pending" question with no card:
+    unanswerable, unprunable for seven days, and counted on the progress bar.
+    The logic layer proves what ``mark_question_failed`` does; this proves the
+    cog actually calls it, and that the asker is told rather than left staring
+    at a modal that closed on nothing.
+    """
+    from bot_modules.games.utils import send_retry
+
+    real_retry = ama_mod.retry_transient
+    slept: list[float] = []
+
+    async def _no_wait(op, **kwargs):
+        async def _record(delay):
+            slept.append(delay)
+
+        return await real_retry(op, sleep=_record, **kwargs)
+
+    monkeypatch.setattr(ama_mod, "retry_transient", _no_wait)
+
+    db = GamesDb(sync_db_path)
+    bot = FakeBot(db)
+    cog = AMACog(bot)  # type: ignore[arg-type]
+
+    host, panelist, asker = FakeMember(1, "Host"), FakeMember(2, "Panelist"), FakeMember(3, "Asker")
+    guild = FakeGuild([host, panelist, asker])
+    channel = FakeChannel(guild)
+
+    game_id = await cog.launch(
+        channel=channel, host_id=host.id, host_name=host.display_name,
+        guild_id=99, options={"mode": "unfiltered", "format": "panel"},
+    )
+    view = bot.active_views[game_id]
+    await view._handle_volunteer(FakeInteraction(panelist, channel, guild, bot))
+
+    # From here the edge is down. 503 is the status discord.py does *not*
+    # retry for us (see send_retry's docstring) — the whole reason the ladder
+    # exists — so it is the one to fail with.
+    attempts = 0
+
+    async def _dead_edge(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        # Deferred before the first try: the ladder's sleeps alone outlast
+        # Discord's 3-second window for a first response.
+        assert submit_inter.response.deferred
+        raise discord.DiscordServerError(MagicMock(status=503), "upstream connect error")
+
+    monkeypatch.setattr(channel, "send", _dead_edge)
+
+    modal = AskQuestionModal(game_id, db, channel, "unfiltered", host.id, panelist.id, view)
+    modal.question._value = "a question nobody will ever see"
+    submit_inter = FakeInteraction(asker, channel, guild, bot)
+    await modal.on_submit(submit_inter)
+
+    # It really went through the ladder, not straight to the handler.
+    assert attempts == send_retry.DEFAULT_ATTEMPTS
+    assert slept == [1.0, 2.0]
+
+    # The entry is still there — removing it would shift every later index,
+    # and those indices are live in buttons already in the channel — but it is
+    # marked failed, which is terminal and drops it from the progress count.
+    row = await db.fetchone(
+        "SELECT payload FROM games_active_games WHERE game_id = ?", (game_id,)
+    )
+    (question,) = json.loads(row["payload"])["questions"]
+    assert question["status"] == "failed"
+
+    # And the asker is told, in words, rather than left guessing — on the
+    # follow-up, since the deferral already spent the first response.
+    assert submit_inter.followup.messages[-1][0] == ama_mod.QUESTION_NOT_POSTED_TEXT

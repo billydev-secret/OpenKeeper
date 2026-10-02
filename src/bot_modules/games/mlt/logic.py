@@ -1,0 +1,287 @@
+"""Pure decision logic for the Most Likely To cog.
+
+All functions here take and return plain Python values so they're unit-
+testable without spinning up Discord. The cog calls these from inside
+its button callbacks and the round-advance closure; the Discord glue
+(sending the message, persisting via ``update_game_payload``) stays in
+the cog.
+
+MLT is closest in shape to Never Have I Ever — both are per-round
+voting games where players cast a single vote and the round resolves
+to a tally. The key MLT-specific difference is that each vote targets
+another *player* (not a guilty/innocent flag), so the tally is keyed
+on candidate user IDs rather than two side-lists, and the "winner" of
+a round is the most-voted player (with ties producing co-winners who
+each get a crown).
+
+Five reusable spines are extracted:
+
+* :func:`add_player` / :func:`remove_player` — idempotent lobby
+  membership management.
+* :func:`apply_vote` — record (or re-target) a single voter's pick,
+  reporting whether they switched from a previous target so the cog
+  can append ``" (changed)"`` to the ephemeral confirmation.
+  :func:`record_vote` wraps it with the no-contact gate: a blocked pick
+  is dropped while the ack-shaping ``changed`` flag comes back unchanged.
+* :func:`tally_votes` — flatten the ``{voter: target}`` map into a
+  ``{target: count}`` tally, ensuring every player is represented
+  (including those who received zero votes).
+* :func:`find_round_winners` — return the list of crown recipients
+  (top vote-getters; the list has length > 1 only on a tie, and is
+  empty when no votes were cast). Given the round's votes it breaks a
+  tie at the top without self-votes, so a room that all voted for
+  itself is not all crowned (vote-games-62).
+* :func:`bump_crowns` — increment per-user crown counts after a round.
+
+A pair of codec helpers (:func:`encode_round_votes`,
+:func:`stringify_crowns`) handles the str-keyed JSON payload shape
+the games stack persists.
+"""
+
+from __future__ import annotations
+
+# Minimum players required before the host can start the game.
+MIN_PLAYERS = 3
+
+# Maximum players allowed in a single lobby. The per-round vote uses a
+# Discord ``Select`` which hard-caps at 25 options, so a bigger lobby
+# would 400 the round message. Cap the join so the round always fits.
+MAX_PLAYERS = 25
+
+
+def clamp_player_limits(min_players: int, max_players: int) -> tuple[int, int]:
+    """Clamp the dashboard's player limits into what a round can actually run.
+
+    The ceiling never exceeds :data:`MAX_PLAYERS` whatever was stored — the
+    per-round vote is a Discord ``Select`` and a bigger lobby would 400 the
+    message — and a ceiling below the floor is raised to meet it, so the pair
+    can never describe a lobby nobody can start.
+    """
+    min_players = max(2, min(int(min_players or MIN_PLAYERS), MAX_PLAYERS))
+    max_players = max(2, min(int(max_players or MAX_PLAYERS), MAX_PLAYERS))
+    if max_players < min_players:
+        max_players = min_players
+    return min_players, max_players
+
+
+def lobby_is_full(players: list[int], max_players: int = MAX_PLAYERS) -> bool:
+    """Return ``True`` when the lobby has reached ``max_players``.
+
+    The cog checks this before :func:`add_player` so it can send a
+    friendly "lobby full" ephemeral instead of silently dropping the
+    joiner.
+    """
+    return len(players) >= max_players
+
+
+def add_player(
+    players: list[int], uid: int, max_players: int = MAX_PLAYERS
+) -> bool:
+    """Append ``uid`` to ``players`` if not already present and there's room.
+
+    Mutates ``players`` in place. Returns ``True`` when the player was
+    newly added, ``False`` for an idempotent re-press **or** when the
+    lobby is already at ``max_players`` (the vote select can't hold more
+    than 25 options, so an unbounded lobby would 400 the round message).
+    """
+    if uid in players:
+        return False
+    if len(players) >= max_players:
+        return False
+    players.append(uid)
+    return True
+
+
+def remove_player(players: list[int], uid: int) -> bool:
+    """Remove ``uid`` from ``players`` if present.
+
+    Mutates ``players`` in place. Returns ``True`` when the player was
+    actually removed, ``False`` for an idempotent no-op.
+    """
+    if uid not in players:
+        return False
+    players.remove(uid)
+    return True
+
+
+def can_start(players: list[int], min_players: int = MIN_PLAYERS) -> bool:
+    """Return ``True`` when there are enough players to start the game.
+
+    The cog gates the Start button on this; ``min_players`` defaults
+    to :data:`MIN_PLAYERS` (3) which matches the cog's hard-coded
+    threshold.
+    """
+    return len(players) >= min_players
+
+
+def apply_vote(
+    votes: dict[int, int],
+    voter_id: int,
+    target_id: int,
+) -> bool:
+    """Record ``voter_id``'s vote for ``target_id`` in ``votes``.
+
+    Mutates ``votes`` in place. The caller is expected to have already
+    gated out non-eligible voters (the cog's select-callback checks
+    ``voter_id`` is in the player pool and returns an ephemeral error
+    otherwise before calling this).
+
+    Behavior:
+
+    * If the voter has no prior vote, the new pick is recorded and
+      ``False`` is returned.
+    * If the voter is changing their pick, the previous target is
+      overwritten and ``True`` is returned so the cog can append
+      ``" (changed)"`` to its ephemeral confirmation.
+    * Re-voting for the same target is a no-op switch (``False``).
+    """
+    prev = votes.get(voter_id)
+    votes[voter_id] = target_id
+    return prev is not None and prev != target_id
+
+
+def record_vote(
+    votes: dict[int, int],
+    voter_id: int,
+    target_id: int,
+    *,
+    blocked: bool,
+) -> tuple[bool, bool]:
+    """Record a pick unless the pair is blocked; return ``(counted, changed)``.
+
+    The no-contact gate for Most Likely To (``docs/specs/no_contact_spec.md``):
+    "most likely to <prompt>" is one member's directed pick of another, so
+    a pair the list keeps apart must not be able to crown each other. The
+    cog resolves ``blocked`` (``is_no_contact_conn`` on voter and target)
+    and this decides what to do with it.
+
+    A blocked pick is simply not stored — the results embed shows counts
+    only, so a dropped vote is invisible — and any earlier vote the voter
+    cast stays as it was. ``changed`` is computed the same way whether or
+    not the vote counted, so the ephemeral "✅ Voted for X (changed)" ack
+    reads identically either way: the blocked party sees exactly what an
+    ordinary voter sees.
+    """
+    prev = votes.get(voter_id)
+    changed = prev is not None and prev != target_id
+    if blocked:
+        return False, changed
+    apply_vote(votes, voter_id, target_id)
+    return True, changed
+
+
+def tally_votes(
+    votes: dict[int, int], players: list[int]
+) -> dict[int, int]:
+    """Aggregate per-voter picks into a per-candidate count.
+
+    Every entry in ``players`` is represented in the result (with a
+    count of zero when no one voted for them). Targets present in
+    ``votes`` but missing from ``players`` are also included so a
+    write-in vote (should one ever sneak past the cog's eligibility
+    check) is still surfaced rather than silently dropped.
+    """
+    tally: dict[int, int] = {uid: 0 for uid in players}
+    for target_id in votes.values():
+        tally[target_id] = tally.get(target_id, 0) + 1
+    return tally
+
+
+def find_round_winners(
+    tally: dict[int, int], votes: dict[int, int] | None = None,
+) -> list[int]:
+    """Return the player IDs tied for the most votes this round.
+
+    * Empty list when ``tally`` is empty OR when the top score is 0
+      (no votes cast — no crowns awarded).
+    * Single-element list for a clear winner.
+    * Two-or-more-element list on a tie, in iteration order of
+      ``tally`` (stable for Python 3.7+).
+
+    Self-votes are allowed and count, but with the round's ``votes``
+    (``{voter: target}``) a **tie at the top is broken without them**: the
+    tied players are re-ranked on votes from other people, and the crown
+    goes to whoever leads that count. A tie of nothing but self-votes —
+    every finalist's only support is their own — crowns no one, so a room
+    that all picked itself is not all crowned (vote-games-62). A tie that
+    survives the re-rank (equal outside support) stays a shared crown.
+    """
+    if not tally:
+        return []
+    max_votes = max(tally.values())
+    if max_votes <= 0:
+        return []
+    winners = [uid for uid, count in tally.items() if count == max_votes]
+    if len(winners) < 2 or not votes:
+        return winners
+    outside = {
+        uid: sum(1 for voter, target in votes.items() if target == uid and voter != uid)
+        for uid in winners
+    }
+    best = max(outside.values())
+    if best <= 0:
+        return []
+    return [uid for uid in winners if outside[uid] == best]
+
+
+def bump_crowns(
+    crowns: dict[str, int], winner_ids: list[int]
+) -> None:
+    """Increment per-user crown counts after a round resolves.
+
+    Mutates ``crowns`` in place. Keys are stringified user IDs to
+    match Discord's payload-serialisation convention.
+    """
+    for uid in winner_ids:
+        key = str(uid)
+        crowns[key] = crowns.get(key, 0) + 1
+
+
+def encode_round_votes(votes: dict[int, int]) -> dict[str, int]:
+    """Encode an in-memory ``{voter: target}`` map for the payload.
+
+    Stringifies the voter keys (target IDs remain ints) to match the
+    JSON-serialised shape persisted under ``payload['rounds'][N]
+    ['votes']``.
+    """
+    return {str(voter): target for voter, target in votes.items()}
+
+
+def queue_prompt(queued_prompts: list[str], prompt: str) -> int:
+    """Append a non-empty prompt to ``queued_prompts``; return new count.
+
+    Mirrors the modal's ``queued_prompts.append`` then label-rebuild
+    flow. Leading/trailing whitespace is stripped; empty submissions
+    are silently ignored (the cog's modal blocks empty input via the
+    ``TextInput`` ``max_length`` constraint, but defending here keeps
+    the logic resilient).
+    """
+    cleaned = prompt.strip()
+    if cleaned:
+        queued_prompts.append(cleaned)
+    return len(queued_prompts)
+
+
+def pop_next_prompt(
+    queued_prompts: list[str],
+) -> tuple[str | None, list[str]]:
+    """Pop the next queued prompt; return ``(prompt, remaining)``.
+
+    Returns ``(None, [])`` when no prompts are queued. The remaining
+    list is a new list (not a view), safe to pass into the recursive
+    round-advance call without aliasing.
+    """
+    if not queued_prompts:
+        return None, []
+    remaining = list(queued_prompts)
+    next_prompt = remaining.pop(0)
+    return next_prompt, remaining
+
+
+def is_eligible_voter(voter_id: int, players: list[int]) -> bool:
+    """Return ``True`` when ``voter_id`` is in the player pool.
+
+    Tiny one-liner the cog uses to gate the vote-select callback
+    behind the lobby pool — extracted so the rule lives in one place.
+    """
+    return voter_id in players

@@ -1,0 +1,629 @@
+"""Tests for the extracted Hot Takes pure-logic modules.
+
+Covers ``bot_modules/games/hottakes/logic.py`` (add_take, shuffle_takes,
+tally_votes, compute_recap_summary) and the cog's own seams — the vote
+loop, the lobby's Start Voting and Cancel Game (now host-panel presses),
+the pacing. The cards themselves are ``tests/games/test_games_hottakes_layouts.py``.
+Mirrors the pressure_cooker / games_traditional pattern: the cog file
+stays thin; this module proves the extracted pieces work without spinning
+up Discord.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import pytest
+
+from bot_modules.games.hottakes.logic import (
+    VOTE_KEYS,
+    VOTE_LABELS,
+    VOTE_VALUES,
+    add_take,
+    compute_recap_summary,
+    shuffle_takes,
+    tally_votes,
+)
+
+
+# ── constants sanity ─────────────────────────────────────────────────
+
+
+def test_vote_constants_are_same_length():
+    assert len(VOTE_LABELS) == len(VOTE_VALUES) == len(VOTE_KEYS) == 5
+
+
+def test_vote_values_are_strictly_ascending():
+    assert VOTE_VALUES == sorted(VOTE_VALUES)
+    assert len(set(VOTE_VALUES)) == len(VOTE_VALUES)
+
+
+# ── add_take ─────────────────────────────────────────────────────────
+
+
+def test_add_take_initializes_takes_list_and_returns_count():
+    payload: dict = {}
+    count = add_take(payload, user_id=42, text="Pineapple belongs on pizza")
+    assert count == 1
+    assert payload["takes"] == [
+        {"user_id": 42, "text": "Pineapple belongs on pizza", "display_order": 0}
+    ]
+
+
+def test_add_take_appends_with_correct_display_order():
+    payload: dict = {}
+    add_take(payload, 1, "first")
+    add_take(payload, 2, "second")
+    count = add_take(payload, 3, "third")
+    assert count == 3
+    assert [t["display_order"] for t in payload["takes"]] == [0, 1, 2]
+    assert [t["text"] for t in payload["takes"]] == ["first", "second", "third"]
+
+
+def test_add_take_preserves_existing_takes():
+    payload = {"takes": [{"user_id": 1, "text": "old", "display_order": 0}]}
+    add_take(payload, 2, "new")
+    assert len(payload["takes"]) == 2
+    assert payload["takes"][1]["text"] == "new"
+    assert payload["takes"][1]["display_order"] == 1
+
+
+# ── shuffle_takes ────────────────────────────────────────────────────
+
+
+def test_shuffle_takes_returns_same_elements():
+    takes = [
+        {"user_id": 1, "text": "a", "display_order": 0},
+        {"user_id": 2, "text": "b", "display_order": 1},
+        {"user_id": 3, "text": "c", "display_order": 2},
+    ]
+    shuffled = shuffle_takes(takes, rng=random.Random(0))
+    assert {t["text"] for t in shuffled} == {"a", "b", "c"}
+    assert len(shuffled) == 3
+
+
+def test_shuffle_takes_rewrites_display_order_to_position():
+    takes = [
+        {"user_id": 1, "text": "a", "display_order": 99},
+        {"user_id": 2, "text": "b", "display_order": 99},
+        {"user_id": 3, "text": "c", "display_order": 99},
+    ]
+    shuffled = shuffle_takes(takes, rng=random.Random(0))
+    assert [t["display_order"] for t in shuffled] == [0, 1, 2]
+
+
+def test_shuffle_takes_with_seeded_rng_is_deterministic():
+    takes = [
+        {"user_id": i, "text": str(i), "display_order": 0} for i in range(5)
+    ]
+    a = shuffle_takes([dict(t) for t in takes], rng=random.Random(42))
+    b = shuffle_takes([dict(t) for t in takes], rng=random.Random(42))
+    assert [t["text"] for t in a] == [t["text"] for t in b]
+
+
+def test_shuffle_takes_default_rng_does_not_crash():
+    """No rng argument falls back to the module-level random."""
+    takes = [{"user_id": 1, "text": "a", "display_order": 0}]
+    out = shuffle_takes(takes)
+    assert len(out) == 1
+    assert out[0]["display_order"] == 0
+
+
+def test_shuffle_takes_empty_list_returns_empty():
+    assert shuffle_takes([]) == []
+
+
+def test_shuffle_takes_does_not_mutate_original_length():
+    """We pass a copy in but inner dicts are shared — the caller can
+    rely on the input list reference still pointing at the same items."""
+    original = [
+        {"user_id": 1, "text": "a", "display_order": 5},
+        {"user_id": 2, "text": "b", "display_order": 6},
+    ]
+    shuffled = shuffle_takes(original, rng=random.Random(0))
+    # Original list reference still has 2 items
+    assert len(original) == 2
+    # But its dicts may have been mutated in-place (they're shared with
+    # the shuffled list) — both refs point to display_order in [0, 1]
+    assert sorted(t["display_order"] for t in original) == [0, 1]
+    assert sorted(t["display_order"] for t in shuffled) == [0, 1]
+
+
+# ── tally_votes ──────────────────────────────────────────────────────
+
+
+def test_tally_votes_no_votes_returns_zeroed_counts_and_zero_avg_std():
+    counts, avg, std = tally_votes({})
+    assert counts == [0, 0, 0, 0, 0]
+    assert avg == 0.0
+    assert std == 0.0
+
+
+def test_tally_votes_single_voter_returns_zero_std():
+    counts, avg, std = tally_votes({100: 4})  # one vote on '🔥' (value 5)
+    assert counts == [0, 0, 0, 0, 1]
+    assert avg == 5.0
+    # stdev of a single sample is 0 by our convention
+    assert std == 0.0
+
+
+def test_tally_votes_multiple_voters_computes_weighted_avg():
+    """Two voters at 1, two at 5 → avg = (1+1+5+5)/4 = 3.0."""
+    votes = {1: 0, 2: 0, 3: 4, 4: 4}
+    counts, avg, std = tally_votes(votes)
+    assert counts == [2, 0, 0, 0, 2]
+    assert avg == 3.0
+    # Sample stdev of [1, 1, 5, 5] ~ 2.309
+    assert math.isclose(std, 2.309401076758503, rel_tol=1e-6)
+
+
+def test_tally_votes_unanimous_vote_yields_zero_std():
+    votes = {1: 2, 2: 2, 3: 2}  # all '😐' (value 3)
+    counts, avg, std = tally_votes(votes)
+    assert counts == [0, 0, 3, 0, 0]
+    assert avg == 3.0
+    assert std == 0.0
+
+
+def test_tally_votes_ignores_out_of_range_indexes():
+    """Defensive: if a stale view ever recorded an out-of-range index
+    we silently skip it rather than crashing."""
+    votes = {1: 4, 2: 99, 3: -1}
+    counts, avg, _std = tally_votes(votes)
+    assert counts == [0, 0, 0, 0, 1]
+    assert avg == 5.0
+
+
+def test_tally_votes_respects_custom_vote_values():
+    """Custom scale: 0/100 binary."""
+    votes = {1: 0, 2: 1}
+    counts, avg, std = tally_votes(votes, vote_values=[0, 100])
+    assert counts == [1, 1]
+    assert avg == 50.0
+    assert math.isclose(std, 70.71067811865476, rel_tol=1e-6)
+
+
+# ── compute_recap_summary ────────────────────────────────────────────
+
+
+def test_compute_recap_summary_returns_none_for_empty_results():
+    assert compute_recap_summary([]) is None
+
+
+def test_compute_recap_summary_single_result_has_no_most_divisive():
+    results = [
+        {"text": "lone take", "avg": 3.0, "std": 0.0, "voters": [1, 2]},
+    ]
+    summary = compute_recap_summary(results)
+    assert summary is not None
+    assert summary["hottest"]["text"] == "lone take"
+    assert summary["coldest"]["text"] == "lone take"
+    assert summary["most_divisive"] is None
+    assert summary["total_voters"] == {1, 2}
+    assert summary["total_takes"] == 1
+
+
+def test_compute_recap_summary_picks_hottest_and_coldest():
+    results = [
+        {"text": "mild", "avg": 3.0, "std": 0.5, "voters": [1]},
+        {"text": "cold", "avg": 1.5, "std": 0.2, "voters": [2]},
+        {"text": "hot", "avg": 4.5, "std": 0.3, "voters": [3]},
+    ]
+    summary = compute_recap_summary(results)
+    assert summary is not None
+    assert summary["hottest"]["text"] == "hot"
+    assert summary["coldest"]["text"] == "cold"
+    assert summary["total_voters"] == {1, 2, 3}
+
+
+def test_compute_recap_summary_most_divisive_uses_highest_std():
+    results = [
+        {"text": "unanimous", "avg": 3.0, "std": 0.0, "voters": [1]},
+        {"text": "split", "avg": 3.0, "std": 2.5, "voters": [2]},
+    ]
+    summary = compute_recap_summary(results)
+    assert summary is not None
+    assert summary["most_divisive"]["text"] == "split"
+
+
+def test_compute_recap_summary_divisive_tiebreak_prefers_distance_from_midpoint():
+    """Two takes with equal std: the picker prefers the one whose avg
+    is farthest from the scale midpoint."""
+    # Midpoint for VOTE_VALUES [1..5] is 3.0
+    results = [
+        {"text": "near-mid", "avg": 3.1, "std": 1.0, "voters": [1]},
+        {"text": "far-from-mid", "avg": 4.8, "std": 1.0, "voters": [2]},
+    ]
+    summary = compute_recap_summary(results)
+    assert summary is not None
+    assert summary["most_divisive"]["text"] == "far-from-mid"
+
+
+def test_compute_recap_summary_dedupes_voters_across_results():
+    results = [
+        {"text": "a", "avg": 2.0, "std": 0.0, "voters": [1, 2]},
+        {"text": "b", "avg": 4.0, "std": 0.0, "voters": [2, 3]},
+    ]
+    summary = compute_recap_summary(results)
+    assert summary is not None
+    assert summary["total_voters"] == {1, 2, 3}
+    assert summary["total_takes"] == 2
+
+
+# ── parametrized: tally_votes covers the full scale ─────────────────
+
+
+@pytest.mark.parametrize("idx,expected_avg", list(enumerate(VOTE_VALUES)))
+def test_tally_votes_single_vote_avg_equals_scale_value(idx, expected_avg):
+    counts, avg, _std = tally_votes({1: idx})
+    assert counts[idx] == 1
+    assert avg == expected_avg
+
+
+# ── economy roster enrichment (Stage 2 faucet) ──────────────────────
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+import discord  # noqa: E402
+
+import bot_modules.games.hottakes.cog as hottakes_cog  # noqa: E402
+from bot_modules.games.utils.game_manager import create_game  # noqa: E402
+from bot_modules.games.db import GamesDb  # noqa: E402
+
+
+class _SpyBot:
+    def __init__(self, db_path) -> None:
+        self.games_db = GamesDb(db_path)
+        self.active_views: dict = {}
+        self.ctx = SimpleNamespace(db_path=db_path)
+
+    def get_cog(self, name):
+        return None
+
+
+async def test_run_voting_pays_voters_and_authors(monkeypatch, sync_db_path):
+    """Roster = voters plus take authors; the winning take's author may not have
+    voted, so a voters-only set would drop their participation + win credit."""
+    spy = AsyncMock()
+    monkeypatch.setattr(hottakes_cog, "end_game", spy)
+    bot = _SpyBot(sync_db_path)
+    payload = {"takes": [{"text": "t1", "user_id": 9}], "results": []}
+    gid = await create_game(bot.games_db, 100, 1, "hottakes", payload=payload)
+    bot.active_views[gid] = object()  # placeholder so the loop's entry guard passes
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    channel = SimpleNamespace(
+        id=100, guild=None,
+        send=AsyncMock(return_value=SimpleNamespace(id=999, edit=AsyncMock())),
+    )
+    task = asyncio.ensure_future(cog._run_voting(None, gid, 1, "Host", channel))
+    try:
+        view = None
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            candidate = bot.active_views.get(gid)
+            if isinstance(candidate, hottakes_cog.HotTakeVoteView):
+                view = candidate
+                break
+        assert view is not None, "vote view was never created"
+        view.votes = {1: 0, 2: 3}  # author 9 never voted
+        await view.advance_callback(SimpleNamespace(edit=AsyncMock()))
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+    call = spy.await_args
+    assert call is not None and spy.await_count == 1
+    assert call.kwargs["player_ids"] == [1, 2, 9]
+    assert call.kwargs["bot"] is bot
+
+
+# ── the 'voting is starting' line names nobody ─────────────────────
+
+from bot_modules.games.hottakes.logic import build_voting_start_message  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("takes", "count_phrase"),
+    [
+        pytest.param([{"text": "t1", "user_id": 123456789}], "1 take ", id="one"),
+        pytest.param(
+            [{"text": "t1", "user_id": 123456789}, {"text": "t2", "user_id": 987654321}],
+            "2 takes ",
+            id="two",
+        ),
+    ],
+)
+def test_voting_start_message_carries_no_submitter(takes, count_phrase):
+    """The lobby promises every take is anonymous. The old start line
+    @-mentioned every submitter, which attributed a lone take outright and
+    made two a coin flip — the ping notification outlives delete_after."""
+    msg = build_voting_start_message(takes)
+    assert "<@" not in msg
+    for take in takes:
+        assert str(take["user_id"]) not in msg
+    assert count_phrase in msg
+    assert "voting is starting" in msg
+
+
+# ── the lobby survives a restart: phase is recorded, Cancel exists ──
+
+from bot_modules.games.utils.game_manager import (  # noqa: E402
+    ConfirmCloseView,
+    get_active_game,
+)
+from bot_modules.games.utils.launch_guard import busy_message  # noqa: E402
+
+
+def _host_interaction(host_id: int, channel):
+    """A press by the host — is_host_or_mod passes on the id alone."""
+    return SimpleNamespace(
+        user=SimpleNamespace(id=host_id, display_name="Host"),
+        channel=channel,
+        channel_id=getattr(channel, "id", None),
+        guild=None,
+        guild_id=9001,
+        message=SimpleNamespace(id=555, edit=AsyncMock(), embeds=[]),
+        response=SimpleNamespace(
+            send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+
+async def test_start_voting_records_the_playing_phase(monkeypatch, sync_db_path):
+    """The row's state is what recovery branches on: a lobby re-registers its
+    buttons, a game in voting is re-driven. Until 2026-09-04 the cog never
+    wrote the phase, so every restart was decided by the take count alone."""
+    bot = _SpyBot(sync_db_path)
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    monkeypatch.setattr(cog, "_run_voting", AsyncMock())
+    payload = {
+        "takes": [
+            {"text": "t1", "user_id": 9, "display_order": 0},
+            {"text": "t2", "user_id": 8, "display_order": 1},
+        ],
+        "results": [],
+    }
+    gid = await create_game(bot.games_db, 100, 1, "hottakes", state="joining", payload=payload)
+    view = hottakes_cog.HotTakesSubmitView(gid, 1, bot.games_db, bot, cog)
+    channel = SimpleNamespace(id=100, guild=None, send=AsyncMock())
+    lobby = SimpleNamespace(id=555, channel=channel, edit=AsyncMock())
+    view.message = lobby  # type: ignore[assignment]
+
+    # From the host panel: the press's own message is the ephemeral panel.
+    press = _host_interaction(1, channel)
+    await view.start_voting(press)  # type: ignore[arg-type]
+
+    row = await get_active_game(bot.games_db, 100)
+    assert row is not None and row["state"] == "playing"
+    assert cog._run_voting.await_count == 1  # type: ignore[attr-defined]
+    # The lobby's closed frame goes on the lobby, not on the panel.
+    assert lobby.edit.await_args.kwargs["view"] is view and view._closed
+    press.message.edit.assert_not_awaited()
+
+
+async def test_cancel_button_ends_the_lobby_without_paying(sync_db_path):
+    """Host/mod Cancel Game from the host panel: confirm popup, then the row
+    is archived as 'cancelled' with nobody paid — a lobby that never voted
+    has no roster — and the lobby card becomes the cancelled notice."""
+    bot = _SpyBot(sync_db_path)
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    payload = {"takes": [{"text": "t1", "user_id": 9, "display_order": 0}], "results": []}
+    gid = await create_game(bot.games_db, 100, 1, "hottakes", state="joining", payload=payload)
+    view = hottakes_cog.HotTakesSubmitView(gid, 1, bot.games_db, bot, cog)
+    bot.active_views[gid] = view
+    anchor = SimpleNamespace(id=555, edit=AsyncMock(), embeds=[])
+    view.message = anchor  # type: ignore[assignment]
+    channel = SimpleNamespace(id=100, guild=None, send=AsyncMock())
+
+    # A non-host is refused.
+    stranger = _host_interaction(42, channel)
+    await view.cancel_game(stranger)  # type: ignore[arg-type]
+    assert stranger.response.send_message.await_args.args[0].startswith("❌")
+    assert await get_active_game(bot.games_db, 100) is not None
+
+    press = _host_interaction(1, channel)
+    await view.cancel_game(press)  # type: ignore[arg-type]
+    confirm = press.response.send_message.await_args.kwargs["view"]
+    assert isinstance(confirm, ConfirmCloseView)
+    assert press.response.send_message.await_args.kwargs["ephemeral"] is True
+
+    await confirm._callback(_host_interaction(1, channel))
+
+    assert await get_active_game(bot.games_db, 100) is None
+    assert gid not in bot.active_views
+    assert view.is_finished()
+    edit = anchor.edit.await_args.kwargs  # the lobby becomes the cancelled notice
+    assert edit["embed"] is None and isinstance(edit["view"], discord.ui.LayoutView)
+    archived = await bot.games_db.fetchone(
+        "SELECT player_count, payload FROM games_game_history WHERE game_id = ?", (gid,)
+    )
+    assert archived is not None
+    assert archived["player_count"] == 0
+    assert json.loads(archived["payload"])["reason"] == "cancelled"
+
+
+async def test_slash_entry_refuses_a_channel_with_a_running_game(monkeypatch, sync_db_path):
+    """/games play hottakes goes through the shared launch guard (platform-18):
+    a second host is refused with the running game named, and nothing launches."""
+    bot = _SpyBot(sync_db_path)
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    launch = AsyncMock()
+    monkeypatch.setattr(cog, "launch", launch)
+    await bot.games_db.execute(
+        "INSERT INTO games_allowed_channels (channel_id, guild_id) VALUES (?, ?)", (100, 9001),
+    )
+    await create_game(bot.games_db, 100, 7, "wyr", message_id=321, guild_id=9001)
+    interaction = _host_interaction(1, SimpleNamespace(id=100, guild=None, send=AsyncMock()))
+
+    await cog.hottakes.callback(cog, interaction)  # type: ignore[arg-type]
+
+    sent = interaction.response.send_message.await_args
+    assert sent.kwargs["ephemeral"] is True
+    assert sent.args[0] == busy_message(
+        "wyr", link="https://discord.com/channels/9001/100/321",
+    )
+    launch.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+
+
+# ── pacing, the two-take floor, self-votes (anon-tail-71/72/74) ──
+
+from bot_modules.games.hottakes.logic import (  # noqa: E402
+    DEFAULT_TAKE_SECONDS,
+    MIN_TAKES,
+    SELF_VOTE_REFUSAL,
+    active_voters,
+    everyone_has_voted,
+    voting_refusal,
+)
+
+
+@pytest.mark.parametrize(
+    ("count", "expect_refused", "fragment"),
+    [
+        pytest.param(0, True, "No hot takes", id="empty"),
+        pytest.param(1, True, "everyone would know whose it is", id="one-take-is-not-anonymous"),
+        pytest.param(2, False, "", id="two-takes-start"),
+    ],
+)
+def test_voting_refusal_needs_two_takes(count, expect_refused, fragment):
+    assert MIN_TAKES == 2
+    takes = [{"text": f"t{i}", "user_id": i} for i in range(count)]
+    refusal = voting_refusal(takes)
+    if expect_refused:
+        assert refusal is not None and refusal.startswith("❌") and fragment in refusal
+    else:
+        assert refusal is None
+
+
+def test_add_take_records_the_distinct_submitters_for_the_lobby_sweep():
+    payload: dict = {}
+    add_take(payload, 9, "a")
+    add_take(payload, 9, "b")
+    add_take(payload, 4, "c")
+    assert payload["participants"] == [9, 4]
+
+
+@pytest.mark.parametrize(
+    ("takes", "results", "exclude", "expected"),
+    [
+        pytest.param([{"user_id": 1}, {"user_id": 2}], [], 1, {2}, id="submitters-minus-the-author"),
+        pytest.param([{"user_id": 1}, {"user_id": 2}], [{"voters": [5, 6]}], 2, {1, 5, 6}, id="earlier-voters-join"),
+        pytest.param([{"user_id": 1}], [], 1, set(), id="a-lone-author-waits-on-nobody"),
+    ],
+)
+def test_active_voters(takes, results, exclude, expected):
+    assert active_voters(takes, results, exclude=exclude) == expected
+
+
+@pytest.mark.parametrize(
+    ("expected", "voted", "result"),
+    [
+        pytest.param({1, 2}, {1, 2, 7}, True, id="all-in"),
+        pytest.param({1, 2}, {1}, False, id="one-missing"),
+        pytest.param(set(), {1}, False, id="nobody-expected-never-advances"),
+    ],
+)
+def test_everyone_has_voted(expected, voted, result):
+    assert everyone_has_voted(expected, voted) is result
+
+
+def _voter(user_id: int):
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id, display_name=f"U{user_id}"),
+        channel=None,
+        message=SimpleNamespace(id=1, edit=AsyncMock()),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+
+async def test_the_author_cannot_rate_their_own_take(sync_db_path):
+    bot = _SpyBot(sync_db_path)
+    advance = AsyncMock()
+    view = hottakes_cog.HotTakeVoteView(
+        "g", 1, "take", 1, 1, bot.games_db, bot, "Host", advance, take_author_id=9,
+    )
+    author = _voter(9)
+    await view.vote_4(author)  # type: ignore[arg-type]
+    assert author.response.send_message.await_args.args[0] == SELF_VOTE_REFUSAL
+    assert view.votes == {}
+
+
+async def test_the_vote_closes_itself_once_everyone_expected_has_voted(sync_db_path):
+    bot = _SpyBot(sync_db_path)
+    advance = AsyncMock()
+    view = hottakes_cog.HotTakeVoteView(
+        "g", 1, "take", 1, 1, bot.games_db, bot, "Host", advance,
+        take_author_id=9, expected_voters={2, 3},
+    )
+    await view.vote_3(_voter(2))  # type: ignore[arg-type]
+    advance.assert_not_awaited()
+    await view.vote_0(_voter(3))  # type: ignore[arg-type]
+    assert advance.await_count == 1
+    assert view.votes == {2: 3, 3: 0}
+
+
+async def test_a_timed_take_closes_on_its_own_and_the_game_still_pays(monkeypatch, sync_db_path):
+    """No press at all: the per-take timer closes the vote, the loop moves on
+    and the ending pays the author — a host-paced game waited forever."""
+    spy = AsyncMock()
+    monkeypatch.setattr(hottakes_cog, "end_game", spy)
+    bot = _SpyBot(sync_db_path)
+    payload = {"takes": [{"text": "t1", "user_id": 9}], "results": [], "round_seconds": 1}
+    gid = await create_game(bot.games_db, 100, 1, "hottakes", payload=payload)
+    bot.active_views[gid] = object()
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    channel = SimpleNamespace(
+        id=100, guild=None,
+        send=AsyncMock(return_value=SimpleNamespace(id=999, edit=AsyncMock())),
+    )
+
+    await asyncio.wait_for(cog._run_voting(None, gid, 1, "Host", channel), timeout=8)
+
+    assert spy.await_count == 1
+    assert spy.await_args.kwargs["player_ids"] == [9]
+    assert spy.await_args.kwargs["round_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("options", "stored_dial", "expected"),
+    [
+        pytest.param({}, None, DEFAULT_TAKE_SECONDS, id="built-in-default"),
+        pytest.param({}, 20, 20, id="dashboard-dial"),
+        pytest.param({"round_seconds": 0}, 20, 0, id="slash-zero-beats-the-dial"),
+        pytest.param({"round_seconds": 90}, None, 90, id="slash-value"),
+    ],
+)
+async def test_launch_resolves_the_take_timer(sync_db_path, options, stored_dial, expected):
+    bot = _SpyBot(sync_db_path)
+    cog = hottakes_cog.HotTakesCog(bot)  # type: ignore[arg-type]
+    if stored_dial is not None:
+        await bot.games_db.execute(
+            "INSERT INTO games_game_config (guild_id, game_type, enabled, options) VALUES (?, ?, 1, ?)",
+            (9001, "hottakes", json.dumps({"round_seconds": stored_dial})),
+        )
+    channel = SimpleNamespace(
+        id=100, guild=None, name="games",
+        send=AsyncMock(return_value=SimpleNamespace(id=555)),
+    )
+    gid = await cog.launch(channel=channel, host_id=1, host_name="Host", guild_id=9001, options={**options, "start_in": 5})
+    assert gid is not None
+    row = await get_active_game(bot.games_db, 100)
+    assert row is not None and row["state"] == "joining"
+    payload = json.loads(row["payload"])
+    assert payload["round_seconds"] == expected
+    assert payload["participants"] == []
+    assert payload["start_epoch"] > 0
+
+
+def test_hot_takes_is_a_lobby_game():
+    from bot_modules.games.constants import LOBBY_GAME_TYPES, LOBBY_MIN_PLAYERS, LOBBY_START_BUTTON
+
+    assert "hottakes" in LOBBY_GAME_TYPES
+    assert LOBBY_START_BUTTON["hottakes"] == "Start Voting"
+    assert LOBBY_MIN_PLAYERS["hottakes"] == MIN_TAKES

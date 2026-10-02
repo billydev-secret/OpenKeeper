@@ -1,0 +1,527 @@
+"""THE RECKONING — the Tuesday post, in three acts (spec §2.5, stage 5).
+
+Act 1 the toll (week, survivors before → after, pot, the gate for new
+arrivals). Act 2 the ledger — the ONLY place picks ever appear — plus the
+Ghost Streak strip. Act 3 the eliminations, one factual line per death,
+source-aware. Copy is just-the-facts throughout (Billy, 2026-08-18 — the
+flavor corpus and its rotation were removed with the feature).
+
+Everything here is pure assembly over a connection; the weekly task in
+``survivor/tasks.py`` does the posting, role swaps, and condolence DMs.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import discord
+
+from bot_modules.core.branding import apply_section_spacing
+from bot_modules.economy.view_helpers import coins
+from bot_modules.economy.service import EconSettings
+from bot_modules.core.branding_service import DEFAULT_ACCENT
+from bot_modules.survivor.service import eliminate_player
+from bot_modules.survivor.logic import (
+    elapsed_weeks,
+    ghost_streaks,
+    pot_totals,
+)
+
+# One factual line per elimination source (§1.2, §6.14). Just-the-facts
+# (2026-08-18): the football death states team, result, and week; the three
+# special sources state their cause plainly.
+FATAL_LINE = "**{name}** — {team} lost. Eliminated in Week {week}."
+GROUNDSKEEPER_LINE = (
+    "**{name}** — out of auto-assigns, no pick made. Eliminated."
+)
+MISSED_LINE = "**{name}** never picked. Eliminated."
+# No leaver line (Billy, 2026-09-11, todo #203). A member who has left the
+# server is dropped from every Survivor surface rather than named, so there
+# is nobody left in the post to eulogise — the roster simply no longer lists
+# them. eliminate_leavers still runs: the game state has to stop accepting
+# their picks. Only the announcement of it is gone. Spec §6.14 amended.
+
+_RESULT_ICON = {
+    "win": "✅", "loss": "💀", "tie": "🤝", "void": "🌫️", None: "⏳",
+}
+
+
+def next_reckoning_week(conn: sqlite3.Connection, season: dict, now: float) -> int | None:
+    """The week Tuesday's post reports: the first unreckoned week whose
+    games have all kicked off. None = nothing to reckon yet."""
+    candidate = int(season["config"].get("last_reckoned_week") or 0) + 1
+    if candidate in elapsed_weeks(conn, season["season_year"], now):
+        return candidate
+    return None
+
+
+def _fill(line: str, *, name: str = "", team: str = "", week: int = 0) -> str:
+    # str.replace, never str.format — a brace in a nickname must not crash
+    # an elimination line (the contract since stage 1).
+    return (
+        line.replace("{name}", name)
+        .replace("{team}", team)
+        .replace("{week}", str(week))
+    )
+
+
+def suspected_leavers(
+    conn: sqlite3.Connection, season: dict, present_ids: set[int]
+) -> list[int]:
+    """Alive players missing from ``present_ids`` (the gateway member
+    cache). A *suspicion* only: the cache is partial for a few seconds after
+    a re-IDENTIFY, so the poster confirms each one with the API before
+    anyone dies of it (survivor-174)."""
+    rows = conn.execute(
+        "SELECT user_id FROM survivor_players "
+        "WHERE season_id = ? AND status = 'alive' ORDER BY user_id",
+        (season["id"],),
+    ).fetchall()
+    return [int(r["user_id"]) for r in rows if int(r["user_id"]) not in present_ids]
+
+
+def eliminate_leavers(
+    conn: sqlite3.Connection,
+    season: dict,
+    week: int,
+    present_ids: set[int],
+    *,
+    confirmed: set[int] | None = None,
+) -> list[int]:
+    """§6.14: alive players no longer in the guild die at this Reckoning
+    (source 'left', streak frozen). Returns who was marked.
+
+    ``confirmed`` is the subset of suspects the caller verified with
+    ``guild.fetch_member``; only those die. ``None`` trusts ``present_ids``
+    outright (tests, and callers that built the set from the API)."""
+    gone = suspected_leavers(conn, season, present_ids)
+    if confirmed is not None:
+        gone = [user_id for user_id in gone if user_id in confirmed]
+    for user_id in gone:
+        eliminate_player(conn, season["id"], user_id, week, source="left")
+    return gone
+
+
+def pay_weekly_wins(
+    conn: sqlite3.Connection, season: dict, week: int
+) -> list[tuple[int, int]]:
+    """The weekly prize (added 2026-08-18): every player whose graded picks
+    for ``week`` were ALL wins (one fate, one prize — a double-pick split
+    week earns nothing) collects ``weekly_win_coins``. Ghosts included: a
+    small retention hook for the dead, which is Ghost Streak's whole point.
+
+    Called ONLY from the posting path, inside the same transaction that
+    marks the week reckoned — once per week structurally, and the panel
+    preview can never pay. Own ledger kind, so the faucet is visible in the
+    economy metrics. Post-Reckoning corrections neither pay late nor claw
+    back — the moment of the Reckoning is the moment of record.
+    Returns [(user_id, amount)].
+    """
+    from bot_modules.economy import service as economy_service
+    from bot_modules.survivor.logic import KIND_WEEKLY_WIN
+
+    amount = int(season["config"].get("weekly_win_coins") or 0)
+    if amount <= 0:
+        return []
+    rows = conn.execute(
+        "SELECT user_id FROM survivor_picks "
+        "WHERE season_id = ? AND week = ? AND result IS NOT NULL "
+        "GROUP BY user_id "
+        "HAVING SUM(CASE WHEN result != 'win' THEN 1 ELSE 0 END) = 0 "
+        "AND SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) > 0",
+        (season["id"], week),
+    ).fetchall()
+    paid = []
+    for r in rows:
+        user_id = int(r["user_id"])
+        economy_service.apply_credit(
+            conn, season["guild_id"], user_id, amount, KIND_WEEKLY_WIN,
+            meta={"season_id": season["id"], "week": week},
+        )
+        paid.append((user_id, amount))
+    return paid
+
+
+def ghost_pick_counts(
+    players: list, by_user: dict[int, list], week: int
+) -> dict[str, int]:
+    """How the ghosts did this week (survivor-182): ``{picked, correct}``.
+
+    A ghost is a player already dead before ``week`` (one who died this week
+    is a death, not a ghost). Picked = at least one pick on file; correct =
+    every graded pick a win, with at least one (the same rule the weekly-win
+    prize uses). Pending (ungraded) picks are ignored in both counts, so a
+    ghost with only pending picks is not counted at all.
+    """
+    picked = correct = 0
+    for pl in players:
+        if pl["status"] != "ghost" or pl["eliminated_week"] == week:
+            continue
+        results = [
+            r["result"] for r in by_user.get(int(pl["user_id"]), [])
+            if r["result"] is not None
+        ]
+        if not results:
+            continue
+        picked += 1
+        if all(r == "win" for r in results):
+            correct += 1
+    return {"picked": picked, "correct": correct}
+
+
+def build_reckoning_data(
+    conn: sqlite3.Connection,
+    season: dict,
+    week: int,
+    now: float,
+    *,
+    hidden: set[int] | None = None,
+) -> dict:
+    """Everything the three acts need, as plain data. No Discord objects.
+
+    ``hidden`` drops departed members (todo #203). They leave the ledger,
+    the eliminations and the streak strip together — and the toll counts are
+    computed from what survives the filter, so before → after still
+    reconciles with the names printed underneath it.
+    """
+    hidden = hidden or set()
+    players = [
+        r for r in conn.execute(
+            "SELECT user_id, status, strikes_used, eliminated_week,"
+            " elimination_source FROM survivor_players WHERE season_id = ?",
+            (season["id"],),
+        ).fetchall()
+        if int(r["user_id"]) not in hidden
+    ]
+    picks = conn.execute(
+        "SELECT user_id, slot, team, result, auto_assigned FROM survivor_picks "
+        "WHERE season_id = ? AND week = ? ORDER BY user_id, slot",
+        (season["id"], week),
+    ).fetchall()
+    by_user: dict[int, list] = {}
+    for p in picks:
+        by_user.setdefault(int(p["user_id"]), []).append(p)
+
+    losing = {"loss", "tie"} if season["config"]["tie_rule"] == "loss" else {"loss"}
+    deaths, ledger, stragglers = [], [], 0
+    alive_now = 0
+    for pl in players:
+        user_id = int(pl["user_id"])
+        died_this_week = pl["eliminated_week"] == week
+        living_at_start = pl["status"] == "alive" or died_this_week
+        if pl["status"] == "alive":
+            alive_now += 1
+        if not living_at_start:
+            continue  # earlier ghosts live in the strip, not the ledger
+        rows = by_user.get(user_id, [])
+        stragglers += sum(1 for r in rows if r["result"] is None)
+        teams = []
+        lost = False
+        for r in rows:
+            icon = _RESULT_ICON.get(r["result"], "·")
+            tag = " 📎" if r["auto_assigned"] else ""
+            teams.append(f"{r['team']}{tag} {icon}")
+            lost |= r["result"] in losing
+        if died_this_week:
+            state = "💀"
+        elif lost:
+            state = "💛→🖤"
+        elif not rows:
+            state = "🌫️"
+        else:
+            state = ""
+        entry = {
+            "user_id": user_id,
+            "teams": " · ".join(teams) if teams else "—",
+            "state": state,
+            "died": died_this_week,
+            "source": pl["elimination_source"] if died_this_week else None,
+            "fatal_team": next(
+                (r["team"] for r in rows if r["result"] in losing), None
+            ),
+        }
+        (deaths if died_this_week else ledger).append(entry)
+
+    # The gate reports gauntlet walkers only: joins since the last Reckoning
+    # AND after the season's first kickoff. Pre-kickoff enrollees never
+    # walked anything — the week-1 gate saying they did was the mockup's
+    # catch (2026-08-18).
+    last_at = int(season["config"].get("last_reckoned_at") or 0)
+    first = conn.execute(
+        "SELECT MIN(kickoff_utc) AS k FROM nfl_games WHERE season_year = ?",
+        (season["season_year"],),
+    ).fetchone()
+    from bot_modules.survivor.logic import kickoff_ts
+
+    gate_after = max(
+        float(last_at), kickoff_ts(first["k"]) if first and first["k"] else 0.0
+    )
+    arrivals = [
+        {"user_id": int(r["user_id"]), "dead": r["status"] == "ghost"}
+        for r in conn.execute(
+            "SELECT user_id, status, joined_at FROM survivor_players "
+            "WHERE season_id = ?",
+            (season["id"],),
+        ).fetchall()
+        if _joined_ts(r["joined_at"]) > gate_after
+        and int(r["user_id"]) not in hidden
+    ]
+
+    streaks = {
+        uid: st for uid, st in ghost_streaks(conn, season, now).items()
+        if uid not in hidden
+    }
+    strip = sorted(
+        ((uid, st) for uid, st in streaks.items() if st["current"] > 0),
+        key=lambda t: (-t[1]["current"], t[0]),
+    )[:3]
+    record = max((st["best"] for st in streaks.values()), default=0)
+
+    return {
+        "week": week,
+        "before": alive_now + len(deaths),
+        "after": alive_now,
+        "pots": pot_totals(conn, season),
+        "wipeout": wipeout_for(conn, season, week, hidden=hidden),
+        "deaths": deaths,
+        "ledger": ledger,
+        "arrivals": arrivals,
+        "stragglers": stragglers,
+        "streak_strip": strip,
+        "streak_record": record,
+        "ghost_picks": ghost_pick_counts(players, by_user, week),
+    }
+
+
+def wipeout_for(
+    conn: sqlite3.Connection,
+    season: dict,
+    week: int,
+    *,
+    hidden: set[int] | None = None,
+) -> dict | None:
+    """How §1.6 resolved ``week``, if it wiped the field out — or None.
+
+    Derived from what the settle sweep recorded, never re-decided here: an
+    annul is a week in the season's ``annulled_weeks``, and a split is a
+    season the sweep marked ``complete``, whose shares are read back out of
+    the ledger so the ceremony can only report money that really moved.
+
+    ``hidden`` drops departed members from the split the same way
+    :func:`build_reckoning_data` drops them everywhere else (todo #203) — a
+    payout is still money that moved, but a departed member isn't shown
+    collecting it any more than they're shown dying.
+    """
+    if week in {int(w) for w in season["config"].get("annulled_weeks") or ()}:
+        return {"kind": "annul", "week": week}
+    if season["status"] != "complete":
+        return None
+    from bot_modules.survivor.payout import payout_receipt
+
+    hidden = hidden or set()
+    shares = [
+        row for row in payout_receipt(conn, season)
+        if row["pot"] == "main" and row["user_id"] not in hidden
+    ]
+    if not shares:
+        return None
+    return {"kind": "split", "week": week, "shares": shares}
+
+
+ANNUL_LINE = (
+    "☠️ **Wipeout.** Everyone died. Therefore nobody did — Week {week} is "
+    "stricken from the record. Nobody is eliminated, and the teams you "
+    "burned stay burned."
+)
+SPLIT_LINE = (
+    "☠️ **Wipeout.** Week {week} killed the whole field, and it is too "
+    "late in the season to strike a week from the record. The season ends "
+    "here — the fallen split the pot."
+)
+
+
+def _joined_ts(joined_at: str) -> float:
+    from bot_modules.survivor.logic import kickoff_ts
+
+    try:
+        return kickoff_ts(joined_at)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def eulogy_for(entry: dict, data: dict, name: str, index: int) -> str:
+    """Act 3, one factual line per death, keyed on its source."""
+    if entry["source"] == "cap":
+        return _fill(GROUNDSKEEPER_LINE, name=name)
+    if entry["source"] == "missed":
+        return _fill(MISSED_LINE, name=name)
+    return _fill(
+        FATAL_LINE, name=name, team=entry["fatal_team"] or "—",
+        week=data["week"],
+    )
+
+
+def named_ids(data: dict) -> list[int]:
+    """Every user id :func:`build_reckoning_embed` will ask to name.
+
+    The resolver prefetches from this, so a name missing here would fall
+    back to a bare ``<@id>`` for exactly one member — the failure mode the
+    house rule exists to prevent. Gathering it beside the builder keeps the
+    two in step.
+    """
+    ids = [e["user_id"] for e in data["deaths"] + data["ledger"]]
+    ids += [a["user_id"] for a in data["arrivals"]]
+    ids += [uid for uid, _ in data["streak_strip"]]
+    wipeout = data.get("wipeout") or {}
+    ids += [share["user_id"] for share in wipeout.get("shares", ())]
+    return sorted(set(ids))
+
+
+def build_reckoning_embed(
+    data: dict,
+    name_of,
+    *,
+    season_name: str,
+    settings: EconSettings | None = None,
+    color: discord.Color | None = None,
+) -> discord.Embed:
+    """The one post. Three acts, one embed, clipped to Discord's limits."""
+    from bot_modules.survivor.embeds import _clip_field
+
+    week = data["week"]
+    embed = discord.Embed(
+        title=f"🏈 Week {week} — The Reckoning",
+        color=color or discord.Color(DEFAULT_ACCENT),
+    )
+    # Act 1 — the toll. Numbers only (just-the-facts, 2026-08-18): the
+    # survivors delta says whether the week took anyone.
+    settings = settings or EconSettings()
+    toll = (
+        f"👥 Survivors **{data['before']} → {data['after']}** · "
+        f"Pot {coins(settings, data['pots']['main'])} · "
+        f"Ghost Pot {coins(settings, data['pots']['ghost'])}"
+    )
+    weekly = data.get("weekly_win")
+    if weekly and weekly["count"]:
+        toll += (
+            f"\n💰 {weekly['count']} correct pick(s) collect "
+            f"{coins(settings, weekly['amount'])} each"
+        )
+    if data["stragglers"]:
+        toll += (
+            f"\n⏳ {data['stragglers']} result(s) still pending — an update "
+            "follows when they're final"
+        )
+    # §1.6: a week that killed everyone leads the post. It is the whole
+    # story of the week, so it goes above the ledger rather than into it.
+    wipeout = data.get("wipeout")
+    if wipeout:
+        line = ANNUL_LINE if wipeout["kind"] == "annul" else SPLIT_LINE
+        toll = _fill(line, week=wipeout["week"]) + "\n\n" + toll
+    embed.description = toll
+    if data["arrivals"]:
+        breathing = sum(1 for a in data["arrivals"] if not a["dead"])
+        lines = [
+            f"{name_of(a['user_id'])} — "
+            + ("💀 arrived eliminated" if a["dead"] else "✅ arrived alive")
+            for a in data["arrivals"]
+        ]
+        word = "player" if len(data["arrivals"]) == 1 else "players"
+        lines.insert(
+            0,
+            f"{len(data['arrivals'])} {word} joined through the Gauntlet "
+            f"this week — {breathing} arrived alive.",
+        )
+        embed.add_field(
+            name="🚪 New Entries", value=_clip_field(lines, "arrivals"),
+            inline=False,
+        )
+    # Act 2 — the ledger, deaths sorted first.
+    rows = data["deaths"] + data["ledger"]
+    if rows:
+        lines = [
+            f"{e['state']} {name_of(e['user_id'])} · {e['teams']}".strip()
+            for e in rows
+        ]
+        embed.add_field(
+            name="📜 The Ledger", value=_clip_field(lines, "players"), inline=False
+        )
+    ghost_picks = data.get("ghost_picks") or {"picked": 0, "correct": 0}
+    if data["streak_strip"] or data["streak_record"] or ghost_picks["picked"]:
+        lines = [
+            f"👻 {name_of(uid)} · {st['current']} straight"
+            for uid, st in data["streak_strip"]
+        ] or ["No active streaks"]
+        lines.append(f"Season record: {data['streak_record']}")
+        if ghost_picks["picked"]:
+            lines.append(
+                f"👻 Ghosts: {ghost_picks['picked']} picked, "
+                f"{ghost_picks['correct']} correct"
+            )
+        embed.add_field(
+            name="Ghost Streak", value="\n".join(lines), inline=False
+        )
+    # Act 3 — eulogies.
+    if data["deaths"]:
+        lines = [
+            eulogy_for(e, data, name_of(e["user_id"]), i)
+            for i, e in enumerate(data["deaths"])
+        ]
+        embed.add_field(
+            name="🪦 Eliminations", value=_clip_field(lines, "eliminated"),
+            inline=False,
+        )
+    if wipeout and wipeout["kind"] == "split":
+        lines = [
+            f"{name_of(share['user_id'])} — {coins(settings, share['amount'])}"
+            for share in wipeout["shares"]
+        ]
+        embed.add_field(
+            name="⚖️ The Split", value=_clip_field(lines, "shares"),
+            inline=False,
+        )
+    embed.set_footer(text=f"{season_name} • results post every Tuesday")
+    # A record card (style guide: Timestamps) — members scroll back to it.
+    embed.timestamp = discord.utils.utcnow()
+    apply_section_spacing(embed)
+    return embed
+
+
+def reckoning_copy_text(embed: discord.Embed) -> str:
+    """The Reckoning card as plain message text, for a host posting it by
+    hand (spec §3.4). Title, description, then each field under its own
+    bold heading; the section spacer's zero-width characters are stripped,
+    since they'd ride along into whatever the host pastes. Footer and
+    timestamp are dropped — they describe the bot's post, not the host's."""
+    parts = [f"**{embed.title}**"]
+    if embed.description:
+        parts.append(embed.description)
+    for field in embed.fields:
+        value = (field.value or "").replace("\u200b", "").rstrip()
+        parts.append(f"**{field.name}**\n{value}")
+    return "\n\n".join(parts)
+
+
+def slate_join_line(
+    *,
+    buyin: int,
+    late_entry: str,
+    gauntlet_mode: bool,
+    settings: EconSettings | None = None,
+) -> str | None:
+    """The one-line door for the weekly slate. None = entry is closed and
+    neither line nor button belongs on the post."""
+    entry = (
+        f"{coins(settings or EconSettings(), buyin)} to enter"
+        if buyin else "free entry"
+    )
+    if not gauntlet_mode:
+        return f"Join below — {entry}."
+    if late_entry == "gauntlet":
+        return (
+            f"Join any week — missed weeks auto-replay as the Gauntlet. "
+            f"({entry} + late fee)"
+        )
+    if late_entry == "ghost_only":
+        return "Late entry joins the Ghost Streak side game — join below."
+    return None  # closed

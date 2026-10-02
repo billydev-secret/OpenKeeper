@@ -1,0 +1,190 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dungeonkeeper"
+version = "1.0.0"
+requires-python = ">=3.14"
+# Direct dependencies, human-edited with loose floors. What machines actually
+# install is the compiled pin set in requirements/*.lock (pip-format, so plain
+# `pip install -r` works everywhere). After editing a list here, recompile its
+# lock — an existing lock's pins are kept unless the edit forces a change:
+#   uv pip compile pyproject.toml -o requirements/base.lock --universal -p 3.14
+#   uv pip compile pyproject.toml --group dev -o requirements/dev.lock --universal -p 3.14
+#   uv pip compile --group pyproject.toml:mcp -o requirements/mcp.lock --universal -p 3.14
+#   uv pip compile --group pyproject.toml:local-llm -o requirements/local-llm.lock \
+#       --universal -p 3.14 -c requirements/base.lock
+# A runtime dependency goes in BOTH base.lock and dev.lock (dev pins the full
+# set); tests/tooling/test_requirements_lock_sync.py fails when a lock is stale.
+dependencies = [
+    "discord.py>=2.6.0",
+    # NOTE: never add the separate `dotenv` PyPI package (v0.9.9) — it is a
+    # deprecated wrapper around python-dotenv and must not be used.
+    "python-dotenv>=1.0.0",
+    "anthropic>=0.40.0",
+    "fastapi>=0.110.0",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.6.0",
+    "httpx>=0.27.0",
+    "itsdangerous>=2.1.0",
+    "jinja2>=3.1.0",
+    "tzdata>=2024.1",
+    "psutil>=5.9.0",
+    "vaderSentiment>=3.3.0",
+    "wavelink>=3.4.0",
+    "spotipy>=2.23.0",
+    "pynacl>=1.5.0",
+    "nudenet",
+    "mediapipe",
+    "Pillow",
+    "pilmoji",
+    "numpy",
+    "matplotlib>=3.8.0",
+    "wordcloud",
+    # llama-cpp-python lives in the local-llm group below — it is the only
+    # dependency that builds from source (no manylinux wheel for cp314), so
+    # hosts using the remote llama-server backend skip a full C++ toolchain
+    # by not installing it. See deploy/README.md.
+    "huggingface_hub>=0.24.0",
+    "faster-whisper>=1.0.0",
+]
+
+[dependency-groups]
+# Test and lint toolchain; its lock (requirements/dev.lock) also pins every
+# runtime dependency above, so one install gives a full dev environment.
+dev = [
+    "ruff>=0.15.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "pytest-xdist>=3.6",
+    "freezegun>=1.4",
+    "syrupy>=4.6",
+    "httpx>=0.27",
+    "pre-commit>=3.8.0",
+    "aiosqlite>=0.19",
+    "pyright>=1.1",
+    "PyYAML>=6.0",
+    # Browser-driven responsive-layout gate (tests/web/test_mobile_layout.py).
+    # The pip package is small; the Chromium build is installed separately
+    # (`python -m playwright install chromium`) only where the sweep runs —
+    # nightly CI and dev machines. The default suite and per-push CI skip it.
+    "playwright>=1.61",
+]
+# The read-only docs/source MCP server (src/dk_mcp/, deployed to /opt/dk-mcp
+# by scripts/deploy_dk_mcp.sh into its own venv). Deliberately NOT a runtime
+# dependency: the bot does not import dk_mcp and must not carry its deps, so
+# its lock is compiled from this group alone.
+mcp = [
+    "mcp>=2.0",
+]
+# In-process LLM inference — only needed when LLAMA_SERVER_URL is UNSET. There
+# is no manylinux wheel for cp314, so installing it needs gcc/g++ and cmake
+# and takes several minutes. Hosts that point LLAMA_SERVER_URL at a llama.cpp
+# `llama-server` elsewhere on the LAN never import llama_cpp (the import is
+# lazy, inside ollama_client's loader thread) and skip this lock. Skipping it
+# while the in-process backend IS in use is not fatal but is visible: the
+# model load fails and ollama_client.status() reports phase="error".
+local-llm = [
+    "llama-cpp-python>=0.3.0",
+]
+
+[project.scripts]
+dungeonkeeper = "dungeonkeeper.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Run tests in parallel via pytest-xdist. Pass ``-n 0`` to disable for
+# debugging a single test (the last -n on the command line wins).
+# ``-m "not browser"`` keeps every Playwright suite out of the default/full run;
+# a command-line ``-m browser`` (gate --quick, nightly) overrides it (last wins).
+addopts = "-n auto -m 'not browser'"
+markers = [
+    # Umbrella for every real-browser (Playwright) dashboard check. Opt-in:
+    # excluded from the default run so the functional suite needs no browser.
+    # gate.py runs these scoped to edited panels; nightly runs them fully. Each
+    # module auto-skips where Playwright / Chromium isn't installed.
+    "browser: real-browser dashboard checks (needs Playwright + Chromium)",
+    # Sub-tag on the layout suite so `-m mobile` can run just it. Every mobile
+    # test is also a browser test.
+    "mobile: responsive-layout subset of the browser suite",
+]
+# Test DBs are template copies deleted per test (tests/db_template.py), so a
+# run's tmp footprint stays flat; what remains here is the empty tmp_path dirs
+# and any non-DB files tests write. Keep only the most recent session (pruned
+# at startup by the main process — this works under xdist; the per-test
+# `retention_policy` does not, so we don't rely on it). If mass sqlite setup
+# errors ever recur: rm -rf /tmp/pytest-of-ben and see the remote runner's
+# preflight in scripts/remote_test.py.
+tmp_path_retention_count = 1
+
+[tool.coverage.run]
+# Required for --cov to work under pytest-xdist: each worker writes its own
+# .coverage.* file and pytest-cov combines them at the end.
+parallel = true
+source = ["src"]
+
+[tool.coverage.report]
+# Regression floor, set just under the measured 50% (2026-07-02, 4316 tests).
+# Raise it as coverage grows; don't lower it to make a failing build pass.
+fail_under = 49
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+"tests/web/conftest.py" = ["E402"]
+# Section-organized test: imports intentionally grouped with their test block.
+"tests/games/test_games_ffa_logic.py" = ["E402"]
+
+[tool.pyright]
+pythonVersion = "3.14"
+include = ["src"]
+extraPaths = ["src"]
+venvPath = "."
+venv = ".venv"
+useLibraryCodeForTypes = false
+reportMissingModuleSource = "none"
+# Standards audit 3.17: files held to strict mode. Grows by file and
+# never shrinks (tests/tooling/test_pyright_strict_list.py).
+strict = [
+    "src/bot_modules/analytics/channel_health_logic.py",
+    "src/bot_modules/analytics/delivery_health_logic.py",
+    "src/bot_modules/breaks/logic.py",
+    "src/bot_modules/bump_tracker/detector_logic.py",
+    "src/bot_modules/casino/logic.py",
+    "src/bot_modules/chat_revive/logic.py",
+    "src/bot_modules/core/gif_guard_logic.py",
+    "src/bot_modules/dm/perms/logic.py",
+    "src/bot_modules/docs/image_logic.py",
+    "src/bot_modules/economy/logic.py",
+    "src/bot_modules/event_echo/logic.py",
+    "src/bot_modules/games/ama/logic.py",
+    "src/bot_modules/games/config/logic.py",
+    "src/bot_modules/games/legitlibs/classic_logic.py",
+    "src/bot_modules/games/mfk/logic.py",
+    "src/bot_modules/games/mlt/logic.py",
+    "src/bot_modules/games/nhie/logic.py",
+    "src/bot_modules/games/rushmore/logic.py",
+    "src/bot_modules/games/session/logic.py",
+    "src/bot_modules/games/story/logic.py",
+    "src/bot_modules/games/traditional/logic.py",
+    "src/bot_modules/inactive/logic.py",
+    "src/bot_modules/mention_awards/logic.py",
+    "src/bot_modules/moderation/tickets/logic.py",
+    "src/bot_modules/music/logic.py",
+    "src/bot_modules/music/playlist/music_playlist_logic.py",
+    "src/bot_modules/needle/logic.py",
+    "src/bot_modules/privacy/logic.py",
+    "src/bot_modules/roles/grant/logic.py",
+    "src/bot_modules/server_features/logic.py",
+    "src/bot_modules/voice/master/logic.py",
+    "src/bot_modules/whisper/logic.py",
+]
+ignore = []

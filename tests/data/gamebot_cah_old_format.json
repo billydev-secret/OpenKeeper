@@ -1,0 +1,1017 @@
+[
+ {
+  "message_id": "1537000000000000001",
+  "created_at": "2026-08-14T02:57:08.128000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "hostowl is starting a Cards Against Humanity game!",
+    "description": "Click \"Join\" below to join in the next **«card»**.\n\n<@1284999999999999995>, select \"Start Game\" to begin once everyone has joined.",
+    "fields": [
+     {
+      "name": "Joined Players",
+      "value": "<@1284999999999999995>, <@1376999999999999998>, <@708199999999999928>, <@203899999999999916>, <@1359999999999999997>"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000002",
+  "created_at": "2026-08-14T02:59:08.535000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Time's up!",
+    "description": "<@1284999999999999995>, <@1376999999999999998>, <@708199999999999928>, <@203899999999999916>, <@1359999999999999997> joined the game!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000003",
+  "created_at": "2026-08-14T02:59:09.109000+00:00",
+  "content": "Loading options...",
+  "embeds": [
+   {
+    "title": "Options saved!",
+    "description": "The game is starting..."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000004",
+  "created_at": "2026-08-14T02:59:27.559000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000005",
+  "created_at": "2026-08-14T02:59:32.720000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@1376999999999999998>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000006",
+  "created_at": "2026-08-14T02:59:33.138000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000007",
+  "created_at": "2026-08-14T02:59:33.560000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000008",
+  "created_at": "2026-08-14T03:00:52.279000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "✅ The player list will be updated at the start of the next round."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000009",
+  "created_at": "2026-08-14T03:00:54.046000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000010",
+  "created_at": "2026-08-14T03:00:54.286000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@1376999999999999998>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000011",
+  "created_at": "2026-08-14T03:01:08.100000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@708199999999999928>!\n\n<@708199999999999928> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000012",
+  "created_at": "2026-08-14T03:01:08.519000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 0\n<@1376999999999999998>: 0\n<@708199999999999928>: 1\n<@203899999999999916>: 0\n<@1359999999999999997>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000013",
+  "created_at": "2026-08-14T03:01:09.071000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000014",
+  "created_at": "2026-08-14T03:01:09.307000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "<@674899999999999927> was added to the game!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000015",
+  "created_at": "2026-08-14T03:01:14.314000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@708199999999999928>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000016",
+  "created_at": "2026-08-14T03:01:14.562000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000017",
+  "created_at": "2026-08-14T03:01:15.095000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000018",
+  "created_at": "2026-08-14T03:01:46.639000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000019",
+  "created_at": "2026-08-14T03:01:47.110000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@708199999999999928>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000020",
+  "created_at": "2026-08-14T03:02:03.214000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@1284999999999999995>!\n\n<@1284999999999999995> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000021",
+  "created_at": "2026-08-14T03:02:03.580000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 1\n<@1376999999999999998>: 0\n<@708199999999999928>: 1\n<@203899999999999916>: 0\n<@1359999999999999997>: 0\n<@674899999999999927>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000022",
+  "created_at": "2026-08-14T03:02:03.959000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000023",
+  "created_at": "2026-08-14T03:02:09.241000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@203899999999999916>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000024",
+  "created_at": "2026-08-14T03:02:09.523000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000025",
+  "created_at": "2026-08-14T03:02:09.926000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000026",
+  "created_at": "2026-08-14T03:02:38.084000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000027",
+  "created_at": "2026-08-14T03:02:38.499000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@203899999999999916>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000028",
+  "created_at": "2026-08-14T03:03:38.925000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@1376999999999999998>!\n\n<@1376999999999999998> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000029",
+  "created_at": "2026-08-14T03:03:39.285000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 1\n<@1376999999999999998>: 1\n<@708199999999999928>: 1\n<@203899999999999916>: 0\n<@1359999999999999997>: 0\n<@674899999999999927>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000030",
+  "created_at": "2026-08-14T03:03:39.809000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000031",
+  "created_at": "2026-08-14T03:03:45.258000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@1359999999999999997>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000032",
+  "created_at": "2026-08-14T03:03:45.557000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000033",
+  "created_at": "2026-08-14T03:03:46.080000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000034",
+  "created_at": "2026-08-14T03:04:34.553000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000035",
+  "created_at": "2026-08-14T03:04:34.839000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@1359999999999999997>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000036",
+  "created_at": "2026-08-14T03:04:43.756000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@708199999999999928>!\n\n<@708199999999999928> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000037",
+  "created_at": "2026-08-14T03:04:44.213000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 1\n<@1376999999999999998>: 1\n<@708199999999999928>: 2\n<@203899999999999916>: 0\n<@1359999999999999997>: 0\n<@674899999999999927>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000038",
+  "created_at": "2026-08-14T03:04:44.789000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000039",
+  "created_at": "2026-08-14T03:04:50.029000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@674899999999999927>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000040",
+  "created_at": "2026-08-14T03:04:50.452000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000041",
+  "created_at": "2026-08-14T03:04:50.964000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000042",
+  "created_at": "2026-08-14T03:06:15.142000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000043",
+  "created_at": "2026-08-14T03:06:15.619000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@674899999999999927>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000044",
+  "created_at": "2026-08-14T03:06:45.259000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@1284999999999999995>!\n\n<@1284999999999999995> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000045",
+  "created_at": "2026-08-14T03:06:45.544000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 2\n<@203899999999999916>: 0\n<@1359999999999999997>: 0\n<@674899999999999927>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000046",
+  "created_at": "2026-08-14T03:06:45.900000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000047",
+  "created_at": "2026-08-14T03:06:51.206000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@1284999999999999995>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000048",
+  "created_at": "2026-08-14T03:06:51.436000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000049",
+  "created_at": "2026-08-14T03:06:51.901000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000050",
+  "created_at": "2026-08-14T03:07:40.040000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000051",
+  "created_at": "2026-08-14T03:07:40.601000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@1284999999999999995>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000052",
+  "created_at": "2026-08-14T03:07:50.861000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@1359999999999999997>!\n\n<@1359999999999999997> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000053",
+  "created_at": "2026-08-14T03:07:51.182000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 2\n<@203899999999999916>: 0\n<@1359999999999999997>: 1\n<@674899999999999927>: 0"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000054",
+  "created_at": "2026-08-14T03:07:51.597000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000055",
+  "created_at": "2026-08-14T03:07:56.965000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@1376999999999999998>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000056",
+  "created_at": "2026-08-14T03:07:57.496000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000057",
+  "created_at": "2026-08-14T03:07:58.042000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000058",
+  "created_at": "2026-08-14T03:08:53.106000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000059",
+  "created_at": "2026-08-14T03:08:53.384000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@1376999999999999998>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000060",
+  "created_at": "2026-08-14T03:09:12.630000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@674899999999999927>!\n\n<@674899999999999927> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000061",
+  "created_at": "2026-08-14T03:09:12.902000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 2\n<@203899999999999916>: 0\n<@1359999999999999997>: 1\n<@674899999999999927>: 1"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000062",
+  "created_at": "2026-08-14T03:09:13.186000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000063",
+  "created_at": "2026-08-14T03:09:18.524000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@708199999999999928>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000064",
+  "created_at": "2026-08-14T03:09:19.036000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000065",
+  "created_at": "2026-08-14T03:09:19.590000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000066",
+  "created_at": "2026-08-14T03:09:54.413000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000067",
+  "created_at": "2026-08-14T03:09:54.878000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@708199999999999928>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000068",
+  "created_at": "2026-08-14T03:10:20.087000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@1359999999999999997>!\n\n<@1359999999999999997> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000069",
+  "created_at": "2026-08-14T03:10:20.382000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 2\n<@203899999999999916>: 0\n<@1359999999999999997>: 2\n<@674899999999999927>: 1"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000070",
+  "created_at": "2026-08-14T03:10:20.747000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000071",
+  "created_at": "2026-08-14T03:10:26.079000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@203899999999999916>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000072",
+  "created_at": "2026-08-14T03:10:26.527000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000073",
+  "created_at": "2026-08-14T03:10:26.942000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@1359999999999999997>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000074",
+  "created_at": "2026-08-14T03:11:04.698000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@1359999999999999997> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000075",
+  "created_at": "2026-08-14T03:11:05.136000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@203899999999999916>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000076",
+  "created_at": "2026-08-14T03:11:32.328000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@708199999999999928>!\n\n<@708199999999999928> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000077",
+  "created_at": "2026-08-14T03:11:32.639000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 3\n<@203899999999999916>: 0\n<@1359999999999999997>: 2\n<@674899999999999927>: 1"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000078",
+  "created_at": "2026-08-14T03:11:32.975000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000079",
+  "created_at": "2026-08-14T03:11:38.202000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@1359999999999999997>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000080",
+  "created_at": "2026-08-14T03:11:38.876000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000081",
+  "created_at": "2026-08-14T03:11:39.864000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@674899999999999927>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000082",
+  "created_at": "2026-08-14T03:12:09.374000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@674899999999999927> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000083",
+  "created_at": "2026-08-14T03:12:09.757000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@1359999999999999997>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000084",
+  "created_at": "2026-08-14T03:12:51.037000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@708199999999999928>!\n\n<@708199999999999928> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000085",
+  "created_at": "2026-08-14T03:12:51.397000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 4\n<@203899999999999916>: 0\n<@1359999999999999997>: 2\n<@674899999999999927>: 1"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000086",
+  "created_at": "2026-08-14T03:12:51.559000+00:00",
+  "content": "The next round will begin in 5 seconds.",
+  "embeds": []
+ },
+ {
+  "message_id": "1537000000000000087",
+  "created_at": "2026-08-14T03:12:57.094000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The current czar is <@674899999999999927>! Wait until the other players have submitted their cards, then choose the best one."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000088",
+  "created_at": "2026-08-14T03:12:57.725000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "This round's black card",
+    "description": null
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000089",
+  "created_at": "2026-08-14T03:12:58.192000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "<a:loading:1146999999999999820> <@1284999999999999995>\n<a:loading:1146999999999999820> <@1376999999999999998>\n<a:loading:1146999999999999820> <@708199999999999928>\n<a:loading:1146999999999999820> <@203899999999999916>\n<a:loading:1146999999999999820> <@1359999999999999997>\n\n*Waiting for everyone to submit a card...*"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000090",
+  "created_at": "2026-08-14T03:13:20.875000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Submission status",
+    "description": "✅ <@1284999999999999995> Submitted!\n✅ <@1376999999999999998> Submitted!\n✅ <@708199999999999928> Submitted!\n✅ <@203899999999999916> Submitted!\n✅ <@1359999999999999997> Submitted!"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000091",
+  "created_at": "2026-08-14T03:13:21.400000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Choose the best card, Card Czar",
+    "description": "«card text redacted»\n<@674899999999999927>, select one of the white card choices below."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000092",
+  "created_at": "2026-08-14T03:14:01.854000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": null,
+    "description": "The winning card is **«card»** which belonged to <@708199999999999928>!\n\n<@708199999999999928> has earned a point."
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000093",
+  "created_at": "2026-08-14T03:14:02.113000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Current Standings",
+    "description": "<@1284999999999999995>: 2\n<@1376999999999999998>: 1\n<@708199999999999928>: 5\n<@203899999999999916>: 0\n<@1359999999999999997>: 2\n<@674899999999999927>: 1"
+   }
+  ]
+ },
+ {
+  "message_id": "1537000000000000094",
+  "created_at": "2026-08-14T03:14:02.869000+00:00",
+  "content": "",
+  "embeds": [
+   {
+    "title": "Game over!",
+    "description": "<@708199999999999928> is the winner!\nTo play fun games with the community, [join our server](https://discord.gg/gamebot-community-618399999999999865)!",
+    "fields": [
+     {
+      "name": "Vex",
+      "value": "**[Level 17]** · *147 XP to Level 18* | +1013 XP"
+     },
+     {
+      "name": "pipp",
+      "value": "🎉 **leveled up to Level 10!** | +1013 XP"
+     },
+     {
+      "name": "Nook2211",
+      "value": "**[Level 2]** | +1519 XP | +300 quest XP\n📋 Quest complete! **Win a game of Cards Against Humanity** (+200 XP)\n📋 Quest complete! **Play in a game with 3+ players** (+100 XP)"
+     },
+     {
+      "name": "finch",
+      "value": "**[Level 10]** | +1013 XP"
+     },
+     {
+      "name": "QuietRidge",
+      "value": "🎉 **leveled up to Level 3!** | +1013 XP"
+     },
+     {
+      "name": "Ivarsen",
+      "value": "🎉 **leveled up to Level 2!** | +1013 XP"
+     },
+     {
+      "name": "Unlockables",
+      "value": "This game contains unlockable content! [Check out the Gamebot shop](https://gamebot.gg/shop) to see what you can get!"
+     }
+    ]
+   }
+  ]
+ }
+]

@@ -1,0 +1,447 @@
+"""Tests for /api/config/games-* — the six duel-game config endpoints.
+
+These routes had **no coverage at all** before this file (Stage 1 of
+docs/plans/config-routes-simplify.md). They are six near-identical handlers
+sharing a five-field "shared tier" (cooldown/sentence/allowlist/two length
+caps) plus a per-game tier, so everything below is one parametrized function
+per behaviour rather than six copies of each.
+
+The bounds asserted here are the contract Stage 4 has to preserve when it
+collapses the six copy-pasted handlers into a shared builder. They are
+*refusals*, not clamps: an out-of-range dial comes back 422 and nothing is
+stored, so the number on the panel is always the number the game plays by.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+# route suffix, GET /config section key, duel_config.game_type
+GAMES = [
+    ("games-pressure", "games_pressure", "pressure"),
+    ("games-quickdraw", "games_quickdraw", "quickdraw"),
+    ("games-hot-potato", "games_hot_potato", "hot_potato"),
+    ("games-hot-potato-group", "games_hot_potato_group", "hot_potato_group"),
+    ("games-chicken", "games_chicken", "chicken"),
+    ("games-musical-chairs", "games_musical_chairs", "musical_chairs"),
+]
+
+_GAME_IDS = [g[2] for g in GAMES]
+
+
+def _section(client, key: str) -> dict:
+    resp = client.get("/api/config")
+    assert resp.status_code == 200
+    return resp.json()[key]
+
+
+# ── shared tier: present and round-trips on all six games ─────────────
+
+
+@pytest.mark.parametrize(("route", "key", "_game"), GAMES, ids=_GAME_IDS)
+def test_shared_tier_round_trips(authed_client, route, key, _game):
+    """Every game surfaces the same five shared knobs, and a PUT is readable
+    back through GET /config."""
+    resp = authed_client.put(
+        f"/api/config/{route}",
+        json={
+            "cooldown_hours": 12,
+            "sentence_hours": 6,
+            "max_nick_length": 20,
+            "max_stakes_length": 500,
+        },
+    )
+    assert resp.status_code == 200
+
+    sec = _section(authed_client, key)
+    assert sec["cooldown_hours"] == 12
+    assert sec["sentence_hours"] == 6
+    assert sec["max_nick_length"] == 20
+    assert sec["max_stakes_length"] == 500
+
+
+@pytest.mark.parametrize(("route", "key", "_game"), GAMES, ids=_GAME_IDS)
+def test_shared_tier_defaults_before_any_write(authed_client, route, key, _game):
+    """With no row written, the section reports the shared defaults rather
+    than erroring or omitting keys."""
+    sec = _section(authed_client, key)
+    assert sec["cooldown_hours"] == 0  # enforced everywhere, ships at 0 (duels-party-116)
+    assert sec["sentence_hours"] == 24
+    assert sec["max_nick_length"] == 32
+    assert sec["max_stakes_length"] == 200
+    assert sec["channel_allowlist"] == []
+
+
+@pytest.mark.parametrize(("route", "key", "_game"), GAMES, ids=_GAME_IDS)
+def test_partial_update_leaves_other_shared_fields_alone(
+    authed_client, route, key, _game
+):
+    """Every field is optional; sending one must not reset the others."""
+    authed_client.put(f"/api/config/{route}", json={"cooldown_hours": 9})
+    authed_client.put(f"/api/config/{route}", json={"sentence_hours": 3})
+
+    sec = _section(authed_client, key)
+    assert sec["cooldown_hours"] == 9
+    assert sec["sentence_hours"] == 3
+
+
+# ── shared tier bounds ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("field", "sent"),
+    [
+        pytest.param("cooldown_hours", -5, id="cooldown-below-0"),
+        pytest.param("sentence_hours", 0, id="sentence-below-1"),
+        pytest.param("sentence_hours", -99, id="sentence-negative"),
+        pytest.param("max_nick_length", 0, id="nick-below-1"),
+        pytest.param("max_nick_length", 999, id="nick-above-32"),
+        pytest.param("max_stakes_length", 0, id="stakes-below-1"),
+        pytest.param("max_stakes_length", 99_999, id="stakes-above-2000"),
+        pytest.param("challenge_limit_per_hour", -1, id="challenge-below-0"),
+        pytest.param("challenge_limit_per_hour", 1000, id="challenge-above-999"),
+    ],
+)
+def test_shared_tier_refuses_out_of_range(authed_client, field, sent):
+    """422, and the stored value is untouched.
+
+    The old handler clamped: an admin who typed 999 into Max Nickname Length
+    got a green "Saved" and a stored 32, with the form still showing 999 until
+    they reloaded. Now the save fails and the box is named.
+    """
+    before = _section(authed_client, "games_pressure")[field]
+    resp = authed_client.put("/api/config/games-pressure", json={field: sent})
+    assert resp.status_code == 422
+    assert field in str(resp.json()["detail"])
+    assert _section(authed_client, "games_pressure")[field] == before
+
+
+@pytest.mark.parametrize(
+    ("field", "sent"),
+    [
+        pytest.param("cooldown_hours", 0, id="cooldown-0-is-valid"),
+        pytest.param("challenge_limit_per_hour", 0, id="challenge-0-is-unlimited"),
+        pytest.param("max_nick_length", 32, id="nick-at-the-ceiling"),
+        pytest.param("max_stakes_length", 2000, id="stakes-at-the-ceiling"),
+    ],
+)
+def test_shared_tier_accepts_its_own_edges(authed_client, field, sent):
+    """The bounds are inclusive — 0 cooldown means no cooldown, and 0
+    challenges per hour means unlimited, so neither may be refused."""
+    resp = authed_client.put("/api/config/games-pressure", json={field: sent})
+    assert resp.status_code == 200
+    assert _section(authed_client, "games_pressure")[field] == sent
+
+
+@pytest.mark.parametrize(("route", "key", "_game"), GAMES, ids=_GAME_IDS)
+def test_channel_allowlist_dedupes_sorts_and_drops_blanks(
+    authed_client, route, key, _game
+):
+    """The allowlist is stored as sorted, de-duplicated JSON and comes back as
+    strings (snowflake-precision rule)."""
+    resp = authed_client.put(
+        f"/api/config/{route}",
+        json={"channel_allowlist": ["300", "100", "200", "100", "  ", ""]},
+    )
+    assert resp.status_code == 200
+
+    allowlist = _section(authed_client, key)["channel_allowlist"]
+    assert allowlist == ["100", "200", "300"]
+    assert all(isinstance(v, str) for v in allowlist)
+
+
+def test_channel_allowlist_survives_snowflake_sized_ids(authed_client):
+    """Ids above 2^53 must not come back as bare JSON numbers."""
+    big = "1469491362444480666"
+    authed_client.put(
+        "/api/config/games-pressure", json={"channel_allowlist": [big]}
+    )
+    assert _section(authed_client, "games_pressure")["channel_allowlist"] == [big]
+
+
+# ── per-game tier ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("route", "key", "payload", "expected"),
+    [
+        pytest.param(
+            "games-quickdraw",
+            "games_quickdraw",
+            {"min_delay": 2.5, "max_delay": 9.0, "draw_window": 4.0},
+            {"min_delay": 2.5, "max_delay": 9.0, "draw_window": 4.0},
+            id="quickdraw",
+        ),
+        pytest.param(
+            "games-hot-potato",
+            "games_hot_potato",
+            {"min_timer": 15.0, "max_timer": 50.0, "min_hold": 1.5},
+            {"min_timer": 15.0, "max_timer": 50.0, "min_hold": 1.5},
+            id="hot_potato",
+        ),
+        pytest.param(
+            "games-hot-potato-group",
+            "games_hot_potato_group",
+            {
+                "min_fuse": 25.0,
+                "max_fuse": 70.0,
+                "min_hold": 3.0,
+                "min_players": 4,
+                "max_players": 12,
+            },
+            {
+                "min_fuse": 25.0,
+                "max_fuse": 70.0,
+                "min_hold": 3.0,
+                "min_players": 4,
+                "max_players": 12,
+            },
+            id="hot_potato_group",
+        ),
+        pytest.param(
+            "games-chicken",
+            "games_chicken",
+            {"min_climb": 12.0, "max_climb": 30.0, "min_players": 3, "max_players": 9},
+            {"min_climb": 12.0, "max_climb": 30.0, "min_players": 3, "max_players": 9},
+            id="chicken",
+        ),
+        pytest.param(
+            "games-musical-chairs",
+            "games_musical_chairs",
+            {
+                "min_music": 6.0,
+                "max_music": 18.0,
+                "scramble_window": 9.0,
+                "min_players": 4,
+                "max_players": 12,
+            },
+            {
+                "min_music": 6.0,
+                "max_music": 18.0,
+                "scramble_window": 9.0,
+                "min_players": 4,
+                "max_players": 12,
+            },
+            id="musical_chairs",
+        ),
+    ],
+)
+def test_per_game_tier_round_trips(authed_client, route, key, payload, expected):
+    resp = authed_client.put(f"/api/config/{route}", json=payload)
+    assert resp.status_code == 200
+
+    sec = _section(authed_client, key)
+    for field, want in expected.items():
+        assert sec[field] == want, field
+
+
+# The per-game floors, taken from the rule table itself so a dial added to
+# ``_DUEL_GAMES`` is covered the day it lands rather than the day someone
+# remembers to add a row here. Each dial still gets its own test id.
+def _floor_cases():
+    from web_server.routes import config as cfg
+
+    routes = {game: (route, key) for route, key, game in GAMES}
+    for game_key, spec in cfg._DUEL_GAMES.items():
+        route, key = routes[game_key]
+        for field, rule in spec["fields"].items():
+            if rule == "bool":
+                continue
+            low, _high = rule
+            yield pytest.param(
+                route, key, field, low, id=f"{game_key}-{field}"
+            )
+
+
+@pytest.mark.parametrize(("route", "key", "field", "low"), list(_floor_cases()))
+def test_a_per_game_dial_below_its_floor_is_refused(
+    authed_client, route, key, field, low
+):
+    """Under the floor is a 422 naming the dial, and nothing is written.
+
+    These used to clamp, which on a fuse dial meant the game ran on a number
+    the admin never chose and the panel never showed: typing 1s into Shortest
+    Fuse saved silently as 5s. Every rule in ``_DUEL_GAMES`` is a floor with
+    no ceiling, so the floor is the whole contract.
+    """
+    before = _section(authed_client, key)[field]
+    sent = low - 1 if isinstance(low, int) else low - 0.5
+    resp = authed_client.put(f"/api/config/{route}", json={field: sent})
+    assert resp.status_code == 422, resp.text
+    assert field in str(resp.json()["detail"])
+    assert _section(authed_client, key)[field] == before
+
+
+@pytest.mark.parametrize(("route", "key", "field", "low"), list(_floor_cases()))
+def test_a_per_game_dial_at_its_floor_is_accepted(
+    authed_client, route, key, field, low
+):
+    """The floor itself is valid — an exclusive bound would make the panel's
+    own minimum unselectable."""
+    resp = authed_client.put(f"/api/config/{route}", json={field: low})
+    # A lone dial can still trip an ordering rule against its stored partner
+    # (min_fuse raised above the stored max_fuse); that is a different, real
+    # refusal and carries its own message rather than a field name.
+    assert resp.status_code in (200, 422)
+    if resp.status_code == 200:
+        assert _section(authed_client, key)[field] == low
+
+
+def test_a_refused_dial_does_not_write_its_neighbours(authed_client):
+    """One bad dial in a multi-field save writes none of them.
+
+    The range check runs over the whole body before the UPDATE is built, so a
+    form with one typo is rejected whole — a half-applied save would leave the
+    game in a state no admin chose.
+    """
+    before = _section(authed_client, "games_quickdraw")
+    resp = authed_client.put(
+        "/api/config/games-quickdraw",
+        json={"min_delay": 2.0, "max_delay": 9.0, "draw_window": 0.0},
+    )
+    assert resp.status_code == 422
+    after = _section(authed_client, "games_quickdraw")
+    for field in ("min_delay", "max_delay", "draw_window"):
+        assert after[field] == before[field], field
+
+
+def test_the_shared_tier_is_not_written_when_a_game_dial_is_refused(authed_client):
+    """The shared knobs and the per-game knobs are two tables, saved by one
+    PUT. A refused per-game dial must not leave the shared half applied."""
+    before = _section(authed_client, "games_quickdraw")["cooldown_hours"]
+    resp = authed_client.put(
+        "/api/config/games-quickdraw",
+        json={"cooldown_hours": before + 7, "draw_window": 0.0},
+    )
+    assert resp.status_code == 422
+    assert _section(authed_client, "games_quickdraw")["cooldown_hours"] == before
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [pytest.param(True, 1, id="true"), pytest.param(False, 0, id="false")],
+)
+def test_musical_chairs_false_start_elim_stores_as_int(authed_client, sent, expected):
+    """The only bool in the six games — persisted as 1/0."""
+    resp = authed_client.put(
+        "/api/config/games-musical-chairs", json={"false_start_elim": sent}
+    )
+    assert resp.status_code == 200
+    sec = _section(authed_client, "games_musical_chairs")
+    assert sec["false_start_elim"] == expected
+
+
+# ── isolation between games ───────────────────────────────────────────
+
+
+def test_shared_tier_is_per_game_not_global(authed_client):
+    """duel_config is keyed by (guild_id, game_type) — editing one game's
+    cooldown must not move another's."""
+    authed_client.put("/api/config/games-pressure", json={"cooldown_hours": 5})
+    authed_client.put("/api/config/games-chicken", json={"cooldown_hours": 11})
+
+    assert _section(authed_client, "games_pressure")["cooldown_hours"] == 5
+    assert _section(authed_client, "games_chicken")["cooldown_hours"] == 11
+    # A game never written to still reports the default.
+    assert _section(authed_client, "games_quickdraw")["cooldown_hours"] == 0
+
+
+# ── field-table / model contract ──────────────────────────────────────
+#
+# The declarative tables added by the simplify pass are read with
+# getattr(body, field, None), so a table naming a field its model does not
+# have would silently write nothing and still return 200 — a saved-looking
+# no-op. These pin every table to its model so that drift fails here instead.
+
+_FIELD_TABLES = [
+    ("_GLOBAL_FIELDS", "GlobalConfigUpdate"),
+    ("_INTAKE_FIELDS", "IntakeConfigUpdate"),
+    ("_XP_ID_FIELDS", "XpConfigUpdate"),
+    ("_XP_COEFF_READERS", "XpConfigUpdate"),
+    ("_INACTIVE_FIELDS", "InactiveConfigUpdate"),
+    ("_NEEDLE_FIELDS", "NeedleGlobalUpdate"),
+]
+
+
+@pytest.mark.parametrize(
+    ("table_name", "model_name"), _FIELD_TABLES, ids=[t for t, _ in _FIELD_TABLES]
+)
+def test_field_table_names_only_real_model_fields(table_name, model_name):
+    from web_server.routes import config as cfg
+
+    table = getattr(cfg, table_name)
+    model = getattr(cfg, model_name)
+    unknown = set(table) - set(model.model_fields)
+    assert not unknown, (
+        f"{table_name} names field(s) {sorted(unknown)} that {model_name} does "
+        f"not declare — those writes would silently no-op"
+    )
+
+
+_DUEL_MODELS = {
+    "pressure": "PressureConfigUpdate",
+    "quickdraw": "QuickdrawConfigUpdate",
+    "hot_potato": "HotPotatoConfigUpdate",
+    "hot_potato_group": "HotPotatoGroupConfigUpdate",
+    "chicken": "ChickenConfigUpdate",
+    "musical_chairs": "MusicalChairsConfigUpdate",
+}
+
+
+@pytest.mark.parametrize(("game_key", "model_name"), sorted(_DUEL_MODELS.items()))
+def test_duel_clamp_table_names_only_real_model_fields(game_key, model_name):
+    from web_server.routes import config as cfg
+
+    clamps = cfg._DUEL_GAMES[game_key]["fields"]
+    model = getattr(cfg, model_name)
+    unknown = set(clamps) - set(model.model_fields)
+    assert not unknown, f"{game_key} clamps unknown field(s) {sorted(unknown)}"
+    # and the shared tier really is shared
+    assert set(cfg._DUEL_SHARED_DEFAULTS) <= set(model.model_fields)
+
+
+# ── nickname denylist ─────────────────────────────────────────────────────────
+# duel_config.nick_denylist has always been enforced (every nickname and every
+# line of stakes text is checked against it, on top of the built-in list), but
+# nothing could write it: the only way to add a guild's own banned words was
+# editing the database by hand. It is a panel field now.
+
+
+@pytest.mark.parametrize(("route", "key", "_game"), GAMES, ids=_GAME_IDS)
+def test_nick_denylist_round_trips(authed_client, route, key, _game):
+    resp = authed_client.put(
+        f"/api/config/{route}", json={"nick_denylist": ["Frobnicate", "  spam  "]}
+    )
+    assert resp.status_code == 200
+    assert _section(authed_client, key)["nick_denylist"] == ["frobnicate", "spam"]
+
+
+def test_nick_denylist_defaults_to_empty(authed_client):
+    assert _section(authed_client, "games_pressure")["nick_denylist"] == []
+
+
+def test_nick_denylist_lowercases_dedupes_and_drops_blanks(authed_client):
+    authed_client.put(
+        "/api/config/games-pressure",
+        json={"nick_denylist": ["Word", "word", "WORD", "", "   ", "other"]},
+    )
+    assert _section(authed_client, "games_pressure")["nick_denylist"] == ["word", "other"]
+
+
+def test_nick_denylist_is_bounded(authed_client):
+    """A sanity ceiling on entries and entry length — it is a word list, not a
+    content filter, and it is read on every nickname and stakes submission."""
+    authed_client.put(
+        "/api/config/games-pressure",
+        json={"nick_denylist": [f"w{i}" for i in range(60)] + ["x" * 200]},
+    )
+    stored = _section(authed_client, "games_pressure")["nick_denylist"]
+    assert len(stored) == 40
+    assert all(len(w) <= 64 for w in stored)
+
+
+def test_nick_denylist_is_per_game(authed_client):
+    """duel_config rows are per game_type, so one game's words stay its own."""
+    authed_client.put("/api/config/games-pressure", json={"nick_denylist": ["alpha"]})
+    assert _section(authed_client, "games_quickdraw")["nick_denylist"] == []

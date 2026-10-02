@@ -1,0 +1,94 @@
+.env
+dungeonkeeper.db
+dungeonkeeper.db-wal
+dungeonkeeper.db-shm
+*.db-wal
+*.db-shm
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+.venv/
+.venv
+# Editor/IDE state is per-machine, never shared config.
+.idea/
+.vscode/
+/.claude/*
+!/.claude/commands/
+!/.claude/agents/
+backups/
+models/
+
+# Manual-verification image for the NSFW classifier. Explicit content — it
+# must never enter the repo, and `git add -A` would otherwise stage it.
+nsfw-test-image.jpg
+lavalink/Lavalink.jar
+lavalink/plugins/
+lavalink/logs/
+*.db
+econ_role_icons/
+log.txt
+log_beta_tools.txt
+node_modules/
+.cache/
+guess_cache/
+test_*.jpg
+test_*.png
+.coverage
+.coverage.*
+coverage*.json
+htmlcov/
+
+# Mod-uploaded doc images (served publicly via /static)
+src/web_server/static/doc-images/
+# Admin-uploaded hub panel banners (served publicly via /static)
+src/web_server/static/panel-banners/
+
+# Per-guild uploaded quote border frames (runtime data next to the dev DB)
+quote_borders/
+econ_icon_catalog/
+swatches/
+econ_emoji/
+
+# Every runtime data dir above gathers under var/ once the operator moves it
+# there (bot_modules/core/paths.py); the per-dir lines protect the old layout.
+/var/
+
+# Remote test dispatch — records which lock hash the remote venv was built from
+.remote-test-stamp
+private/
+
+# Bought commercial fonts (assets/fonts/README.md): licensed for this bot's
+# images only, never redistributed, so the .ttf files live on the host and not
+# in git. Install them by hand on a fresh checkout.
+assets/fonts/ThughtBlack.ttf
+assets/fonts/ThughtRegular.ttf
+
+# The live server's channel/role map is operational detail, kept out of the
+# public repo (private/server_map.md on the prod host).
+docs/server_map.md
+
+# Littered into the cwd by cog tests whose fake ctx uses this relative db_path
+# (tests/games/test_games_ama_panel_flow.py and three siblings).
+/unused-branding-db
+
+# Build and packaging output (pip install / python -m build)
+*.egg-info/
+/build/
+/dist/
+# pip install --prefix . litter
+/lib/
+
+# Hypothesis example database (created wherever pytest runs)
+.hypothesis/
+
+# Rotated logs
+log.txt.*
+
+# Local one-off scratch scripts
+/scratch/
+# `--db db` litter: an extensionless SQLite file at the root (committed once, 5d5024dc)
+/db
+
+# Plan docs are local build scaffolding; decisions go into the spec (CLAUDE.md)
+docs/plans/

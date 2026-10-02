@@ -1,0 +1,206 @@
+"""Tests for pressure_cooker views and modals."""
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import discord
+
+from bot_modules.duels.views import ChallengeView, ResultView
+from bot_modules.duels.modals import NicknameModal
+from bot_modules.duels.pressure_cooker.views import GameView, gauge_bar
+from tests.fakes import FakeUser, fake_interaction
+
+
+# ── gauge_bar ─────────────────────────────────────────────────────────────────
+
+def test_gauge_bar_empty():
+    result = gauge_bar(0)
+    assert "0/100" in result
+    assert "▰" not in result
+
+
+def test_gauge_bar_half():
+    result = gauge_bar(50)
+    assert "50/100" in result
+    assert "▰" in result
+    assert "▱" in result
+
+
+def test_gauge_bar_full():
+    result = gauge_bar(100)
+    assert "100/100" in result
+    assert "▱" not in result
+
+
+def test_gauge_bar_over_ceiling_clamps():
+    result = gauge_bar(115)
+    assert "115/100" in result  # shows actual value
+    assert "▱" not in result    # bar is full
+
+
+# ── ChallengeView ─────────────────────────────────────────────────────────────
+
+async def test_challenge_accept_by_target():
+    on_accept = AsyncMock()
+    on_decline = AsyncMock()
+    view = ChallengeView(game_id=1, target_id=42, on_accept=on_accept, on_decline=on_decline)
+
+    interaction = fake_interaction(user=FakeUser(id=42))
+    # Find the accept button and call its callback
+    accept_btn = next(b for b in view.walk_children() if isinstance(b, discord.ui.Button) and b.emoji and "✅" in str(b.emoji))
+    await accept_btn.callback(interaction)
+
+    on_accept.assert_awaited_once_with(interaction, 1)
+    on_decline.assert_not_awaited()
+
+
+async def test_challenge_accept_by_wrong_user_rejected():
+    on_accept = AsyncMock()
+    view = ChallengeView(game_id=1, target_id=42, on_accept=on_accept, on_decline=AsyncMock())
+
+    interaction = fake_interaction(user=FakeUser(id=99))
+    accept_btn = next(b for b in view.walk_children() if isinstance(b, discord.ui.Button) and b.emoji and "✅" in str(b.emoji))
+    await accept_btn.callback(interaction)
+
+    on_accept.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    call_kwargs = interaction.response.send_message.call_args
+    assert call_kwargs.kwargs.get("ephemeral") is True
+
+
+async def test_challenge_decline_by_target():
+    on_decline = AsyncMock()
+    view = ChallengeView(game_id=1, target_id=42, on_accept=AsyncMock(), on_decline=on_decline)
+
+    interaction = fake_interaction(user=FakeUser(id=42))
+    decline_btn = next(b for b in view.walk_children() if isinstance(b, discord.ui.Button) and b.emoji and "❌" in str(b.emoji))
+    await decline_btn.callback(interaction)
+
+    on_decline.assert_awaited_once_with(interaction, 1)
+
+
+async def test_challenge_decline_by_wrong_user_rejected():
+    on_decline = AsyncMock()
+    view = ChallengeView(game_id=1, target_id=42, on_accept=AsyncMock(), on_decline=on_decline)
+
+    interaction = fake_interaction(user=FakeUser(id=77))
+    decline_btn = next(b for b in view.walk_children() if isinstance(b, discord.ui.Button) and b.emoji and "❌" in str(b.emoji))
+    await decline_btn.callback(interaction)
+
+    on_decline.assert_not_awaited()
+
+
+# ── GameView ──────────────────────────────────────────────────────────────────
+#
+# A LayoutView's buttons live inside their own ActionRow (a bare Button can't
+# sit at a V2 message's top level — the same reason the ChallengeView lookups
+# above walk children too), so every lookup below walks nested children —
+# ``walk_children()`` — rather than indexing ``view.children``.
+
+
+def _pump_button(view: GameView) -> discord.ui.Button:
+    return next(c for c in view.walk_children() if isinstance(c, discord.ui.Button))
+
+
+async def test_game_view_pump_fires_callback():
+    on_pump = AsyncMock()
+    view = GameView(game_id=5, on_pump=on_pump)
+
+    interaction = fake_interaction(user=FakeUser(id=10))
+    await _pump_button(view).callback(interaction)
+
+    on_pump.assert_awaited_once_with(interaction, 5)
+
+
+def test_game_view_custom_id_encodes_game_id():
+    view = GameView(game_id=99, on_pump=AsyncMock())
+    assert _pump_button(view).custom_id == "pump:99"
+
+
+def test_game_view_render_keeps_control_row_last():
+    """render() resets the card to fresh content and re-adds the control row
+    last, so a re-render can never duplicate or lose the PUMP button."""
+    view = GameView(game_id=1, on_pump=AsyncMock())
+    view.render([discord.ui.TextDisplay("state one")])
+    view.render([discord.ui.TextDisplay("state two"), discord.ui.TextDisplay("more")])
+    texts = [c.content for c in view.walk_children() if isinstance(c, discord.ui.TextDisplay)]
+    assert texts == ["state two", "more"]
+    assert isinstance(view.children[-1], discord.ui.ActionRow)
+    assert _pump_button(view).custom_id == "pump:1"
+
+
+# ── ResultView ────────────────────────────────────────────────────────────────
+
+def _make_result_view(game_id=7, winner_id=1, loser_id=2):
+    return ResultView(
+        game_id=game_id,
+        winner_id=winner_id,
+        loser_id=loser_id,
+        on_set_nick=AsyncMock(),
+    )
+
+
+def _get_btn(view: ResultView, emoji_char: str) -> discord.ui.Button:
+    return next(
+        b for b in view.children
+        if isinstance(b, discord.ui.Button) and b.emoji and emoji_char in str(b.emoji)
+    )
+
+
+async def test_result_set_nick_by_winner():
+    on_set_nick = AsyncMock()
+    view = ResultView(7, winner_id=1, loser_id=2, on_set_nick=on_set_nick)
+    interaction = fake_interaction(user=FakeUser(id=1))
+    await _get_btn(view, "📝").callback(interaction)
+    on_set_nick.assert_awaited_once_with(interaction, 7)
+
+
+async def test_result_set_nick_by_wrong_user():
+    on_set_nick = AsyncMock()
+    view = ResultView(7, winner_id=1, loser_id=2, on_set_nick=on_set_nick)
+    interaction = fake_interaction(user=FakeUser(id=99))
+    await _get_btn(view, "📝").callback(interaction)
+    on_set_nick.assert_not_awaited()
+    assert interaction.response.send_message.called
+
+
+def test_result_view_has_only_name_button():
+    view = _make_result_view(game_id=42)
+    custom_ids = {b.custom_id for b in view.children if isinstance(b, discord.ui.Button)}
+    assert custom_ids == {"set_nick:42"}
+
+
+def test_result_view_disable_disables_button():
+    view = _make_result_view()
+    view.disable()
+    assert all(b.disabled for b in view.children if isinstance(b, discord.ui.Button))
+
+
+def test_result_view_button_label():
+    view = _make_result_view()
+    btn = next(b for b in view.children if isinstance(b, discord.ui.Button))
+    assert btn.label == "Name the Loser"
+
+
+# ── NicknameModal ─────────────────────────────────────────────────────────────
+
+async def test_nickname_modal_on_submit_calls_callback():
+    on_submit = AsyncMock()
+    modal = NicknameModal(game_id=3, on_submit=on_submit)
+    # Simulate the TextInput value being set
+    modal.nick_input._value = "LoserFace"
+    interaction = fake_interaction(user=FakeUser(id=1))
+    await modal.on_submit(interaction)
+    on_submit.assert_awaited_once_with(interaction, 3, "LoserFace")
+
+
+async def test_nickname_modal_passes_raw_value():
+    submitted = []
+
+    async def capture(interaction, game_id, raw):
+        submitted.append(raw)
+
+    modal = NicknameModal(game_id=1, on_submit=capture)
+    modal.nick_input._value = "  SpaceyNick  "
+    await modal.on_submit(fake_interaction())
+    assert submitted == ["  SpaceyNick  "]

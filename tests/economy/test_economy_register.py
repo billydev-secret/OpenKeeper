@@ -1,0 +1,1284 @@
+"""Economy register — ledger collector, memo rendering, cards, drain loop."""
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.core.layout import check_budget
+from bot_modules.economy import quests as quest_logic
+from bot_modules.economy.register import (
+    SKIP_KINDS,
+    _KIND_DISPLAY,
+    RegisterEntry,
+    build_register_entry_layout,
+    build_signoff_notice_layout,
+    collect_register_entries,
+    kind_display,
+    render_memo,
+    suppress_signoff_notice,
+)
+from bot_modules.economy.signoff_notice import announce_signoff_outcome
+from bot_modules.economy import quests_service as quests_svc
+from bot_modules.economy.loop import (
+    register_tick,
+    REGISTER_MAX_PER_TICK,
+    REGISTER_STALE_SECONDS,
+    run_guild_register,
+)
+from bot_modules.economy.service import (
+    DEFAULT_ECON_SETTINGS,
+    apply_credit,
+    apply_debit,
+    load_econ_settings,
+    save_econ_settings,
+    transfer_currency,
+)
+from tests.db_template import migrated_db
+from tests.fakes import FakeGuild
+from tests.paths import REPO_ROOT
+
+GUILD_ID = 9001
+CHANNEL_ID = 111
+USER_ID = 4242
+NOW = 1_700_000_000.0
+
+
+@pytest.fixture
+def db(tmp_path):
+    db_path = tmp_path / "test.db"
+    migrated_db(db_path)
+    return db_path
+
+
+def _row(conn, user_id, amount, *, kind, meta=None, actor_id=None, age=0.0):
+    """Insert a ledger row directly, with control over its age."""
+    import json
+
+    conn.execute(
+        "INSERT INTO econ_ledger "
+        "(guild_id, user_id, amount, kind, actor_id, meta, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            GUILD_ID,
+            user_id,
+            amount,
+            kind,
+            actor_id,
+            json.dumps(meta) if meta else None,
+            NOW - age,
+        ),
+    )
+    # Mirror the wallet the same way apply_credit/apply_debit would, in two
+    # steps: the table's CHECK (balance >= 0) rejects an opening negative row.
+    conn.execute(
+        "INSERT OR IGNORE INTO econ_wallets "
+        "(guild_id, user_id, balance, created_at, updated_at) "
+        "VALUES (?, ?, 0, ?, ?)",
+        (GUILD_ID, user_id, NOW, NOW),
+    )
+    conn.execute(
+        "UPDATE econ_wallets SET balance = balance + ? "
+        "WHERE guild_id = ? AND user_id = ?",
+        (amount, GUILD_ID, user_id),
+    )
+
+
+def _entry(**overrides) -> RegisterEntry:
+    base: dict[str, Any] = dict(
+        ledger_id=1,
+        user_id=USER_ID,
+        amount=50,
+        kind="quest",
+        actor_id=None,
+        meta={},
+        created_at=NOW,
+        balance_after=100,
+    )
+    base.update(overrides)
+    return RegisterEntry(**base)
+
+
+def _names(uid: int) -> str:
+    return f"User{uid}"
+
+
+def _view(items) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=None)
+    for item in items:
+        view.add_item(item)
+    return view
+
+
+def _all_text(items) -> str:
+    return "\n".join(
+        item.content
+        for item in _view(items).walk_children()
+        if isinstance(item, discord.ui.TextDisplay)
+    )
+
+
+# ── migration 125: monthly → guild-wide community reconciliation ────────
+
+
+def _mk_old_monthly(conn, *, kind, community_target=None, active=True):
+    """An old-style monthly quest (pre-125: a per-user board quest). A kindless
+    one is built by mutating a daily, since create_quest now forbids it."""
+    if kind:
+        qid = quests_svc.create_quest(
+            conn, GUILD_ID, title="m", description="", qtype="monthly",
+            reward=50, signoff=0, criteria="", starts_at=None, ends_at=None,
+            rotate_tag="", community_target=community_target, created_by=None,
+            trigger_kind=kind,
+        )
+    else:
+        qid = quests_svc.create_quest(
+            conn, GUILD_ID, title="m", description="", qtype="daily",
+            reward=50, signoff=0, criteria="", starts_at=None, ends_at=None,
+            rotate_tag="", community_target=None, created_by=None,
+        )
+        conn.execute(
+            "UPDATE econ_quests SET qtype = 'monthly', trigger_kind = '' WHERE id = ?",
+            (qid,),
+        )
+    if active:
+        quests_svc.set_quest_active(conn, GUILD_ID, qid, True)
+    return qid
+
+
+def _reconcile_125(conn):
+    """Re-run migration 125's reconciliation DML (everything after the ALTER)."""
+
+    path = (
+        REPO_ROOT
+        / "src" / "migrations" / "125_econ_monthly_community.sql"
+    )
+    sql = path.read_text(encoding="utf-8")
+    marker = "ALTER TABLE econ_day_marks ADD COLUMN last_community_month TEXT;"
+    conn.executescript(sql.split(marker, 1)[1])
+
+
+def test_migration_125_reconciles_existing_monthly_quests(db):
+    with open_db(db) as conn:
+        # Read the month from SQLite, not from Python's local date: migration
+        # 125's own DML filters on strftime('%Y-%m','now'), which is UTC. The
+        # two agree almost always and disagree for the last few hours of a
+        # month in any behind-UTC timezone -- seeding rows under the local
+        # month that the migration then looks for under the next one, summing
+        # nothing. Asking the same clock the migration asks makes the test
+        # deterministic everywhere instead of green until 17:00 on the 31st.
+        this_month = conn.execute("SELECT strftime('%Y-%m','now')").fetchone()[0]
+        auto_a = _mk_old_monthly(conn, kind="message_sent")  # lowest id, kept
+        auto_b = _mk_old_monthly(conn, kind="reply_sent")    # collapsed off
+        kindless = _mk_old_monthly(conn, kind="")            # deactivated
+
+        # In-flight per-user progress this month for the surviving auto quest.
+        for uid, cur in ((1, 4), (2, 3)):
+            conn.execute(
+                "INSERT INTO econ_quest_progress "
+                "(quest_id, user_id, period, current, target) VALUES (?, ?, ?, ?, 5)",
+                (auto_a, uid, this_month, cur),
+            )
+        # A per-user claim already PAID this month — must NOT be clawed back.
+        conn.execute(
+            "INSERT INTO econ_quest_claims "
+            "(quest_id, guild_id, user_id, period, state, created_at) "
+            "VALUES (?, ?, 1, ?, 'paid', 0)",
+            (auto_a, GUILD_ID, this_month),
+        )
+
+        _reconcile_125(conn)
+
+        rows = {
+            int(r["id"]): r for r in conn.execute(
+                "SELECT id, active, community_target, last_run_week, community_slot "
+                "FROM econ_quests WHERE guild_id = ?", (GUILD_ID,),
+            )
+        }
+        # Kindless deactivated; lowest-id auto kept, its sibling collapsed off.
+        assert int(rows[kindless]["active"]) == 0
+        assert int(rows[auto_a]["active"]) == 1
+        assert int(rows[auto_b]["active"]) == 0
+        # Guild-wide counter seeded from this month's summed progress (4 + 3).
+        prog = conn.execute(
+            "SELECT current FROM econ_community_progress WHERE quest_id = ?",
+            (auto_a,),
+        ).fetchone()
+        assert int(prog["current"]) == 7
+        # Target sized (>= floor), cursor stamped to this month, single lane.
+        assert int(rows[auto_a]["community_target"]) >= 10
+        assert rows[auto_a]["last_run_week"] == this_month
+        assert int(rows[auto_a]["community_slot"]) == 1
+        # No clawback: the already-paid per-user claim is untouched.
+        claim = conn.execute(
+            "SELECT state FROM econ_quest_claims WHERE quest_id = ? AND state = 'paid'",
+            (auto_a,),
+        ).fetchone()
+        assert claim is not None and claim["state"] == "paid"
+
+
+# ── collector ──────────────────────────────────────────────────────────
+
+
+def test_collect_returns_rows_after_cursor_oldest_first(db):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind="grant")
+        _row(conn, USER_ID, 20, kind="quest")
+        _row(conn, USER_ID, -5, kind="rental")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.amount for e in entries] == [10, 20, -5]
+    assert [e.ledger_id for e in entries] == [1, 2, 3]
+
+
+def test_collect_skips_rows_at_or_before_cursor(db):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind="grant")
+        _row(conn, USER_ID, 20, kind="quest")
+        entries = collect_register_entries(conn, GUILD_ID, 1, 10)
+
+    assert [e.ledger_id for e in entries] == [2]
+
+
+def test_collect_honours_limit(db):
+    with open_db(db) as conn:
+        for _ in range(5):
+            _row(conn, USER_ID, 10, kind="quest")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 2)
+
+    assert len(entries) == 2
+
+
+# ── anonymous-kind quests are never posted ─────────────────────────────
+
+
+def _mk_quest(conn, *, trigger_kind, qtype="daily"):
+    """An active auto-tracked quest on ``trigger_kind``."""
+    qid = quests_svc.create_quest(
+        conn, GUILD_ID, title=f"q-{trigger_kind}", description="", qtype=qtype,
+        reward=50, signoff=0, criteria="", starts_at=None, ends_at=None,
+        rotate_tag="", community_target=None, created_by=None,
+        trigger_kind=trigger_kind,
+    )
+    quests_svc.set_quest_active(conn, GUILD_ID, qid, True)
+    return qid
+
+
+# Every trigger kind the register must never name, spelled out literally.
+# Parametrizing over ANON_KINDS itself proves the filter honours whatever the
+# set contains, but can never catch a kind *missing* from it — which is how
+# ``guess_post`` sat exposed from the day Guess Who shipped, spoiling live
+# rounds. This table is the enforcement; ANON_KINDS is the implementation, and
+# the two are pinned together by the closure test below.
+MUST_NEVER_POST = [
+    pytest.param("confession", id="confession-is-anonymous"),
+    pytest.param("confession_reply", id="confession-reply-is-anonymous"),
+    pytest.param("whisper", id="whisper-sender-is-anonymous"),
+    pytest.param("ama_ask", id="ama-question-is-anonymous"),
+    # Guess Who: the submitter *is* the answer (both call sites pass
+    # answer_id=submitter_id), so naming them doesn't merely expose a private
+    # act — it hands the room the solution before anyone guesses.
+    pytest.param("guess_post", id="guess-post-submitter-is-the-answer"),
+    # Pen Pals: both halves of a pairing fire in the same transaction, so two
+    # adjacent register cards name not just who was matched but who with —
+    # while the room itself defaults to mods-only visibility.
+    pytest.param("pen_pal", id="pen-pal-pairing-correlates"),
+    pytest.param("pen_pal_complete", id="pen-pal-complete-correlates"),
+]
+
+
+@pytest.mark.parametrize("kind", MUST_NEVER_POST)
+def test_anon_kind_quest_payouts_are_never_collected(db, kind):
+    """The deanonymization-by-timing leak: a register card reading
+    "**X** earned *Send a Whisper*" lands seconds after the anonymous whisper
+    itself, naming the sender. The payout must not reach the feed at all —
+    redacting the title would still name the member at the telltale moment."""
+    with open_db(db) as conn:
+        qid = _mk_quest(conn, trigger_kind=kind)
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": qid})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries == []
+
+
+def test_anon_kinds_covers_every_kind_the_register_must_hide(db):
+    """``MUST_NEVER_POST`` is the privacy contract; ANON_KINDS is how the three
+    enforcing surfaces read it. A kind in the contract but not the set would
+    leak on the *other* two surfaces (community top-contributor names, sign-off
+    cards) even with the register green, so pin them together here."""
+    assert set(quest_logic.ANON_KINDS) >= {p.values[0] for p in MUST_NEVER_POST}
+
+
+@pytest.mark.parametrize("ledger_kind", ["quest_bonus", "quest"])
+def test_rows_stamped_anon_are_never_collected(db, ledger_kind):
+    """Not every row a suppressed claim writes carries its quest id. The
+    board-clear bonus carries none at all, and the ``daily_complete`` tick
+    carries the *progression* quest's id — both would post at the second the
+    anonymous action happened, which is the whole leak. The claim path stamps
+    ``meta.anon`` on anything it writes downstream of a suppressed quest, and
+    the drain honours the stamp whatever the ledger kind."""
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind=ledger_kind, meta={"anon": 1})
+        _row(conn, USER_ID, 40, kind="grant")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.amount for e in entries] == [40]
+    # Still real money: the next posted entry's balance has to include it.
+    assert [e.balance_after for e in entries] == [50]
+
+
+@pytest.mark.parametrize("ledger_kind", ["quest", "quest_community",
+                                         "quest_community_bonus"])
+def test_anon_suppression_covers_every_quest_ledger_kind(db, ledger_kind):
+    """All three ledger kinds carry ``meta.quest_id``; the community ones name
+    contributors just as directly as the per-member payout."""
+    with open_db(db) as conn:
+        qid = _mk_quest(conn, trigger_kind="whisper")
+        _row(conn, USER_ID, 50, kind=ledger_kind, meta={"quest_id": qid})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries == []
+
+
+def test_non_anon_quest_payouts_still_post(db):
+    """Only the anonymous kinds go quiet — including whisper_guess, whose
+    solve the whisper cog already announces publicly by name."""
+    with open_db(db) as conn:
+        loud = _mk_quest(conn, trigger_kind="whisper_guess")
+        quiet = _mk_quest(conn, trigger_kind="whisper")
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": quiet})
+        _row(conn, USER_ID, 25, kind="quest", meta={"quest_id": loud})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.amount for e in entries] == [25]
+
+
+def test_anon_rows_do_not_starve_the_batch(db):
+    """Same SQL-not-Python rule as SKIP_KINDS, and with sharper teeth here:
+    the drain cursor only advances over rows collect *returns*, so a batch
+    that filtered to empty in Python would park the cursor and stall the feed
+    permanently rather than merely delaying it."""
+    with open_db(db) as conn:
+        quiet = _mk_quest(conn, trigger_kind="confession")
+        for _ in range(50):
+            _row(conn, USER_ID, 5, kind="quest", meta={"quest_id": quiet})
+        _row(conn, USER_ID, 50, kind="grant")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 8)
+
+    assert [e.kind for e in entries] == ["grant"]
+
+
+def test_anon_suppressed_rows_still_move_the_balance(db):
+    """A suppressed payout is real money — the reconstructed balance on the
+    next posted entry has to include it, or the feed prints bad arithmetic."""
+    with open_db(db) as conn:
+        quiet = _mk_quest(conn, trigger_kind="whisper")
+        _row(conn, USER_ID, 30, kind="quest", meta={"quest_id": quiet})
+        _row(conn, USER_ID, 50, kind="grant")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.balance_after for e in entries] == [80]
+
+
+def test_null_and_malformed_meta_survive_the_anon_filter(db):
+    """The filter reaches into ``meta`` in SQL, where json_extract raises on a
+    non-JSON value — a single hand-written row must not break the whole drain."""
+    with open_db(db) as conn:
+        _mk_quest(conn, trigger_kind="whisper")  # arms the filter clause
+        _row(conn, USER_ID, 10, kind="grant")  # meta NULL
+        conn.execute(
+            "INSERT INTO econ_ledger "
+            "(guild_id, user_id, amount, kind, actor_id, meta, created_at) "
+            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (GUILD_ID, USER_ID, 20, "grant", "not json", NOW),
+        )
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.amount for e in entries] == [10, 20]
+
+
+# ── skipped kinds ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("kind", SKIP_KINDS)
+def test_skipped_kinds_are_never_collected(db, kind):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind=kind)
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries == []
+
+
+def test_auto_faucets_do_not_starve_the_batch(db):
+    """A midnight burst of logins must not consume the whole limit.
+
+    Filtering has to happen in SQL, not after the LIMIT — otherwise a day-roll
+    flood returns a batch of nothing-to-post and real entries wait for ticks.
+    """
+    with open_db(db) as conn:
+        for _ in range(50):
+            _row(conn, USER_ID, 5, kind="login")
+        _row(conn, USER_ID, 50, kind="quest")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 8)
+
+    assert [e.kind for e in entries] == ["quest"]
+
+
+def test_balance_accounts_for_skipped_rows_in_between(db):
+    """A skipped login still moved the wallet — the maths must include it."""
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 100, kind="quest")
+        _row(conn, USER_ID, 5, kind="login")  # not posted, but real money
+        _row(conn, USER_ID, 20, kind="quest")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    # 100 → (+5 login, hidden) → 125, not 120.
+    assert [e.balance_after for e in entries] == [100, 125]
+
+
+def test_collect_ignores_other_guilds(db):
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_ledger (guild_id, user_id, amount, kind, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (GUILD_ID + 1, USER_ID, 99, "quest", NOW),
+        )
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries == []
+
+
+def test_balance_after_is_reconstructed_per_row(db):
+    """Each entry shows the balance that row produced, not the live balance."""
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 100, kind="grant")
+        _row(conn, USER_ID, 50, kind="quest")
+        _row(conn, USER_ID, -30, kind="rental")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.balance_after for e in entries] == [100, 150, 120]
+
+
+def test_balance_after_excludes_rows_beyond_the_batch(db):
+    """A credit landing after the batch must not skew the drained rows."""
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 100, kind="grant")
+        _row(conn, USER_ID, 50, kind="quest")
+        _row(conn, USER_ID, 999, kind="grant")  # beyond the limit-2 batch
+        entries = collect_register_entries(conn, GUILD_ID, 0, 2)
+
+    assert [e.balance_after for e in entries] == [100, 150]
+
+
+def test_balance_after_tracks_each_user_separately(db):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 100, kind="grant")
+        _row(conn, 7777, 40, kind="grant")
+        _row(conn, USER_ID, 10, kind="quest")
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [(e.user_id, e.balance_after) for e in entries] == [
+        (USER_ID, 100),
+        (7777, 40),
+        (USER_ID, 110),
+    ]
+
+
+def _make_quest(conn, *, title="Daily Chatterbox", **kw):
+    return quests_svc.create_quest(
+        conn, GUILD_ID, title=title, description="",
+        qtype="daily", reward=50, signoff=0, criteria="",
+        starts_at=None, ends_at=None, rotate_tag="",
+        community_target=None, created_by=None, **kw,
+    )
+
+
+def _claim(conn, quest_id, user_id, period="2023-11-14"):
+    cur = conn.execute(
+        "INSERT INTO econ_quest_claims "
+        "(quest_id, guild_id, user_id, period, state, created_at) "
+        "VALUES (?, ?, ?, ?, 'paid', ?)",
+        (quest_id, GUILD_ID, user_id, period, NOW),
+    )
+    return cur.lastrowid
+
+
+def test_collect_resolves_quest_title_and_target(db):
+    with open_db(db) as conn:
+        qid = _make_quest(conn, target_count=5, trigger_kind="message_sent")
+        cid = _claim(conn, qid, USER_ID)
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": qid, "claim_id": cid})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries[0].quest_title == "Daily Chatterbox"
+    assert entries[0].quest_target == 5
+
+
+def test_banded_quest_shows_the_members_own_target(db):
+    """A banded quest draws each member a different target — show theirs.
+
+    The library's target_count is meaningless for a band; printing it would
+    show a tally the member never actually worked to.
+    """
+    from bot_modules.economy.quests import effective_target
+
+    period = "2023-11-14"
+    with open_db(db) as conn:
+        qid = _make_quest(
+            conn, target_min=5, target_max=15, trigger_kind="message_sent"
+        )
+        cid = _claim(conn, qid, USER_ID, period=period)
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": qid, "claim_id": cid})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    expected = effective_target(
+        1, 5, 15, user_id=USER_ID, quest_id=qid, period=period
+    )
+    assert 5 <= expected <= 15
+    assert entries[0].quest_target == expected
+
+
+def test_banded_quest_without_a_claim_shows_no_tally(db):
+    """No claim means no period, so no honest per-member target exists."""
+    with open_db(db) as conn:
+        qid = _make_quest(
+            conn, target_min=5, target_max=15, trigger_kind="message_sent"
+        )
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": qid})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries[0].quest_target == 1  # renders as a plain "Quest: **title**"
+
+
+def test_collect_handles_deleted_quest(db):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 50, kind="quest", meta={"quest_id": 12345})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries[0].quest_title == ""
+    assert render_memo(entries[0], _names) == "Quest: **a quest**"
+
+
+def test_collect_survives_malformed_meta(db):
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_ledger "
+            "(guild_id, user_id, amount, kind, meta, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (GUILD_ID, USER_ID, 10, "quest", "not json{", NOW),
+        )
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert entries[0].meta == {}
+
+
+def test_collect_via_real_credit_and_debit_helpers(db):
+    """End-to-end against the actual wallet chokepoints, not hand-built rows."""
+    with open_db(db) as conn:
+        apply_credit(conn, GUILD_ID, USER_ID, 100, "grant", actor_id=1, meta={})
+        apply_debit(conn, GUILD_ID, USER_ID, 40, "rental", meta={"perk": "role_color"})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [(e.amount, e.balance_after) for e in entries] == [(100, 100), (-40, 60)]
+
+
+# ── memo rendering ─────────────────────────────────────────────────────
+
+
+def test_memo_quest_names_the_quest():
+    entry = _entry(kind="quest", quest_title="Daily Chatterbox", quest_target=1)
+    assert render_memo(entry, _names) == "Quest: **Daily Chatterbox**"
+
+
+def test_memo_counted_quest_shows_final_tally():
+    entry = _entry(kind="quest", quest_title="Daily Chatterbox", quest_target=5)
+    assert render_memo(entry, _names) == "Quest: **Daily Chatterbox** (5/5)"
+
+
+def test_memo_quest_falls_back_when_quest_deleted():
+    entry = _entry(kind="quest", quest_title="")
+    assert render_memo(entry, _names) == "Quest: **a quest**"
+
+
+def test_memo_rental_uses_human_perk_label():
+    entry = _entry(kind="rental", amount=-50, meta={"perk": "role_color"})
+    assert render_memo(entry, _names) == "Perk rental: **Custom role color**"
+
+
+def test_memo_rental_renewal_says_renewal():
+    entry = _entry(kind="rental", amount=-50, meta={"perk": "role_icon", "renewal": True})
+    assert render_memo(entry, _names) == "Perk renewal: **Role icon**"
+
+
+def test_transfer_is_one_consolidated_entry():
+    """Both legs are one event — name both sides, don't post it twice."""
+    entry = _entry(kind="transfer_out", amount=-25, meta={"to": 777})
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+
+    assert f"**User{USER_ID} → User777**" in text
+    assert render_memo(entry, _names) == "Transfer"
+    # Sideways movement: unsigned, and neither a leading + nor −.
+    assert "25" in text
+    assert "−25" not in text
+    assert "+25" not in text
+    assert "'s wallet:" in text
+
+
+def test_transfer_shows_the_sender_memo():
+    """A transfer's memo — the whole point of the note — reaches the feed."""
+    entry = _entry(kind="transfer_out", amount=-25, meta={"to": 777, "memo": "lunch"})
+    assert render_memo(entry, _names) == "Transfer — lunch"
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+    assert "lunch" in text
+
+
+def test_transfer_footer_escapes_a_markdown_bearing_sender_name():
+    """The footer's sender name gets the same escaping as the header's — a
+    display name of ``_Sam_Antha_`` must not italicize in the ``-#`` line."""
+    entry = _entry(kind="transfer_out", user_id=555, amount=-25, meta={"to": 777})
+    names = {555: "_Sam_Antha_", 777: "User777"}
+    text = _all_text(
+        build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, lambda uid: names[uid])
+    )
+    footer_line = text.splitlines()[-1]
+    assert "\\_Sam\\_Antha\\_" in footer_line
+    assert "_Sam_Antha_'s" not in footer_line
+
+
+def test_transfer_blank_memo_falls_back_to_plain_transfer():
+    """An empty/whitespace memo doesn't leave a dangling em dash."""
+    entry = _entry(kind="transfer_out", amount=-25, meta={"to": 777, "memo": "   "})
+    assert render_memo(entry, _names) == "Transfer"
+
+
+def test_memo_login_includes_source_and_streak():
+    entry = _entry(kind="login", meta={"source": "voice", "streak": 4})
+    assert render_memo(entry, _names) == "Daily login (voice) — 4-day streak"
+
+
+def test_memo_login_omits_streak_of_one():
+    entry = _entry(kind="login", meta={"source": "text", "streak": 1})
+    assert render_memo(entry, _names) == "Daily login (text)"
+
+
+def test_memo_milestone_and_conversion():
+    assert render_memo(_entry(kind="milestone", meta={"streak": 30}), _names) == (
+        "Streak milestone — 30 days"
+    )
+    assert render_memo(_entry(kind="conversion", meta={"xp": 1200.7}), _names) == (
+        "XP conversion — 1,201 XP earned"
+    )
+
+
+def test_memo_grant_credits_the_actor_and_reason():
+    entry = _entry(kind="grant", actor_id=999, meta={"reason": "event prize"})
+    assert render_memo(entry, _names) == "Staff grant by User999 — event prize"
+
+
+def test_memo_grant_without_reason():
+    entry = _entry(kind="grant", actor_id=999, meta={})
+    assert render_memo(entry, _names) == "Staff grant by User999"
+
+
+def test_memo_grant_escapes_actor_name_and_reason():
+    # The actor's resolved name and the staff-typed reason both reach the
+    # public register description raw from their sources (a self-settable
+    # nickname; an unbounded slash-command param) — both need escaping so a
+    # member can't forge bold/italic into the feed.
+    entry = _entry(
+        kind="grant", actor_id=999, meta={"reason": "bonus for **helping mods** @here"}
+    )
+    memo = render_memo(entry, lambda uid: "_Root_ **Admin**")
+    assert memo == "Staff grant by \\_Root\\_ \\*\\*Admin\\*\\* — bonus for \\*\\*helping mods\\*\\* @here"
+
+
+def test_memo_grant_reason_is_escaped_then_fit():
+    # The reason param carries no max_length, so an adversarial reason built
+    # entirely of markdown characters can double past the description cap
+    # after escaping — render_memo must fit the escaped string, not the raw
+    # one, or the whole register post 400s.
+    from bot_modules.core.branding import FIELD_VALUE_LIMIT
+
+    entry = _entry(kind="grant", actor_id=999, meta={"reason": "*" * 2000})
+    memo = render_memo(entry, _names)
+    reason_part = memo.split(" — ", 1)[1]
+    assert len(reason_part) <= FIELD_VALUE_LIMIT
+    assert reason_part.count("\\") > 0  # still escaped, not raw-clipped
+
+
+def test_memo_covers_every_simple_kind():
+    for kind, expected in [
+        ("quest_community", "Community quest payout"),
+        ("qotd", "Answered the question of the day"),
+        ("game_participation", "Game participation"),
+        ("game_win", "Game win"),
+    ]:
+        assert render_memo(_entry(kind=kind), _names) == expected
+
+
+def test_memo_unknown_kind_degrades_gracefully():
+    """A future payout kind must never render a blank memo."""
+    entry = _entry(kind="mystery_bonus")
+    assert render_memo(entry, _names) == "Mystery bonus"
+
+
+def test_quest_board_clear_bonus_has_its_own_glyph_and_memo():
+    """The full-board bonus is a mapped kind, not the generic coin fallback."""
+    entry = _entry(kind="quest_bonus", meta={"qtype": "daily", "period": "2026-07-21"})
+    assert render_memo(entry, _names) == "Quest board clear"
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+    assert "🎉" in text
+    assert "Quest board clear" in text
+
+
+# ── kind_display: the shared glyph/label vocabulary ────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "glyph", "label"),
+    [
+        ("cat_catch", "🐱", "Cat caught"),
+        ("qa_reward", "🧪", "QA testing reward"),
+        ("quest_community_bonus", "🤝", "Community quest bonus"),
+        ("quest_reroll", "🔁", "Quest reroll"),
+        ("wager_payout", "🎰", "Game wager won"),
+    ],
+)
+def test_kind_display_maps_known_kinds(kind, glyph, label):
+    assert kind_display(kind) == (glyph, label)
+
+
+def test_kind_display_unknown_kind_degrades_to_coin_and_title_case():
+    """An unmapped kind never leaks its raw snake_case token."""
+    assert kind_display("qa_void") == ("🪙", "Qa void")
+
+
+def test_split_kinds_no_longer_collide_with_their_old_glyph_twins():
+    """quest_reroll left 🎲 (game_participation); wager_payout left 🏆 (milestone)."""
+    assert _KIND_DISPLAY["quest_reroll"][0] != _KIND_DISPLAY["game_participation"][0]
+    assert _KIND_DISPLAY["wager_payout"][0] != _KIND_DISPLAY["milestone"][0]
+
+
+def test_footer_drops_a_custom_currency_emoji():
+    """Custom emoji render as raw text outside an embed's icon-bearing footer
+    slot too, so the ``-#`` balance line omits it (the amount line above still
+    carries it)."""
+    import dataclasses
+
+    settings = dataclasses.replace(
+        DEFAULT_ECON_SETTINGS, currency_emoji="<:doubloon:999>"
+    )
+    text = _all_text(build_register_entry_layout(_entry(balance_after=330), settings, _names))
+    footer_line = text.splitlines()[-1]
+    assert "<:doubloon:999>" not in footer_line
+    assert "330" in footer_line
+
+
+# ── card ───────────────────────────────────────────────────────────────
+
+
+def test_card_credit_is_signed():
+    text = _all_text(build_register_entry_layout(_entry(amount=50), DEFAULT_ECON_SETTINGS, _names))
+    assert "+50" in text
+
+
+def test_card_debit_shows_minus():
+    entry = _entry(amount=-200, kind="rental", meta={"perk": "text_room"})
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+    assert "−200" in text
+
+
+def test_card_shows_balance_and_header():
+    entry = _entry(balance_after=1250)
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+    assert "1,250" in text
+    assert f"**User{USER_ID}**" in text
+
+
+def test_card_memo_is_in_the_body():
+    entry = _entry(kind="quest", quest_title="Daily Chatterbox", quest_target=5)
+    text = _all_text(build_register_entry_layout(entry, DEFAULT_ECON_SETTINGS, _names))
+    assert "Daily Chatterbox" in text
+    assert "(5/5)" in text
+
+
+def test_card_thumbnails_when_an_avatar_is_given():
+    entry = _entry()
+    items = build_register_entry_layout(
+        entry, DEFAULT_ECON_SETTINGS, _names, avatar_url="https://example.invalid/a.png"
+    )
+    section = next(i for i in items if isinstance(i, discord.ui.Section))
+    assert section.accessory.media.url == "https://example.invalid/a.png"
+
+
+def test_card_has_no_thumbnail_without_an_avatar():
+    items = build_register_entry_layout(_entry(), DEFAULT_ECON_SETTINGS, _names)
+    assert not any(isinstance(i, discord.ui.Section) for i in items)
+
+
+def test_fullest_card_fits_the_budget():
+    """The fullest card this module builds: a transfer entry (both names,
+    plus a memo) with a thumbnail, and a signoff-denial notice carrying a
+    multi-line deny reason. Measured, not assumed (guide § The budget)."""
+    entry = _entry(
+        kind="transfer_out",
+        amount=-2_500,
+        meta={
+            "to": 777,
+            "memo": "a reasonably long memo about what this payment covers",
+        },
+        balance_after=123_456,
+    )
+    transfer_view = _view(
+        build_register_entry_layout(
+            entry,
+            DEFAULT_ECON_SETTINGS,
+            _names,
+            avatar_url="https://example.invalid/a.png",
+        )
+    )
+    check_budget(transfer_view)
+
+    signoff_view = _view(
+        build_signoff_notice_layout(
+            "denied",
+            member_name="A Rather Long Member Name",
+            quest_title="A daily quest with a fairly long descriptive title",
+            deny_reason=(
+                "This doesn't look like it happened in the right channel.\n"
+                "Please try again and post your proof there next time."
+            ),
+            avatar_url="https://example.invalid/a.png",
+        )
+    )
+    check_budget(signoff_view)
+
+
+# ── drain loop ─────────────────────────────────────────────────────────
+
+
+def _channel():
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    return channel
+
+
+def _bot(guild) -> MagicMock:
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    return bot
+
+
+def _guild_with_channel(channel):
+    guild = FakeGuild(id=GUILD_ID)
+    guild.channels[CHANNEL_ID] = channel
+    return guild
+
+
+def _enable(conn, *, cursor=0):
+    """Turn the feed on. Default cursor 0 = already seeded, drain everything."""
+    save_econ_settings(
+        conn,
+        GUILD_ID,
+        {
+            "enabled": True,
+            "register_channel_id": CHANNEL_ID,
+            "register_cursor_id": cursor,
+        },
+    )
+
+
+def _cursor(db) -> int:
+    with open_db(db) as conn:
+        return load_econ_settings(conn, GUILD_ID).register_cursor_id
+
+
+@pytest.mark.asyncio
+async def test_loop_skips_when_no_register_channel(db):
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD_ID, {"enabled": True})
+    bot = _bot(FakeGuild(id=GUILD_ID))
+
+    assert await run_guild_register(bot, db, GUILD_ID, NOW) == 0
+    bot.get_guild.assert_not_called()  # bails before touching the gateway
+
+
+@pytest.mark.asyncio
+async def test_loop_skips_when_economy_disabled(db):
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD_ID, {"register_channel_id": CHANNEL_ID})
+    bot = _bot(FakeGuild(id=GUILD_ID))
+
+    assert await run_guild_register(bot, db, GUILD_ID, NOW) == 0
+    bot.get_guild.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_first_enable_seeds_cursor_and_posts_nothing(db):
+    """Switching the feed on must never replay the guild's history."""
+    with open_db(db) as conn:
+        for _ in range(3):
+            _row(conn, USER_ID, 10, kind="grant")
+        _enable(conn, cursor=-1)  # never seeded
+    channel = _channel()
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == 0
+    channel.send.assert_not_awaited()
+    assert _cursor(db) == 3
+
+
+@pytest.mark.asyncio
+async def test_first_transaction_on_an_empty_ledger_is_not_swallowed(db):
+    """Seeding an empty ledger must not skip the guild's first-ever payout.
+
+    A 0 cursor is a *seeded* empty ledger, not an unseeded one — re-seeding it
+    would jump the cursor past the first real row and lose it silently.
+    """
+    with open_db(db) as conn:
+        _enable(conn, cursor=-1)
+    channel = _channel()
+    bot = _bot(_guild_with_channel(channel))
+
+    await run_guild_register(bot, db, GUILD_ID, NOW)  # seeds against an empty ledger
+    assert _cursor(db) == 0
+
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 50, kind="quest")
+
+    assert await run_guild_register(bot, db, GUILD_ID, NOW) == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_posts_new_rows_and_advances_cursor(db):
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind="grant")
+        _enable(conn, cursor=1)
+        _row(conn, USER_ID, 50, kind="quest")
+        _row(conn, USER_ID, -20, kind="rental", meta={"perk": "role_color"})
+    channel = _channel()
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == 2
+    assert channel.send.await_count == 2
+    assert _cursor(db) == 3
+
+
+@pytest.mark.asyncio
+async def test_drain_is_not_repeated_on_the_next_tick(db):
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        _row(conn, USER_ID, 50, kind="quest")
+    channel = _channel()
+    bot = _bot(_guild_with_channel(channel))
+
+    assert await run_guild_register(bot, db, GUILD_ID, NOW) == 1
+    assert await run_guild_register(bot, db, GUILD_ID, NOW) == 0
+    assert channel.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_rows_are_skipped_but_cursor_advances(db):
+    """A backlog after downtime is noise — skip it, don't spam the channel."""
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        _row(conn, USER_ID, 10, kind="grant", age=REGISTER_STALE_SECONDS + 60)
+        _row(conn, USER_ID, 50, kind="quest", age=0.0)
+    channel = _channel()
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == 1  # only the fresh row
+    assert _cursor(db) == 2  # but the stale one is never re-examined
+
+
+@pytest.mark.asyncio
+async def test_drain_caps_rows_per_tick(db):
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        for _ in range(REGISTER_MAX_PER_TICK + 5):
+            _row(conn, USER_ID, 5, kind="grant")
+    channel = _channel()
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == REGISTER_MAX_PER_TICK
+    assert _cursor(db) == REGISTER_MAX_PER_TICK  # the rest spill to next tick
+
+
+@pytest.mark.asyncio
+async def test_forbidden_leaves_cursor_for_retry(db):
+    """A permissions problem must not silently burn the entries."""
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        _row(conn, USER_ID, 50, kind="quest")
+    channel = _channel()
+    channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no"))
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == 0
+    assert _cursor(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_channel_posts_nothing(db):
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        _row(conn, USER_ID, 50, kind="quest")
+
+    guild = FakeGuild(id=GUILD_ID)  # channel not in the guild
+    assert await run_guild_register(_bot(guild), db, GUILD_ID, NOW) == 0
+
+
+@pytest.mark.asyncio
+async def test_transfer_posts_once_not_twice(db):
+    """The two ledger legs of one transfer must produce one entry."""
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        apply_credit(conn, GUILD_ID, USER_ID, 100, "grant", actor_id=9, meta={})
+        transfer_currency(conn, GUILD_ID, USER_ID, 7777, 25)
+    channel = _channel()
+
+    posted = await run_guild_register(_bot(_guild_with_channel(channel)), db, GUILD_ID, NOW)
+
+    assert posted == 2  # the grant + ONE transfer entry (not two legs)
+    headers = []
+    for c in channel.send.await_args_list:
+        view = c.kwargs["view"]
+        first_text = next(
+            i for i in view.walk_children() if isinstance(i, discord.ui.TextDisplay)
+        )
+        headers.append(first_text.content.splitlines()[0].strip("*"))
+    # The loop's own name fallback for a member the gateway doesn't know.
+    assert headers[1] == f"User {USER_ID} → User 7777"
+
+
+@pytest.mark.asyncio
+async def test_register_tick_covers_every_guild_and_isolates_failures(db):
+    """One bad guild must not stall the rest of the sweep."""
+    other = 9002
+    with open_db(db) as conn:
+        _enable(conn, cursor=0)
+        _row(conn, USER_ID, 50, kind="quest")
+        save_econ_settings(conn, other, {"enabled": False})
+
+    channel = _channel()
+    guild = _guild_with_channel(channel)
+    broken = FakeGuild(id=other)
+    bot = MagicMock()
+    bot.guilds = [broken, guild]
+    bot.get_guild = MagicMock(side_effect=lambda gid: {GUILD_ID: guild, other: broken}[gid])
+
+    await register_tick(bot, db, NOW)
+
+    channel.send.assert_awaited_once()  # the enabled guild still drained
+
+
+def test_casino_refunds_post_while_stakes_and_payouts_skip(db):
+    """Casino bet spam is kept out of the feed (it would outrun the drain
+    budget and starve other kinds), but the make-whole refunds still post."""
+    with open_db(db) as conn:
+        _row(conn, USER_ID, 10, kind="casino_payout")
+        _row(conn, USER_ID, -10, kind="casino_stake")
+        _row(conn, USER_ID, 10, kind="casino_refund", meta={"game": "roulette"})
+        entries = collect_register_entries(conn, GUILD_ID, 0, 10)
+
+    assert [e.kind for e in entries] == ["casino_refund"]
+
+
+# ── sign-off outcomes ──────────────────────────────────────────────────
+#
+# Denials and expiries move no currency, so they never reach the drain above.
+# They are posted by hand, and the register is the *only* place a member is
+# told: the bank-channel card is gone and nothing DMs.
+
+
+def test_a_denial_says_what_happened_and_why():
+    text = _all_text(
+        build_signoff_notice_layout(
+            "denied", member_name="Alex", quest_title="Post a selfie",
+            deny_reason="no screenshot attached",
+        )
+    )
+    assert "**Alex**" in text
+    assert "Post a selfie" in text
+    assert "no screenshot attached" in text
+    assert "Quest sign-off denied" in text
+
+
+def test_signoff_notice_escapes_and_quotes_a_multiline_deny_reason():
+    """Deny reason is mod-typed free text reaching a TextDisplay — escaped so
+    it can't inject markdown, and quoted per line so a multi-line reason
+    can't break out of the blockquote (mirrors quest_layouts.py's
+    deny_reason_quote for the same commit's approval card)."""
+    text = _all_text(
+        build_signoff_notice_layout(
+            "denied", member_name="Alex", quest_title="Q",
+            deny_reason="*not* real\nsecond line",
+        )
+    )
+    assert "> \\*not\\* real" in text
+    assert "> second line" in text
+
+
+def test_a_denial_reason_is_escaped():
+    # The deny reason is a mod's own modal text (member-authored, so far as
+    # markdown-forging goes), blockquoted into the public register feed.
+    text = _all_text(
+        build_signoff_notice_layout(
+            "denied", member_name="Alex", quest_title="Post a selfie",
+            deny_reason="not > __enough__ effort, try again",
+        )
+    )
+    assert "\\_\\_enough\\_\\_" in text
+    assert "__enough__" not in text
+
+
+def test_a_denial_without_a_reason_still_reads():
+    text = _all_text(
+        build_signoff_notice_layout(
+            "denied", member_name="Alex", quest_title="Post a selfie"
+        )
+    )
+    assert "denied" in text.lower()
+    assert ">" not in text  # no empty blockquote
+
+
+def test_an_expiry_is_not_dressed_as_a_decision():
+    """Nobody denied it — it timed out — so it gets neither the denial's
+    glyph nor its reason line."""
+    text = _all_text(
+        build_signoff_notice_layout(
+            "expired", member_name="Alex", quest_title="Post a selfie"
+        )
+    )
+    assert "Quest claim expired" in text
+    assert "expired" in text.lower()
+    assert "denied" not in text.lower()
+
+
+def test_a_notice_carries_no_balance_footer():
+    """Nothing moved; a wallet total beside a denial would imply it did."""
+    text = _all_text(
+        build_signoff_notice_layout(
+            "denied", member_name="Alex", quest_title="Q", deny_reason="no"
+        )
+    )
+    assert "wallet" not in text.lower()
+    assert "balance" not in text.lower()
+
+
+def test_a_member_who_left_is_never_a_raw_id():
+    text = _all_text(
+        build_signoff_notice_layout("expired", member_name="", quest_title="Q")
+    )
+    assert "**someone**" in text
+
+
+@pytest.mark.parametrize("kind", sorted(quest_logic.ANON_KINDS))
+def test_privacy_suppressed_quests_never_reach_the_feed(kind):
+    """The same rule the payout drain applies: "X's claim for *Send a Whisper*
+    was denied" names the whisperer exactly as the payout would have."""
+    assert suppress_signoff_notice(kind) is True
+
+
+def test_an_ordinary_quest_is_not_suppressed():
+    assert suppress_signoff_notice("photo_post") is False
+    assert suppress_signoff_notice("") is False
+    assert suppress_signoff_notice(None) is False
+
+
+@pytest.mark.asyncio
+async def test_announcing_a_denial_posts_to_the_register(db):
+    with open_db(db) as conn:
+        _enable(conn)
+    channel = _channel()
+    guild = _guild_with_channel(channel)
+
+    posted = await announce_signoff_outcome(
+        _bot(guild), db, GUILD_ID,
+        state="denied", user_id=USER_ID, quest_title="Post a selfie",
+        deny_reason="too blurry",
+    )
+
+    assert posted is True
+    view = channel.send.await_args.kwargs["view"]
+    text = "\n".join(
+        i.content for i in view.walk_children() if isinstance(i, discord.ui.TextDisplay)
+    )
+    assert "too blurry" in text
+
+
+@pytest.mark.asyncio
+async def test_a_suppressed_quest_announces_nowhere(db):
+    """Deliberately silent — see docs/specs/economy_spec.md. The member still sees
+    the claim reopen on their own quest board."""
+    with open_db(db) as conn:
+        _enable(conn)
+    channel = _channel()
+
+    posted = await announce_signoff_outcome(
+        _bot(_guild_with_channel(channel)), db, GUILD_ID,
+        state="denied", user_id=USER_ID, quest_title="Send a Whisper",
+        trigger_kind="whisper", deny_reason="nope",
+    )
+
+    assert posted is False
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_guild_with_no_register_channel_announces_nowhere(db):
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD_ID, {"enabled": True, "register_channel_id": 0})
+    channel = _channel()
+
+    posted = await announce_signoff_outcome(
+        _bot(_guild_with_channel(channel)), db, GUILD_ID,
+        state="denied", user_id=USER_ID, quest_title="Q", deny_reason="no",
+    )
+
+    assert posted is False
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_approval_is_never_announced_by_hand(db):
+    """It credits ledger kind "quest" and the drain posts it; a second post
+    here would double-report the same payout."""
+    with open_db(db) as conn:
+        _enable(conn)
+    channel = _channel()
+
+    posted = await announce_signoff_outcome(
+        _bot(_guild_with_channel(channel)), db, GUILD_ID,
+        state="paid", user_id=USER_ID, quest_title="Q",
+    )
+
+    assert posted is False
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_forbidden_register_channel_is_not_fatal(db):
+    """The resolution is already committed and the member already paid — a
+    permissions problem must never surface as a failed sign-off."""
+    with open_db(db) as conn:
+        _enable(conn)
+    channel = _channel()
+    channel.send = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(status=403), "nope")
+    )
+
+    posted = await announce_signoff_outcome(
+        _bot(_guild_with_channel(channel)), db, GUILD_ID,
+        state="expired", user_id=USER_ID, quest_title="Q",
+    )
+
+    assert posted is False

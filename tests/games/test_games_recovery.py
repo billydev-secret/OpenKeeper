@@ -1,0 +1,856 @@
+"""Crash-recovery seam: after a restart, in-flight games re-register their views.
+
+Each party cog registers a ``recover_game`` in ``bot.game_recoverers``; the
+startup sweep (``recover_active_games``) walks ``games_active_games`` and hands
+each row to its recoverer, which rebuilds the view and re-binds it to the stored
+message via ``bot.add_view(view, message_id=...)``. These tests launch a game,
+simulate a restart by clearing the in-memory view map, run the sweep, and assert
+the view is back and bound to the right message.
+"""
+
+import asyncio
+import json
+
+import pytest
+
+from bot_modules.games.clapback.cog import ClapbackCog, ClapbackJoinView
+from bot_modules.games.fantasies.cog import FantasiesCog, FantasiesMainView
+from bot_modules.games.ffa.cog import FFACog
+from bot_modules.games.hottakes.cog import HotTakesSubmitView, HotTakeVoteView, HotTakesCog
+from bot_modules.games.legitlibs import LegitLibsCog
+from bot_modules.games.price.cog import PriceCog
+from bot_modules.games.rushmore.cog import RushmoreCog, RushmoreJoinView
+from bot_modules.games.mfk.cog import MFKCog
+from bot_modules.games.mlt.cog import MLTCog, MLTJoinView
+from bot_modules.games.nhie.cog import NHIECog
+from bot_modules.games.story.cog import StoryCog, StoryJoinView
+from bot_modules.games.traditional.cog import TraditionalCog
+from bot_modules.games.ttl.cog import TTLCog, TTLGuessView, TTLSubmitView
+from bot_modules.games.wyr.cog import WYRCog
+from bot_modules.games.utils.game_manager import (
+    create_game,
+    get_game_payload,
+    update_game_message,
+    update_game_payload,
+)
+from bot_modules.games.utils.recovery import recover_active_games
+from bot_modules.games.db import GamesDb
+
+
+class _FakeMessage:
+    def __init__(self, mid: int):
+        self.id = mid
+        self.embeds: list = []
+        self.edited = False
+
+    async def edit(self, **kwargs):
+        self.edited = True
+        return None
+
+
+class _FakeChannel:
+    guild = None
+
+    def __init__(self, cid: int):
+        self.id = cid
+        self.name = "games"
+        self.sends: list = []
+        self._messages: dict[int, _FakeMessage] = {}
+        self._next = 1000
+
+    async def send(self, *args, **kwargs):
+        self._next += 1
+        msg = _FakeMessage(self._next)
+        self._messages[msg.id] = msg
+        self.sends.append((args, kwargs))
+        return msg
+
+    async def fetch_message(self, mid: int):
+        msg = self._messages.get(int(mid))
+        if msg is None:
+            raise KeyError(mid)  # mimics discord.NotFound for a deleted message
+        return msg
+
+
+class _FakeBot:
+    def __init__(self, db: GamesDb):
+        self.games_db = db
+        self.active_views: dict = {}
+        self.game_launchers: dict = {}
+        self.game_recoverers: dict = {}
+        self.added_views: list = []
+        self._channels: dict[int, _FakeChannel] = {}
+
+    def get_channel(self, cid: int):
+        return self._channels.get(int(cid))
+
+    def get_cog(self, name: str):
+        return None
+
+    def add_view(self, view, message_id=None):
+        self.added_views.append((view, message_id))
+
+
+async def _launch_and_restart(cog_cls, game_type, launch_options):
+    """Launch a game, then simulate a restart (clear the in-memory view map)."""
+    db = GamesDb(_launch_and_restart.db_path)
+    bot = _FakeBot(db)
+    cog = cog_cls(bot)  # type: ignore[arg-type]
+    bot.game_recoverers[game_type] = cog.recover_game
+
+    channel = _FakeChannel(4242)
+    bot._channels[channel.id] = channel
+
+    game_id = await cog.launch(
+        channel=channel, host_id=2001, host_name="Tester",
+        guild_id=9001, options=launch_options,
+    )
+    assert game_id is not None
+
+    row = await db.fetchone("SELECT * FROM games_active_games WHERE game_id = ?", (game_id,))
+    assert row["message_id"] is not None
+    launched_msg_id = row["message_id"]
+
+    # Simulate the restart: the persistent-view registry and active_views are bare.
+    bot.active_views.clear()
+
+    await recover_active_games(bot)
+    return bot, game_id, launched_msg_id
+
+
+@pytest.fixture(autouse=True)
+def _bind_db(sync_db_path):
+    _launch_and_restart.db_path = sync_db_path
+    yield
+
+
+async def test_traditional_recovers_view_bound_to_message():
+    bot, game_id, msg_id = await _launch_and_restart(TraditionalCog, "traditional", {})
+
+    assert game_id in bot.active_views, "view not re-registered in active_views"
+    assert len(bot.added_views) == 1, "expected exactly one add_view call"
+    view, bound_id = bot.added_views[0]
+    assert bound_id == msg_id, "view must be bound to the game's message_id"
+    assert bot.active_views[game_id] is view
+
+
+async def test_ffa_recovers_with_prompt_from_payload():
+    # Embed mode (/games play ffa) is the stateful, recoverable variant; a custom
+    # prompt skips the DB prompt bank so the test needs no seeded questions.
+    bot, game_id, msg_id = await _launch_and_restart(
+        FFACog, "ffa", {"prompt": "best pizza topping?", "kind": "truth"}
+    )
+
+    assert game_id in bot.active_views
+    view, bound_id = bot.added_views[0]
+    assert bound_id == msg_id
+    assert view.text == "best pizza topping?", "prompt not restored from payload"
+
+
+async def test_mfk_recovers_view():
+    bot, game_id, msg_id = await _launch_and_restart(MFKCog, "mfk", {})
+
+    assert game_id in bot.active_views
+    _, bound_id = bot.added_views[0]
+    assert bound_id == msg_id
+
+
+async def test_unknown_game_type_is_skipped_not_crashed(sync_db_path):
+    """A game whose type has no registered recoverer is skipped cleanly."""
+    from bot_modules.games.utils.game_manager import create_game, update_game_message
+
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)  # no recoverers registered
+    channel = _FakeChannel(777)
+    bot._channels[channel.id] = channel
+    msg = await channel.send()
+
+    game_id = await create_game(db, channel.id, 1, "no_such_game", state="open", payload={})
+    await update_game_message(db, game_id, msg.id)
+
+    await recover_active_games(bot)  # must not raise
+
+    assert bot.added_views == []
+    assert game_id not in bot.active_views
+
+
+async def test_wyr_recovers_round_view():
+    bot, game_id, msg_id = await _launch_and_restart(WYRCog, "wyr", {"question": "fly | be invisible"})
+    assert game_id in bot.active_views
+    view, bound_id = bot.added_views[0]
+    assert bound_id == msg_id
+    assert view.option_a == "fly" and view.option_b == "be invisible"
+
+
+async def test_nhie_recovers_round_view():
+    bot, game_id, msg_id = await _launch_and_restart(NHIECog, "nhie", {"question": "ghosted someone"})
+    assert game_id in bot.active_views
+    view, bound_id = bot.added_views[0]
+    assert bound_id == msg_id
+    assert view.statement == "ghosted someone"
+
+
+async def test_mlt_recovers_join_lobby():
+    bot, game_id, msg_id = await _launch_and_restart(MLTCog, "mlt", {})
+    assert game_id in bot.active_views
+    view, bound_id = bot.added_views[0]
+    assert isinstance(view, MLTJoinView)
+    assert bound_id == msg_id
+
+
+async def test_story_recovers_join_lobby():
+    bot, game_id, msg_id = await _launch_and_restart(StoryCog, "story", {})
+    assert game_id in bot.active_views
+    view, bound_id = bot.added_views[0]
+    assert isinstance(view, StoryJoinView)
+    assert bound_id == msg_id
+
+
+async def test_story_in_play_ends_gracefully(sync_db_path):
+    """A story past the join phase can't resume, so it's ended cleanly."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = StoryCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["story"] = cog.recover_game
+    channel = _FakeChannel(999)
+    bot._channels[channel.id] = channel
+    game_id = await cog.launch(
+        channel=channel, host_id=2001, host_name="Tester", guild_id=9001, options={},
+    )
+    payload = await get_game_payload(db, game_id)
+    payload["sentences"] = [{"author": 2001, "text": "Once upon a time"}]
+    await update_game_payload(db, game_id, payload)
+
+    bot.active_views.clear()
+    await recover_active_games(bot)
+
+    assert bot.added_views == []  # no view re-registered
+    assert game_id not in bot.active_views
+    row = await db.fetchone("SELECT * FROM games_active_games WHERE game_id = ?", (game_id,))
+    assert row is None  # game ended
+
+
+async def test_clapback_recover_respawns_game_loop(sync_db_path):
+    """Recovery retires the stale phase message and re-spawns the game loop."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = ClapbackCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["clapback"] = cog.recover_game
+    calls = {}
+
+    async def fake_run_game(game_id, channel, payload):
+        calls["run_game"] = len(payload.get("round_history", [])) + 1
+
+    cog._run_game = fake_run_game  # type: ignore[method-assign]
+
+    channel = _FakeChannel(1100)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 1, "clapback", state="playing",
+        payload={"config": {"rounds": 3}, "players": [1, 2], "host_id": 1, "scores": {},
+                 "round_history": [{"round": 1, "prompt": "p", "matchups": []}]},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    for _ in range(10):
+        await asyncio.sleep(0.01)
+        if "run_game" in calls:
+            break
+    try:
+        assert stale.edited
+        assert calls.get("run_game") == 2  # resumes after the one completed round
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def test_clapback_resume_rolls_clapbacks_back_with_the_scores(sync_db_path):
+    """A crash in matchup 3 of a round: the score rollback was right, but the
+    CLAPBACK tally survived it and the recap bragged one or two extra
+    (clapback-14). Both come back from their checkpoints."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = ClapbackCog(bot)  # type: ignore[arg-type]
+    recap = {}
+
+    async def fake_recap(game_id, channel, payload, config):
+        recap["clapbacks"] = dict(payload["clapbacks"])
+        recap["scores"] = dict(payload["scores"])
+
+    cog._post_recap = fake_recap  # type: ignore[method-assign]
+    channel = _FakeChannel(1150)
+    game_id = await create_game(
+        db, channel.id, 1, "clapback", state="playing",
+        payload={"config": {"rounds": 1, "timer": 30, "vote_timer": 30}, "players": [1, 2],
+                 "host_id": 1,
+                 "scores": {"1": 250, "2": 0}, "scores_checkpoint": {"1": 125, "2": 0},
+                 "clapbacks": {"1": 2, "2": 0}, "clapbacks_checkpoint": {"1": 1, "2": 0},
+                 "round_history": [{"round": 1, "prompt": "p", "matchups": []}]},
+    )
+    bot.active_views[game_id] = object()
+
+    await cog._run_game(game_id, channel, await get_game_payload(db, game_id))
+
+    assert recap["scores"] == {"1": 125, "2": 0}
+    assert recap["clapbacks"] == {"1": 1, "2": 0}
+
+
+async def test_price_recover_resumes_mid_round_without_score_drift(sync_db_path):
+    """Round 2 was submitted (so it's in payload["rounds"]) but interrupted
+    mid-scoring. Resume must use completed_rounds (1) -> round 2, NOT
+    len(rounds) (2) -> round 3, and roll scores back to the checkpoint so the
+    partial round-2 point is neither double-counted nor lost."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = PriceCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["price"] = cog.recover_game
+    calls = {}
+
+    async def fake_run_round(*, round_num, **kw):
+        calls["round_num"] = round_num
+
+    cog._run_round = fake_run_round  # type: ignore[method-assign]
+
+    channel = _FakeChannel(1200)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 7, "price", state="playing",
+        payload={"settings": {"rounds": 3, "timer": 60, "vote_timer": 30, "source": "bank"},
+                 "total_rounds": 3,
+                 "rounds": {"1": {}, "2": {}},  # round 2 entry exists but wasn't scored
+                 "completed_rounds": 1,
+                 "scores": {"reasonable_wins": {"7": 2}, "unhinged_wins": {}},      # partial round-2 point
+                 "scores_checkpoint": {"reasonable_wins": {"7": 1}, "unhinged_wins": {}}},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    for _ in range(10):
+        await asyncio.sleep(0.01)
+        if "round_num" in calls:
+            break
+    try:
+        assert stale.edited
+        assert calls.get("round_num") == 2  # completed_rounds+1, not len(rounds)+1
+        payload = await get_game_payload(db, game_id)
+        assert payload["scores"] == {"reasonable_wins": {"7": 1}, "unhinged_wins": {}}
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def test_rushmore_recover_join_lobby(sync_db_path):
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = RushmoreCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["rushmore"] = cog.recover_game
+    channel = _FakeChannel(1300)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 9, "rushmore", state="joining",
+        payload={"settings": {"timer": 60, "source": "host", "vote_timer": 30},
+                 "players": [9, 10], "topic": "movies"},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    await recover_active_games(bot)
+
+    view, bound_id = bot.added_views[0]
+    assert isinstance(view, RushmoreJoinView)
+    assert bound_id == stale.id
+    assert view.players == [9, 10]
+    assert view.topic == "movies"
+
+
+async def test_rushmore_recover_underway_ends_gracefully(sync_db_path):
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = RushmoreCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["rushmore"] = cog.recover_game
+    channel = _FakeChannel(1301)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 9, "rushmore", state="playing",
+        payload={"settings": {"timer": 60, "source": "host", "vote_timer": 30},
+                 "players": [9, 10], "topic": "movies", "boards": {}},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    await recover_active_games(bot)
+
+    assert bot.added_views == []
+    row = await db.fetchone("SELECT * FROM games_active_games WHERE game_id = ?", (game_id,))
+    assert row is None  # underway game ended gracefully
+
+
+async def test_fantasies_recovers_control_panel(sync_db_path):
+    """Host-driven: the main control panel re-registers, round counter restored."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = FantasiesCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["fantasies"] = cog.recover_game
+    channel = _FakeChannel(321)
+    bot._channels[channel.id] = channel
+    game_id = await cog.launch(
+        channel=channel, host_id=2001, host_name="Tester", guild_id=9001, options={},
+    )
+    row = await db.fetchone("SELECT message_id FROM games_active_games WHERE game_id = ?", (game_id,))
+    msg_id = row["message_id"]
+    payload = await get_game_payload(db, game_id)
+    payload["rounds"] = {"1": [{"text": "x", "user_id": 1, "category": "F"}],
+                         "2": [{"text": "y", "user_id": 2, "category": "F"}]}
+    await update_game_payload(db, game_id, payload)
+
+    bot.active_views.clear()
+    await recover_active_games(bot)
+
+    view, bound_id = bot.added_views[0]
+    assert isinstance(view, FantasiesMainView)
+    assert bound_id == msg_id
+    assert view.round_num == 2  # numbering continues from the last collected round
+
+
+async def _poll_for(bot, game_id, view_type, tries=50):
+    """Wait for a re-driven background loop to post and register its view."""
+    for _ in range(tries):
+        if isinstance(bot.active_views.get(game_id), view_type):
+            return bot.active_views[game_id]
+        await asyncio.sleep(0.02)
+    return bot.active_views.get(game_id)
+
+
+def _cancel_pending(baseline):
+    """Cancel only tasks spawned since ``baseline`` (re-driven game loops).
+
+    Scoped to avoid touching the test runner's own tasks, which matters under
+    pytest-xdist / asyncio_mode=auto.
+    """
+    for task in asyncio.all_tasks() - baseline:
+        if task is not asyncio.current_task():
+            task.cancel()
+
+
+async def test_ttl_redrives_guessing_skipping_played_subjects(sync_db_path):
+    """Re-drive restarts the interrupted subject's round; scored subjects skipped."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = TTLCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["ttl"] = cog.recover_game
+    channel = _FakeChannel(654)
+    bot._channels[channel.id] = channel
+    subs = {"111": {"statements": ["a", "b", "c"], "lie": 2},
+            "222": {"statements": ["d", "e", "f"], "lie": 0}}
+    game_id = await create_game(
+        db, channel.id, 2001, "ttl", state="guessing",
+        payload={"submissions": subs, "submission_count": 2, "submitter_names": {},
+                 "scores": {"111": {"correct": 1, "fooled": 0, "points": 1}}, "prompt": None},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        view = await _poll_for(bot, game_id, TTLGuessView)
+        assert isinstance(view, TTLGuessView), f"got {type(view).__name__}"
+        assert view.subject_id == 222  # 111 already scored -> skipped
+        # The loop registers the view *before* posting the fresh message and
+        # persisting its id (games_ttl_cog: active_views[..] = view → send →
+        # update_game_message), so poll rather than read the row once.
+        row = None
+        for _ in range(50):
+            row = await db.fetchone(
+                "SELECT message_id FROM games_active_games WHERE game_id = ?", (game_id,)
+            )
+            if row is not None and int(row["message_id"]) != stale.id:
+                break
+            await asyncio.sleep(0.02)
+        assert row is not None and int(row["message_id"]) != stale.id
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def test_hottakes_redrives_voting_skipping_done_takes(sync_db_path):
+    """Re-drive resumes voting at the first take without a persisted result."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = HotTakesCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["hottakes"] = cog.recover_game
+    channel = _FakeChannel(655)
+    bot._channels[channel.id] = channel
+    takes = [{"text": "take A", "user_id": 111}, {"text": "take B", "user_id": 222}]
+    results = [{"text": "take A", "counts": {}, "avg": 0, "std": 0, "voters": [111], "author": 111}]
+    game_id = await create_game(
+        db, channel.id, 2001, "hottakes", state="voting",
+        payload={"takes": takes, "results": results},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        view = await _poll_for(bot, game_id, HotTakeVoteView)
+        assert isinstance(view, HotTakeVoteView), f"got {type(view).__name__}"
+        assert view.take_num == 2  # take A done -> resume at take B
+        assert view.take_text == "take B"
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def _legitlibs_interrupted(sync_db_path, mode):
+    """Seed an in-flight LegitLibs round, restart, and run the sweep."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = LegitLibsCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["legitlibs"] = cog.recover_game
+    channel = _FakeChannel(1500)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 5, "legitlibs", state="joining",
+        payload={"mode": mode, "players": [5], "host_id": 5},
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    await recover_active_games(bot)
+    return bot, channel, game_id
+
+
+async def test_legitlibs_interrupted_ends_and_unblocks(sync_db_path):
+    """A mid-flight LegitLibs round can't resume, so recovery ends it (freeing
+    the channel) and posts a restart notice — no view is re-registered."""
+    bot, channel, game_id = await _legitlibs_interrupted(sync_db_path, "classic")
+
+    assert bot.added_views == []  # nothing to rebind — it's a blocking loop
+    assert game_id not in bot.active_views
+    row = await bot.games_db.fetchone(
+        "SELECT * FROM games_active_games WHERE game_id = ?", (game_id,)
+    )
+    assert row is None  # channel unblocked immediately
+    notices = [a for (a, _kw) in channel.sends if a and "interrupted by a bot restart" in str(a[0])]
+    assert notices, "no restart notice posted"
+    assert "LegitLibs" in str(notices[-1][0])
+
+
+async def test_legitlibs_quiplash_interrupted_labels_quiplash(sync_db_path):
+    """Quiplash shares the legitlibs launcher/type; the notice names the mode."""
+    bot, channel, game_id = await _legitlibs_interrupted(sync_db_path, "quiplash")
+
+    row = await bot.games_db.fetchone(
+        "SELECT * FROM games_active_games WHERE game_id = ?", (game_id,)
+    )
+    assert row is None
+    notices = [a for (a, _kw) in channel.sends if a and "interrupted by a bot restart" in str(a[0])]
+    assert notices and "Quiplash" in str(notices[-1][0])
+
+
+async def test_legitlibs_setup_registers_recoverer(monkeypatch):
+    """setup() wires legitlibs into bot.game_recoverers (the registry the sweep
+    walks); without it a restart mid-round bricks every button."""
+    from discord import app_commands
+
+    from bot_modules.games import legitlibs as games_legitlibs
+
+    # Throwaway command group so setup() doesn't mutate the shared `play` group.
+    monkeypatch.setattr(
+        games_legitlibs, "play", app_commands.Group(name="play", description="x")
+    )
+
+    class _Bot:
+        def __init__(self):
+            self.game_launchers: dict = {}
+            self.game_recoverers: dict = {}
+            self.tree = self
+
+        def remove_command(self, _name):
+            return None
+
+        async def add_cog(self, _cog):
+            return None
+
+    bot = _Bot()
+    await games_legitlibs.setup(bot)
+    assert "legitlibs" in bot.game_recoverers
+
+
+async def test_deleted_anchor_message_is_skipped(sync_db_path):
+    """When the anchor message is gone, recovery skips rather than crashing."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = TraditionalCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["traditional"] = cog.recover_game
+
+    channel = _FakeChannel(888)
+    bot._channels[channel.id] = channel
+    game_id = await cog.launch(
+        channel=channel, host_id=2001, host_name="Tester", guild_id=9001, options={},
+    )
+    bot.active_views.clear()
+
+    # Drop the message so fetch_message raises (simulates a deleted message).
+    channel._messages.clear()
+
+    await recover_active_games(bot)  # must not raise
+
+    assert bot.added_views == []
+    assert game_id not in bot.active_views
+
+
+async def test_expired_games_are_archived_by_the_recovery_pass(sync_db_path):
+    """A game past the 24h limit is not recovered — and until 2026-09-04 it
+    was not archived either, keeping dead buttons and a 'busy' channel for up
+    to an hour until the cleanup loop's first tick (platform-30)."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = WYRCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["wyr"] = cog.recover_game
+    channel = _FakeChannel(4242)
+    bot._channels[channel.id] = channel
+
+    stale = await create_game(db, channel.id, 2001, "wyr", message_id=1, guild_id=9001)
+    await db.execute(
+        "UPDATE games_active_games SET created_at = datetime('now', '-30 hours')"
+        " WHERE game_id = ?", (stale,),
+    )
+    fresh = await create_game(db, channel.id, 2001, "wyr", message_id=2, guild_id=9001)
+
+    await recover_active_games(bot)
+
+    assert await db.fetchone(
+        "SELECT 1 FROM games_active_games WHERE game_id = ?", (stale,)
+    ) is None
+    assert await db.fetchone(
+        "SELECT 1 FROM games_active_games WHERE game_id = ?", (fresh,)
+    ) is not None
+    archived = await db.fetchone(
+        "SELECT guild_id, payload FROM games_game_history WHERE game_id = ?", (stale,)
+    )
+    assert archived is not None and archived["guild_id"] == 9001
+    assert json.loads(archived["payload"])["reason"] == "expired"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"takes": [], "results": []}, id="empty-lobby"),
+        pytest.param(
+            {"takes": [{"text": "take A", "user_id": 111, "display_order": 0}], "results": []},
+            id="takes-collected-voting-not-started",
+        ),
+    ],
+)
+async def test_hottakes_lobby_reregisters_submit_view_instead_of_voting(sync_db_path, payload):
+    """A Hot Takes lobby survives a restart as a lobby (platform-29 / anon-tail-66).
+
+    Until 2026-09-04 recover_game keyed on the take count alone: an empty
+    lobby was skipped (dead buttons until the sweep), and a lobby with any
+    takes was re-driven straight into voting — without the host pressing
+    Start Voting, cutting off members still writing.
+    """
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = HotTakesCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["hottakes"] = cog.recover_game
+    channel = _FakeChannel(656)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 2001, "hottakes", state="joining", payload=payload, guild_id=9001,
+    )
+    anchor = await channel.send()
+    await update_game_message(db, game_id, anchor.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        assert len(bot.added_views) == 1
+        view, bound_id = bot.added_views[0]
+        assert isinstance(view, HotTakesSubmitView)
+        assert bound_id == anchor.id
+        assert bot.active_views[game_id] is view
+        assert anchor.edited is False  # no "picking up where we left off" redrive
+        # Voting was never started, so nothing spun up a vote loop.
+        await asyncio.sleep(0.05)
+        assert not isinstance(bot.active_views.get(game_id), HotTakeVoteView)
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def test_hottakes_playing_phase_is_redriven_not_relobbied(sync_db_path):
+    """Once the host has pressed Start Voting the row says 'playing', and a
+    restart resumes the vote — the lobby branch must not catch it."""
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = HotTakesCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["hottakes"] = cog.recover_game
+    channel = _FakeChannel(657)
+    bot._channels[channel.id] = channel
+    takes = [{"text": "take A", "user_id": 111}]
+    game_id = await create_game(
+        db, channel.id, 2001, "hottakes", state="playing",
+        payload={"takes": takes, "results": []}, guild_id=9001,
+    )
+    stale = await channel.send()
+    await update_game_message(db, game_id, stale.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        view = await _poll_for(bot, game_id, HotTakeVoteView)
+        assert isinstance(view, HotTakeVoteView), f"got {type(view).__name__}"
+        assert view.take_text == "take A"
+        assert bot.added_views == []  # re-driven, not re-registered as a lobby
+    finally:
+        _cancel_pending(_baseline)
+
+
+# ── clapback-3 / vote-games-56: a lobby survives a restart as a lobby ────────
+
+
+async def test_clapback_lobby_reregisters_join_view_instead_of_redriving(sync_db_path):
+    """A Clapback lobby open across a restart gets its Join/Start row back.
+
+    Until 2026-09-04 recover_game re-drove the game loop on a 'joining' row:
+    an empty roster played five no-op rounds to a 'Winner: Nobody' recap, and
+    a joined roster crashed on the missing scores key at the first vote
+    (clapback-3). Mirrors Rushmore's join-phase branch.
+    """
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = ClapbackCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["clapback"] = cog.recover_game
+    redriven = {}
+
+    async def fake_run_game(game_id, channel, payload):
+        redriven["yes"] = True
+
+    cog._run_game = fake_run_game  # type: ignore[method-assign]
+    channel = _FakeChannel(1101)
+    bot._channels[channel.id] = channel
+    config = {"rounds": 3, "timer": 60, "vote_timer": 30, "anonymous": False}
+    game_id = await create_game(
+        db, channel.id, 1, "clapback", state="joining",
+        payload={"config": config, "players": [1, 2], "host_id": 1}, guild_id=9001,
+    )
+    anchor = await channel.send()
+    await update_game_message(db, game_id, anchor.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        assert len(bot.added_views) == 1
+        view, bound_id = bot.added_views[0]
+        assert isinstance(view, ClapbackJoinView)
+        assert bound_id == anchor.id
+        assert view.message is anchor
+        assert view.config == config
+        assert view.host_id == 1
+        # discord.py only re-binds a persistent view to an existing message.
+        assert view.timeout is None
+        assert bot.active_views[game_id] is view
+        assert anchor.edited is False  # no "picking up where we left off"
+        await asyncio.sleep(0.05)
+        assert "yes" not in redriven
+    finally:
+        _cancel_pending(_baseline)
+
+
+@pytest.mark.parametrize(
+    "submissions",
+    [
+        pytest.param({}, id="empty-lobby"),
+        pytest.param(
+            {"111": {"statements": ["a", "b", "c"], "lie": 2},
+             "222": {"statements": ["d", "e", "f"], "lie": 0}},
+            id="submissions-in-start-not-pressed",
+        ),
+    ],
+)
+async def test_ttl_lobby_reregisters_submit_view_instead_of_redriving(sync_db_path, submissions):
+    """A Two Truths lobby survives a restart as a lobby (vote-games-56).
+
+    Until 2026-09-04 recovery re-drove guessing for any row holding a
+    submission — the host's Start Guessing (and its 2-submission floor) was
+    bypassed, and an empty lobby was left with dead buttons. The cog never
+    wrote a phase to the row, so recovery could not tell a lobby from a game
+    in progress; Start Guessing now records ``guessing`` and recovery branches
+    on it.
+    """
+    db = GamesDb(sync_db_path)
+    bot = _FakeBot(db)
+    cog = TTLCog(bot)  # type: ignore[arg-type]
+    bot.game_recoverers["ttl"] = cog.recover_game
+    channel = _FakeChannel(655)
+    bot._channels[channel.id] = channel
+    game_id = await create_game(
+        db, channel.id, 2001, "ttl", state="joining",
+        payload={"submissions": submissions, "submission_count": len(submissions),
+                 "submitter_names": {}, "scores": {}, "prompt": "childhood"},
+        guild_id=9001,
+    )
+    anchor = await channel.send()
+    await update_game_message(db, game_id, anchor.id)
+
+    bot.active_views.clear()
+    _baseline = set(asyncio.all_tasks())
+    await recover_active_games(bot)
+    try:
+        assert len(bot.added_views) == 1
+        view, bound_id = bot.added_views[0]
+        assert isinstance(view, TTLSubmitView)
+        assert bound_id == anchor.id
+        assert view.prompt == "childhood"
+        assert view.host_id == 2001
+        assert bot.active_views[game_id] is view
+        assert anchor.edited is False
+        await asyncio.sleep(0.05)
+        assert not isinstance(bot.active_views.get(game_id), TTLGuessView)
+    finally:
+        _cancel_pending(_baseline)
+
+
+async def test_start_redrive_retires_the_anchor_as_a_v2_notice(monkeypatch):
+    """The round anchor is a Components V2 card now; Discord refuses
+    ``content=`` on one, so the old edit 400'd silently and left a
+    live-looking vote card after a restart (ship review, 2026-10-01)."""
+    import discord
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from bot_modules.core.layout import V2_EDIT
+    from bot_modules.games.utils import recovery
+
+    spawned = []
+    monkeypatch.setattr(recovery, "spawn", lambda coro, **kw: spawned.append(coro) or coro.close())
+    message = SimpleNamespace(edit=AsyncMock())
+    bot = SimpleNamespace(active_views={})
+
+    async def _loop():
+        return None
+
+    await recovery.start_redrive(
+        bot, "g1", message, _loop(), channel=SimpleNamespace(id=1, name="games"), log_label="t",
+    )
+
+    kwargs = message.edit.await_args.kwargs
+    assert "content" not in kwargs or kwargs["content"] is None
+    assert {k: kwargs[k] for k in V2_EDIT} == V2_EDIT
+    shown = [i.content for i in kwargs["view"].walk_children() if isinstance(i, discord.ui.TextDisplay)]
+    assert shown == [recovery.PICKING_UP_TEXT]
+    assert isinstance(bot.active_views["g1"], recovery.RecoverySentinel)
+    assert len(spawned) == 1

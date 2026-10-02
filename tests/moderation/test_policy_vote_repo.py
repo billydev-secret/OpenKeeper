@@ -1,0 +1,193 @@
+"""Tier 1: policy ticket repo helpers — status-guarded resolve + expiry query."""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.moderation.service import (
+    create_policy_ticket,
+    find_expired_policy_votes,
+    get_policy_ticket,
+    resolve_policy_vote,
+    set_policy_visibility,
+    start_policy_vote,
+)
+
+GUILD = 9001
+CREATOR = 1001
+
+
+def _seed_voting_policy(db_path: Path, *, started_offset: float = -1.0) -> int:
+    """Create a policy ticket already in 'voting' state, with vote_started_at offset from now."""
+    with open_db(db_path) as conn:
+        pid = create_policy_ticket(
+            conn,
+            guild_id=GUILD,
+            creator_id=CREATOR,
+            channel_id=555,
+            title="test policy",
+            description="test desc",
+        )
+        start_policy_vote(conn, pid, vote_text="test vote text")
+        # Override vote_started_at so we can simulate elapsed time without sleeping.
+        conn.execute(
+            "UPDATE policy_tickets SET vote_started_at = ? WHERE id = ?",
+            (time.time() + started_offset, pid),
+        )
+    return pid
+
+
+def test_resolve_policy_vote_returns_true_when_voting(sync_db_path: Path):
+    pid = _seed_voting_policy(sync_db_path)
+    with open_db(sync_db_path) as conn:
+        assert resolve_policy_vote(conn, pid, status="passed") is True
+        row = get_policy_ticket(conn, pid)
+    assert row is not None
+    assert row["status"] == "passed"
+    assert row["vote_ended_at"] is not None
+
+
+def test_resolve_policy_vote_second_call_returns_false(sync_db_path: Path):
+    """Race protection: the loser of a concurrent finalize gets False."""
+    pid = _seed_voting_policy(sync_db_path)
+    with open_db(sync_db_path) as conn:
+        assert resolve_policy_vote(conn, pid, status="passed") is True
+        # Second call sees status != 'voting' and bails.
+        assert resolve_policy_vote(conn, pid, status="failed") is False
+        row = get_policy_ticket(conn, pid)
+    assert row is not None
+    assert row["status"] == "passed"  # unchanged by the losing caller
+
+
+def test_resolve_policy_vote_skips_open_policy(sync_db_path: Path):
+    """Open (pre-vote) policies are not yet 'voting' and must not be resolved."""
+    with open_db(sync_db_path) as conn:
+        pid = create_policy_ticket(
+            conn,
+            guild_id=GUILD,
+            creator_id=CREATOR,
+            channel_id=555,
+            title="t",
+            description="d",
+        )
+        assert resolve_policy_vote(conn, pid, status="failed") is False
+        row = get_policy_ticket(conn, pid)
+    assert row is not None
+    assert row["status"] == "open"
+
+
+def test_find_expired_policy_votes_empty_when_none_voting(sync_db_path: Path):
+    with open_db(sync_db_path) as conn:
+        create_policy_ticket(
+            conn,
+            guild_id=GUILD,
+            creator_id=CREATOR,
+            channel_id=555,
+            title="t",
+            description="d",
+        )
+        expired = find_expired_policy_votes(conn, GUILD, timeout_seconds=3600)
+    assert expired == []
+
+
+def test_find_expired_policy_votes_returns_overdue(sync_db_path: Path):
+    pid = _seed_voting_policy(sync_db_path, started_offset=-7200.0)  # 2h ago
+    with open_db(sync_db_path) as conn:
+        expired = find_expired_policy_votes(conn, GUILD, timeout_seconds=3600)
+    assert [p["id"] for p in expired] == [pid]
+
+
+def test_find_expired_policy_votes_skips_recent_votes(sync_db_path: Path):
+    _seed_voting_policy(sync_db_path, started_offset=-60.0)  # 1m ago
+    with open_db(sync_db_path) as conn:
+        expired = find_expired_policy_votes(conn, GUILD, timeout_seconds=3600)
+    assert expired == []
+
+
+def test_find_expired_policy_votes_zero_timeout_disabled(sync_db_path: Path):
+    _seed_voting_policy(sync_db_path, started_offset=-86400.0)  # 1d ago
+    with open_db(sync_db_path) as conn:
+        expired = find_expired_policy_votes(conn, GUILD, timeout_seconds=0)
+    assert expired == []
+
+
+def test_find_expired_policy_votes_scopes_to_guild(sync_db_path: Path):
+    _seed_voting_policy(sync_db_path, started_offset=-7200.0)
+    with open_db(sync_db_path) as conn:
+        expired_other = find_expired_policy_votes(conn, GUILD + 1, timeout_seconds=3600)
+    assert expired_other == []
+
+
+async def test_vote_timeout_sweep_consults_every_guild(sync_db_path: Path, monkeypatch):
+    """One timeout pass per guild, keyed by that guild's id. The loop used to
+    consult only ctx.guild_id, which made the dashboard's per-guild voting
+    deadline a silent no-op off the home guild (IA audit 2026-08-29)."""
+    from types import SimpleNamespace
+
+    from bot_modules.moderation.jail import jail_commands
+
+    seen: list[int] = []
+
+    def _record(conn, guild_id, *, timeout_seconds):
+        seen.append(guild_id)
+        return []
+
+    monkeypatch.setattr(jail_commands, "find_expired_policy_votes", _record)
+    ctx = SimpleNamespace(open_db=lambda: open_db(sync_db_path), guild_id=GUILD)
+    for gid in (GUILD, 9002):
+        await jail_commands._policy_vote_timeout_pass(
+            SimpleNamespace(), ctx, SimpleNamespace(id=gid)
+        )
+    assert seen == [GUILD, 9002]
+
+
+# ── Visibility (migration 219) ────────────────────────────────────────
+
+
+def _seed_open_policy(db_path: Path) -> int:
+    with open_db(db_path) as conn:
+        return create_policy_ticket(
+            conn,
+            guild_id=GUILD,
+            creator_id=CREATOR,
+            channel_id=556,
+            title="visibility policy",
+            description="desc",
+        )
+
+
+def test_a_new_policy_is_mods_only(sync_db_path: Path):
+    """The column ships dark: nothing is open until a button says so."""
+    pid = _seed_open_policy(sync_db_path)
+    with open_db(sync_db_path) as conn:
+        assert get_policy_ticket(conn, pid)["visibility"] == "mods"
+
+
+def test_set_policy_visibility_round_trips(sync_db_path: Path):
+    pid = _seed_open_policy(sync_db_path)
+    with open_db(sync_db_path) as conn:
+        set_policy_visibility(conn, pid, visibility="public")
+    with open_db(sync_db_path) as conn:
+        assert get_policy_ticket(conn, pid)["visibility"] == "public"
+
+    # And back — the toggle has to survive a return trip, since a mod who
+    # opens a channel by mistake needs the deny to go back on.
+    with open_db(sync_db_path) as conn:
+        set_policy_visibility(conn, pid, visibility="mods")
+    with open_db(sync_db_path) as conn:
+        assert get_policy_ticket(conn, pid)["visibility"] == "mods"
+
+
+def test_visibility_is_per_policy(sync_db_path: Path):
+    """Opening one proposal must not open another."""
+    first = _seed_open_policy(sync_db_path)
+    with open_db(sync_db_path) as conn:
+        second = create_policy_ticket(
+            conn, guild_id=GUILD, creator_id=CREATOR, channel_id=557,
+            title="other", description="desc",
+        )
+        set_policy_visibility(conn, first, visibility="public")
+    with open_db(sync_db_path) as conn:
+        assert get_policy_ticket(conn, first)["visibility"] == "public"
+        assert get_policy_ticket(conn, second)["visibility"] == "mods"

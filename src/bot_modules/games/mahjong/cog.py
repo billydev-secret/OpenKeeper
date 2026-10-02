@@ -1,0 +1,1302 @@
+"""Meadow Mahjong cog — Discord glue only, no rules (stage 6 of
+docs/plans/meadow-mahjong.md, spec §6).
+
+Thin by design: every decision lives in games/mahjong (engine + service);
+this file renders state, routes taps, and keeps the sticky table message
+at the bottom of its channel. Member self-service only — the entire admin
+surface is the dashboard panel (route id ``mahjong``); this cog registers
+exactly one command, ``/mahjong``.
+
+One StickyPanel per live table (tables are per-channel, the house sticky
+is per-guild-key — each panel here loads/saves its own table's message id
+and the on_message listener routes by channel). The one-table-per-channel
+schema rule is what keeps two panels from ever sharing a channel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import Bot
+
+from bot_modules.core.background import spawn
+from bot_modules.core.db_utils import open_db
+from bot_modules.core.layout import V2_EDIT, ExpiringLayoutView, card
+from bot_modules.core.utils import has_mod_or_admin_permissions
+from bot_modules.core.sticky import PanelContent, StickyPanel
+from bot_modules.games.mahjong import layouts as mj_layouts
+from bot_modules.games.mahjong.bot_logic import bot_name, is_bot_id
+from bot_modules.games.mahjong.tiles import FULL_RANK
+from bot_modules.games.mahjong import match_logic as mj_match
+from bot_modules.games.mahjong import views as mj_views
+from bot_modules.games.utils.host_panel import (
+    HOST_COMMAND,
+    CallbackHostPanel,
+    reply as host_reply,
+    send_panel,
+)
+from bot_modules.games.mahjong.game_logic import (
+    AUTO_PASS,
+    ActionRejected,
+    AssistReadout,
+    GameState,
+    Phase,
+    assist_readout,
+    assist_relevant,
+    close_table_refusal,
+    table_controls_refusal,
+)
+from bot_modules.games.mahjong.mahjong_service import (
+    STALE_TABLE,
+    MahjongService,
+    NudgeRecord,
+    TableError,
+    activate_due_cards,
+    escrow_amount,
+    fill_bot_allowed,
+    get_active_card,
+    load_settings,
+)
+from bot_modules.games.mahjong.tile_render import rack_str
+from bot_modules.core.utils import jump_url
+from bot_modules.advisor.service import dashboard_url
+from bot_modules.games.mahjong.tiles import Tile, sort_rack
+from bot_modules.economy.service import get_balance
+from bot_modules.games.start_ping_service import (
+    resolve_game_lobby_role,
+    role_only_mentions,
+)
+
+log = logging.getLogger(__name__)
+
+#: A pre-move table card's Cancel / Close Table lands here.
+MOVED_TO_HOST_PANEL = (
+    f"Cancel and Close Table moved — {HOST_COMMAND} opens the table's controls."
+)
+NOT_AT_TABLE_REPLY = "❌ Only the table's host, its players or a mod can use the table controls."
+CANCELLED_REPLY = "Table cancelled; every escrow returned."
+CLOSED_REPLY = "Table closed."
+
+
+class MahjongCog(commands.Cog):
+    def __init__(self, bot: "Bot"):
+        self.bot = bot
+        self.service = MahjongService(bot.ctx.db_path)
+        self.service.set_listener(self._on_transition)
+        #: table_id → its sticky panel; rebuilt on resume.
+        self.panels: dict[int, StickyPanel] = {}
+        #: (table_id, member_id) → (ephemeral rack message, stored_at) —
+        #: plus, as a third element when the cog built it, the LayoutView on
+        #: that message, which a refresh stops before swapping a fresh one
+        #: in (ExpiringLayoutView's contract). Discord lets us edit an
+        #: ephemeral for ~15 min after the click, so an open rack panel
+        #: live-updates with the game instead of the member re-pressing
+        #: Open Rack each turn. Latest press wins.
+        self.rack_watch: dict[tuple[int, int], tuple] = {}
+        #: channel_id → table_id for the on_message sticky routing.
+        self.channel_tables: dict[int, int] = {}
+        #: table_id → its last-rendered phase, read by the sticky's ``hold``
+        #: so chat during a claim window can't move the card mid-window.
+        self.table_phase: dict[int, Phase] = {}
+        #: table_id → the pings that still owe a sweep (mahjong-144): the
+        #: plain "your draw" lines of the current turn, and every standing
+        #: second-strike warning, which is kept across turns (the member it
+        #: names is the one not looking) until the seat is no longer one
+        #: miss from folding. This is the fast path; the same record is
+        #: written to the table row after every change, so a restart
+        #: mid-hand can still delete a ping for a turn that has passed.
+        self.nudges: dict[int, NudgeRecord] = {}
+
+    async def cog_load(self) -> None:
+        self.card_scheduler.start()
+        spawn(self._resume(), label="mahjong resume", logger=log)
+
+    async def cog_unload(self) -> None:
+        self.card_scheduler.cancel()
+        for panel in self.panels.values():
+            panel.cancel_all()
+        await self.service.shutdown()
+
+    async def _resume(self) -> None:
+        await self.bot.wait_until_ready()
+        table_ids = await self.service.resume_tables()
+        for table_id in table_ids:
+            meta = await self.service.table_meta(table_id)
+            state = await self.service.load_state(table_id)
+            if meta is None or state is None or meta["status"] != "live":
+                continue  # a past-due timer already closed it (resume race)
+            self.table_phase[table_id] = state.phase
+            # the pings the pre-restart process posted and never swept
+            self.nudges[table_id] = await self.service.get_nudges(table_id)
+            self._track_table(table_id, meta["channel_id"])
+            self.bot.add_view(
+                mj_views.TableView(self, table_id, register_all=True)
+            )
+        if table_ids:
+            log.info("Mahjong: resumed %d live table(s).", len(table_ids))
+
+    # ── Sticky plumbing (one panel per table) ───────────────────────────
+
+    def _track_table(self, table_id: int, channel_id: int) -> None:
+        self.channel_tables[channel_id] = table_id
+        if table_id in self.panels:
+            return
+
+        def load_ids(_guild_id: int) -> tuple[int, int]:
+            with open_db(self.bot.ctx.db_path) as conn:
+                row = conn.execute(
+                    "SELECT channel_id, sticky_message_id FROM mahjong_tables "
+                    "WHERE id = ?", (table_id,),
+                ).fetchone()
+            if row is None or row["sticky_message_id"] is None:
+                return (0, 0)
+            return (int(row["channel_id"]), int(row["sticky_message_id"]))
+
+        def save_ids(_guild_id: int, channel_id: int, message_id: int) -> None:
+            with open_db(self.bot.ctx.db_path) as conn:
+                conn.execute(
+                    "UPDATE mahjong_tables SET sticky_message_id = ? "
+                    "WHERE id = ?", (message_id, table_id),
+                )
+                conn.commit()
+
+        async def build(guild: discord.Guild) -> PanelContent:
+            content = await self._build_table_panel(guild, table_id)
+            if content is None:
+                raise RuntimeError("table closed between trigger and restick")
+            return content
+
+        async def hold(_guild_id: int) -> bool:
+            # A chat-driven repost mid-claim-window moved the card — with the
+            # only Mahjong/Call/Pass buttons — during the game's tightest
+            # decision (mahjong-154). The window is seconds long, so the
+            # restick just waits it out; the resolving transition's own
+            # place_or_refresh re-sticks the card anyway.
+            return self.table_phase.get(table_id) is Phase.CLAIM_WINDOW
+
+        self.panels[table_id] = StickyPanel(
+            f"mahjong table {table_id}", self.bot,
+            load_ids=load_ids, save_ids=save_ids, build=build,
+            hold=hold, hold_poll=2.0,
+        )
+
+    def _untrack_table(self, table_id: int, channel_id: int | None) -> None:
+        panel = self.panels.pop(table_id, None)
+        if panel is not None:
+            panel.cancel_all()
+        self.table_phase.pop(table_id, None)
+        if channel_id is not None and self.channel_tables.get(channel_id) == table_id:
+            self.channel_tables.pop(channel_id, None)
+
+    @commands.Cog.listener("on_member_remove")
+    async def _fold_leaver(self, member: discord.Member) -> None:
+        """A seated member left the guild: their seat folds fallow (escrow
+        stays held and pays per the fallow rules). The economy cog's generic
+        leaver-refund sweep excludes mahjong for exactly this reason."""
+        try:
+            await self.service.member_left(member.guild.id, member.id)
+        except Exception:
+            log.exception("Mahjong: leaver fold failed for %d", member.id)
+
+    @commands.Cog.listener("on_message")
+    async def _sticky_on_message(self, message: discord.Message) -> None:
+        if message.guild is None:
+            return
+        table_id = self.channel_tables.get(message.channel.id)
+        if table_id is None:
+            return
+        panel = self.panels.get(table_id)
+        if panel is not None:
+            await panel.on_message(message)
+
+    async def _build_table_panel(
+        self, guild: discord.Guild, table_id: int
+    ) -> PanelContent | None:
+        meta = await self.service.table_meta(table_id)
+        state = await self.service.load_state(table_id)
+        if meta is None or state is None or meta["status"] != "live":
+            return None
+        season = await self.service.card_for_table(table_id)
+        escrow = (
+            escrow_amount(season, meta["mode"], meta["stake"]) if season else 0
+        )
+        practice = bool(meta.get("practice"))
+        body = mj_layouts.build_table_panel(
+            state, self._escaped(self._names(guild, state)), meta["stake"], escrow,
+            meta["deadline_at"], practice=practice,
+        )
+        add_bot = False
+        # the button shows only where the service would accept the tap:
+        # dial on, and two members already seated (mahjong-143)
+        if not practice and fill_bot_allowed(state):
+
+            def _dial():
+                with open_db(self.bot.ctx.db_path) as conn:
+                    return load_settings(conn, guild.id).fill_bots
+
+            add_bot = await asyncio.to_thread(_dial)
+        return PanelContent(
+            layout=mj_views.TableView(self, table_id, state.phase, add_bot=add_bot, body=body),
+        )
+
+    def _names(self, guild: discord.Guild, state: GameState) -> dict[int, str]:
+        out: dict[int, str] = {}
+        for s in state.seats:
+            if is_bot_id(s.member_id):
+                out[s.member_id] = bot_name(s.member_id)  # 🌱 — never a member
+                continue
+            member = guild.get_member(s.member_id)
+            out[s.member_id] = member.display_name if member else f"User {s.member_id}"
+        return out
+
+    def _seat_names(self, guild: discord.Guild, state: GameState) -> dict[int, str]:
+        names = self._names(guild, state)
+        return {i: names[s.member_id] for i, s in enumerate(state.seats)}
+
+    @staticmethod
+    def _escaped(names: dict[int, str]) -> dict[int, str]:
+        """``names`` as card-safe text.
+
+        The raw dict from :meth:`_names`/:meth:`_seat_names` also feeds
+        non-rendering UI (a Charleston pick's select placeholder via
+        ``to_label``), which must not be escaped — so callers escape only at
+        the point they hand a names dict to a card builder, not at the
+        source.
+        """
+        return {k: discord.utils.escape_markdown(v) for k, v in names.items()}
+
+    # ── Service listener: render after every transition ─────────────────
+
+    async def _on_transition(
+        self, table_id: int, state: GameState, events: list
+    ) -> None:
+        self.table_phase[table_id] = state.phase
+        meta = await self.service.table_meta(table_id)
+        if meta is None:
+            log.warning("mahjong: table %d transition: no meta — skip", table_id)
+            return
+        guild = self.bot.get_guild(meta["guild_id"])
+        if guild is None:
+            log.warning(
+                "mahjong: table %d transition: guild %s not in cache — "
+                "sticky NOT updated", table_id, meta["guild_id"])
+            return
+        channel = guild.get_channel(meta["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            log.warning(
+                "mahjong: table %d transition: channel %s is %s — "
+                "sticky NOT updated", table_id, meta["channel_id"],
+                type(channel).__name__)
+            return
+        names = self._seat_names(guild, state)
+
+        # public announcement cards ride their own messages
+        for kind, data in events:
+            if data.get("private"):
+                continue  # delivered on the tap's own response, never here
+            if kind == "joker_redeemed":
+                await self._safe_send(channel, view=card(mj_layouts.build_joker_redeemed(
+                    discord.utils.escape_markdown(names.get(data["seat"], "?")),
+                    discord.utils.escape_markdown(names.get(data["owner"], "?")),
+                    Tile(data["tile"]),
+                )))
+            elif kind == "mahjong":
+                out = state.outcome
+                if out is not None and out.winner is not None:
+                    season = await self.service.card_for_table(table_id)
+                    shown = self._winning_groups(state, out.winner, season)
+                    await self._safe_send(channel, view=card(mj_layouts.build_mahjong_reveal(
+                        out, discord.utils.escape_markdown(names.get(out.winner, "?")), shown,
+                    )))
+            elif kind == "hand_settled":
+                out = state.outcome
+                if out is not None:
+                    await self._safe_send(channel, view=card(mj_layouts.build_settlement(
+                        out, names, meta["stake"],
+                    )))
+            elif kind == "table_closed":
+                self._untrack_table(table_id, meta["channel_id"])
+                await self._clear_nudges(channel, table_id)
+
+        if meta["status"] == "live":
+            self._track_table(table_id, meta["channel_id"])
+            panel = self.panels.get(table_id)
+            if panel is not None:
+                await panel.place_or_refresh(guild, channel)
+                log.info(
+                    "mahjong: table %d sticky refreshed in #%s",
+                    table_id, channel.name)
+            else:
+                log.warning(
+                    "mahjong: table %d transition: no panel tracked", table_id)
+            # after the card, so the ping sits under it rather than burying it
+            await self._post_nudges(channel, table_id, state, events)
+        elif meta["sticky_message_id"]:
+            # closed: the final card says why, buttons gone (mahjong-151)
+            reason = next(
+                (d.get("reason") for k, d in events if k == "table_closed"),
+                meta.get("closed_reason"),
+            )
+            try:
+                msg = channel.get_partial_message(meta["sticky_message_id"])
+                await msg.edit(
+                    view=card(await self._closed_card(guild, state, meta, reason)),
+                    **V2_EDIT,
+                )
+            except discord.HTTPException:
+                pass
+        await self._refresh_rack_watches(table_id, state, meta, names)
+
+    async def _closed_card(
+        self, guild: discord.Guild, state: GameState, meta: dict,
+        reason: str | None,
+    ) -> list[discord.ui.Item]:
+        """The final card: no buttons, and the reason it closed."""
+        return mj_layouts.build_table_panel(
+            state, self._escaped(self._names(guild, state)), meta["stake"], 0, None,
+            practice=bool(meta.get("practice")), closed_reason=reason,
+        )
+
+    async def _post_nudges(
+        self, channel, table_id: int, state: GameState, events: list
+    ) -> None:
+        """The turn signal (mahjong-144): a 4-seat hand runs an hour and a
+        seat acts one turn in four, and the only cue used to be a line in
+        the sticky embed — a member who tabbed away folded in three turn
+        timers and, in Duel, paid. So each human turn start posts a plain
+        ``<@id> — your draw`` (content, never an embed; the mention is
+        allow-listed to that one member) and the second strike a warning.
+        The previous turn's draw line is deleted first, so the channel
+        carries at most one turn's worth; the warning stays up across turns
+        — the member it names is the one not looking — until the seat is
+        no longer one miss from folding (``warning_live``).
+
+        Every message id lands on the table row as well as in memory: the
+        deletes all happen on a *later* transition, so a restart in between
+        used to orphan them and leave a member pinged for a turn that had
+        already passed."""
+        record = self.nudges.setdefault(table_id, NudgeRecord())
+        dirty = await self._expire_warnings(channel, record, state)
+        key = mj_layouts.turn_key(state)
+        wanted = list(key) if key is not None else None
+        changed = wanted != record.turn_key
+        lines = mj_layouts.nudge_lines(state, events, turn_changed=changed)
+        if changed:
+            await self._sweep_draws(channel, record)
+            record.turn_key = wanted
+            dirty = True
+        for member_id, content, warning in lines:
+            try:
+                msg = await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, replied_user=False,
+                        users=[discord.Object(id=member_id)],
+                    ),
+                )
+            except discord.HTTPException:
+                log.warning("Mahjong: nudge failed in #%s", channel, exc_info=True)
+                continue
+            dirty = True
+            if warning:
+                await self._delete_quietly(
+                    channel, record.warnings.pop(member_id, None))
+                record.warnings[member_id] = msg.id
+            else:
+                record.draws.append(msg.id)
+        if dirty:
+            await self.service.set_nudges(table_id, record)
+
+    async def _expire_warnings(
+        self, channel, record: NudgeRecord, state: GameState
+    ) -> bool:
+        """Drop every warning whose seat is no longer one miss from folding.
+        Returns whether anything went, so the caller writes the row once."""
+        stale = [m for m in record.warnings if not mj_layouts.warning_live(state, m)]
+        for member_id in stale:
+            await self._delete_quietly(channel, record.warnings.pop(member_id))
+        return bool(stale)
+
+    async def _sweep_draws(self, channel, record: NudgeRecord) -> None:
+        """The turn moved on: its draw lines go, the warnings stay."""
+        for message_id in record.draws:
+            await self._delete_quietly(channel, message_id)
+        record.draws.clear()
+        record.turn_key = None
+
+    async def _clear_nudges(self, channel, table_id: int) -> None:
+        """Sweep everything, warnings included — the table is going away,
+        and a closed table has nothing left to fold."""
+        record = self.nudges.pop(table_id, None)
+        if record is None:
+            record = await self.service.get_nudges(table_id)
+        await self._sweep_draws(channel, record)
+        for message_id in list(record.warnings.values()):
+            await self._delete_quietly(channel, message_id)
+        record.warnings.clear()
+        await self.service.set_nudges(table_id, record)
+
+    @staticmethod
+    async def _delete_quietly(channel, message_id: int | None) -> None:
+        if message_id is None:
+            return
+        try:
+            await channel.get_partial_message(message_id).delete()
+        except discord.HTTPException:
+            pass  # already gone (a mod swept it) — nothing to keep
+
+    #: An interaction token outlives its click by 15 minutes; refresh only
+    #: comfortably inside that.
+    RACK_WATCH_TTL = 13 * 60
+
+    async def _refresh_rack_watches(
+        self, table_id: int, state: GameState, meta: dict,
+        names: dict[int, str],
+    ) -> None:
+        """Live-update every open ephemeral rack panel for this table — a
+        member's panel follows the game instead of them re-pressing Open
+        Rack each turn. Expired or dismissed panels drop out silently; the
+        button is always there to open a fresh one."""
+        now = time.time()
+        closing = meta["status"] != "live"
+        for key in [k for k in self.rack_watch if k[0] == table_id]:
+            entry = self.rack_watch[key]
+            msg, stored_at = entry[0], entry[1]
+            shown = entry[2] if len(entry) > 2 else None
+            seat = state.seat_of(key[1])
+            if now - stored_at > self.RACK_WATCH_TTL or seat is None:
+                del self.rack_watch[key]
+                continue
+            # The panel on screen is replaced wholesale; stop it first so
+            # its own timeout can't grey the fresh one out later.
+            if shown is not None:
+                shown.stop()
+            try:
+                if closing:
+                    await msg.edit(view=mj_views.RackPanel(mj_layouts.build_rack_panel(
+                        state, seat, None,
+                        context="Hand over — see the table card.",
+                    ), timeout=None))
+                    del self.rack_watch[key]
+                    continue
+                body = mj_layouts.build_rack_panel(
+                    state, seat, meta.get("deadline_at"),
+                    context=self._rack_context(state, seat, names),
+                    assist=await self._assist_for(table_id, state, seat),
+                )
+                fresh = self._rack_view(state, seat, table_id, names, body)
+                await msg.edit(view=fresh)
+                fresh.message = msg
+                self.rack_watch[key] = (msg, stored_at, fresh)
+            except discord.HTTPException:
+                del self.rack_watch[key]  # token expired or panel dismissed
+
+    def _winning_groups(self, state: GameState, seat: int, card) -> str:
+        """The winning 14 rendered group by group (§6.12) — re-matched from
+        the final state; falls back to the sorted rack if the card moved."""
+        winner = state.seats[seat]
+        try:
+            if card is None:
+                raise LookupError("card gone")
+            matches = mj_match.match_hand(
+                list(winner.rack), [e.as_match() for e in winner.exposures],
+                card,
+            )
+            best = mj_match.best_match([
+                m for m in matches if m.hand.id == (state.outcome.line_id if state.outcome else None)
+            ] or matches)
+            if best is not None:
+                return "  ·  ".join(
+                    " ".join([mj_layouts.tile_str(nat)] * count)
+                    for nat, count in mj_match.resolved_groups(best)
+                )
+        except Exception:  # noqa: BLE001 — best-effort grouped render over hand-matching logic; any failure falls back to the plain rack string
+            log.debug("reveal group render fell back", exc_info=True)
+        shown = rack_str(sort_rack(winner.rack))
+        for e in winner.exposures:
+            shown += "   " + " ".join(
+                [mj_layouts.tile_str(e.natural)] * (e.count - e.jokers)
+                + [mj_layouts.tile_str(Tile.JOKER)] * e.jokers
+            )
+        return shown
+
+    async def _safe_send(self, channel: discord.TextChannel, **kwargs) -> None:
+        """A public announcement card, pinging nobody."""
+        try:
+            await channel.send(
+                allowed_mentions=discord.AllowedMentions.none(), **kwargs
+            )
+        except discord.HTTPException:
+            log.warning("Mahjong: send failed in #%s", channel, exc_info=True)
+
+    # ── /mahjong ────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="mahjong",
+        description="Meadow Mahjong — open your panel: play, study the card, see your stats.",
+    )
+    @app_commands.guild_only()
+    async def mahjong(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                settings = load_settings(conn, guild.id)
+                active = get_active_card(conn, guild.id)
+                balance = get_balance(conn, guild.id, interaction.user.id)
+                return settings, active, balance
+
+        settings, active, balance = await asyncio.to_thread(_q)
+        if not settings.enabled:
+            await interaction.response.send_message(
+                "Meadow Mahjong isn't open on this server yet.", ephemeral=True
+            )
+            return
+        season = active[1] if active else None
+        panel = mj_views.MemberPanelView(self, mj_layouts.build_member_panel(
+            season, settings.stakes_allowed, balance,
+            escrow_for=(
+                (lambda seats, stake: escrow_amount(season, seats, stake))
+                if season is not None else None
+            ),
+        ))
+        await interaction.response.send_message(view=panel, ephemeral=True)
+        panel.message = await self._original(interaction)
+
+    @staticmethod
+    async def _original(interaction: discord.Interaction):
+        """The ephemeral message just sent, for an expiring view to grey
+        out later — or None when Discord won't say."""
+        try:
+            return await interaction.original_response()
+        except discord.HTTPException:
+            return None
+
+    # ── Member-panel handlers ───────────────────────────────────────────
+
+    async def handle_create_start(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                settings = load_settings(conn, guild.id)
+                active = get_active_card(conn, guild.id)
+                return settings, active
+
+        settings, active = await asyncio.to_thread(_q)
+        if active is None:
+            await interaction.response.send_message(
+                "No Meadow Card is active — an admin sets one on the dashboard.",
+                ephemeral=True,
+            )
+            return
+        card = active[1]
+
+        def escrow_for(seat_count: int, stake: int) -> int:
+            return escrow_amount(card, seat_count, stake)
+
+        picker = mj_views.CreateTableView(
+            self, settings.stakes_allowed, escrow_for,
+            short_rank=settings.short_deck_rank,
+            practice_open=settings.practice_bots,
+        )
+        await interaction.response.send_message(view=picker, ephemeral=True)
+        picker.message = await self._original(interaction)
+
+    async def handle_create_open(
+        self, interaction: discord.Interaction, seat_count: int, stake: int,
+        max_rank: int = FULL_RANK,
+    ) -> None:
+        guild = interaction.guild
+        assert guild is not None and interaction.channel_id is not None
+        if not isinstance(interaction.channel, discord.TextChannel):
+            # a thread/voice-text table could hold escrow behind a card the
+            # sticky machinery can never post (stage-6 review)
+            await interaction.response.send_message(
+                "❌ Tables live in regular text channels — open one there.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            table_id = await self.service.create_table(
+                guild.id, interaction.channel_id, interaction.user.id,
+                seat_count, stake, max_rank=max_rank,
+            )
+        except (TableError, ActionRejected) as e:
+            await interaction.followup.send(self._dress(str(e)), ephemeral=True)
+            return
+        self._track_table(table_id, interaction.channel_id)
+        panel = self.panels.get(table_id)
+        channel = guild.get_channel(interaction.channel_id)
+        if panel is not None and isinstance(channel, discord.TextChannel):
+            await panel.place_or_refresh(guild, channel)
+            await self._announce_table(
+                guild, channel, table_id, seat_count, stake, max_rank)
+        await interaction.followup.send(
+            "Table's open — the card is in the channel. Escrow locks in as "
+            "seats fill.", ephemeral=True,
+        )
+
+    async def _announce_table(
+        self, guild: discord.Guild, channel: discord.TextChannel,
+        table_id: int, seat_count: int, stake: int, max_rank: int,
+    ) -> None:
+        """One plain Game Lobby line under a new real table (mahjong-149):
+        the card alone was silent outside its channel, and a 4-seat lobby
+        can't fill on passers-by. Reads the same dial the lobby-games sweep
+        pings (``game_lobby_ping_role_id``); a guild with no role set posts
+        nothing. Never fails the open — the table is already up."""
+        try:
+            resolved, role_id = await resolve_game_lobby_role(self.bot, guild.id)
+            if not resolved or role_id is None:
+                return
+            meta = await self.service.table_meta(table_id)
+            if meta is None or not meta.get("sticky_message_id"):
+                return
+            await channel.send(
+                mj_layouts.build_table_open_ping(
+                    role_id, seat_count, stake, seat_count - 1,
+                    jump_url(guild.id, channel.id, int(meta["sticky_message_id"])),
+                    quick=max_rank != FULL_RANK,
+                ),
+                allowed_mentions=role_only_mentions(role_id),
+            )
+        except Exception:  # noqa: BLE001 — best-effort ping spans a DB lookup and a Discord send; a new table must not fail over a missed ping
+            log.warning("Mahjong: table-open ping failed for table %d",
+                        table_id, exc_info=True)
+
+    async def handle_create_practice(
+        self, interaction: discord.Interaction, seat_count: int,
+        max_rank: int = FULL_RANK,
+    ) -> None:
+        """A practice table (bots plan B5): stake-free, born full of bots,
+        dealt on the ordinary countdown. Same channel rules as a real one;
+        ``max_rank`` below the full deck is a quick practice table
+        (mahjong-147) and passes the same house gate as a staked one."""
+        guild = interaction.guild
+        assert guild is not None and interaction.channel_id is not None
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Tables live in regular text channels — open one there.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            table_id = await self.service.create_table(
+                guild.id, interaction.channel_id, interaction.user.id,
+                seat_count, 0, practice=True, max_rank=max_rank,
+            )
+        except (TableError, ActionRejected) as e:
+            await interaction.followup.send(self._dress(str(e)), ephemeral=True)
+            return
+        self._track_table(table_id, interaction.channel_id)
+        panel = self.panels.get(table_id)
+        channel = guild.get_channel(interaction.channel_id)
+        if panel is not None and isinstance(channel, discord.TextChannel):
+            await panel.place_or_refresh(guild, channel)
+            log.info(
+                "mahjong: table %d practice card placed in #%s",
+                table_id, channel.name)
+        else:
+            log.warning(
+                "mahjong: table %d practice card NOT placed (panel=%s, "
+                "channel=%s)", table_id, panel is not None,
+                type(channel).__name__)
+        await interaction.followup.send(
+            "🌱 Practice table's open — the bots are seated and the deal is "
+            "coming. No stakes, no stats — just practice.", ephemeral=True,
+        )
+
+    async def handle_card_viewer(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                return get_active_card(conn, guild.id)
+
+        active = await asyncio.to_thread(_q)
+        if active is None:
+            await interaction.response.send_message(
+                "No card is active right now.", ephemeral=True
+            )
+            return
+        # One card per page: a Components V2 message holds one card, so a
+        # long season arrives as a run of ephemeral messages.
+        pages = mj_layouts.build_card_viewer(active[1])
+        await interaction.response.send_message(view=card(pages[0]), ephemeral=True)
+        for page in pages[1:10]:
+            await interaction.followup.send(view=card(page), ephemeral=True)
+
+    async def handle_my_stats(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                return [
+                    dict(r) for r in conn.execute(
+                        "SELECT * FROM mahjong_stats WHERE guild_id = ? "
+                        "AND user_id = ?",
+                        (guild.id, interaction.user.id),
+                    )
+                ]
+
+        rows = await asyncio.to_thread(_q)
+        await interaction.response.send_message(
+            view=card(mj_layouts.build_my_stats(rows)), ephemeral=True
+        )
+
+    async def handle_how_to_play(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                active = get_active_card(conn, guild.id)
+                return load_settings(conn, guild.id), active
+
+        settings, active = await asyncio.to_thread(_q)
+        await interaction.response.send_message(
+            view=card(mj_layouts.build_how_to_play(
+                active[1] if active else None, settings, dashboard_url(),
+            )),
+            ephemeral=True,
+        )
+
+    async def handle_my_settings(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        assert guild is not None
+        current = await self.service.member_assist_mode(guild.id, interaction.user.id)
+        menu = mj_views.MySettingsView(self, current)
+        await interaction.response.send_message(view=menu, ephemeral=True)
+        menu.message = await self._original(interaction)
+
+    async def handle_assist_pick(
+        self, interaction: discord.Interaction, mode: str,
+        replaced: mj_views.MySettingsView | None = None,
+    ) -> None:
+        guild = interaction.guild
+        assert guild is not None
+        await self.service.choose_assist_mode(guild.id, interaction.user.id, mode)
+        if replaced is not None:
+            # The fresh menu goes onto the same message; the old one's timer
+            # would otherwise grey the new one out when it fires
+            # (ExpiringLayoutView's contract).
+            replaced.stop()
+        label = next(
+            (lbl for v, lbl, _ in mj_views.ASSIST_CHOICES if v == mode), mode
+        )
+        menu = mj_views.MySettingsView(
+            self, mode, note=f"**My Settings** — assistance set to **{label}**.",
+        )
+        await interaction.response.edit_message(view=menu)
+        menu.message = await self._original(interaction)
+
+    # ── The host panel (/games host) ────────────────────────────────────
+
+    @staticmethod
+    def _is_mod(member) -> bool:
+        return isinstance(member, discord.Member) and has_mod_or_admin_permissions(
+            member.guild_permissions
+        )
+
+    async def open_channel_host_panel(self, interaction: discord.Interaction) -> bool:
+        """``/games host`` in a channel with a Mahjong table: Cancel and
+        Close Table on one ephemeral panel. Tables are not rows in
+        ``games_active_games`` (``host_panel.CHANNEL_HOST_PANEL_COGS``), so
+        the table is found through the cog's own channel map. Returns False
+        for a channel with no live table, so the next game gets a look.
+        The host, a seated player or a mod may open it — the union of who the
+        two buttons' own gates (:meth:`panel_cancel`, :meth:`panel_close`)
+        let through."""
+        table_id = self.channel_tables.get(interaction.channel_id or 0)
+        if table_id is None:
+            return False
+        state = await self.service.load_state(table_id)
+        if state is None or state.phase is Phase.CLOSED:
+            return False
+        refusal = table_controls_refusal(
+            state, interaction.user.id, is_mod=self._is_mod(interaction.user),
+        )
+        if refusal is not None:
+            await host_reply(interaction, NOT_AT_TABLE_REPLY)
+            return True
+        panel = CallbackHostPanel(
+            mj_layouts.build_host_panel_layout(),
+            {
+                mj_layouts.HOST_CANCEL_ID: lambda i, p: self.panel_cancel(i, p, table_id),
+                mj_layouts.HOST_CLOSE_ID: lambda i, p: self.panel_close(i, p, table_id),
+            },
+        )
+        await send_panel(interaction, panel, label="mahjong host panel")
+        return True
+
+    async def _panel_done(
+        self, interaction: discord.Interaction, panel: ExpiringLayoutView, text: str,
+    ) -> None:
+        """Replace the panel with a one-line card saying it worked, stopping
+        the panel first so its timer can't grey the card out."""
+        panel.stop()
+        done = discord.ui.LayoutView(timeout=None)
+        done.add_item(discord.ui.TextDisplay(text))
+        await interaction.edit_original_response(view=done)
+
+    async def panel_cancel(
+        self, interaction: discord.Interaction, panel: ExpiringLayoutView, table_id: int,
+    ) -> None:
+        """Cancel, from the host panel: the lobby's host, or a mod, scraps
+        the table before the deal. The engine holds the host check
+        (``cancel_table``); a mod passes ``member_id=None``."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.service.act(
+                table_id, "cancel",
+                member_id=None if self._is_mod(interaction.user) else interaction.user.id,
+            )
+        except (TableError, ActionRejected) as e:
+            await self._reply(interaction, self._dress(str(e)))
+            return
+        await self._panel_done(interaction, panel, CANCELLED_REPLY)
+
+    async def panel_close(
+        self, interaction: discord.Interaction, panel: ExpiringLayoutView, table_id: int,
+    ) -> None:
+        """Close Table, from the host panel: a seated player once the hand
+        is settled, or a mod in any phase (``close_table_refusal``)."""
+        state = await self.service.load_state(table_id)
+        refusal = close_table_refusal(
+            state, interaction.user.id, is_mod=self._is_mod(interaction.user),
+        )
+        if refusal == "stale":
+            await self._reply(interaction, STALE_TABLE)
+            return
+        if refusal is not None:
+            await self._reply(interaction, "❌ Only the players (or a mod) can close a table.")
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.service.dissolve_table(table_id, "closed")
+        except (TableError, ActionRejected) as e:
+            await self._reply(interaction, self._dress(str(e)))
+            return
+        await self._panel_done(interaction, panel, CLOSED_REPLY)
+
+    # ── Table-button dispatch ───────────────────────────────────────────
+
+    async def handle_table_button(
+        self, interaction: discord.Interaction, table_id: int, action: str
+    ) -> None:
+        try:
+            if action == "join":
+                await self._act_simple(
+                    interaction,
+                    self.service.join_table(table_id, interaction.user.id),
+                    "You're seated — escrow locked. 🀄",
+                    table_id,
+                )
+            elif action == "add_bot":
+                await self._act_simple(
+                    interaction,
+                    self.service.add_bot(table_id, interaction.user.id),
+                    "🌱 Bot seated — house escrow locked.",
+                    table_id,
+                )
+            elif action in ("cancel", "close"):
+                # Left the card for the host panel (2026-10-01); a card
+                # posted before that still shows them until its next repost.
+                await self._reply(interaction, MOVED_TO_HOST_PANEL)
+            elif action == "rack":
+                await self._send_rack(interaction, table_id)
+            elif action in ("vote_y", "vote_n"):
+                await self._act_simple(
+                    interaction,
+                    self.service.act(table_id, "vote",
+                                     member_id=interaction.user.id,
+                                     yes=action == "vote_y"),
+                    "Vote's in.",
+                    table_id,
+                )
+            elif action == "claim_pass":
+                await self._act_simple(
+                    interaction,
+                    self.service.act(table_id, "claim",
+                                     member_id=interaction.user.id,
+                                     kind="pass"),
+                    "Passed.",
+                    table_id,
+                )
+            elif action == "claim_mj":
+                await self._claim_mahjong(interaction, table_id)
+            elif action == "claim_call":
+                await self._claim_call_start(interaction, table_id)
+            elif action == "rematch":
+                await self._act_simple(
+                    interaction,
+                    self.service.act(table_id, "rematch",
+                                     member_id=interaction.user.id),
+                    "Rematch vote in — everyone must press it.",
+                    table_id,
+                )
+            else:
+                await interaction.response.send_message(
+                    STALE_TABLE, ephemeral=True
+                )
+        except (TableError, ActionRejected) as e:
+            await self._reply(interaction, self._dress(str(e)))
+
+    def _rack_is_live(self, table_id: int, member_id: int) -> bool:
+        """Is this member watching a rack panel that just refreshed itself?
+
+        The refresh runs inside ``act()`` — before any confirmation would be
+        sent — and drops its entry the moment an edit fails, so a True here
+        means the member is provably looking at up-to-date state and a
+        "Pass is in." ephemeral would just repeat what the panel's own Now
+        line already says.
+        """
+        entry = self.rack_watch.get((table_id, member_id))
+        return entry is not None and time.time() - entry[1] <= self.RACK_WATCH_TTL
+
+    async def _confirm(
+        self, interaction, table_id: int, events, done: str
+    ) -> None:
+        """Say only what the live panel can't: private notes always, the
+        routine confirmation only when no live rack panel is showing it."""
+        note = self._private_note(interaction.user.id, events)
+        if note:
+            await interaction.followup.send(note, ephemeral=True)
+        elif not self._rack_is_live(table_id, interaction.user.id):
+            await interaction.followup.send(done, ephemeral=True)
+
+    async def _act_simple(self, interaction, coro, done: str, table_id=None) -> None:
+        await interaction.response.defer(ephemeral=True)
+        events = await coro
+        await self._confirm(interaction, table_id or 0, events, done)
+
+    @staticmethod
+    def _dress(message: str) -> str:
+        # STALE_TABLE stays bare everywhere it appears: dressing it only on
+        # some paths would make the no-contact refusal distinguishable
+        return message if message == STALE_TABLE else f"❌ {message}"
+
+    def _private_note(self, member_id: int, events) -> str | None:
+        """Turn a private engine event into the ❌ this member alone sees."""
+        if not events:
+            return None
+        for kind, data in events:
+            if not data.get("private"):
+                continue
+            if kind == "claim_downgraded":
+                why = data.get("why", "")
+                if why == "invalid_mahjong":
+                    return ("❌ That 14 doesn't match a line on the card — "
+                            "your response became a Pass. (Nobody else saw this.)")
+                return ("❌ That call can't stand — your response became a "
+                        "Pass. (Nobody else saw this.)")
+        return None
+
+    async def _reply(self, interaction: discord.Interaction, text: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    async def _seat_of(
+        self, interaction: discord.Interaction, table_id: int
+    ) -> tuple[GameState, int] | None:
+        state = await self.service.load_state(table_id)
+        if state is None:
+            await self._reply(interaction, STALE_TABLE)
+            return None
+        seat = state.seat_of(interaction.user.id)
+        if seat is None:
+            await self._reply(interaction, "You're not at this table.")
+            return None
+        return state, seat
+
+    # ── Rack panel (the §6.4 fallback and every private picker) ─────────
+
+    async def _send_rack(
+        self, interaction: discord.Interaction, table_id: int
+    ) -> None:
+        got = await self._seat_of(interaction, table_id)
+        if got is None:
+            return
+        state, seat = got
+        guild = interaction.guild
+        assert guild is not None
+        meta = await self.service.table_meta(table_id)
+        names = self._names(guild, state)
+        body = mj_layouts.build_rack_panel(
+            state, seat, meta["deadline_at"] if meta else None,
+            context=self._rack_context(state, seat, names),
+            assist=await self._assist_for(table_id, state, seat),
+        )
+        view = self._rack_view(state, seat, table_id, names, body)
+        msg = await self._reply_layout(interaction, view)
+        if msg is not None:
+            view.message = msg
+            self.rack_watch[(table_id, interaction.user.id)] = (msg, time.time(), view)
+
+    async def _assist_for(
+        self, table_id: int, state: GameState, seat: int
+    ) -> AssistReadout | None:
+        """The seat's readout for a rack render, or None (mode off, table
+        gone, or no decision pending) — never an exception: assistance may
+        not break the panel it decorates."""
+        if not assist_relevant(state, seat):
+            return None  # free gates first — no DB trip for a None (F6)
+        try:
+            got = await self.service.assist_context(
+                table_id, state.seats[seat].member_id
+            )
+            if got is None:
+                return None
+            card, mode = got
+            return assist_readout(state, seat, card, mode)
+        except Exception:
+            log.exception("assist readout failed for table %d", table_id)
+            return None
+
+    def _rack_context(self, state: GameState, seat: int, names: dict[int, str]) -> str | None:
+        """The panel's Now line — what this seat must do, or what it has
+        already done. Every phase reports the seat's own status, because
+        the live panel is the confirmation: a member who has acted sees it
+        here instead of collecting a separate ephemeral per tap."""
+        if state.phase is Phase.CHARLESTON:
+            rnd = "First" if state.charleston_round == 1 else "Second"
+            return (f"{rnd} Charleston, pass {state.pass_index + 1} of 3 — "
+                    "pick your tiles below."
+                    if seat not in state.pending_picks
+                    else "Your pass is in — waiting on the table.")
+        if state.phase is Phase.CHARLESTON_VOTE:
+            if seat in state.votes:
+                said = "yes" if state.votes[seat] else "no"
+                return f"Your vote ({said}) is in — waiting on the table."
+            return "Vote on the table card: run the second Charleston?"
+        if state.phase is Phase.COURTESY_PROPOSE:
+            if seat in state.proposals:
+                return (f"You offered {state.proposals[seat]} — "
+                        "waiting on the table.")
+            return "Offer 0–3 courtesy tiles below."
+        if state.phase is Phase.COURTESY_PICK:
+            if seat in state.courtesy_owed and seat not in state.courtesy_gives:
+                return f"Give {state.courtesy_owed[seat]} tile(s) below."
+            return "Courtesy trades are wrapping up."
+        if state.phase is Phase.CLAIM_WINDOW:
+            if seat in state.claims:
+                kind = state.claims[seat][0]
+                if kind == AUTO_PASS:
+                    # the engine passed for a seat with no legal route —
+                    # not a decision the member made, so not "You passed"
+                    return ("Nothing to claim here — the window moves on "
+                            "without you.")
+                shown = {"pass": "passed", "call": "called",
+                         "mahjong": "declared Mahjong"}.get(kind, kind)
+                return f"You {shown} — waiting on the window."
+            if seat == state.live_discarder:
+                return "Your discard is live — waiting on the table."
+            return "A discard is live — claim from the table card."
+        if state.phase is Phase.AWAIT_DISCARD and state.turn != seat:
+            # names is also handed raw to _rack_view (a select placeholder,
+            # which renders no markdown), so escape only this extracted copy.
+            turn_name = discord.utils.escape_markdown(names.get(
+                state.seats[state.turn].member_id, f"seat {state.turn + 1}"
+            ))
+            return f"Waiting on {turn_name}."
+        if state.phase is Phase.SETTLE:
+            if seat in state.rematch_votes:
+                return "Rematch vote in — every seat must press it."
+            return "Hand over — Rematch or Close on the table card."
+        return None
+
+    def _rack_view(
+        self, state: GameState, seat: int, table_id: int,
+        names: dict[int, str] | None = None, body: list | None = None,
+    ) -> mj_views.RackPanel:
+        """The rack card with the phase's picker under it — or the bare rack
+        when this seat has nothing to pick right now."""
+        rack = state.seats[seat].rack
+        shown = body or []
+        if state.phase is Phase.CHARLESTON and seat not in state.pending_picks:
+            to_label = None
+            if state.seat_count == 2 and names:
+                to_label = names.get(state.seats[1 - seat].member_id)
+            return mj_views.CharlestonPickView(
+                self, table_id, rack,
+                final_pass=state.pass_index == 2,
+                to_label=to_label, body=shown,
+            )
+        if state.phase is Phase.COURTESY_PROPOSE and seat not in state.proposals:
+            return mj_views.CourtesyProposeView(self, table_id, body=shown)
+        if (state.phase is Phase.COURTESY_PICK
+                and seat in state.courtesy_owed
+                and seat not in state.courtesy_gives):
+            return mj_views.CourtesyGiveView(
+                self, table_id, rack, state.courtesy_owed[seat], body=shown,
+            )
+        if state.phase is Phase.AWAIT_DISCARD and state.turn == seat:
+            return mj_views.TurnView(self, table_id, state, seat, body=shown)
+        return mj_views.RackPanel(shown)
+
+    async def _reply_layout(self, interaction, view):
+        """Send the ephemeral panel and return an editable message handle
+        (valid ~15 min on the interaction's token) for the live refresh."""
+        if interaction.response.is_done():
+            return await interaction.followup.send(view=view, ephemeral=True, wait=True)
+        await interaction.response.send_message(view=view, ephemeral=True)
+        return await self._original(interaction)
+
+    # ── Phase handlers (called from views) ──────────────────────────────
+
+    async def handle_charleston_pick(
+        self, interaction, table_id: int, tiles: list[Tile], blind_n: int
+    ) -> None:
+        await self._do(interaction, table_id, "charleston_pick",
+                       tiles=tiles, blind_n=blind_n,
+                       done="Pass is in. 🤫" if blind_n else "Pass is in.")
+
+    async def handle_courtesy_propose(
+        self, interaction, table_id: int, n: int
+    ) -> None:
+        await self._do(interaction, table_id, "courtesy_propose", n=n,
+                       done=f"Offered {n}.")
+
+    async def handle_courtesy_give(
+        self, interaction, table_id: int, tiles: list[Tile]
+    ) -> None:
+        await self._do(interaction, table_id, "courtesy_pick", tiles=tiles,
+                       done="Tiles handed over.")
+
+    async def handle_discard(
+        self, interaction, table_id: int, tile: Tile
+    ) -> None:
+        await self._do(interaction, table_id, "discard", tile=tile,
+                       done="Discarded.")
+
+    async def handle_redeem(
+        self, interaction, table_id: int, exposure_id: int, tile: Tile
+    ) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.service.act(
+                table_id, "redeem_joker", member_id=interaction.user.id,
+                exposure_id=exposure_id, tile=tile,
+            )
+        except (TableError, ActionRejected) as e:
+            await self._reply(interaction, self._dress(str(e)))
+            return
+        # §6.11: the redeemer's refreshed panel — joker in rack, discard next
+        got = await self._seat_of(interaction, table_id)
+        if got is None:
+            return
+        state, seat = got
+        meta = await self.service.table_meta(table_id)
+        body = mj_layouts.build_rack_panel(
+            state, seat, meta["deadline_at"] if meta else None,
+            context="Joker's yours — now discard.",
+            assist=await self._assist_for(table_id, state, seat),
+        )
+        view = self._rack_view(state, seat, table_id, body=body)
+        msg = await self._reply_layout(interaction, view)
+        if msg is not None:
+            view.message = msg
+            self.rack_watch[(table_id, interaction.user.id)] = (msg, time.time(), view)
+
+    async def handle_self_mahjong(self, interaction, table_id: int) -> None:
+        await self._do(interaction, table_id, "mahjong", done="🀄 Mahjong!")
+
+    async def _claim_mahjong(self, interaction, table_id: int) -> None:
+        await self._do(interaction, table_id, "claim", kind="mahjong",
+                       done="🀄 Mahjong!")
+
+    async def _claim_call_start(self, interaction, table_id: int) -> None:
+        got = await self._seat_of(interaction, table_id)
+        if got is None:
+            return
+        state, seat = got
+        if state.phase is not Phase.CLAIM_WINDOW or state.live_discard is None:
+            await self._reply(interaction, STALE_TABLE)
+            return
+        pool = [
+            t for t in state.seats[seat].rack
+            if t is state.live_discard or t is Tile.JOKER
+        ]
+        if len(pool) < 2:
+            # nothing pickable — submit the bare call and let the engine
+            # downgrade it privately (§2.5: the tap never leaks)
+            await self.handle_call_submit(interaction, table_id, pool)
+            return
+        picker = mj_views.CallTilesView(
+            self, table_id, state.seats[seat].rack, state.live_discard
+        )
+        await interaction.response.send_message(view=picker, ephemeral=True)
+        picker.message = await self._original(interaction)
+
+    async def handle_call_submit(
+        self, interaction, table_id: int, tiles: list[Tile],
+        for_discard: Tile | None = None,
+    ) -> None:
+        if for_discard is not None:
+            state = await self.service.load_state(table_id)
+            if state is None or state.live_discard is not for_discard:
+                # the picker outlived its window — never consume the new one
+                await self._reply(interaction, STALE_TABLE)
+                return
+        await self._do(interaction, table_id, "claim", kind="call",
+                       tiles=tiles,
+                       done="Call's in — it stands unless a Mahjong outranks it.")
+
+    async def _do(
+        self, interaction, table_id: int, action: str, *, done: str, **kwargs
+    ) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+            events = await self.service.act(
+                table_id, action, member_id=interaction.user.id, **kwargs
+            )
+        except (TableError, ActionRejected) as e:
+            await self._reply(interaction, self._dress(str(e)))
+            return
+        await self._confirm(interaction, table_id, events, done)
+
+    # ── Scheduled card activation ───────────────────────────────────────
+
+    @tasks.loop(minutes=1)
+    async def card_scheduler(self) -> None:
+        def _q():
+            with open_db(self.bot.ctx.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT guild_id FROM mahjong_cards "
+                    "WHERE status = 'scheduled'"
+                ).fetchall()
+                changed = False
+                for r in rows:
+                    changed = activate_due_cards(conn, int(r["guild_id"])) or changed
+                return changed
+
+        try:
+            await asyncio.to_thread(_q)
+        except Exception:
+            log.exception("Mahjong card scheduler tick failed")
+
+    @card_scheduler.before_loop
+    async def _wait_ready(self) -> None:
+        await self.bot.wait_until_ready()
+
+
+async def setup(bot: "Bot") -> None:
+    await bot.add_cog(MahjongCog(bot))

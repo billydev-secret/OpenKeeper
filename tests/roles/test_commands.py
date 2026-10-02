@@ -1,0 +1,608 @@
+"""Tests for slash command handlers.
+
+The /grant command lives in ``bot_modules.roles.grant.cog`` (RoleGrantCog),
+which resolves the grant config and delegates to
+``bot_modules.roles.grant.role_grant_commands._execute_grant``. Tests drive the
+cog's command callback directly so both the permission/config gate and the
+shared execution path are covered.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.roles.grant.cog import RoleGrantCog
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _make_interaction(*, user_id: int = 100, guild: Any = None, channel: Any = None) -> MagicMock:
+    ix = MagicMock()
+    ix.response.send_message = AsyncMock()
+    ix.response.is_done = MagicMock(return_value=False)
+    ix.response.defer = AsyncMock()
+    ix.followup.send = AsyncMock()
+    user = MagicMock()
+    user.id = user_id
+    ix.user = user
+    ix.guild = guild
+    ix.channel = channel
+    ix.guild_id = guild.id if guild else None
+    return ix
+
+
+def _make_ctx(**kwargs) -> MagicMock:
+    ctx = MagicMock()
+    ctx.is_mod = MagicMock(return_value=kwargs.get("is_mod", False))
+    # Explicit, not left to MagicMock's auto-attribute: a bare mock returns a
+    # truthy object, which would silently satisfy the prerequisite gate's
+    # admin bypass and make the gate tests pass without the gate running.
+    ctx.is_admin = MagicMock(return_value=kwargs.get("is_admin", False))
+    ctx.can_grant_any_role = MagicMock(return_value=kwargs.get("can_grant_any_role", False))
+    ctx.can_use_xp_grant = MagicMock(return_value=kwargs.get("can_use_xp_grant", False))
+    actor = MagicMock()
+    actor.id = kwargs.get("actor_id", 100)
+    ctx.get_interaction_member = MagicMock(return_value=actor)
+    ctx.grant_roles = kwargs.get("grant_roles", {
+        "denizen": {"label": "Denizen", "role_id": kwargs.get("denizen_role_id", 0), "log_channel_id": 0, "announce_channel_id": 0, "grant_message": "", "required_role_id": 0},
+        "nsfw": {"label": "NSFW", "role_id": 0, "log_channel_id": 0, "announce_channel_id": 0, "grant_message": "", "required_role_id": 0},
+        "veteran": {"label": "Veteran", "role_id": 0, "log_channel_id": 0, "announce_channel_id": 0, "grant_message": "", "required_role_id": 0},
+        "kink": {"label": "Kink", "role_id": 0, "log_channel_id": 0, "announce_channel_id": 0, "grant_message": "", "required_role_id": 0},
+        "goldengirl": {"label": "Golden Girl", "role_id": 0, "log_channel_id": 0, "announce_channel_id": 0, "grant_message": "", "required_role_id": 0},
+    })
+    # Grant definitions are read per-guild via ctx.guild_config(gid).grant_roles.
+    _gc = MagicMock()
+    _gc.grant_roles = ctx.grant_roles
+    ctx.guild_config = MagicMock(return_value=_gc)
+    ctx.can_use_grant_role = MagicMock(return_value=kwargs.get("can_grant_any_role", False))
+    ctx.greeter_role_id = kwargs.get("greeter_role_id", 0)
+    ctx.xp_excluded_channel_ids = kwargs.get("xp_excluded_channel_ids", set())
+    ctx.xp_grant_allowed_user_ids = kwargs.get("xp_grant_allowed_user_ids", set())
+    ctx.get_xp_config_target_channel = MagicMock(return_value=kwargs.get("target_channel"))
+    ctx.add_config_id_value = MagicMock(return_value=set())
+    ctx.remove_config_id_value = MagicMock(return_value=set())
+    ctx.set_config_value = MagicMock(return_value="0")
+    ctx.open_db = MagicMock()
+    ctx.open_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+    ctx.open_db.return_value.__exit__ = MagicMock(return_value=False)
+    return ctx
+
+
+class _MockRole:
+    def __init__(
+        self,
+        position: int = 0,
+        role_id: int = 1,
+        name: str = "Role",
+        permissions: discord.Permissions | None = None,
+    ):
+        self.position = position
+        self.id = role_id
+        self.name = name
+        self.mention = f"<@&{role_id}>"
+        # Read by core.role_safety before /grant hands anything out.
+        self.managed = False
+        self.permissions = permissions or discord.Permissions.none()
+
+    def is_default(self) -> bool:
+        return False
+
+    def __ge__(self, other: _MockRole) -> bool:
+        return self.position >= other.position
+
+    def __lt__(self, other: _MockRole) -> bool:
+        return self.position < other.position
+
+
+def _make_member(*, bot: bool = False, user_id: int = 200, roles=None) -> MagicMock:
+    m = MagicMock()
+    m.bot = bot
+    m.id = user_id
+    m.roles = roles or []
+    m.mention = f"<@{user_id}>"
+    m.add_roles = AsyncMock()
+    return m
+
+
+def _guild_with_role(role):
+    guild = MagicMock()
+    guild.get_role = MagicMock(return_value=role)
+    guild.me = MagicMock()
+    guild.me.guild_permissions.manage_roles = True
+    guild.me.top_role = _MockRole(position=10)
+    return guild
+
+
+def _guild_with_roles(*roles):
+    """A guild whose ``get_role`` resolves by id (None for anything else).
+
+    The prerequisite gate looks up two different roles on the same guild, so
+    the single-role helper above can't express "the granted role exists but
+    the required one was deleted".
+    """
+    by_id = {r.id: r for r in roles}
+    guild = MagicMock()
+    guild.get_role = MagicMock(side_effect=lambda rid: by_id.get(rid))
+    guild.me = MagicMock()
+    guild.me.guild_permissions.manage_roles = True
+    guild.me.top_role = _MockRole(position=10)
+    return guild
+
+
+# ── grant command tests ───────────────────────────────────────────────
+
+@pytest.fixture
+def grant_setup():
+    ctx = _make_ctx(can_grant_any_role=True, denizen_role_id=999)
+    _bot = MagicMock()
+    _bot.ctx = ctx
+    cog = RoleGrantCog(_bot)
+    cmd = RoleGrantCog.grant_cmd.callback
+
+    async def grant(interaction, member):
+        return await cmd(cog, interaction, "denizen", member)
+
+    return ctx, grant
+
+
+async def test_no_permission_denied(grant_setup):
+    """Off the allow-list, with nothing wrong on the member's side.
+
+    Needs a real guild: the allow-list refusal now happens inside the executor
+    (so a member's own state can outrank it), and a guild-less interaction is
+    answered with "only works in a server" long before it — which is how this
+    assertion used to pass without the permission branch running at all.
+    """
+    ctx, grant = grant_setup
+    ctx.can_use_grant_role.return_value = False
+    ix = _make_interaction(guild=_guild_with_role(_MockRole(position=1, role_id=999)))
+    member = _make_member()
+    await grant(ix, member)
+    member.add_roles.assert_not_awaited()
+    ix.response.send_message.assert_awaited_once()
+    assert "permission" in ix.response.send_message.call_args[0][0].lower()
+    assert ix.response.send_message.call_args[1]["ephemeral"] is True
+
+
+async def test_bot_target_denied(grant_setup):
+    _, grant = grant_setup
+    ix = _make_interaction(guild=MagicMock())
+    await grant(ix, _make_member(bot=True))
+    assert "bots" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_self_assign_denied_for_non_mod(grant_setup):
+    ctx, grant = grant_setup
+    ctx.is_mod.return_value = False
+    ctx.get_interaction_member.return_value.id = 200
+    ix = _make_interaction(user_id=200, guild=MagicMock())
+    await grant(ix, _make_member(user_id=200))
+    assert "yourself" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_self_assign_allowed_for_mod(grant_setup):
+    ctx, grant = grant_setup
+    ctx.is_mod.return_value = True
+    ctx.get_interaction_member.return_value.id = 200
+    denizen_role = _MockRole(position=1, role_id=999)
+    guild = _guild_with_role(denizen_role)
+    ix = _make_interaction(user_id=200, guild=guild)
+    member = _make_member(user_id=200)
+    await grant(ix, member)
+    member.add_roles.assert_awaited_once()
+
+
+async def test_role_not_configured_denied(grant_setup):
+    ctx, grant = grant_setup
+    ctx.grant_roles["denizen"]["role_id"] = 0
+    ix = _make_interaction(guild=MagicMock())
+    await grant(ix, _make_member())
+    assert "not configured" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_role_not_found_denied(grant_setup):
+    _, grant = grant_setup
+    guild = MagicMock()
+    guild.get_role = MagicMock(return_value=None)
+    ix = _make_interaction(guild=guild)
+    await grant(ix, _make_member())
+    assert "no longer exists" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_member_already_has_role_denied(grant_setup):
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=1, role_id=999)
+    ix = _make_interaction(guild=_guild_with_role(denizen_role))
+    await grant(ix, _make_member(roles=[denizen_role]))
+    assert "already has" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_bot_missing_manage_roles_denied(grant_setup):
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=1, role_id=999)
+    guild = _guild_with_role(denizen_role)
+    guild.me.guild_permissions.manage_roles = False
+    ix = _make_interaction(guild=guild)
+    await grant(ix, _make_member())
+    assert "manage roles" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_role_above_bot_denied(grant_setup):
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=10, role_id=999)
+    guild = MagicMock()
+    guild.get_role = MagicMock(return_value=denizen_role)
+    guild.me = MagicMock()
+    guild.me.guild_permissions.manage_roles = True
+    guild.me.top_role = _MockRole(position=5)
+    ix = _make_interaction(guild=guild)
+    await grant(ix, _make_member())
+    assert "above my highest role" in ix.response.send_message.call_args[0][0].lower()
+
+
+@pytest.mark.parametrize(
+    "perms",
+    [
+        pytest.param(discord.Permissions(manage_messages=True), id="manage-messages"),
+        pytest.param(discord.Permissions(administrator=True), id="administrator"),
+    ],
+)
+async def test_elevated_role_denied(grant_setup, perms):
+    """A grant definition is config: /grant never hands out mod-level
+    permissions, even to a mod running it (2026-09-14 decision)."""
+    _, grant = grant_setup
+    staff = _MockRole(position=1, role_id=999, name="STAFF", permissions=perms)
+    ix = _make_interaction(guild=_guild_with_role(staff))
+    member = _make_member()
+    await grant(ix, member)
+    member.add_roles.assert_not_awaited()
+    assert "elevated permissions" in ix.response.send_message.call_args[0][0]
+
+
+async def test_forbidden_on_add_roles_handled(grant_setup):
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=1, role_id=999)
+    guild = _guild_with_role(denizen_role)
+    ix = _make_interaction(guild=guild)
+    member = _make_member()
+    forbidden = discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Permissions")
+    member.add_roles = AsyncMock(side_effect=forbidden)
+    await grant(ix, member)
+    ix.response.defer.assert_awaited_once()
+    assert "couldn't grant" in ix.followup.send.call_args[0][0].lower()
+
+
+async def test_grant_success_posts_public_message(grant_setup):
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=1, role_id=999)
+    guild = _guild_with_role(denizen_role)
+    ix = _make_interaction(guild=guild)
+    member = _make_member()
+    await grant(ix, member)
+    member.add_roles.assert_awaited_once()
+    ix.response.defer.assert_awaited_once()
+    ix.followup.send.assert_awaited_once()
+    assert "granted" in ix.followup.send.call_args[0][0].lower()
+
+
+# ── prerequisite role gate ───────────────────────────────────────────────
+#
+# The guild shape these cover is the real one that filed the bug: the
+# "denizen" grant hands out Member, and its required_role_id is the
+# verification role (intake_verified_role_id). The gate existed in
+# _execute_grant from the start but the cog never passed required_role_id
+# through, so it never ran and unverified members were granted Member.
+
+PREREQ_ROLE_ID = 555
+
+
+@pytest.fixture
+def prereq_setup():
+    """/grant where the Member grant requires the verified role first."""
+    ctx = _make_ctx(can_grant_any_role=True, denizen_role_id=999)
+    ctx.grant_roles["denizen"]["required_role_id"] = PREREQ_ROLE_ID
+    _bot = MagicMock()
+    _bot.ctx = ctx
+    cog = RoleGrantCog(_bot)
+    cmd = RoleGrantCog.grant_cmd.callback
+
+    async def grant(interaction, member):
+        return await cmd(cog, interaction, "denizen", member)
+
+    return ctx, grant
+
+
+async def test_grant_blocked_when_prerequisite_missing(prereq_setup):
+    """The reported bug: verification absent, grant attempted, role handed out."""
+    _, grant = prereq_setup
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_not_awaited()
+    text = ix.response.send_message.call_args[0][0]
+    assert verified_role.mention in text
+    assert ix.response.send_message.call_args[1]["ephemeral"] is True
+
+
+async def test_unpermitted_actor_is_told_the_member_is_unverified(prereq_setup):
+    """Todo #176, through the glue that caused it.
+
+    The cog used to answer the allow-list itself and return, so this caller
+    saw "You don't have permission to use this command" and never learned the
+    newcomer hadn't verified. The wiring assertion is that the cog now carries
+    the allow-list answer into the executor instead of acting on it.
+    """
+    ctx, grant = prereq_setup
+    ctx.can_use_grant_role.return_value = False
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_not_awaited()
+    text = ix.response.send_message.call_args[0][0]
+    assert verified_role.mention in text
+    assert "permission" not in text.lower()
+
+
+async def test_grant_allowed_when_prerequisite_held(prereq_setup):
+    _, grant = prereq_setup
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[verified_role])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_awaited_once()
+
+
+async def test_grant_blocked_when_prerequisite_role_deleted(prereq_setup):
+    """Fails closed: a prerequisite that no longer exists can't be satisfied."""
+    _, grant = prereq_setup
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    ix = _make_interaction(guild=_guild_with_roles(member_role))  # no 555
+    member = _make_member(roles=[])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_not_awaited()
+    assert "misconfigured" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_mod_does_not_bypass_prerequisite(prereq_setup):
+    """Mods are gated too — only admins override (see role_grant_spec.md)."""
+    ctx, grant = prereq_setup
+    ctx.is_mod.return_value = True
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_not_awaited()
+
+
+async def test_admin_bypasses_prerequisite(prereq_setup):
+    """Admins keep the override so a guild can't lock itself out of its grants."""
+    ctx, grant = prereq_setup
+    ctx.is_admin.return_value = True
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[])
+
+    await grant(ix, member)
+
+    member.add_roles.assert_awaited_once()
+
+
+async def test_already_has_role_reported_as_such_despite_missing_prerequisite(
+    prereq_setup,
+):
+    """A no-op must report as a no-op.
+
+    Telling a greeter "they need @Verified first" about someone who already
+    holds the role invites hand-adding the prerequisite in Discord — the
+    manual bypass the gate exists to prevent.
+    """
+    _, grant = prereq_setup
+    member_role = _MockRole(position=1, role_id=999, name="Member")
+    verified_role = _MockRole(position=2, role_id=PREREQ_ROLE_ID, name="Verified")
+    ix = _make_interaction(guild=_guild_with_roles(member_role, verified_role))
+    member = _make_member(roles=[member_role])  # has Member, lacks Verified
+
+    await grant(ix, member)
+
+    member.add_roles.assert_not_awaited()
+    assert "already has" in ix.response.send_message.call_args[0][0].lower()
+
+
+async def test_unconfigured_prerequisite_grants_freely(grant_setup):
+    """required_role_id = 0 (the default) leaves every grant ungated."""
+    _, grant = grant_setup
+    denizen_role = _MockRole(position=1, role_id=999)
+    ix = _make_interaction(guild=_guild_with_role(denizen_role))
+    member = _make_member()
+
+    await grant(ix, member)
+
+    member.add_roles.assert_awaited_once()
+
+
+# ── /grant closes the prune ledger ───────────────────────────────────────
+# (The old /grant_missing audit moved to the dashboard's Grant Audit panel;
+# its bucketing coverage lives in tests/roles/test_role_grant_audit_logic.py.)
+
+
+async def test_grant_marks_open_prune_event_restored(grant_setup, tmp_path):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.roles.grant.audit_service import (
+        get_open_prune_events,
+        record_prune_events,
+    )
+    from tests.db_template import migrated_db
+
+    guild_id = 12345
+    db_path = tmp_path / "grant.db"
+    migrated_db(db_path)
+
+    ctx, grant = grant_setup
+    ctx.open_db = lambda: open_db(db_path)
+
+    denizen_role = _MockRole(position=1, role_id=999)
+    guild = _guild_with_role(denizen_role)
+    guild.id = guild_id
+    ix = _make_interaction(guild=guild)
+    member = _make_member(user_id=201)
+
+    with open_db(db_path) as conn:
+        record_prune_events(conn, guild_id, [201], 999, 100.0)
+
+    await grant(ix, member)
+
+    member.add_roles.assert_awaited_once()
+    with open_db(db_path) as conn:
+        assert get_open_prune_events(conn, guild_id, 999) == []
+        row = conn.execute(
+            "SELECT restored_at FROM role_prune_events WHERE user_id = 201"
+        ).fetchone()
+        assert row["restored_at"] is not None
+
+
+# ── /grant_audit card posting ────────────────────────────────────────────
+
+
+@pytest.fixture
+def grant_audit_setup(tmp_path):
+    from bot_modules.core.db_utils import open_db
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "audit_card.db"
+    migrated_db(db_path)
+
+    ctx = _make_ctx(is_mod=True)
+    ctx.grant_roles["nsfw"]["role_id"] = 555
+    ctx.open_db = lambda: open_db(db_path)
+    ctx.db_path = db_path
+    _bot = MagicMock()
+    _bot.ctx = ctx
+    cog = RoleGrantCog(_bot)
+
+    # /grant_audit was replaced by the dashboard's Grant Audit panel on
+    # 2026-07-28. The card placement is the same; only its entry point moved,
+    # so these drive
+    # post_audit_card(guild, channel) directly. Permission is the route's now.
+    async def grant_audit(guild, channel, *, role_key="nsfw", min_level=5):
+        return await cog.post_audit_card(
+            guild, channel, role_key=role_key, min_level=min_level
+        )
+
+    return ctx, grant_audit, db_path
+
+
+def _audit_guild():
+    role = _MockRole(role_id=555, name="NSFW")
+    role.members = []
+    guild = MagicMock()
+    guild.id = 12345
+    guild.me = None
+    guild.get_role = MagicMock(return_value=role)
+    guild.get_member = MagicMock(return_value=None)
+    return guild
+
+
+def _audit_channel(channel_id=777):
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = channel_id
+    channel.mention = f"<#{channel_id}>"
+    message = MagicMock()
+    message.id = 2**60 + 7
+    channel.send = AsyncMock(return_value=message)
+    channel.fetch_message = AsyncMock()
+    return channel, message
+
+
+# "denied for non-mod" moved with the command: post_audit_card is unguarded by
+# design, and its only caller is POST /api/panels/{key}/post, which is
+# admin-gated (tests/web/test_panels_routes.py plus the authz sweep).
+
+
+async def test_grant_audit_posts_card_and_stores_ref(grant_audit_setup):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.roles.grant.audit_service import load_card_ref
+
+    ctx, grant_audit, db_path = grant_audit_setup
+    guild = _audit_guild()
+    channel, message = _audit_channel()
+
+    await grant_audit(guild, channel)
+
+    channel.send.assert_awaited_once()
+    embed = channel.send.call_args.kwargs["embed"]
+    assert embed.title == "📋 Grant Audit — NSFW"
+    with open_db(db_path) as conn:
+        ref = load_card_ref(conn, 12345)
+    assert (ref.channel_id, ref.message_id) == (channel.id, message.id)
+    assert (ref.grant_name, ref.min_level) == ("nsfw", 5)
+
+
+async def test_grant_audit_repost_same_channel_edits_in_place(grant_audit_setup):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.roles.grant.audit_service import save_card_ref
+
+    ctx, grant_audit, db_path = grant_audit_setup
+    guild = _audit_guild()
+    channel, _ = _audit_channel()
+    old_message = MagicMock()
+    old_message.id = 424242
+    old_message.edit = AsyncMock()
+    channel.fetch_message = AsyncMock(return_value=old_message)
+    with open_db(db_path) as conn:
+        save_card_ref(conn, 12345, channel.id, old_message.id, "nsfw", 5)
+
+    await grant_audit(guild, channel)
+
+    old_message.edit.assert_awaited_once()
+    channel.send.assert_not_awaited()
+
+
+async def test_grant_audit_refuses_an_unconfigured_role(grant_audit_setup):
+    """post_audit_card raises with the reason so the route can name what to fix
+    — an admin who picked a role that isn't set up should be told that, not
+    handed a generic failure."""
+    import pytest
+
+    ctx, grant_audit, _ = grant_audit_setup
+    guild = _audit_guild()
+    channel, _ = _audit_channel()
+
+    with pytest.raises(ValueError) as exc:
+        await grant_audit(guild, channel, role_key="not-configured")
+    assert "not configured" in str(exc.value)
+    channel.send.assert_not_awaited()
+
+
+async def test_grant_audit_refuses_a_min_level_below_one(grant_audit_setup):
+    import pytest
+
+    ctx, grant_audit, _ = grant_audit_setup
+    guild = _audit_guild()
+    channel, _ = _audit_channel()
+
+    with pytest.raises(ValueError) as exc:
+        await grant_audit(guild, channel, min_level=0)
+    assert "at least 1" in str(exc.value)
+    channel.send.assert_not_awaited()

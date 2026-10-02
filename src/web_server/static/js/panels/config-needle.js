@@ -1,0 +1,449 @@
+import {
+  loadConfig, loadChannels, channelName, apiPut, apiDelete, showStatus,
+  guardForm, renderMetaWarning, mountChannelPicker,
+  mountAsync, trackCard, clearCardDirty, hasDirtySibling, rerenderUnlessDirty,
+  guardedSubmit,
+} from "../config-helpers.js";
+import { toast, confirmDialog } from "../ui.js";
+import { esc } from "../api.js";
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const DEFAULT_TITLE_TYPE    = "first_fifty";
+const DEFAULT_DELETE_BEHAVIOR = "archive_if_empty";
+const DEFAULT_REPLY_TYPE    = "default";
+const DEFAULT_AUTO_ARCHIVE  = 1440;
+
+const TITLE_TYPES = [
+  { value: "first_fifty", label: "First 50 characters of the message (default)" },
+  { value: "first_line",  label: "First line of the message" },
+  { value: "user_date",   label: "Member name and date" },
+  { value: "custom",      label: "A template you write" },
+];
+
+const DELETE_BEHAVIORS = [
+  { value: "archive_if_empty", label: "Delete the thread if nobody replied, otherwise archive it (default)" },
+  { value: "archive",          label: "Always archive the thread" },
+  { value: "delete",           label: "Always delete the thread" },
+  { value: "nothing",          label: "Leave the thread open" },
+];
+
+const REPLY_TYPES = [
+  { value: "default", label: "The server-wide message set above" },
+  { value: "custom",  label: "A message you write for this channel" },
+  { value: "none",    label: "No message at all" },
+];
+
+// Discord accepts exactly these four; the server stores anything else as 1 day.
+const AUTO_ARCHIVE_CHOICES = [
+  { value: 60,    label: "1 hour" },
+  { value: 1440,  label: "1 day (default)" },
+  { value: 4320,  label: "3 days" },
+  { value: 10080, label: "1 week" },
+];
+const AUTO_ARCHIVE_HINT =
+  "A thread with no new replies for this long is archived. Anyone can still open it by replying.";
+
+const VALID_TITLE_TYPES    = new Set(TITLE_TYPES.map(t => t.value));
+const VALID_DELETE_BEHAVIORS = new Set(DELETE_BEHAVIORS.map(t => t.value));
+const VALID_REPLY_TYPES    = new Set(REPLY_TYPES.map(t => t.value));
+const VALID_AUTO_ARCHIVE   = new Set(AUTO_ARCHIVE_CHOICES.map(t => t.value));
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function safeOf(set, v, fallback) {
+  return set.has(v) ? v : fallback;
+}
+
+function selectOptions(choices, selected) {
+  return choices.map(
+    c => `<option value="${esc(c.value)}"${c.value === selected ? " selected" : ""}>${esc(c.label)}</option>`
+  ).join("");
+}
+
+// The one toggle idiom: a checkbox row with a hint that states what changes.
+function checkbox(name, checked, label, hint) {
+  return `<div class="field">
+    <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+      <input type="checkbox" name="${esc(name)}"${checked ? " checked" : ""} />
+      ${esc(label)}
+    </label>
+    ${hint ? `<div class="field-hint">${esc(hint)}</div>` : ""}
+  </div>`;
+}
+
+const REQUIRE_ATTACHMENT_LABEL = "Require an Image or File on Every Post";
+const REQUIRE_ATTACHMENT_HINT =
+  "Needs Manage Messages. Posts with no upload are deleted and get no thread; "
+  + "moderators and bots are exempt.";
+
+// Shown while the box is ticked in a channel where the bot can't delete: the
+// rule would remove nothing, and a setting that isn't enforced must say so.
+const REMOVAL_BLOCKED_TEXT =
+  "Posts without an upload are not being removed here: the bot is missing Manage Messages "
+  + "in this channel. Grant it in the channel's permission settings, then reload this page.";
+
+function removalWarning(blocked) {
+  return `<div class="meta-warning" role="alert" data-removal-warning style="${blocked ? "" : "display:none"}">${esc(REMOVAL_BLOCKED_TEXT)}</div>`;
+}
+
+// ── Channel card ─────────────────────────────────────────────────────────────
+
+function channelCard(r, channels) {
+  const chName    = channelName(channels, r.channel_id);
+  const titleType = safeOf(VALID_TITLE_TYPES, r.title_type, "first_fifty");
+  const delBeh    = safeOf(VALID_DELETE_BEHAVIORS, r.delete_behavior, "archive_if_empty");
+  const replyType = safeOf(VALID_REPLY_TYPES, r.reply_type, "default");
+  const autoArchive = safeOf(VALID_AUTO_ARCHIVE, r.auto_archive_minutes, DEFAULT_AUTO_ARCHIVE);
+  const isCustomTitle = titleType === "custom";
+  const isCustomReply = replyType === "custom";
+
+  const uid = `nd-${esc(String(r.channel_id))}`;
+
+  return `
+    <form class="form card" style="margin-bottom:16px;" data-needle-channel="${r.channel_id}">
+      <div class="section-label">${esc(chName)}</div>
+      ${removalWarning(r.removal_blocked)}
+
+      <div class="field-row">
+        <div class="field">
+          <label for="${uid}-title-type">Name the Thread After</label>
+          <select name="title_type" id="${uid}-title-type">${selectOptions(TITLE_TYPES, titleType)}</select>
+          <div class="field-hint">Members can rename their own thread afterwards.</div>
+        </div>
+        <div class="field" data-custom-title-field style="${isCustomTitle ? "" : "display:none"}">
+          <label for="${uid}-custom-title">Your Title Template</label>
+          <input type="text" name="custom_title" id="${uid}-custom-title" value="${esc(r.custom_title)}" placeholder="$USER on $DATE" />
+          <div class="field-hint">Placeholders: <code>$USER</code> is the poster's name, <code>$DATE</code> is the post's date (YYYY-MM-DD, UTC).</div>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="${uid}-delete-behavior">If the Original Message Is Deleted</label>
+          <select name="delete_behavior" id="${uid}-delete-behavior">${selectOptions(DELETE_BEHAVIORS, delBeh)}</select>
+          <div class="field-hint">Deleting a thread also deletes every reply in it, permanently.</div>
+        </div>
+        <div class="field">
+          <label for="${uid}-slowmode">Slow Mode Inside Threads (seconds)</label>
+          <input type="number" name="slowmode" id="${uid}-slowmode" required value="${esc(String(r.slowmode ?? 0))}" min="0" max="21600" step="1" style="max-width:120px;" />
+          <div class="field-hint">Members must wait this long between replies in the thread. Enter 0 for no wait. Maximum 21600 (6 hours).</div>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="${uid}-reply-type">Message Posted in the New Thread</label>
+          <select name="reply_type" id="${uid}-reply-type">${selectOptions(REPLY_TYPES, replyType)}</select>
+          <div class="field-hint">A short greeting the bot posts as the thread's first reply.</div>
+        </div>
+        <div class="field" data-custom-reply-field style="${isCustomReply ? "" : "display:none"}">
+          <label for="${uid}-custom-reply">Your Thread Message</label>
+          <input type="text" name="custom_reply" id="${uid}-custom-reply" value="${esc(r.custom_reply)}" placeholder="Welcome $USER! — $THREAD" />
+          <div class="field-hint">Placeholders: <code>$USER</code> the poster, <code>$CHANNEL</code> the channel, <code>$THREAD</code> the new thread.</div>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="${uid}-auto-archive">Threads Archive After</label>
+          <select name="auto_archive_minutes" id="${uid}-auto-archive">${selectOptions(AUTO_ARCHIVE_CHOICES, autoArchive)}</select>
+          <div class="field-hint">${esc(AUTO_ARCHIVE_HINT)}</div>
+        </div>
+        <div class="field">
+          <label for="${uid}-reactions">Emoji Added to Every Post</label>
+          <input type="text" name="default_reactions" id="${uid}-reactions" value="${esc(r.default_reactions)}" placeholder="None" />
+          <div class="field-hint">Comma-separated emoji the bot reacts with on every post. Leave blank for none.</div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        ${checkbox("include_bots", r.include_bots, "Also Thread Messages From Bots",
+          "Posts from bots and webhooks get threads too. Otherwise they are skipped.")}
+        ${checkbox("notify_op_on_reply", r.notify_op_on_reply, "Allow Reply DMs",
+          "Members who opted in (Help & Settings → Roles & Pings) get a DM when someone replies in their thread here.")}
+        ${checkbox("require_attachment", r.require_attachment, REQUIRE_ATTACHMENT_LABEL, REQUIRE_ATTACHMENT_HINT)}
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-primary">Save</button>
+        <button type="button" class="btn btn-danger" data-needle-remove="${r.channel_id}">Stop Auto-Threading</button>
+        <span data-needle-status></span>
+      </div>
+    </form>`;
+}
+
+// ── Global settings section ───────────────────────────────────────────────────
+
+function globalSettingsCard(needle) {
+  return `
+    <form class="form card" data-needle-global>
+      <div class="section-label">Server-Wide Defaults</div>
+      <div class="field-hint" style="margin-bottom:10px;">These apply to every auto-threaded channel below.</div>
+
+      <div class="field">
+        <label for="nd-default-reply">Default Thread Message</label>
+        <input type="text" name="default_reply" id="nd-default-reply" value="${esc(needle.default_reply)}" placeholder="Thread created by $USER in $CHANNEL" />
+        <div class="field-hint">For channels set to "The server-wide message set above". Blank posts nothing. Placeholders: <code>$USER</code>, <code>$CHANNEL</code>, <code>$THREAD</code>.</div>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+        <button type="submit" class="btn btn-primary">Save</button>
+        <span data-global-status></span>
+      </div>
+    </form>`;
+}
+
+// ── Mount / render ────────────────────────────────────────────────────────────
+
+export function mount(container) {
+  container.innerHTML = `<div class="panel"><div class="empty">Loading…</div></div>`;
+  return mountAsync(container, async () => {
+    const [config, channels] = await Promise.all([loadConfig(), loadChannels()]);
+    render(container, config.needle || { channels: [], default_reply: "" }, channels);
+  }, { errorMsg: "Couldn’t load the auto-thread settings." });
+}
+
+function render(container, needle, channels) {
+  const cfgs = needle.channels || [];
+
+  const existingCards = cfgs.length
+    ? cfgs.map(r => channelCard(r, channels)).join("")
+    : `<div class="empty">No channels are auto-threaded yet. Add your first one below.</div>`;
+
+  container.innerHTML = `
+    <div class="panel">
+      <header>
+        <h2>Auto-Thread</h2>
+        <div class="subtitle">Give every message in a channel its own thread, so replies stay tidy</div>
+      </header>
+      ${renderMetaWarning()}
+
+      ${globalSettingsCard(needle)}
+
+      <div class="section-label" style="margin-top:24px;">Auto-Threaded Channels</div>
+      <div data-needle-rules>${existingCards}</div>
+
+      <div class="section-label" style="margin-top:16px;">Add a Channel</div>
+      <form class="form card" data-needle-add>
+        <div class="field">
+          <label>Channel</label>
+          <span data-picker="channel_id"></span>
+          <div class="field-hint">Every message posted here gets its own thread from now on. Older messages are left alone.</div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="nd-new-title-type">Name the Thread After</label>
+            <select name="title_type" id="nd-new-title-type">${selectOptions(TITLE_TYPES, DEFAULT_TITLE_TYPE)}</select>
+          </div>
+          <div class="field">
+            <label for="nd-new-delete-behavior">If the Original Message Is Deleted</label>
+            <select name="delete_behavior" id="nd-new-delete-behavior">${selectOptions(DELETE_BEHAVIORS, DEFAULT_DELETE_BEHAVIOR)}</select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="nd-new-reply-type">Message Posted in the New Thread</label>
+            <select name="reply_type" id="nd-new-reply-type">${selectOptions(REPLY_TYPES, DEFAULT_REPLY_TYPE)}</select>
+          </div>
+          <div class="field">
+            <label for="nd-new-slowmode">Slow Mode Inside Threads (seconds)</label>
+            <input type="number" name="slowmode" id="nd-new-slowmode" required value="0" min="0" max="21600" step="1" style="max-width:120px;" />
+            <div class="field-hint">Enter 0 for no wait. Maximum 21600 (6 hours).</div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="nd-new-auto-archive">Threads Archive After</label>
+            <select name="auto_archive_minutes" id="nd-new-auto-archive">${selectOptions(AUTO_ARCHIVE_CHOICES, DEFAULT_AUTO_ARCHIVE)}</select>
+            <div class="field-hint">${esc(AUTO_ARCHIVE_HINT)}</div>
+          </div>
+          <div class="field">
+            <label for="nd-new-reactions">Emoji Added to Every Post</label>
+            <input type="text" name="default_reactions" id="nd-new-reactions" value="" placeholder="None" />
+            <div class="field-hint">Separate emoji with commas. Leave blank for none.</div>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;">
+          ${checkbox("include_bots", false, "Also Thread Messages From Bots",
+            "Posts from bots and webhooks get threads too. Otherwise they are skipped.")}
+          ${checkbox("notify_op_on_reply", false, "Allow Reply DMs",
+            "Members who opted in (Help & Settings → Roles & Pings) get a DM when someone replies in their thread here.")}
+          ${checkbox("require_attachment", false, REQUIRE_ATTACHMENT_LABEL, REQUIRE_ATTACHMENT_HINT)}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+          <button type="submit" class="btn btn-primary">Add Channel</button>
+          <span data-needle-add-status></span>
+        </div>
+      </form>
+    </div>`;
+
+  wireGlobal(container);
+  wireShowHide(container);
+  wireExistingCards(container, cfgs);
+  wireRemove(container, channels);
+  wireAdd(container, channels);
+}
+
+// ── Wire: global settings form ────────────────────────────────────────────────
+
+function wireGlobal(container) {
+  const form = container.querySelector("[data-needle-global]");
+  const status = form.querySelector("[data-global-status]");
+  guardForm(form);
+  guardedSubmit(form, async () => {
+    const fd = new FormData(form);
+    try {
+      await apiPut("/api/config/needle/settings", {
+        default_reply:    fd.get("default_reply")    || "",
+      });
+      showStatus(status, true);
+    } catch (err) {
+      showStatus(status, false, err.message);
+    }
+  });
+}
+
+// ── Wire: show/hide conditional fields ───────────────────────────────────────
+
+function wireShowHide(container) {
+  container.querySelectorAll("select[name=title_type]").forEach(sel => {
+    const form = sel.closest("form");
+    sel.addEventListener("change", () => {
+      const f = form.querySelector("[data-custom-title-field]");
+      if (f) f.style.display = sel.value === "custom" ? "" : "none";
+    });
+  });
+  container.querySelectorAll("select[name=reply_type]").forEach(sel => {
+    const form = sel.closest("form");
+    sel.addEventListener("change", () => {
+      const f = form.querySelector("[data-custom-reply-field]");
+      if (f) f.style.display = sel.value === "custom" ? "" : "none";
+    });
+  });
+}
+
+// ── Wire: save existing channel cards ────────────────────────────────────────
+
+function wireExistingCards(container, cfgs) {
+  for (const r of cfgs) {
+    const form   = container.querySelector(`[data-needle-channel="${r.channel_id}"]`);
+    if (!form) continue;
+    const status = form.querySelector("[data-needle-status]");
+    guardForm(form);
+    // Tracked so the add/remove rebuilds below can tell whether a sibling card
+    // still holds unsaved edits (F4).
+    trackCard(form);
+    guardedSubmit(form, async () => {
+      const fd = new FormData(form);
+      const payload = buildPayload(fd, status, form);
+      if (!payload) return;
+      try {
+        const saved = await apiPut(`/api/config/needle/${r.channel_id}`, payload);
+        const warning = form.querySelector("[data-removal-warning]");
+        if (warning) warning.style.display = saved && saved.removal_blocked ? "" : "none";
+        showStatus(status, true);
+        clearCardDirty(form);
+      } catch (err) {
+        showStatus(status, false, err.message);
+      }
+    });
+  }
+}
+
+// ── Wire: remove buttons ──────────────────────────────────────────────────────
+
+function wireRemove(container, channels) {
+  container.querySelectorAll("[data-needle-remove]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const name = channelName(channels, btn.dataset.needleRemove);
+      const ok = await confirmDialog(
+        `Stop creating threads for new messages in ${name}? Threads that already exist are left alone.`,
+        { title: "Stop Auto-Threading", danger: true, confirmLabel: "Stop Auto-Threading" },
+      );
+      if (!ok) return;
+      try {
+        await apiDelete(`/api/config/needle/${btn.dataset.needleRemove}`);
+        const fresh = await loadConfig();
+        // The removed card must go, so this rebuild can't be held back — but
+        // say so when it takes unsaved edits with it (F4).
+        const rules = container.querySelector("[data-needle-rules]");
+        if (rules && hasDirtySibling(rules, btn.closest("[data-needle-channel]"))) {
+          toast("Channel removed. Unsaved edits in the other channels were discarded.", "info");
+        }
+        render(container, fresh.needle || {}, channels);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    });
+  });
+}
+
+// ── Wire: add form ────────────────────────────────────────────────────────────
+
+function wireAdd(container, channels) {
+  const form      = container.querySelector("[data-needle-add]");
+  const addStatus = container.querySelector("[data-needle-add-status]");
+  // Searchable picker replaces the old plain <select> (W-C4). Snowflakes stay
+  // strings and "0" remains the unset sentinel.
+  const picker = mountChannelPicker(
+    form.querySelector('[data-picker="channel_id"]'), channels, "0",
+    { emptyValue: "0", emptyLabel: "(pick a channel)", label: "Channel" },
+  );
+  guardForm(form);
+  guardedSubmit(form, async () => {
+    const fd = new FormData(form);
+    const channelId = picker.getValue() || "0";
+    if (channelId === "0") {
+      showStatus(addStatus, false, "Pick a channel first.");
+      return;
+    }
+    const payload = buildPayload(fd, addStatus, form);
+    if (!payload) return;
+    try {
+      await apiPut(`/api/config/needle/${channelId}`, payload);
+      const fresh = await loadConfig();
+      // Adding a channel used to rebuild every card and silently drop whatever
+      // was typed into an existing one (F4). Hold the rebuild while that's the
+      // case and point at the reload instead.
+      const rules = container.querySelector("[data-needle-rules]");
+      const rerender = () => render(container, fresh.needle || {}, channels);
+      if (!rules) {
+        rerender();
+      } else if (!rerenderUnlessDirty(rules, null, rerender)) {
+        showStatus(addStatus, true, "Added — reload to see it listed above.");
+      }
+    } catch (err) {
+      showStatus(addStatus, false, err.message);
+    }
+  });
+}
+
+// ── Build payload from FormData ───────────────────────────────────────────────
+
+function buildPayload(fd, statusEl, form) {
+  // Validate the one numeric field before posting, naming it (W-C5).
+  const rawSlow = String(fd.get("slowmode") ?? "").trim();
+  const slowmode = rawSlow === "" ? 0 : parseInt(rawSlow, 10);
+  if (!Number.isFinite(slowmode) || slowmode < 0 || slowmode > 21600) {
+    showStatus(statusEl, false, "Slow Mode Inside Threads must be a whole number of seconds between 0 and 21600.");
+    const el = form.querySelector('[name="slowmode"]');
+    if (el) el.focus();
+    return null;
+  }
+  const rawArchive = parseInt(String(fd.get("auto_archive_minutes") ?? ""), 10);
+  const auto_archive_minutes = VALID_AUTO_ARCHIVE.has(rawArchive) ? rawArchive : DEFAULT_AUTO_ARCHIVE;
+  return {
+    title_type:          fd.get("title_type")          || DEFAULT_TITLE_TYPE,
+    custom_title:        fd.get("custom_title")        || "",
+    include_bots:        fd.has("include_bots"),
+    notify_op_on_reply:  fd.has("notify_op_on_reply"),
+    require_attachment:  fd.has("require_attachment"),
+    slowmode,
+    auto_archive_minutes,
+    delete_behavior:     fd.get("delete_behavior")     || DEFAULT_DELETE_BEHAVIOR,
+    reply_type:          fd.get("reply_type")          || DEFAULT_REPLY_TYPE,
+    custom_reply:        fd.get("custom_reply")        || "",
+    default_reactions:   fd.get("default_reactions")   || "",
+  };
+}

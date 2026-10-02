@@ -1,0 +1,246 @@
+import { api, esc, fmtTs, fmtAge } from "../api.js";
+import { initClampCells } from "../clamp-cell.js";
+import { showTranscript } from "../transcript-modal.js";
+import { makeFilterStrip } from "../tab-strip.js";
+import { renderLoading, renderEmpty, renderError, showRetryableError } from "../states.js";
+
+const STATUS_BADGE = {
+  open:   '<span class="badge badge-info">Open</span>',
+  voting: '<span class="badge badge-warning">Voting</span>',
+  closed: '<span class="badge badge-dim">Closed</span>',
+};
+
+// Lowercased blob of visible text (title, description, creator) plus metadata
+// that never renders (raw IDs, status) so a query can match on either.
+function policyHaystack(t) {
+  return [t.id, `#${t.id}`, t.status, t.creator_name, t.creator_id, t.title, t.description]
+    .filter((v) => v != null && v !== "")
+    .join(" ")
+    .toLowerCase();
+}
+
+function matchesSearch(t, query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const hay = policyHaystack(t);
+  return terms.every((term) => hay.includes(term));
+}
+
+/**
+ * The ticket-list half of the Policy Tickets page. Mounted into a region by
+ * panels/policy-tickets.js, above the settings. Moderator-level information —
+ * no gating applies here.
+ */
+export function mountTickets(container) {
+  container.innerHTML = `
+    <div>
+      <div class="section-label">Tickets</div>
+      <div class="field-hint" style="margin-bottom:10px;">Policy changes members have proposed, and how the votes went</div>
+
+      <div class="mod-stats" data-stats>
+        <div class="mod-stat open"><div class="lbl">Open</div><div class="v">—</div><div class="sub">loading\u2026</div></div>
+        <div class="mod-stat claimed"><div class="lbl">Voting</div><div class="v">—</div><div class="sub"></div></div>
+        <div class="mod-stat resolved"><div class="lbl">Closed</div><div class="v">—</div><div class="sub"></div></div>
+        <div class="mod-stat avg"><div class="lbl">Total</div><div class="v">—</div><div class="sub"></div></div>
+      </div>
+
+      <div class="ticket-list-head" style="margin-bottom:8px">
+        <h3>Queue</h3>
+        <div class="ctrl-group" role="group" aria-label="Filter policy tickets" data-filter-group>
+          <button class="active" data-filter="">All</button>
+          <button data-filter="open">Open</button>
+          <button data-filter="voting">Voting</button>
+          <button data-filter="closed">Closed</button>
+        </div>
+      </div>
+
+      <div class="ticket-search" style="border:0;padding:0 0 8px">
+        <input type="search" data-search autocomplete="off"
+          placeholder="Search title, description, creator, ID…"
+          aria-label="Search policy tickets" />
+      </div>
+
+      <div class="table-scroll" data-table-wrap>
+        ${renderLoading("Loading policy tickets…")}
+      </div>
+    </div>
+  `;
+
+  const filterGroup = container.querySelector("[data-filter-group]");
+  const statsEl = container.querySelector("[data-stats]");
+  const tableWrap = container.querySelector("[data-table-wrap]");
+  const searchEl = container.querySelector("[data-search]");
+
+  let currentFilter = "";
+  let currentSearch = "";
+  let loadedTickets = [];
+
+  // A search spans every status regardless of the active tab, so it needs the
+  // full unfiltered set. Fetched once and cached; guarded against overlapping
+  // fetches from rapid typing.
+  let allTickets = null;
+  let allPromise = null;
+  // A failed search fetch used to be console-only: the user saw "no matches"
+  // for a request that never landed. Remember it and say so instead.
+  let searchFailed = false;
+  function ensureAll() {
+    if (allTickets) return Promise.resolve();
+    if (!allPromise) {
+      allPromise = api("/api/moderation/policy-tickets")
+        .then((data) => { allTickets = data.policy_tickets || []; searchFailed = false; })
+        .catch((err) => {
+          console.error("Failed to load all policy tickets for search:", err);
+          // NOT `allTickets = []`: that is a cached answer, and `ensureAll`
+          // returns early on any non-null value, so one failed fetch made
+          // search permanently broken for the rest of the session. null means
+          // "still unknown", which is the truth and lets a retry re-fetch.
+          allTickets = null;
+          searchFailed = true;
+        })
+        .finally(() => { allPromise = null; });
+    }
+    return allPromise;
+  }
+
+  function renderTable() {
+    const searching = currentSearch.trim() !== "";
+    if (searching && searchFailed) {
+      // Searching reads the full list, not the page on screen, so this region
+      // is all there is to act on: the filter strip above re-fetches the page
+      // and would leave the search just as broken.
+      showRetryableError(
+        tableWrap,
+        "Couldn’t load the full ticket list to search — try again.",
+        () => { searchFailed = false; return ensureAll().then(renderTable); },
+      );
+      return;
+    }
+    const source = searching ? (allTickets || []) : loadedTickets;
+    const tickets = source.filter((t) => matchesSearch(t, currentSearch));
+    if (!tickets.length) {
+      tableWrap.innerHTML = renderEmpty(
+        currentSearch
+          ? "No policy tickets match your search. Try fewer words, or clear the search box."
+          : "No policy tickets in this queue yet. Members open them with the policy "
+            + "command in Discord, and moderators put them to a vote.",
+      );
+      return;
+    }
+
+    const timeHeader = currentFilter === "voting" ? "Vote Started" : currentFilter === "closed" ? "Vote Ended" : "Age";
+    const rows = tickets.map((t) => {
+      const badge = STATUS_BADGE[t.status] || esc(t.status);
+      const timeCol = t.status === "voting"
+        ? fmtTs(t.vote_started_at)
+        : t.status === "closed"
+          ? fmtTs(t.vote_ended_at)
+          : fmtAge(Date.now() / 1000 - t.created_at) + " ago";
+
+      return `
+        <tr class="clickable-row" tabindex="0" data-record-type="policy_ticket" data-record-id="${t.id}">
+          <td>${badge}</td>
+          <td>#${t.id}</td>
+          <td class="user-cell">${esc(t.creator_name || t.creator_id)}</td>
+          <td class="reason-cell" title="${esc(t.title)}">${esc(t.title || "—")}</td>
+          <td class="reason-cell" title="${esc(t.description)}">${esc(t.description || "—")}</td>
+          <td>${fmtTs(t.created_at)}</td>
+          <td>${timeCol}</td>
+        </tr>
+      `;
+    }).join("");
+
+    tableWrap.innerHTML = `
+      <table class="data-table">
+        <thead><tr>
+          <th>Status</th><th>ID</th><th>Creator</th><th>Title</th>
+          <th>Description</th><th>Created</th><th>${timeHeader}</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+    const openRow = (e) => {
+      const row = e.target.closest("tr.clickable-row");
+      if (row) showTranscript(row.dataset.recordType, row.dataset.recordId);
+    };
+    // Title and Description both clamp here. The expander stops propagation,
+    // so reading a cell does not also fire the row click below and open the
+    // transcript modal over the table you were reading.
+    initClampCells(tableWrap);
+    const tbody = tableWrap.querySelector("tbody");
+    tbody?.addEventListener("click", openRow);
+    tbody?.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      if (!e.target.closest("tr.clickable-row")) return;
+      e.preventDefault();
+      openRow(e);
+    });
+  }
+
+  async function refresh() {
+    const params = {};
+    if (currentFilter) params.status = currentFilter;
+
+    try {
+      const data = await api("/api/moderation/policy-tickets", params);
+
+      statsEl.innerHTML = `
+        <div class="mod-stat open">
+          <div class="lbl">Open</div>
+          <div class="v">${data.open_count}</div>
+          <div class="sub">${data.open_count === 1 ? "proposal" : "proposals"}</div>
+        </div>
+        <div class="mod-stat claimed">
+          <div class="lbl">Voting</div>
+          <div class="v">${data.voting_count}</div>
+          <div class="sub">${data.voting_count ? "in progress" : "none"}</div>
+        </div>
+        <div class="mod-stat resolved">
+          <div class="lbl">Closed</div>
+          <div class="v">${data.closed_count}</div>
+          <div class="sub"></div>
+        </div>
+        <div class="mod-stat avg">
+          <div class="lbl">Total</div>
+          <div class="v">${data.total_count}</div>
+          <div class="sub"></div>
+        </div>
+      `;
+
+      loadedTickets = data.policy_tickets || [];
+      renderTable();
+    } catch (err) {
+      // Don't leave the stat strip frozen on "loading…" after a failure.
+      statsEl.querySelectorAll(".sub").forEach((el) => { el.textContent = ""; });
+      tableWrap.innerHTML = renderError(`Couldn’t load policy tickets — try again. (${err.message})`);
+    }
+  }
+
+  makeFilterStrip(filterGroup, (value) => {
+    currentFilter = value;
+    refresh();
+  });
+
+  searchEl.addEventListener("input", async () => {
+    currentSearch = searchEl.value;
+    if (currentSearch.trim() && !allTickets) {
+      await ensureAll();
+    }
+    renderTable();
+  });
+
+  refresh();
+
+  // Same reasoning as the Tickets and Jails queues: a moderation queue that
+  // never re-fetches quietly goes stale while mods act on it. Poll while the
+  // tab is visible and leave the current view alone if a poll fails.
+  const poll = setInterval(() => {
+    if (document.hidden) return;
+    refresh().catch(() => {});
+  }, 45000);
+
+  return {
+    unmount() {
+      clearInterval(poll);
+    },
+  };
+}

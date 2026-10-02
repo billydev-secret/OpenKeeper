@@ -1,0 +1,112 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # lint / typecheck / test are independent jobs (no `needs:` between them) so
+  # a red pyright can no longer hide pytest results behind it. These three
+  # used to be sequential steps in one job: a failing pyright step aborted
+  # the job before the pytest step ran, which twice left real pytest
+  # failures masked behind an unrelated type error for days.
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-python-deps
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-python-deps
+
+      - name: Type check (pyright)
+        run: pyright
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-python-deps
+
+      - name: Run tests
+        env:
+          BOT_ENV: dev
+          DISCORD_TOKEN_DEV: fake-token
+          GUILD_ID_DEV: "9001"
+          DB_PATH_DEV: dk_dev.db
+          AUDIT_CHANNEL_DEV: "0"
+        run: |
+          python -m pytest --tb=short -q --cov=src --cov-report=term-missing
+
+  # Browser-driven panel checks (responsive layout + panel-load health).
+  # These used to run in the per-commit gate on the developer's own machine,
+  # which meant every parallel session could launch its own Chromium; moved
+  # here so the cost is paid once, on a runner, in parallel with the suite.
+  # Selected by marker, never by filename — naming files is what once left five
+  # of the seven browser test files running in no tier at all.
+  browser:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-python-deps
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      # axe-core for the browser-marked accessibility sweep (test_panel_a11y),
+      # which fails rather than skips under CI when it is missing.
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Install JS dev deps
+        run: npm install --no-save
+
+      - name: Browser checks (layout + panel console + accessibility)
+        env:
+          BOT_ENV: dev
+          DISCORD_TOKEN_DEV: fake-token
+          GUILD_ID_DEV: "9001"
+          DB_PATH_DEV: dk_dev.db
+          AUDIT_CHANNEL_DEV: "0"
+        run: |
+          python -m pytest -m browser --tb=short -q tests/
+
+  # Frontend lint. The browser JS/CSS was never linted in CI (the pytest
+  # eslint/stylelint items silently skip when node_modules is absent).
+  # This job runs them for real, and it is blocking: the deferral to
+  # continue-on-error was only ever meant to last until it reported clean.
+  js-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Install JS dev deps
+        run: npm install --no-save
+
+      - name: ESLint
+        # The whole static tree, not just js/: login.js and manual.js sit at
+        # its root (the CSP forced them out of the two HTML pages), and a
+        # glob ending in js/ is how they came to be linted by nothing.
+        run: npx eslint src/web_server/static
+
+      - name: Stylelint
+        run: npx stylelint "src/web_server/static/**/*.css"

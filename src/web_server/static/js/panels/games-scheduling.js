@@ -1,0 +1,479 @@
+import { api, apiPost, esc, fmtTs } from "../api.js";
+import {
+  apiPut, apiDelete, showStatus, guardForm, mountAsync,
+  loadChannels, loadRoles, channelSelect, roleSelect, selectValueOrAdd,
+} from "../config-helpers.js";
+import { renderLoading, renderEmpty, showRetryableError } from "../states.js";
+import { toast, confirmDialog } from "../ui.js";
+
+// All user-supplied content rendered via innerHTML uses esc() for XSS safety.
+
+const WEEKDAYS = [
+  ["1", "Mon", "0"], ["2", "Tue", "1"], ["3", "Wed", "2"], ["4", "Thu", "3"],
+  ["5", "Fri", "4"], ["6", "Sat", "5"], ["7", "Sun", "6"],
+];
+
+let _options = null;   // { games: [{type,name,icon,hosting,fields}], retry_grace_seconds }
+
+// What "schedule it" actually buys, per game (discovery-4). Most party games
+// open a lobby and wait for a human; only a few finish on their own.
+// Keys mirror hosting_kind() / HOSTING_LABEL in games/constants.py.
+const HOSTING_TAG = {
+  self: "Self-running",
+  timer: "Self-running with a round timer",
+  countdown: "Starts itself after a countdown",
+  host: "Needs a host",
+};
+const HOSTING_HINT = {
+  self: "Runs itself: the bot posts it and it finishes on its own.",
+  timer: "Runs itself only with a round timer set below. With none, it shows one question and waits.",
+  countdown: "Starts itself after a ten-minute countdown once enough players join. "
+    + "The schedule’s creator is tagged if the room is short.",
+  host: "Needs a host. Lobby games tag the schedule’s creator on opening; AMA, LegitLibs "
+    + "and the Truth or Dare games don’t.",
+};
+let _channels = [];
+let _roles = [];
+let _editingId = null;  // null = create mode
+
+function fmtTime(min) {
+  const h = String(Math.floor(min / 60)).padStart(2, "0");
+  const m = String(min % 60).padStart(2, "0");
+  return `${h}:${m}`;
+}
+
+function fmtNextRun(ts) {
+  return fmtTs(ts);
+}
+
+function recurrenceLabel(row) {
+  if (row.recurrence === "once") return `Once · ${row.start_date || "no date set"}`;
+  if (row.recurrence === "daily") return "Daily";
+  if (row.recurrence === "weekly") {
+    const names = (row.recur_days || []).map((d) => WEEKDAYS[d] ? WEEKDAYS[d][1] : d);
+    return `Weekly · ${names.join(", ")}`;
+  }
+  return row.recurrence;
+}
+
+export function mount(container) {
+  container.innerHTML = `
+    <div class="panel">
+      <header>
+        <h2>Game Scheduling</h2>
+        <div class="subtitle">Launch party games on their own, at times you pick. Every time below is server time.</div>
+      </header>
+
+      <section>
+        <div class="section-label" data-region="form-title">New Schedule</div>
+        <div class="form" style="max-width:none;">
+          <div style="display:flex;flex-wrap:wrap;gap:12px;">
+            <div class="field" style="flex:1;min-width:200px;">
+              <label>Game
+                <select class="w-full" data-ctrl="game"></select>
+              </label>
+            </div>
+            <div class="field" style="flex:1;min-width:200px;">
+              <label>Channel
+                <select class="w-full" data-ctrl="channel"></select>
+              </label>
+              <div class="field-hint">Any channel the bot can post in. The allowed-channel list on
+                Global Config doesn&rsquo;t apply to schedules.</div>
+            </div>
+          </div>
+
+          <div class="field-hint" data-region="hosting-hint" style="margin:-4px 0 4px;"></div>
+
+          <div data-region="game-options" style="margin:4px 0;"></div>
+
+          <div style="display:flex;flex-wrap:wrap;gap:12px;">
+            <div class="field" style="flex:1;min-width:160px;">
+              <label>Repeat
+                <select class="w-full" data-ctrl="recurrence">
+                  <option value="once">Once</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                </select>
+              </label>
+            </div>
+            <div class="field" style="flex:1;min-width:140px;">
+              <label>Time of Day (Server Time)
+                <input class="w-full" type="time" data-ctrl="time" value="20:00" />
+              </label>
+            </div>
+            <div class="field" data-region="date-field" style="flex:1;min-width:160px;display:none;">
+              <label>Date
+                <input class="w-full" type="date" data-ctrl="date" />
+              </label>
+            </div>
+          </div>
+
+          <fieldset class="field" data-region="weekday-field"
+                    style="display:none;border:0;padding:0;margin:0;min-inline-size:0;">
+            <legend style="font-size:12px;font-weight:600;color:var(--ink-dim);padding:0;">On These Days</legend>
+            <div data-region="weekdays" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:4px;"></div>
+          </fieldset>
+
+          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;">
+            <div class="field m-0">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" data-ctrl="announce" /> Announce When It Starts
+              </label>
+              <div class="field-hint">Posts a note in the channel the moment the game goes up, linking straight to it.</div>
+            </div>
+            <div class="field" data-region="role-field" style="flex:1;min-width:200px;display:none;">
+              <label>Ping Role (Optional)
+                <select class="w-full" data-ctrl="role"></select>
+              </label>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <button class="btn btn-primary" data-action="save">Create Schedule</button>
+            <button class="btn" data-action="cancel-edit" style="display:none;">Cancel</button>
+            <span data-status="save" class="save-status"></span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-label">Scheduled Games</div>
+        <div data-region="list">${renderLoading("Loading schedules…")}</div>
+      </section>
+    </div>
+  `;
+
+  _editingId = null;
+  // `init` attaches every listener in the panel — the Save button, both
+  // selects, the weekday boxes — and it does so *after* its opening
+  // `await Promise.all`. Catching that rejection here used to leave the whole
+  // form standing but inert: it looked clickable and did nothing, with the
+  // only error tucked into the list region at the bottom. Let it reach
+  // mountAsync, which replaces the lot with one error and a Try again.
+  return mountAsync(container, () => init(container), {
+    errorMsg: "Couldn’t load game scheduling.",
+  });
+}
+
+async function init(root) {
+  [_options, _channels, _roles] = await Promise.all([
+    api("/api/games/schedule/options"),
+    loadChannels(),
+    loadRoles(),
+  ]);
+
+  // Game select
+  const gameSel = root.querySelector('[data-ctrl="game"]');
+  gameSel.innerHTML = _options.games
+    .map((g) => `<option value="${esc(g.type)}">${esc(g.icon)} ${esc(g.name)} — ${esc(HOSTING_TAG[g.hosting] || HOSTING_TAG.host)}</option>`)
+    .join("");
+
+  // Channel + role selects
+  root.querySelector('[data-ctrl="channel"]').innerHTML =
+    channelSelect(_channels, null, { allowNone: false });
+  root.querySelector('[data-ctrl="role"]').innerHTML =
+    roleSelect(_roles, null, { allowNone: true });
+
+  // Weekday checkboxes
+  root.querySelector('[data-region="weekdays"]').innerHTML = WEEKDAYS
+    .map(([_n, label, val]) =>
+      `<label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:normal;">
+        <input type="checkbox" data-weekday="${val}" /> ${esc(label)}
+      </label>`)
+    .join("");
+
+  renderGameOptions(root);
+  wireEvents(root);
+  // Warn before a sidebar click throws away a half-built schedule.
+  guardForm(root.querySelector(".form"));
+  await refreshList(root);
+}
+
+function renderGameOptions(root, values = {}) {
+  const gameType = root.querySelector('[data-ctrl="game"]').value;
+  const game = _options.games.find((g) => g.type === gameType);
+  const hosting = (game && game.hosting) || "host";
+  root.querySelector('[data-region="hosting-hint"]').textContent = HOSTING_HINT[hosting] || HOSTING_HINT.host;
+  const region = root.querySelector('[data-region="game-options"]');
+  const fields = (game && game.fields) || [];
+  if (!fields.length) {
+    region.innerHTML = "";
+    return;
+  }
+  let html = '<div style="display:flex;flex-wrap:wrap;gap:12px;">';
+  for (const f of fields) {
+    const v = values[f.name] !== undefined ? values[f.name] : f.default;
+    let control;
+    if (f.type === "choice") {
+      const opts = (f.choices || [])
+        .map((c) => `<option value="${esc(c.value)}"${String(v) === String(c.value) ? " selected" : ""}>${esc(c.label)}</option>`)
+        .join("");
+      control = `<select class="w-full" data-opt="${esc(f.name)}" data-opt-type="choice">${opts}</select>`;
+    } else if (f.type === "bool") {
+      control = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:normal;">
+        <input type="checkbox" data-opt="${esc(f.name)}" data-opt-type="bool"${v ? " checked" : ""} /> On
+      </label>`;
+    } else if (f.type === "int") {
+      const minA = f.min !== undefined ? ` min="${f.min}"` : "";
+      const maxA = f.max !== undefined ? ` max="${f.max}"` : "";
+      control = `<input class="w-full" type="number"${minA}${maxA} data-opt="${esc(f.name)}" data-opt-type="int" value="${esc(String(v ?? ""))}" />`;
+    } else {
+      control = `<input class="w-full" type="text" data-opt="${esc(f.name)}" data-opt-type="str" value="${esc(String(v ?? ""))}" />`;
+    }
+    // Wrap idiom: the control lives inside its label, so a click on the text
+    // focuses the field and screen readers announce the right name.
+    html += `<div class="field" style="flex:1;min-width:180px;margin:0;">
+      <label>${esc(f.label)} ${control}</label>
+    </div>`;
+  }
+  html += "</div>";
+  region.innerHTML = html;
+}
+
+function gatherOptions(root) {
+  const out = {};
+  root.querySelectorAll("[data-opt]").forEach((el) => {
+    const name = el.getAttribute("data-opt");
+    const type = el.getAttribute("data-opt-type");
+    if (type === "bool") {
+      out[name] = el.checked;
+    } else if (type === "int") {
+      if (el.value !== "") out[name] = parseInt(el.value, 10);
+    } else {
+      out[name] = el.value;
+    }
+  });
+  return out;
+}
+
+function updateConditionalFields(root) {
+  const rec = root.querySelector('[data-ctrl="recurrence"]').value;
+  root.querySelector('[data-region="date-field"]').style.display = rec === "once" ? "" : "none";
+  root.querySelector('[data-region="weekday-field"]').style.display = rec === "weekly" ? "" : "none";
+}
+
+function wireEvents(root) {
+  root.querySelector('[data-ctrl="game"]').addEventListener("change", () => renderGameOptions(root));
+  root.querySelector('[data-ctrl="recurrence"]').addEventListener("change", () => updateConditionalFields(root));
+  root.querySelector('[data-ctrl="announce"]').addEventListener("change", (e) => {
+    root.querySelector('[data-region="role-field"]').style.display = e.target.checked ? "" : "none";
+  });
+  root.querySelector('[data-action="save"]').addEventListener("click", () => save(root));
+  root.querySelector('[data-action="cancel-edit"]').addEventListener("click", () => resetForm(root));
+  updateConditionalFields(root);
+}
+
+function readForm(root) {
+  const rec = root.querySelector('[data-ctrl="recurrence"]').value;
+  const body = {
+    game_type: root.querySelector('[data-ctrl="game"]').value,
+    channel_id: root.querySelector('[data-ctrl="channel"]').value,
+    options: gatherOptions(root),
+    recurrence: rec,
+    time: root.querySelector('[data-ctrl="time"]').value,
+    announce: root.querySelector('[data-ctrl="announce"]').checked,
+  };
+  const roleVal = root.querySelector('[data-ctrl="role"]').value;
+  if (body.announce && roleVal && roleVal !== "0") body.announce_role_id = roleVal;
+  if (rec === "once") body.start_date = root.querySelector('[data-ctrl="date"]').value || null;
+  if (rec === "weekly") {
+    body.recur_days = Array.from(root.querySelectorAll('[data-weekday]:checked'))
+      .map((el) => parseInt(el.getAttribute("data-weekday"), 10));
+  }
+  return body;
+}
+
+async function save(root) {
+  const status = root.querySelector('[data-status="save"]');
+  const body = readForm(root);
+  if (!body.channel_id || body.channel_id === "0") {
+    showStatus(status, false, "Pick a channel first.");
+    return;
+  }
+  if (!body.time) {
+    showStatus(status, false, "Pick a time of day first.");
+    return;
+  }
+  try {
+    if (_editingId !== null) {
+      await apiPut(`/api/games/schedule/${_editingId}`, body);
+    } else {
+      await apiPost("/api/games/schedule", body);
+    }
+    showStatus(status, true, "Saved");
+    resetForm(root);
+    await refreshList(root);
+  } catch (e) {
+    showStatus(status, false, `Couldn’t save that schedule — ${e.message}`);
+  }
+}
+
+function resetForm(root) {
+  _editingId = null;
+  root.querySelector('[data-region="form-title"]').textContent = "New Schedule";
+  root.querySelector('[data-action="save"]').textContent = "Create Schedule";
+  root.querySelector('[data-action="cancel-edit"]').style.display = "none";
+  root.querySelector('[data-ctrl="recurrence"]').value = "once";
+  root.querySelector('[data-ctrl="time"]').value = "20:00";
+  root.querySelector('[data-ctrl="date"]').value = "";
+  root.querySelector('[data-ctrl="announce"]').checked = false;
+  root.querySelector('[data-region="role-field"]').style.display = "none";
+  root.querySelectorAll('[data-weekday]').forEach((el) => { el.checked = false; });
+  renderGameOptions(root);
+  updateConditionalFields(root);
+}
+
+function startEdit(root, row) {
+  _editingId = row.id;
+  root.querySelector('[data-region="form-title"]').textContent = `Editing #${row.id}`;
+  root.querySelector('[data-action="save"]').textContent = "Save Changes";
+  root.querySelector('[data-action="cancel-edit"]').style.display = "";
+  root.querySelector('[data-ctrl="game"]').value = row.game_type;
+  // The selects are built from the *current* channel and role lists, so a
+  // schedule pointing at something deleted in Discord has no option to land
+  // on: the channel select (allowNone: false, no "(none)" row) would read ""
+  // and the role select would fall to "0". save() posts every column, so
+  // opening a schedule to change its time would quietly move where it posts.
+  selectValueOrAdd(
+    root.querySelector('[data-ctrl="channel"]'),
+    row.channel_id,
+    (v) => `\u26a0 Missing channel (id ${v})`,
+  );
+  root.querySelector('[data-ctrl="recurrence"]').value = row.recurrence;
+  root.querySelector('[data-ctrl="time"]').value = fmtTime(row.time_of_day);
+  root.querySelector('[data-ctrl="date"]').value = row.start_date || "";
+  root.querySelector('[data-ctrl="announce"]').checked = !!row.announce;
+  root.querySelector('[data-region="role-field"]').style.display = row.announce ? "" : "none";
+  selectValueOrAdd(
+    root.querySelector('[data-ctrl="role"]'),
+    row.announce_role_id ? String(row.announce_role_id) : "0",
+    (v) => `\u26a0 Missing role (id ${v})`,
+  );
+  const days = new Set((row.recur_days || []).map(String));
+  root.querySelectorAll('[data-weekday]').forEach((el) => {
+    el.checked = days.has(el.getAttribute("data-weekday"));
+  });
+  renderGameOptions(root, row.options || {});
+  updateConditionalFields(root);
+  root.querySelector(".panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+const STATUS_LABEL = {
+  launched: "✅ Launched", skipped_active: "⏭️ Skipped — channel stayed busy",
+  skipped_disabled: "🚫 Skipped — game is off",
+  skipped_giveup: "⌛ Gave up — channel stayed busy",
+  skipped_hidden: "🙈 Skipped — the room was hidden that day",
+  error: "⚠️ Failed", launching: "▶️ Launching now",
+};
+
+// A due slot whose channel is busy stays due and retries every minute until
+// its grace runs out, so "skipped" would be premature — say what it's doing.
+function lastRunLabel(row) {
+  if (!row.last_status) return "";
+  const grace = (_options && _options.retry_grace_seconds) || 0;
+  const stillDue = row.status === "active" && row.next_run_at && row.next_run_at * 1000 <= Date.now();
+  if (row.last_status === "skipped_active" && stillDue) {
+    return ` · ⏳ Channel busy — retrying until ${esc(fmtTs(row.next_run_at + grace))}`;
+  }
+  // A one-time row whose launch itself failed gets its slot back and retries
+  // the same way, so "Failed" alone would read as cancelled when it isn't.
+  if (row.last_status === "error" && stillDue) {
+    return ` · ⚠️ Launch failed — retrying until ${esc(fmtTs(row.next_run_at + grace))}`;
+  }
+  return ` · Last run: ${esc(STATUS_LABEL[row.last_status] || row.last_status)}`;
+}
+
+async function refreshList(root) {
+  const region = root.querySelector('[data-region="list"]');
+  let rows;
+  try {
+    rows = await api("/api/games/schedule");
+  } catch (e) {
+    // The form above still works — it is only the list that is missing — so
+    // this stays a region-level failure rather than blanking the page. But
+    // nothing here re-ran the fetch: the row actions need rows, and the only
+    // other route was to fill in and submit the whole form.
+    showRetryableError(
+      region,
+      `Couldn’t load your schedules — try again. (${e.message})`,
+      () => refreshList(root),
+    );
+    return;
+  }
+  if (!rows.length) {
+    region.innerHTML = renderEmpty(
+      "No scheduled games yet. Use the form above to start a game on its own.",
+    );
+    return;
+  }
+  const chName = (id) => {
+    const c = _channels.find((x) => String(x.id) === String(id));
+    return c ? `#${c.name}` : `#${id}`;
+  };
+  region.innerHTML = rows.map((r) => {
+    const paused = r.status === "paused";
+    const done = r.status === "done" || r.status === "cancelled";
+    const last = lastRunLabel(r);
+    const lastLaunched = r.last_launched_at
+      ? `Last launched: ${esc(fmtTs(r.last_launched_at))}`
+      : "Never launched yet";
+    const statusTag = paused ? '<span class="tag">Paused</span>'
+      : done ? `<span class="tag">${esc(r.status)}</span>` : "";
+    const hostingTag = `<span class="tag">${esc(HOSTING_TAG[r.hosting] || HOSTING_TAG.host)}</span>`;
+    return `
+      <div class="card" data-id="${r.id}" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;margin-bottom:8px;border:1px solid var(--rule);border-radius:8px;">
+        <div style="min-width:0;">
+          <div style="font-weight:600;">${esc(r.game_icon)} ${esc(r.game_name)} ${hostingTag} ${statusTag}</div>
+          <div class="field-hint" style="margin:2px 0 0;">
+            ${esc(chName(r.channel_id))} · ${esc(recurrenceLabel(r))} · ${esc(fmtTime(r.time_of_day))}
+            ${r.announce ? " · 📣 Announced" : ""}
+          </div>
+          <div class="field-hint" style="margin:2px 0 0;">
+            ${done ? "" : `Next launch: ${esc(fmtNextRun(r.next_run_at))}`}${last}
+          </div>
+          <div class="field-hint" style="margin:2px 0 0;">${lastLaunched}</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-shrink:0;">
+          ${done ? "" : `<button class="btn" data-act="run-now" data-id="${r.id}">Run Now</button>`}
+          ${done ? "" : (paused
+            ? `<button class="btn" data-act="resume" data-id="${r.id}">Resume</button>`
+            : `<button class="btn" data-act="pause" data-id="${r.id}">Pause</button>`)}
+          <button class="btn" data-act="edit" data-id="${r.id}">Edit</button>
+          <button class="btn btn-danger" data-act="delete" data-id="${r.id}">Delete</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  region.querySelectorAll("[data-act]").forEach((btn) => {
+    btn.addEventListener("click", () => handleRowAction(root, btn, rows));
+  });
+}
+
+async function handleRowAction(root, btn, rows) {
+  const id = btn.getAttribute("data-id");
+  const act = btn.getAttribute("data-act");
+  try {
+    if (act === "edit") {
+      const row = rows.find((r) => String(r.id) === String(id));
+      if (row) startEdit(root, row);
+      return;
+    }
+    if (act === "delete") {
+      const ok = await confirmDialog(
+        "Delete this schedule? Games already running keep going.",
+        { title: "Delete Schedule", danger: true, confirmLabel: "Delete" },
+      );
+      if (!ok) return;
+      await apiDelete(`/api/games/schedule/${id}`);
+    } else if (act === "pause") {
+      await apiPost(`/api/games/schedule/${id}/pause`, {});
+    } else if (act === "resume") {
+      await apiPost(`/api/games/schedule/${id}/resume`, {});
+    } else if (act === "run-now") {
+      await apiPost(`/api/games/schedule/${id}/run-now`, {});
+    }
+    await refreshList(root);
+  } catch (e) {
+    toast(`Couldn’t ${act === "delete" ? "delete that schedule" : "update that schedule"} — ${e.message}`, "error");
+  }
+}

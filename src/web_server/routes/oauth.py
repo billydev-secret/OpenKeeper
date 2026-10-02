@@ -1,0 +1,432 @@
+"""Discord OAuth2 login flow — /auth/discord, /callback, /logout."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import secrets
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+import httpx
+from fastapi import APIRouter, Request
+from fastapi.responses import RedirectResponse
+
+from web_server.auth import (
+    SESSION_COOKIE,
+    SESSION_MAX_AGE,
+    DiscordOAuthAuth,
+    SessionStoreUnavailable,
+    resolve_discord_perms,
+)
+
+_log = logging.getLogger("dungeonkeeper.web.oauth")
+
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
+DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
+
+router = APIRouter()
+
+
+def _base_url() -> str:
+    raw = os.getenv("DASHBOARD_BASE_URL", "http://localhost:8080").strip()
+    parts = urlsplit(raw)
+    path = parts.path.rstrip("/")
+    if path.endswith("/callback"):
+        path = path[: -len("/callback")]
+    normalized = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    return normalized.rstrip("/")
+
+
+def _oauth_redirect_uri() -> str:
+    return f"{_base_url()}/callback"
+
+
+def _is_secure() -> bool:
+    return _base_url().startswith("https://")
+
+
+_RETURN_TO_COOKIE = "dk_oauth_return"
+
+
+def _discord_avatar_url(user_id: int, avatar_hash: str | None) -> str:
+    if avatar_hash:
+        ext = "gif" if avatar_hash.startswith("a_") else "png"
+        return f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.{ext}?size=64"
+    # Default avatar: Discord uses (user_id >> 22) % 6 for non-migrated users
+    idx = (user_id >> 22) % 6
+    return f"https://cdn.discordapp.com/embed/avatars/{idx}.png"
+
+
+def _safelisted_return_urls() -> list[str]:
+    """Explicitly allowed absolute return-to URLs after OAuth callback."""
+    roots = {_base_url()}
+    extra_urls = os.getenv("DASHBOARD_RETURN_TO_URLS", "")
+    for raw in extra_urls.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        roots.add(raw.rstrip("/"))
+    return sorted(roots)
+
+
+def _is_safe_return_to(value: str | None) -> bool:
+    if not value:
+        return False
+    if value.startswith("/"):
+        return True
+
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+
+    base = urlsplit(_base_url())
+    # Allow same-scheme, same-host sibling apps on different ports (for example
+    # a separate wellness panel running on 8079 alongside the main dashboard).
+    if parsed.scheme == base.scheme and parsed.hostname == base.hostname:
+        return True
+
+    safelist = _safelisted_return_urls()
+    for prefix in safelist:
+        if value == prefix or value.startswith(prefix + "/"):
+            return True
+    return False
+
+
+# ── Initiate OAuth2 ────────────────────────────────────────────────────
+
+
+@router.get("/auth/discord", include_in_schema=False)
+async def auth_discord(request: Request) -> RedirectResponse:
+    client_id = os.getenv("DISCORD_CLIENT_ID", "")
+    redirect_uri = _oauth_redirect_uri()
+    state = secrets.token_urlsafe(32)
+
+    url = (
+        DISCORD_AUTHORIZE
+        + "?"
+        + urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "identify guilds",
+                "state": state,
+            }
+        )
+    )
+
+    response = RedirectResponse(url, status_code=302)
+    response.set_cookie(
+        "dk_oauth_state",
+        state,
+        max_age=300,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure(),
+    )
+
+    # Honor optional return_to (used by the wellness panel on 8079)
+    return_to = request.query_params.get("return_to")
+    if return_to and _is_safe_return_to(return_to):
+        response.set_cookie(
+            _RETURN_TO_COOKIE,
+            return_to,
+            max_age=300,
+            httponly=True,
+            samesite="lax",
+            secure=_is_secure(),
+        )
+    return response
+
+
+# ── Discord rate limits ─────────────────────────────────────────────────────
+#
+# Discord answers a burst of logins with 429 and a Retry-After saying exactly
+# how long to wait. Ignoring it turned a rate limit into a failed login: the
+# callback saw a non-200, redirected to /login?error=…, and the member got
+# "something went wrong" on a request that would have succeeded a moment later.
+#
+# The budget is deliberately small. scripts/ uses this same shape with six
+# attempts and no ceiling because nobody is watching a backfill run; this is a
+# browser sitting on a blank tab, so it tries a couple of times and only for a
+# wait short enough that a member would rather wait than retry by hand. A
+# longer Retry-After falls straight through to the caller's existing error
+# redirect, which is the honest outcome.
+_OAUTH_ATTEMPTS = 3
+_MAX_RETRY_WAIT = 5.0
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Seconds Discord asked us to wait, or None if there is nothing to honour.
+
+    The header is authoritative; the JSON body carries the same number and is
+    the fallback for the edge-level 429s (Cloudflare) that come back without
+    one — those bodies are HTML, hence the tolerant parse.
+    """
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        try:
+            raw = resp.json().get("retry_after")
+        except (ValueError, AttributeError):
+            raw = None
+    try:
+        return float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+async def _discord_call(
+    client: httpx.AsyncClient, method: str, url: str, **kwargs
+) -> httpx.Response:
+    """One Discord API call, obeying Retry-After within the budget above."""
+    resp = await client.request(method, url, **kwargs)
+    for _ in range(_OAUTH_ATTEMPTS - 1):
+        if resp.status_code != 429:
+            return resp
+        delay = _retry_after_seconds(resp)
+        if delay is None or delay > _MAX_RETRY_WAIT:
+            return resp
+        # Never log kwargs — the token exchange carries the client secret.
+        _log.warning("Discord rate-limited %s %s; waiting %.2fs", method, url, delay)
+        await asyncio.sleep(delay + 0.25)  # pad for clock skew, as scripts/ does
+        resp = await client.request(method, url, **kwargs)
+    return resp
+
+
+# ── OAuth2 callback ─────────────────────────────────────────────────────
+
+
+@router.get("/callback", include_in_schema=False)
+async def callback(request: Request) -> RedirectResponse:
+    # CSRF check — state must match the cookie we set
+    cookie_state = request.cookies.get("dk_oauth_state")
+    query_state = request.query_params.get("state")
+    if not cookie_state or cookie_state != query_state:
+        return _login_redirect("invalid_state")
+
+    code = request.query_params.get("code")
+    if not code:
+        # Log the raw error for debugging, but show a safe predefined message
+        raw_error = request.query_params.get("error", "unknown")
+        _log.warning("OAuth denied: error=%s", raw_error)
+        return _login_redirect("denied")
+
+    client_id = os.getenv("DISCORD_CLIENT_ID", "")
+    client_secret = os.getenv("DISCORD_CLIENT_SECRET", "")
+    redirect_uri = _oauth_redirect_uri()
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # 1. Exchange authorization code for access token
+        token_resp = await _discord_call(
+            client,
+            "POST",
+            DISCORD_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        if token_resp.status_code != 200:
+            _log.warning("Token exchange failed: status=%d", token_resp.status_code)
+            return _login_redirect("token_failed")
+        access_token: str = token_resp.json()["access_token"]
+
+        # 2. Fetch user identity
+        headers = {"Authorization": f"Bearer {access_token}"}
+        user_resp = await _discord_call(
+            client, "GET", f"{DISCORD_API}/users/@me", headers=headers
+        )
+        if user_resp.status_code != 200:
+            return _login_redirect("profile_failed")
+        user_data = user_resp.json()
+        user_id = int(user_data["id"])
+        username = user_data.get("global_name") or user_data["username"]
+        avatar_url = _discord_avatar_url(user_id, user_data.get("avatar"))
+
+        # 3. Build mutual guild list + resolve permissions for active guild
+        ctx = request.app.state.ctx
+        primary_guild_id = ctx.guild_id
+        permission_bits = 0
+
+        bot = getattr(ctx, "bot", None)
+
+        role_ids: list[int] = []
+        role_names: list[str] = []
+        mutual_guilds: list[dict] = []
+
+        if bot and bot.guilds:
+            # Build list of guilds the user shares with the bot
+            for g in bot.guilds:
+                member = g.get_member(user_id)
+                if member:
+                    mutual_guilds.append({
+                        "id": g.id,
+                        "name": g.name,
+                        "icon": str(g.icon.url) if g.icon else None,
+                    })
+
+            # Support user: also include opted-in guilds they haven't joined
+            support_user_id = int(os.getenv("SUPPORT_USER_ID", "0") or "0")
+            if support_user_id and user_id == support_user_id:
+                existing_ids = {g["id"] for g in mutual_guilds}
+                opted_in_ids = await asyncio.to_thread(_get_opted_in_guild_ids, ctx)
+                for g in bot.guilds:
+                    if g.id not in existing_ids and g.id in opted_in_ids:
+                        mutual_guilds.append({
+                            "id": g.id,
+                            "name": g.name,
+                            "icon": str(g.icon.url) if g.icon else None,
+                        })
+
+            if not mutual_guilds:
+                return _login_redirect("no_shared_guild")
+
+            # Default to primary guild if user is in it, else first mutual
+            if any(g["id"] == primary_guild_id for g in mutual_guilds):
+                active_guild_id = primary_guild_id
+            else:
+                active_guild_id = mutual_guilds[0]["id"]
+
+            # Resolve permissions for the active guild
+            active_guild = bot.get_guild(active_guild_id)
+            if active_guild:
+                member = active_guild.get_member(user_id)
+                if member:
+                    permission_bits = member.guild_permissions.value
+                    role_ids = [r.id for r in member.roles if not r.is_default()]
+                    role_names = [r.name for r in member.roles if not r.is_default()]
+        else:
+            # Standalone mode — check via user's guild list
+            guilds_resp = await _discord_call(
+                client, "GET", f"{DISCORD_API}/users/@me/guilds", headers=headers
+            )
+            if guilds_resp.status_code != 200:
+                return _login_redirect("guilds_failed")
+            # In standalone mode we only know about the primary guild
+            guild_entry = next(
+                (g for g in guilds_resp.json() if int(g["id"]) == primary_guild_id),
+                None,
+            )
+            if not guild_entry:
+                return _login_redirect("no_shared_guild")
+            permission_bits = int(guild_entry.get("permissions", "0"))
+            active_guild_id = primary_guild_id
+            mutual_guilds = [{
+                "id": int(guild_entry["id"]),
+                "name": guild_entry.get("name", str(guild_entry["id"])),
+                "icon": None,
+            }]
+
+    # 4. Create session cookie
+    #
+    # The OAuth access token is deliberately not handed to the session: the
+    # cookie is signed, not encrypted, and nothing reads the token back.
+    auth: DiscordOAuthAuth = request.app.state.auth  # type: ignore[assignment]
+    try:
+        generation = await asyncio.to_thread(auth.current_generation, ctx, user_id)
+    except SessionStoreUnavailable:
+        # A cookie minted at a guessed generation would be refused on its first
+        # request anyway, or, if the guess ran high, outlive the next logout.
+        return _login_redirect("session_failed")
+    cookie_value = auth.create_session_cookie(
+        user_id=user_id,
+        username=username,
+        permission_bits=permission_bits,
+        role_ids=role_ids,
+        role_names=role_names,
+        guild_id=active_guild_id,
+        guilds=mutual_guilds,
+        avatar_url=avatar_url,
+        generation=generation,
+    )
+
+    _log.info(
+        "Login: %s (id=%d, perms=%s)",
+        username,
+        user_id,
+        resolve_discord_perms(permission_bits),
+    )
+
+    # Honor a safelisted return_to from the original /auth/discord call.
+    # Defaults to the dashboard root.
+    return_to = request.cookies.get(_RETURN_TO_COOKIE)
+    final_redirect: str = (
+        return_to if return_to and _is_safe_return_to(return_to) else "/"
+    )
+
+    response = RedirectResponse(final_redirect, status_code=302)
+    response.set_cookie(
+        SESSION_COOKIE,
+        cookie_value,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure(),
+        path="/",
+    )
+    response.delete_cookie("dk_oauth_state")
+    response.delete_cookie(_RETURN_TO_COOKIE)
+    return response
+
+
+# ── Logout ──────────────────────────────────────────────────────────────
+
+
+@router.get("/logout", include_in_schema=False)
+async def logout(request: Request) -> RedirectResponse:
+    """Log out, server-side.
+
+    Dropping the cookie only clears *this* browser; a copy captured anywhere
+    else stayed valid for the full 30-day ``max_age``. Bumping the user's
+    session generation retires every cookie minted before now, this browser's
+    included.
+    """
+    auth = request.app.state.auth
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if isinstance(auth, DiscordOAuthAuth) and cookie:
+        session = auth.read_session(cookie)
+        if session and session.get("uid"):
+            ctx = request.app.state.ctx
+            await asyncio.to_thread(auth.revoke_sessions, ctx, int(session["uid"]))
+
+    response = RedirectResponse("/login", status_code=302)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+
+def _get_opted_in_guild_ids(ctx) -> set[int]:
+    """Return IDs of guilds that have opted in to support access (blocking, run via to_thread)."""
+    try:
+        with ctx.open_db() as conn:
+            rows = conn.execute(
+                "SELECT guild_id FROM config WHERE key = 'support_access_enabled' AND value = '1'"
+            ).fetchall()
+            return {row["guild_id"] for row in rows}
+    except Exception:  # noqa: BLE001 — auth-adjacent: fails closed to "no guild opted in" rather than a 500
+        return set()
+
+
+_ERROR_MESSAGES: dict[str, str] = {
+    "invalid_state": "Invalid OAuth state. Please try again.",
+    "denied": "Authorization was denied.",
+    "token_failed": "Login failed — could not exchange token.",
+    "profile_failed": "Login failed — could not fetch your Discord profile.",
+    "guilds_failed": "Login failed — could not verify guild membership.",
+    "no_shared_guild": "You must share a server with the bot to use this dashboard.",
+    "session_failed": "Login failed — the dashboard couldn't reach its database. Try again in a moment.",
+}
+
+
+def _login_redirect(error_code: str) -> RedirectResponse:
+    return RedirectResponse(
+        f"/login?error={urlencode({'': error_code})[1:]}",
+        status_code=302,
+    )

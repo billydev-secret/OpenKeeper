@@ -1,0 +1,1077 @@
+"""Tests for services/xp_service.should_grant_level_role."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
+import pytest
+
+from bot_modules.core.xp_system import AwardResult, init_xp_tables
+from bot_modules.xp.service import (
+    LevelRoleDecision,
+    handle_level_progress,
+    nsfw_grant_role_id,
+    should_grant_level_role,
+)
+
+THRESHOLD = 5
+ROLE_ID = 777
+
+# The level announcements now thread the guild accent; these tests drive
+# MagicMock guilds whose avatar.read() isn't awaitable, so stub the lookup.
+_STUB_ACCENT = discord.Color(0x123456)
+
+
+@pytest.fixture(autouse=True)
+def _stub_resolve_accent(monkeypatch):
+    monkeypatch.setattr(
+        "bot_modules.core.branding.resolve_accent_color",
+        AsyncMock(return_value=_STUB_ACCENT),
+    )
+
+_GRANT_OK: dict[str, Any] = dict(
+    new_level=THRESHOLD,
+    role_grant_level=THRESHOLD,
+    level_role_id=ROLE_ID,
+    role_exists=True,
+    member_already_has_role=False,
+)
+
+
+# ── happy path ────────────────────────────────────────────────────────
+
+
+def test_grants_when_all_conditions_met():
+    assert should_grant_level_role(**_GRANT_OK) is LevelRoleDecision.GRANT
+
+
+def test_grants_when_above_threshold():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "new_level": 10})
+        is LevelRoleDecision.GRANT
+    )
+
+
+# ── SKIP_NOT_CONFIGURED ───────────────────────────────────────────────
+
+
+def test_skip_not_configured_when_role_id_zero():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "level_role_id": 0})
+        is LevelRoleDecision.SKIP_NOT_CONFIGURED
+    )
+
+
+def test_skip_not_configured_when_role_id_negative():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "level_role_id": -1})
+        is LevelRoleDecision.SKIP_NOT_CONFIGURED
+    )
+
+
+# ── SKIP_BELOW_THRESHOLD ──────────────────────────────────────────────
+
+
+def test_skip_below_threshold_when_level_lower():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "new_level": THRESHOLD - 1})
+        is LevelRoleDecision.SKIP_BELOW_THRESHOLD
+    )
+
+
+def test_skip_below_threshold_at_level_zero():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "new_level": 0})
+        is LevelRoleDecision.SKIP_BELOW_THRESHOLD
+    )
+
+
+def test_threshold_is_inclusive():
+    # Exactly at threshold → grant (not below)
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "new_level": THRESHOLD})
+        is LevelRoleDecision.GRANT
+    )
+
+
+# ── SKIP_ROLE_MISSING ─────────────────────────────────────────────────
+
+
+def test_skip_role_missing_when_configured_but_absent():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "role_exists": False})
+        is LevelRoleDecision.SKIP_ROLE_MISSING
+    )
+
+
+# ── SKIP_ALREADY_HAS ──────────────────────────────────────────────────
+
+
+def test_skip_already_has_when_member_has_role():
+    assert (
+        should_grant_level_role(**{**_GRANT_OK, "member_already_has_role": True})
+        is LevelRoleDecision.SKIP_ALREADY_HAS
+    )
+
+
+# ── priority ordering ─────────────────────────────────────────────────
+
+
+def test_not_configured_beats_below_threshold():
+    # id=0 AND below threshold → id check wins
+    result = should_grant_level_role(
+        **{**_GRANT_OK, "level_role_id": 0, "new_level": 0}
+    )
+    assert result is LevelRoleDecision.SKIP_NOT_CONFIGURED
+
+
+def test_below_threshold_beats_role_missing():
+    # below threshold AND role missing → level check wins
+    result = should_grant_level_role(
+        **{**_GRANT_OK, "new_level": 0, "role_exists": False}
+    )
+    assert result is LevelRoleDecision.SKIP_BELOW_THRESHOLD
+
+
+def test_role_missing_beats_already_has():
+    # role missing AND already_has flag somehow true → role-missing wins
+    # (in practice already_has cannot be true when role doesn't exist, but
+    #  the ordering guard is important anyway)
+    result = should_grant_level_role(
+        **{**_GRANT_OK, "role_exists": False, "member_already_has_role": True}
+    )
+    assert result is LevelRoleDecision.SKIP_ROLE_MISSING
+
+
+# ── all skip reasons surface distinctly ──────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, LevelRoleDecision.GRANT),
+        ({"level_role_id": 0}, LevelRoleDecision.SKIP_NOT_CONFIGURED),
+        ({"new_level": THRESHOLD - 1}, LevelRoleDecision.SKIP_BELOW_THRESHOLD),
+        ({"role_exists": False}, LevelRoleDecision.SKIP_ROLE_MISSING),
+        ({"member_already_has_role": True}, LevelRoleDecision.SKIP_ALREADY_HAS),
+    ],
+)
+def test_each_decision_reachable(overrides, expected):
+    assert should_grant_level_role(**{**_GRANT_OK, **overrides}) is expected
+
+
+@pytest.mark.parametrize(
+    ("grant_roles", "configured", "expected"),
+    [
+        # The legacy path: a grant whose internal key happens to be "nsfw".
+        pytest.param({"nsfw": {"role_id": 555}}, 0, 555, id="legacy-grant-key"),
+        pytest.param({}, 0, 0, id="nothing-configured"),
+        # The dashboard's Promotion Review Grant Role wins when set — the fix
+        # for a guild whose grant is named anything else ("spicy", "adult"),
+        # or that has no grants at all, where the field silently vanished.
+        pytest.param({}, 777, 777, id="dashboard-role-with-no-grants"),
+        pytest.param(
+            {"spicy": {"role_id": 555}}, 777, 777, id="dashboard-role-custom-key"
+        ),
+        pytest.param(
+            {"nsfw": {"role_id": 555}}, 777, 777, id="dashboard-role-overrides-grant"
+        ),
+        # "(none)" on the picker stores 0, which must not shadow the fallback.
+        pytest.param({"nsfw": {"role_id": 555}}, 0, 555, id="picker-none-falls-back"),
+    ],
+)
+def test_nsfw_grant_role_id(grant_roles, configured, expected):
+    assert nsfw_grant_role_id(grant_roles, configured) == expected
+
+
+# ── handle_level_progress: deliver owed levels + persist the mark ─────────
+#
+# These cover the announce path that fixes the silent quest level-up: a level
+# owed (new_level > announced_level) must be announced and the mark advanced,
+# and a member with nothing owed must stay quiet.
+
+LOG_CHANNEL = 4242
+GUILD_ID = 900
+MEMBER_ID = 111
+
+
+def _seed_member(db_path: Path, *, total_xp: float, level: int, announced_level: int):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    init_xp_tables(conn)
+    conn.execute(
+        "INSERT INTO member_xp (guild_id, user_id, total_xp, level, announced_level) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (GUILD_ID, MEMBER_ID, total_xp, level, announced_level),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _announced_level(db_path: Path) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT announced_level FROM member_xp WHERE guild_id = ? AND user_id = ?",
+            (GUILD_ID, MEMBER_ID),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class _FakeMember:
+    def __init__(self, *, joined_at=None):
+        self.guild = type("G", (), {"id": GUILD_ID, "get_role": lambda self, _: None})()
+        self.id = MEMBER_ID
+        self.mention = "<@111>"
+        self.display_name = "Lvl_Up"
+        self.display_avatar = type("A", (), {"url": "http://x/a.png"})()
+        self.joined_at = joined_at
+        self.roles = []
+
+
+def _award(*, old_level, new_level, announced_level, total_xp):
+    return AwardResult(
+        awarded_xp=1.0,
+        total_xp=total_xp,
+        old_level=old_level,
+        new_level=new_level,
+        announced_level=announced_level,
+        role_grant_due=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owed_quest_level_is_announced_and_marked(tmp_path):
+    """A level won silently (announced_level lags new_level) is announced now.
+
+    The award itself did not level up (old == new); the gap is announced_level.
+    This is the exact quest case: the member is one level higher than they were
+    told, and this ordinary award is what surfaces it.
+    """
+    db_path = tmp_path / "xp.db"
+    _seed_member(db_path, total_xp=64.0, level=3, announced_level=2)
+    member = _FakeMember()
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=3, new_level=3, announced_level=2, total_xp=64.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=LOG_CHANNEL,
+            level_5_log_channel_id=0,
+            db_path=db_path,
+        )
+
+    assert channel.send.await_count == 1  # only the owed level 3
+    assert _announced_level(db_path) == 3
+
+
+@pytest.mark.asyncio
+async def test_nothing_owed_stays_quiet(tmp_path):
+    db_path = tmp_path / "xp.db"
+    _seed_member(db_path, total_xp=64.0, level=3, announced_level=3)
+    member = _FakeMember()
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=3, new_level=3, announced_level=3, total_xp=64.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=LOG_CHANNEL,
+            level_5_log_channel_id=0,
+            db_path=db_path,
+        )
+
+    channel.send.assert_not_awaited()
+    assert _announced_level(db_path) == 3
+
+
+@pytest.mark.asyncio
+async def test_second_award_after_announce_is_silent(tmp_path):
+    """Once a level is announced, the next award over the same span says nothing."""
+    db_path = tmp_path / "xp.db"
+    _seed_member(db_path, total_xp=64.0, level=3, announced_level=2)
+    member = _FakeMember()
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        award = _award(old_level=3, new_level=3, announced_level=2, total_xp=64.0)
+        await handle_level_progress(
+            member, award, "text_message",
+            level_5_role_id=0, level_up_log_channel_id=LOG_CHANNEL,
+            level_5_log_channel_id=0, db_path=db_path,
+        )
+        assert channel.send.await_count == 1
+
+        # The mark advanced to 3; a fresh award now reads announced_level=3.
+        channel.send.reset_mock()
+        await handle_level_progress(
+            member,
+            _award(old_level=3, new_level=3, announced_level=3, total_xp=64.5),
+            "text_message",
+            level_5_role_id=0, level_up_log_channel_id=LOG_CHANNEL,
+            level_5_log_channel_id=0, db_path=db_path,
+        )
+        channel.send.assert_not_awaited()
+        assert _announced_level(db_path) == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_send_leaves_level_unmarked_for_retry(tmp_path):
+    """A Discord send failure must not advance the mark past the failed level."""
+    import discord
+
+    db_path = tmp_path / "xp.db"
+    _seed_member(db_path, total_xp=142.0, level=4, announced_level=2)
+    member = _FakeMember()
+    channel = AsyncMock()
+    # Level 3 sends, level 4 fails.
+    channel.send.side_effect = [None, discord.HTTPException(AsyncMock(), "boom")]
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=4, new_level=4, announced_level=2, total_xp=142.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=LOG_CHANNEL,
+            level_5_log_channel_id=0,
+            db_path=db_path,
+        )
+
+    # 3 landed, 4 did not -> mark stops at 3 so 4 retries next award.
+    assert _announced_level(db_path) == 3
+
+
+# ── maybe_log_level_5: "Spicy access" indicator ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_shows_spicy_access_granted():
+    from bot_modules.xp.service import maybe_log_level_5
+
+    member = _FakeMember()
+    member.roles = [type("R", (), {"id": 555})()]
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0, nsfw_role_id=555)
+
+    embed = channel.send.await_args.kwargs["embed"]
+    field = next(f for f in embed.fields if f.name == "Spicy access")
+    assert field.value == "✅ Granted"
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_shows_spicy_access_not_granted():
+    from bot_modules.xp.service import maybe_log_level_5
+
+    member = _FakeMember()
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0, nsfw_role_id=555)
+
+    embed = channel.send.await_args.kwargs["embed"]
+    field = next(f for f in embed.fields if f.name == "Spicy access")
+    assert field.value == "❌ Not granted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored, swapped, expected",
+    [
+        pytest.param([555], False, "on_break", id="spicy-saved"),
+        pytest.param([555], True, "on_break_lite", id="spicy-saved-lite"),
+        pytest.param([777], False, "not_granted", id="break-without-spicy"),
+    ],
+)
+async def test_level_5_post_distinguishes_a_break_from_not_granted(
+    tmp_path, stored, swapped, expected
+):
+    """A member whose Spicy role sits in a break snapshot is not "not granted"
+    — the first card must agree with refresh_level_5_cards."""
+    from bot_modules.breaks.store import create_break
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.xp import promotion_review_service as promo_svc
+    from bot_modules.xp.service import maybe_log_level_5
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "xp.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        create_break(
+            conn, guild_id=GUILD_ID, user_id=MEMBER_ID,
+            stored_roles=stored, swapped_spicy=swapped,
+        )
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    channel.id = LOG_CHANNEL
+    channel.send.return_value = type("M", (), {"id": 9001})()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(
+            member, 500.0, LOG_CHANNEL, 0, nsfw_role_id=555, db_path=db_path
+        )
+
+    embed = channel.send.await_args.kwargs["embed"]
+    field = next(f for f in embed.fields if f.name == promo_svc.SPICY_FIELD_NAME)
+    assert field.value == {
+        "on_break": promo_svc.SPICY_ON_BREAK,
+        "on_break_lite": promo_svc.SPICY_ON_BREAK_LITE,
+        "not_granted": promo_svc.SPICY_NOT_GRANTED,
+    }[expected]
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_records_the_card_for_later_refresh(tmp_path):
+    """Without a stored row the card can never be un-staled — the reported bug."""
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.xp import promotion_review_service as promo_svc
+    from bot_modules.xp.service import maybe_log_level_5
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "xp.db"
+    migrated_db(db_path)
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    channel.id = LOG_CHANNEL
+    channel.send.return_value = type("M", (), {"id": 9001})()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(
+            member, 500.0, LOG_CHANNEL, 0, nsfw_role_id=555, db_path=db_path
+        )
+
+    with open_db(db_path) as conn:
+        rows = promo_svc.level_5_cards_for(conn, GUILD_ID, MEMBER_ID)
+    assert [(r["channel_id"], r["message_id"]) for r in rows] == [(LOG_CHANNEL, 9001)]
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_pings_only_the_configured_role_manager(tmp_path):
+    """The card announces itself to the role managers who review promotions."""
+    from bot_modules.core.db_utils import open_db, set_config_value
+    from bot_modules.xp import promotion_review_service as promo_svc
+    from bot_modules.xp.service import maybe_log_level_5
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "xp.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        set_config_value(conn, promo_svc.PING_ROLE_KEY, "902", GUILD_ID)
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    channel.id = LOG_CHANNEL
+    channel.send.return_value = type("M", (), {"id": 9001})()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0, db_path=db_path)
+
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "<@&902>"
+    # Exactly that role: no @everyone, no user mentions.
+    assert kwargs["allowed_mentions"].to_dict() == {"roles": [902], "parse": []}
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_is_silent_when_no_ping_role_is_set(tmp_path):
+    """Unset ping role must not fall back to discord.py's permissive default."""
+    from bot_modules.xp.service import maybe_log_level_5
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "xp.db"
+    migrated_db(db_path)
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    channel.id = LOG_CHANNEL
+    channel.send.return_value = type("M", (), {"id": 9001})()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0, db_path=db_path)
+
+    kwargs = channel.send.await_args.kwargs
+    assert "content" not in kwargs
+    assert kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_without_db_path_still_posts(tmp_path):
+    """Recording is additive: no db_path means no row, but the card still lands."""
+    from bot_modules.xp.service import maybe_log_level_5
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0, nsfw_role_id=555)
+    assert channel.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_uses_accent_and_glyph_title():
+    """The milestone card follows the guild accent, not a hard-coded gold."""
+    from bot_modules.xp.service import maybe_log_level_5
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(
+            member, 500.0, LOG_CHANNEL, 0, accent=_STUB_ACCENT
+        )
+
+    embed = channel.send.await_args.kwargs["embed"]
+    assert embed.color == _STUB_ACCENT
+    assert embed.color != discord.Color.gold()
+    assert (embed.title or "").startswith("🎉")
+    # Named (escaped), never <@111>: the log reader may not have cached them.
+    assert embed.description.startswith("Lvl\\_Up just reached")
+
+
+@pytest.mark.asyncio
+async def test_level_up_post_uses_accent_and_glyph_title():
+    """Ordinary level-up cards follow the accent, not a hard-coded blue."""
+    from bot_modules.xp.service import maybe_log_level_ups
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_ups(
+            member, 2, 3, 120.0, LOG_CHANNEL, 0, accent=_STUB_ACCENT
+        )
+
+    embed = channel.send.await_args.kwargs["embed"]
+    assert embed.color == _STUB_ACCENT
+    assert embed.color != discord.Color.blue()
+    assert (embed.title or "").startswith("⭐")
+    assert embed.description == "Lvl\\_Up leveled up to level 3."
+
+
+def _pinged_user_ids(call) -> list[int]:
+    allowed = call.kwargs.get("allowed_mentions")
+    if allowed is None or allowed.users is False:
+        return []
+    return [u.id for u in allowed.users]
+
+
+@pytest.mark.parametrize(
+    ("announced", "new", "level_5_channel", "posted", "pinged_level"),
+    [
+        pytest.param(2, 3, 0, [3], 3, id="single-level"),
+        pytest.param(1, 4, 0, [2, 3, 4], 4, id="backlog-pings-last-only"),
+        # Level 5 goes to the dedicated card in the same channel, so the
+        # burst's last *general* card (4) carries the ping.
+        pytest.param(3, 5, LOG_CHANNEL, [4], 4, id="skipped-level-5-is-last"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_level_up_pings_the_member_once_per_burst(
+    announced, new, level_5_channel, posted, pinged_level
+):
+    """The member is tagged in ``content`` — never inside the embed, which
+    keeps the resolved name — and only on the burst's last card, so a
+    backlog of levels is one notification rather than one per level."""
+    from bot_modules.xp.service import maybe_log_level_ups
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_ups(
+            member, announced, new, 500.0, LOG_CHANNEL, level_5_channel
+        )
+
+    calls = channel.send.await_args_list
+    titles = [c.kwargs["embed"].title for c in calls]
+    assert titles == [f"⭐ Level {lvl} reached" for lvl in posted]
+    for call, level in zip(calls, posted):
+        if level == pinged_level:
+            assert call.kwargs["content"] == "<@111>"
+            assert _pinged_user_ids(call) == [MEMBER_ID]
+            allowed = call.kwargs["allowed_mentions"]
+            assert allowed.everyone is False and allowed.roles == []
+        else:
+            assert "content" not in call.kwargs
+        assert "<@" not in (call.kwargs["embed"].description or "")
+
+
+@pytest.mark.asyncio
+async def test_level_up_failed_burst_pings_nobody():
+    """A send failing part-way leaves the unsent levels for the next award,
+    whose last card pings — so the member is never pinged for a burst that
+    will be re-announced."""
+    from bot_modules.xp.service import maybe_log_level_ups
+
+    member = _FakeMember()
+    channel = AsyncMock()
+    forbidden = discord.Forbidden(
+        type("R", (), {"status": 403, "reason": "Forbidden"})(), "no"
+    )
+    channel.send.side_effect = [None, forbidden]
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        delivered = await maybe_log_level_ups(member, 1, 3, 500.0, LOG_CHANNEL, 0)
+
+    assert delivered == 2
+    assert "content" not in channel.send.await_args_list[0].kwargs
+
+
+@pytest.mark.asyncio
+async def test_level_5_post_omits_spicy_field_when_not_configured():
+    from bot_modules.xp.service import maybe_log_level_5
+
+    member = _FakeMember()
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await maybe_log_level_5(member, 500.0, LOG_CHANNEL, 0)
+
+    embed = channel.send.await_args.kwargs["embed"]
+    assert not any(f.name == "Spicy access" for f in embed.fields)
+
+
+# ── handle_level_progress: promotion-post tenure gate ──────────────────────
+
+LEVEL5_LOG_CHANNEL = 5050
+
+
+def _seed_member_with_migrations(
+    db_path: Path, *, total_xp: float, level: int, announced_level: int
+):
+    from tests.db_template import migrated_db
+
+    migrated_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO member_xp (guild_id, user_id, total_xp, level, announced_level) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (GUILD_ID, MEMBER_ID, total_xp, level, announced_level),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _read_pending_promotion_post(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM pending_promotion_posts WHERE guild_id = ? AND user_id = ?",
+            (GUILD_ID, MEMBER_ID),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+async def test_fresh_join_defers_level_5_post_instead_of_sending(tmp_path):
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=4)
+    member = _FakeMember(joined_at=datetime.now(timezone.utc))
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=5, new_level=5, announced_level=4, total_xp=999.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=0,
+            level_5_log_channel_id=LEVEL5_LOG_CHANNEL,
+            db_path=db_path,
+        )
+
+    channel.send.assert_not_awaited()
+    pending = _read_pending_promotion_post(db_path)
+    assert pending is not None
+    assert pending["total_xp"] == 999.0
+    from bot_modules.xp.service import PROMOTION_REVIEW_MIN_TENURE
+
+    expected = (member.joined_at + PROMOTION_REVIEW_MIN_TENURE).timestamp()
+    assert pending["eligible_at"] == pytest.approx(expected, abs=1)
+
+
+async def test_established_member_gets_immediate_level_5_post(tmp_path):
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=4)
+    member = _FakeMember(joined_at=datetime.now(timezone.utc) - timedelta(days=30))
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=5, new_level=5, announced_level=4, total_xp=999.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=0,
+            level_5_log_channel_id=LEVEL5_LOG_CHANNEL,
+            db_path=db_path,
+        )
+
+    channel.send.assert_awaited_once()
+    assert _read_pending_promotion_post(db_path) is None
+
+
+async def test_no_joined_at_gets_immediate_level_5_post(tmp_path):
+    """A member fake without a joined_at (e.g. an odd cache state) doesn't hang forever."""
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=4)
+    member = _FakeMember(joined_at=None)
+    channel = AsyncMock()
+
+    with patch(
+        "bot_modules.xp.service.get_guild_channel_or_thread",
+        return_value=channel,
+    ):
+        await handle_level_progress(
+            member,
+            _award(old_level=5, new_level=5, announced_level=4, total_xp=999.0),
+            "text_message",
+            level_5_role_id=0,
+            level_up_log_channel_id=0,
+            level_5_log_channel_id=LEVEL5_LOG_CHANNEL,
+            db_path=db_path,
+        )
+
+    channel.send.assert_awaited_once()
+    assert _read_pending_promotion_post(db_path) is None
+
+
+# ── the Level 5 card waits for the NSFW opt-in (Ben, 2026-09-30) ───────────
+
+OPTIN = 4343
+SPICY = 555
+
+
+class _OptinMember(_FakeMember):
+    """A member whose guild knows the opt-in role unless it was deleted."""
+
+    def __init__(self, roles=(), *, optin_exists=True, joined_at=None):
+        super().__init__(joined_at=joined_at)
+        self.guild = type(
+            "G", (), {
+                "id": GUILD_ID,
+                "get_role": lambda self, rid: object() if optin_exists and rid == OPTIN else None,
+            },
+        )()
+        self.roles = [type("R", (), {"id": r})() for r in roles]
+
+
+def _with_optin_dial(db_path: Path) -> None:
+    from bot_modules.core.db_utils import open_db, set_config_value
+    from bot_modules.onboarding.intake import service as intake_svc
+
+    with open_db(db_path) as conn:
+        set_config_value(conn, intake_svc.STAGE2_OPTIN_ROLE_KEY, str(OPTIN), GUILD_ID)
+
+
+def _sent_channel():
+    channel = AsyncMock()
+    channel.id = LEVEL5_LOG_CHANNEL
+    channel.send.return_value = type("M", (), {"id": 9001})()
+    return channel
+
+
+@pytest.mark.parametrize(
+    "roles, optin_exists, posts",
+    [
+        pytest.param([], True, False, id="no-optin-no-card"),
+        pytest.param([OPTIN], True, True, id="opted-in-gets-the-card"),
+        pytest.param([], False, True, id="deleted-optin-role-still-posts"),
+    ],
+)
+async def test_level_5_card_waits_for_the_optin(tmp_path, roles, optin_exists, posts):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.xp import promotion_review_service as promo_svc
+    from bot_modules.xp.service import maybe_log_level_5
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=5)
+    _with_optin_dial(db_path)
+    channel = _sent_channel()
+    with patch("bot_modules.xp.service.get_guild_channel_or_thread", return_value=channel):
+        await maybe_log_level_5(
+            _OptinMember(roles, optin_exists=optin_exists),
+            999.0, LEVEL5_LOG_CHANNEL, 0, db_path=db_path,
+        )
+    assert channel.send.await_count == (1 if posts else 0)
+    with open_db(db_path) as conn:
+        assert bool(promo_svc.level_5_cards_for(conn, GUILD_ID, MEMBER_ID)) is posts
+
+
+def _optin_cfg():
+    from bot_modules.core.xp_system import DEFAULT_XP_SETTINGS
+
+    return type("Cfg", (), {
+        "xp_settings": DEFAULT_XP_SETTINGS,
+        "grant_roles": {},
+        "promotion_review_grant_role_id": SPICY,
+        "level_5_log_channel_id": LEVEL5_LOG_CHANNEL,
+        "level_5_role_id": 0,
+    })()
+
+
+_SETTLED = datetime.now(timezone.utc) - timedelta(days=30)
+
+
+@pytest.mark.parametrize(
+    "roles, added, announced, posts",
+    [
+        pytest.param([OPTIN], {OPTIN}, 5, True, id="picking-the-optin-posts-the-card"),
+        pytest.param([OPTIN, 1], {1}, 5, False, id="another-role-added"),
+        pytest.param([OPTIN, SPICY], {OPTIN}, 5, False, id="already-has-access"),
+        pytest.param([OPTIN], {OPTIN}, 4, False, id="not-level-5-yet"),
+    ],
+)
+async def test_picking_the_optin_posts_a_withheld_card(tmp_path, roles, added, announced, posts):
+    from bot_modules.xp.service import maybe_post_level_5_on_optin
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=announced, announced_level=announced)
+    _with_optin_dial(db_path)
+    channel = _sent_channel()
+    with patch("bot_modules.xp.service.get_guild_channel_or_thread", return_value=channel):
+        await maybe_post_level_5_on_optin(
+            _OptinMember(roles, joined_at=_SETTLED), added, _optin_cfg(), db_path
+        )
+    assert channel.send.await_count == (1 if posts else 0)
+
+
+async def test_picking_the_optin_twice_posts_one_card(tmp_path):
+    from bot_modules.xp.service import maybe_post_level_5_on_optin
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=5)
+    _with_optin_dial(db_path)
+    channel = _sent_channel()
+    member = _OptinMember([OPTIN], joined_at=_SETTLED)
+    with patch("bot_modules.xp.service.get_guild_channel_or_thread", return_value=channel):
+        await maybe_post_level_5_on_optin(member, {OPTIN}, _optin_cfg(), db_path)
+        await maybe_post_level_5_on_optin(member, {OPTIN}, _optin_cfg(), db_path)
+    assert channel.send.await_count == 1
+
+
+async def test_picking_the_optin_before_tenure_parks_the_card(tmp_path):
+    from bot_modules.xp.service import maybe_post_level_5_on_optin
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=5)
+    _with_optin_dial(db_path)
+    channel = _sent_channel()
+    member = _OptinMember([OPTIN], joined_at=datetime.now(timezone.utc))
+    with patch("bot_modules.xp.service.get_guild_channel_or_thread", return_value=channel):
+        await maybe_post_level_5_on_optin(member, {OPTIN}, _optin_cfg(), db_path)
+    channel.send.assert_not_awaited()
+    assert _read_pending_promotion_post(db_path)["total_xp"] == 999.0
+
+
+async def test_an_unset_optin_dial_never_posts_on_a_role_add(tmp_path):
+    from bot_modules.xp.service import maybe_post_level_5_on_optin
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=999.0, level=5, announced_level=5)
+    channel = _sent_channel()
+    with patch("bot_modules.xp.service.get_guild_channel_or_thread", return_value=channel):
+        await maybe_post_level_5_on_optin(
+            _OptinMember([OPTIN], joined_at=_SETTLED), {OPTIN}, _optin_cfg(), db_path
+        )
+    channel.send.assert_not_awaited()
+
+
+# ── promotion_review_recheck_loop ───────────────────────────────────────────
+
+
+async def test_recheck_loop_posts_due_member_and_clears_the_row(tmp_path):
+    from bot_modules.xp.service import (
+        promotion_review_recheck_loop,
+        record_pending_promotion_post,
+    )
+    from bot_modules.core.db_utils import open_db
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=42.0, level=5, announced_level=5)
+    with open_db(db_path) as conn:
+        record_pending_promotion_post(conn, GUILD_ID, MEMBER_ID, 42.0, eligible_at=0.0)
+
+    member = _FakeMember(joined_at=datetime.now(timezone.utc) - timedelta(days=30))
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=member)
+    bot = MagicMock()
+    bot.wait_until_ready = AsyncMock()
+    bot.is_closed = MagicMock(side_effect=[False, True])
+    bot.get_guild = MagicMock(return_value=guild)
+
+    from bot_modules.core.xp_system import DEFAULT_XP_SETTINGS
+
+    cfg = MagicMock()
+    cfg.level_5_log_channel_id = LEVEL5_LOG_CHANNEL
+    cfg.level_5_role_id = 0
+    cfg.xp_settings = DEFAULT_XP_SETTINGS
+    cfg.grant_roles = {}
+    cfg.promotion_review_grant_role_id = 0
+
+    channel = AsyncMock()
+    with (
+        patch(
+            "bot_modules.xp.service.get_guild_channel_or_thread",
+            return_value=channel,
+        ),
+        patch("bot_modules.xp.service.asyncio.sleep", new=AsyncMock()),
+    ):
+        await promotion_review_recheck_loop(
+            bot, db_path, lambda gid: cfg, interval_seconds=0
+        )
+
+    channel.send.assert_awaited_once()
+    assert _read_pending_promotion_post(db_path) is None
+
+
+async def test_recheck_loop_drops_row_for_member_who_left(tmp_path):
+    import discord
+
+    from bot_modules.xp.service import (
+        promotion_review_recheck_loop,
+        record_pending_promotion_post,
+    )
+    from bot_modules.core.db_utils import open_db
+
+    db_path = tmp_path / "xp.db"
+    _seed_member_with_migrations(db_path, total_xp=42.0, level=5, announced_level=5)
+    with open_db(db_path) as conn:
+        record_pending_promotion_post(conn, GUILD_ID, MEMBER_ID, 42.0, eligible_at=0.0)
+
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=None)
+    guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "Unknown Member"))
+    bot = MagicMock()
+    bot.wait_until_ready = AsyncMock()
+    bot.is_closed = MagicMock(side_effect=[False, True])
+    bot.get_guild = MagicMock(return_value=guild)
+
+    with patch("bot_modules.xp.service.asyncio.sleep", new=AsyncMock()):
+        await promotion_review_recheck_loop(
+            bot, db_path, lambda gid: MagicMock(), interval_seconds=0
+        )
+
+    assert _read_pending_promotion_post(db_path) is None
+
+
+# ── level reward role safety (2026-09-14) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_level_reward_never_grants_an_elevated_role():
+    """The reward role is a dial; one pointed at a mod role grants nothing."""
+    from tests.fakes import FakeRole
+
+    from bot_modules.xp.service import maybe_grant_level_role
+
+    role = FakeRole(id=ROLE_ID, permissions=discord.Permissions(administrator=True))
+    member = MagicMock()
+    member.roles = []
+    member.add_roles = AsyncMock()
+    member.guild.me = None  # off-gateway: permissions alone disqualify
+    member.guild.get_role = MagicMock(return_value=role)
+
+    await maybe_grant_level_role(member, THRESHOLD, ROLE_ID)
+
+    member.add_roles.assert_not_awaited()
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["on_a_break", "free"])
+@pytest.mark.asyncio
+async def test_level_reward_skips_a_member_under_a_hold(tmp_path, held):
+    """Chatting in the break channel can cross the bar; the reward the break
+    stripped must not come back mid-break (the saved roles return it)."""
+    from tests.db_template import migrated_db
+    from tests.fakes import FakeRole
+
+    from bot_modules.breaks.store import create_break
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.xp.service import maybe_grant_level_role
+
+    db_path = tmp_path / "xp.db"
+    migrated_db(db_path)
+    if held:
+        with open_db(db_path) as conn:
+            create_break(
+                conn, guild_id=GUILD_ID, user_id=MEMBER_ID,
+                stored_roles=[ROLE_ID], swapped_spicy=False,
+            )
+    role = FakeRole(id=ROLE_ID)
+    member = MagicMock()
+    member.id = MEMBER_ID
+    member.guild.id = GUILD_ID
+    member.roles = []
+    member.add_roles = AsyncMock()
+    member.guild.me = None
+    member.guild.get_role = MagicMock(return_value=role)
+
+    with patch("bot_modules.xp.service.grant_block_reason", return_value=None):
+        await maybe_grant_level_role(member, THRESHOLD, ROLE_ID, db_path=db_path)
+
+    assert member.add_roles.await_count == (0 if held else 1)

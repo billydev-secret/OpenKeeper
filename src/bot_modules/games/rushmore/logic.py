@@ -1,0 +1,452 @@
+"""Pure decision logic for the Mt. Rushmore Draft cog.
+
+All functions here take and return plain Python values so they're unit-
+testable without spinning up Discord. The cog calls these from inside
+its button callbacks, modal handlers, and the draft loop; the Discord
+glue (sending the message, persisting via ``update_game_payload``)
+stays in the cog.
+
+High-leverage pieces:
+
+* :func:`generate_snake_order` — builds the ``[round, player_id]`` pair
+  list for a snake draft; round 1 forward, round 2 reverse, etc.
+* :func:`is_duplicate` / :func:`find_who_picked` — case-insensitive
+  helpers used by the pick-modal duplicate check.
+* :func:`eligible_voters` — filters the player list down to those with
+  at least one real (non-skipped, non-empty) pick.
+* :func:`tally_votes` — turns a ``{voter: target}`` map into the winner
+  uids, max-vote count, and the sorted ``[(uid, votes)]`` list the
+  winner embed and recap both consume; a tie is broken on fewest skips,
+  then lowest total pick time (social-prompt-36).
+* :func:`compute_recap_stats` — derives the first-pick, skipped, fast/
+  slow, and unanimous/split fields the recap embed renders. Pulled out
+  so the parsing of ``f"{uid}_{rnd}"`` keys lives in one place.
+* :func:`clamp_settings` — applies the slash-command bounds so the
+  cog and any future API entrypoint share one rule set.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+# How many picks each player makes — surfaced here so the cog, embed
+# builders, and tests all share the same constant.
+DRAFT_ROUNDS: int = 4
+
+# Sentinel value stored in ``boards[uid][i]`` when a player ran out the
+# clock for that pick. Compared as a string so the embed builders and
+# stats logic agree on what counts as "real pick" vs "skipped".
+SKIPPED_MARKER: str = "⏭️ Skipped"
+
+# Length of the post-draft window in which players may fill their own
+# skipped slots before the final boards are shown.
+BACKFILL_SECONDS: int = 60
+
+# Fallback pick timer when a server has never set its own "Seconds to Make
+# a Pick" dial. The dial's own range (clamp_settings, below) stays 10-120 —
+# only this default changed.
+DEFAULT_PICK_SECONDS: int = 45
+
+# How long to hold a blitz-round board redraw open once armed (todo #208/
+# #209). Blitz has every player picking at once, so a burst of accepted
+# picks needs to collapse into one Discord edit rather than one per pick —
+# long enough that a handful of players clicking within the same second or
+# two land inside the same window, short enough the board still reads live.
+REDRAW_COALESCE_SECONDS: float = 1.5
+
+
+class RedrawCoalescer:
+    """Collapses a burst of redraw requests into a single call.
+
+    Blitz mode has every player picking at once, so treating each accepted
+    pick as its own immediate redraw would mean five players landing within
+    the same second cost five board edits — real rate-limit risk. ``schedule``
+    is safe to call once per pick: the first call while idle arms a delay of
+    :data:`REDRAW_COALESCE_SECONDS`, and every call that lands before that
+    delay fires is absorbed for free (a no-op) rather than queuing its own
+    redraw. Only the delay's own fire actually redraws, and it calls
+    ``redraw_fn`` fresh at that moment, so a coalesced batch still shows
+    every pick that landed inside the window — not just the one that armed
+    it.
+
+    Deliberately not :class:`bot_modules.games.utils.live_bar.LiveBarUpdater`:
+    that helper rate-limits against the wall-clock time of the *last actual
+    edit*, so the first call after any quiet period always fires immediately
+    — correct for a vote bar trickling in one vote at a time, wrong here,
+    where the very first pick of a round would still get its own instant
+    edit and the rest of the simultaneous batch a second one: two edits for
+    one burst, not the one this exists to guarantee. ``core.sticky``'s
+    debounce is the other existing candidate; it's a much heavier fit,
+    coupled to a per-guild lock map, a placed-message registry and
+    post-before-delete channel reposting — none of which applies to editing
+    one message this cog already owns, so a small purpose-built coalescer
+    beats reusing or partially unpicking it.
+    """
+
+    def __init__(self, delay: float = REDRAW_COALESCE_SECONDS) -> None:
+        self._delay = delay
+        self._task: "asyncio.Task[None] | None" = None
+
+    def schedule(self, redraw_fn: Callable[[], Awaitable[None]]) -> None:
+        """Arm a coalesced redraw unless one is already pending."""
+        if self._task is not None and not self._task.done():
+            return
+
+        async def _fire() -> None:
+            await asyncio.sleep(self._delay)
+            await redraw_fn()
+
+        self._task = asyncio.create_task(_fire())
+
+    def cancel(self) -> None:
+        """Cancel any pending redraw. Safe to call when nothing is scheduled."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+
+def generate_snake_order(
+    players: list[int], rounds: int = DRAFT_ROUNDS,
+) -> list[list[int]]:
+    """Return ``[round_num, player_id]`` pairs in snake draft order.
+
+    Round 1 goes forward in ``players`` order, round 2 reverses, round
+    3 forwards again, and so on. ``round_num`` is 1-indexed because the
+    cog displays it directly in embeds.
+    """
+    order: list[list[int]] = []
+    for r in range(rounds):
+        if r % 2 == 0:
+            order.extend([[r + 1, pid] for pid in players])
+        else:
+            order.extend([[r + 1, pid] for pid in reversed(players)])
+    return order
+
+
+def is_duplicate(pick: str, all_picks: list[str]) -> bool:
+    """Return ``True`` when ``pick`` collides with any prior pick.
+
+    Comparison is case-insensitive and whitespace-trimmed, matching the
+    duplicate-check the modal uses to reject a player's input.
+    """
+    normalized = pick.strip().lower()
+    return normalized in [p.strip().lower() for p in all_picks]
+
+
+def find_who_picked(
+    pick: str, boards: dict[str, list[Any]],
+) -> str | None:
+    """Return the uid (as str) of whichever board already contains ``pick``.
+
+    Skips empty slots and the :data:`SKIPPED_MARKER` sentinel. Returns
+    ``None`` when nobody has it. Used by the pick modal to point the
+    player at who beat them to it.
+    """
+    norm = pick.strip().lower()
+    for uid_str, board in boards.items():
+        for p in board:
+            if p and p != SKIPPED_MARKER and p.strip().lower() == norm:
+                return uid_str
+    return None
+
+
+def first_skipped_slot(board: list[Any]) -> int | None:
+    """Index of the first :data:`SKIPPED_MARKER` slot, or ``None``.
+
+    Backfill fills slots in board order, so "which slot am I fixing" is
+    always the first skipped one.
+    """
+    for i, pick in enumerate(board):
+        if pick == SKIPPED_MARKER:
+            return i
+    return None
+
+
+def players_with_skips(boards: dict[str, list[Any]]) -> list[str]:
+    """Uids (as str, board order) that still have at least one skipped slot."""
+    return [
+        uid for uid, board in boards.items()
+        if any(p == SKIPPED_MARKER for p in board)
+    ]
+
+
+def apply_backfill(
+    boards: dict[str, list[Any]],
+    skipped: list[str],
+    uid: int | str,
+    pick_text: str,
+) -> int | None:
+    """Fill ``uid``'s first skipped slot with ``pick_text``.
+
+    Mutates ``boards`` and ``skipped`` in place: the slot gets the pick and
+    the matching ``f"{uid}_{round}"`` entry leaves the skipped list (so the
+    recap's skip stats reflect what actually stayed empty). ``pick_times``
+    is deliberately untouched — backfills aren't turn-timed and must not
+    compete for fastest/slowest pick.
+
+    Returns the 0-indexed slot that was filled, or ``None`` when the player
+    has no board or no skipped slots (nothing changes).
+    """
+    board = boards.get(str(uid))
+    if not board:
+        return None
+    slot = first_skipped_slot(board)
+    if slot is None:
+        return None
+    board[slot] = pick_text
+    key = f"{uid}_{slot + 1}"
+    if key in skipped:
+        skipped.remove(key)
+    return slot
+
+
+def eligible_voters(
+    players: list[int], boards: dict[str, list[Any]],
+) -> list[int]:
+    """Return the subset of ``players`` who made at least one real pick.
+
+    A player whose board is all-empty or all-skipped is excluded so the
+    vote dropdown doesn't show people with nothing to judge. Order is
+    preserved from ``players``.
+    """
+    eligible: list[int] = []
+    for uid in players:
+        board = boards.get(str(uid), [])
+        has_pick = any(p and p != SKIPPED_MARKER for p in board)
+        if has_pick:
+            eligible.append(uid)
+    return eligible
+
+
+def skip_count(uid: int, skipped: list[str]) -> int:
+    """How many of ``uid``'s picks ran out the clock (``f"{uid}_{round}"`` keys)."""
+    prefix = f"{uid}_"
+    return sum(1 for key in skipped if key.startswith(prefix))
+
+
+def total_pick_time(uid: int, pick_times: dict[str, float | None]) -> float:
+    """Seconds ``uid`` spent on the picks they completed (skips store None)."""
+    prefix = f"{uid}_"
+    return sum(t for key, t in pick_times.items() if key.startswith(prefix) and t is not None)
+
+
+def break_tie(
+    tied: list[int],
+    skipped: list[str] | None,
+    pick_times: dict[str, float | None] | None,
+) -> list[int]:
+    """Narrow a vote tie: fewest skips wins, then the lowest total pick time.
+
+    A tie is common at Rushmore's three-player floor (the vote cycles), and
+    every tied uid used to win and be paid. Both tie-breaks are earned in
+    the draft itself — showing up for your picks, and being decisive — so
+    they are fair game. Returns every uid still tied after both, so a true
+    dead heat (identical skips and times) is still shared.
+    """
+    if len(tied) < 2:
+        return list(tied)
+    skips = skipped or []
+    times = pick_times or {}
+    fewest = min(skip_count(uid, skips) for uid in tied)
+    tied = [uid for uid in tied if skip_count(uid, skips) == fewest]
+    if len(tied) < 2:
+        return tied
+    fastest = min(total_pick_time(uid, times) for uid in tied)
+    return [uid for uid in tied if total_pick_time(uid, times) == fastest]
+
+
+def tally_votes(
+    votes: dict[int, int],
+    eligible: list[int],
+    *,
+    skipped: list[str] | None = None,
+    pick_times: dict[str, float | None] | None = None,
+) -> tuple[list[int], int, list[tuple[int, int]]]:
+    """Tally ``{voter: target}`` votes into winners + sorted results.
+
+    Returns ``(winner_uids, max_votes, all_results)``:
+
+    * ``winner_uids`` is the uid with the most votes; a tie is broken by
+      :func:`break_tie` on ``skipped`` / ``pick_times`` when given, and
+      only a dead heat after both leaves several. Empty when no votes were
+      cast.
+    * ``max_votes`` is the top vote count, or 0 when no votes.
+    * ``all_results`` is ``[(uid, votes)]`` covering every player in
+      ``eligible`` (zero-vote players included), sorted highest-first.
+
+    Iteration follows ``eligible`` order for the zero-vote tail; ties
+    fall back to that order.
+    """
+    tally: dict[int, int] = {}
+    for _voter, target in votes.items():
+        tally[target] = tally.get(target, 0) + 1
+
+    if tally:
+        max_votes = max(tally.values())
+        winner_uids = break_tie(
+            [uid for uid, v in tally.items() if v == max_votes], skipped, pick_times,
+        )
+    else:
+        winner_uids = []
+        max_votes = 0
+
+    all_results: list[tuple[int, int]] = [
+        (uid, tally.get(uid, 0)) for uid in eligible
+    ]
+    all_results.sort(key=lambda x: x[1], reverse=True)
+
+    return winner_uids, max_votes, all_results
+
+
+def compute_recap_stats(
+    draft_order: list[list[int]],
+    boards: dict[str, list[Any]],
+    all_picks: list[str],
+    pick_times: dict[str, float | None],
+    skipped: list[str],
+    votes: dict[int, int],
+    name_resolver: Any = None,
+) -> dict[str, Any]:
+    """Derive the stat fields the recap embed renders.
+
+    ``name_resolver`` is a callable ``int -> str`` that maps a uid to a
+    display name; if ``None`` the string form of the uid is used (so
+    tests can omit it). All other inputs come straight off the
+    ``RushmoreDraftView``.
+
+    Returns a dict with keys:
+
+    * ``first_pick`` — ``{"pick": str, "player": str}`` for the round-1
+      pick-1 board entry, or absent when that slot is empty/skipped.
+    * ``skipped_count`` — total skips this game (always present).
+    * ``skipped_names`` — list of unique player names who skipped at
+      least once (omitted when nobody skipped).
+    * ``fastest`` / ``slowest`` — ``{"pick": str, "player": str,
+      "time": float}`` for the fastest and slowest completed picks
+      (omitted when no timed picks exist).
+    * ``unanimous`` — ``True`` when one and only one player received
+      votes (and at least one vote was cast).
+    * ``vote_split`` — number of distinct players who received votes,
+      present only when more than one did.
+    """
+    def _resolve(uid: int) -> str:
+        if name_resolver is None:
+            return str(uid)
+        return name_resolver(uid)
+
+    stats: dict[str, Any] = {}
+
+    # First overall pick — round 1, first slot in the draft order.
+    if all_picks and draft_order:
+        first_pick_uid = draft_order[0][1]
+        first_board = boards.get(str(first_pick_uid), [])
+        if first_board and first_board[0] and first_board[0] != SKIPPED_MARKER:
+            stats["first_pick"] = {
+                "pick": first_board[0],
+                "player": _resolve(first_pick_uid),
+            }
+
+    stats["skipped_count"] = len(skipped)
+    if skipped:
+        skipped_uids: list[int] = []
+        seen: set[int] = set()
+        for key in skipped:
+            uid_str = key.rsplit("_", 1)[0]
+            uid = int(uid_str)
+            if uid not in seen:
+                seen.add(uid)
+                skipped_uids.append(uid)
+        stats["skipped_names"] = [_resolve(uid) for uid in skipped_uids]
+
+    # Fastest / slowest among picks that finished (skips store None).
+    valid_times = {k: v for k, v in pick_times.items() if v is not None}
+    if valid_times:
+        # mypy/pyright dislikes ``v is not None`` flow-narrowing through
+        # the dict comp into ``min/max``; the cast via local typing keeps
+        # the lambda explicit.
+        def _t(key: str) -> float:
+            val = valid_times[key]
+            assert val is not None  # narrowed by filter above
+            return val
+
+        fastest_key = min(valid_times, key=_t)
+        slowest_key = max(valid_times, key=_t)
+
+        def _pick_info(key: str) -> dict[str, Any]:
+            uid_str, rnd_str = key.rsplit("_", 1)
+            uid = int(uid_str)
+            rnd = int(rnd_str)
+            board = boards.get(uid_str, [])
+            pick_text = board[rnd - 1] if 0 <= rnd - 1 < len(board) else "?"
+            return {
+                "pick": pick_text or "?",
+                "player": _resolve(uid),
+                "time": _t(key),
+            }
+
+        stats["fastest"] = _pick_info(fastest_key)
+        stats["slowest"] = _pick_info(slowest_key)
+
+    # Unanimous / split flags for the vote outcome.
+    tally: dict[int, int] = {}
+    for _voter, target in votes.items():
+        tally[target] = tally.get(target, 0) + 1
+    unique_targets = set(tally.keys())
+    if len(unique_targets) == 1 and tally:
+        stats["unanimous"] = True
+    elif len(unique_targets) > 1:
+        stats["vote_split"] = len(unique_targets)
+
+    return stats
+
+
+# The draft has a join phase, so unlike the timer knobs these are real gates.
+# The ceiling is 25 because the vote is a Discord ``Select``, which hard-caps
+# at 25 options — the same reason games_mlt.logic caps its lobby there. Before
+# this the Join button had no cap and the vote roster was sliced at 25, so
+# player 26 drafted a full board and then could not be voted for.
+MIN_PLAYERS = 3
+MAX_PLAYERS = 25
+
+
+def lobby_is_full(players: list[int], max_players: int = MAX_PLAYERS) -> bool:
+    """Return ``True`` when the lobby has reached ``max_players``."""
+    return len(players) >= max_players
+
+
+def can_start(players: list[int], min_players: int = MIN_PLAYERS) -> bool:
+    """Return ``True`` when there are enough players to start the draft."""
+    return len(players) >= min_players
+
+
+def clamp_player_limits(min_players: int, max_players: int) -> tuple[int, int]:
+    """Clamp the dashboard's player limits into what the draft can actually run.
+
+    The floor is at least :data:`MIN_PLAYERS` (a two-player draft is a
+    guaranteed 1–1 vote — nobody can vote for themselves — and a one-player
+    draft is not a game; social-prompt-36) and the ceiling never exceeds
+    :data:`MAX_PLAYERS`, whatever the dashboard stored — a server that saved
+    200 before this dial was bounded must not produce a lobby the vote
+    message cannot render. A ceiling below the floor is raised to meet it,
+    so the pair can never describe a lobby nobody can start.
+    """
+    min_players = max(MIN_PLAYERS, min(int(min_players or MIN_PLAYERS), MAX_PLAYERS))
+    max_players = max(MIN_PLAYERS, min(int(max_players or MAX_PLAYERS), MAX_PLAYERS))
+    if max_players < min_players:
+        max_players = min_players
+    return min_players, max_players
+
+
+def clamp_settings(timer: int, vote_timer: int) -> tuple[int, int]:
+    """Clamp the slash-command timer inputs into the allowed ranges.
+
+    Returns ``(timer, vote_timer)`` with ``timer`` in ``[10, 120]`` and
+    ``vote_timer`` in ``[10, 60]``. Mirrors the cog's pre-extraction
+    clamp block so the slash command and any future API entrypoint
+    share one rule set.
+    """
+    timer = max(10, min(timer, 120))
+    vote_timer = max(10, min(vote_timer, 60))
+    return timer, vote_timer

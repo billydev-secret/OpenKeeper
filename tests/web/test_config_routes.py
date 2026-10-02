@@ -1,0 +1,3245 @@
+"""Tests for /api/config/* endpoints."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from starlette.testclient import TestClient
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.games.guess.repo import insert_audit_event
+from web_server.auth import SESSION_COOKIE, DiscordOAuthAuth
+from web_server.server import create_app
+
+
+# ── End-to-end multi-guild isolation ───────────────────────────────────
+#
+# These drive the REAL seam: a non-primary guild edits its own config via the
+# web API, and the bot-side reader (real GuildConfig.load from the DB, via
+# FakeCtx.guild_config) reflects it — while the home guild stays isolated.
+
+_SECOND_GUILD = 88_888_888
+
+
+def _second_guild_client(fake_ctx) -> TestClient:
+    """A Discord-OAuth client whose active guild is a NON-primary second guild
+    (the user is a member/admin of both home and the second guild)."""
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)  # home = fake_ctx.guild_id
+    client = TestClient(create_app(fake_ctx, auth=auth))
+    cookie = auth.create_session_cookie(
+        user_id=1,
+        username="tester",
+        access_token="token",
+        permission_bits=0x8,
+        guild_id=_SECOND_GUILD,
+        guilds=[
+            {"id": fake_ctx.guild_id, "name": "Home", "icon": None},
+            {"id": _SECOND_GUILD, "name": "Second", "icon": None},
+        ],
+    )
+    client.cookies.set(SESSION_COOKIE, cookie)
+    return client
+
+
+def test_e2e_welcome_config_is_per_guild_and_isolated(fake_ctx):
+    client = _second_guild_client(fake_ctx)
+
+    resp = client.put(
+        "/api/config/welcome",
+        json={
+            "welcome_channel_id": "5551234",
+            "welcome_message": "Welcome to the second server!",
+        },
+    )
+    assert resp.status_code == 200  # per-guild, not 403
+
+    # Bot-side read for the second guild reflects the edit (real GuildConfig.load).
+    second_cfg = fake_ctx.guild_config(_SECOND_GUILD)
+    assert second_cfg.welcome_channel_id == 5551234
+    assert second_cfg.welcome_message == "Welcome to the second server!"
+
+    # Home guild untouched — strict no-fallback for non-home means no cross-bleed.
+    assert fake_ctx.guild_config(fake_ctx.guild_id).welcome_channel_id == 0
+
+
+def test_e2e_moderation_roles_per_guild_permission_isolation(fake_ctx):
+    client = _second_guild_client(fake_ctx)
+
+    resp = client.put("/api/config/moderation", json={"mod_role_ids": "424242"})
+    assert resp.status_code == 200
+
+    second_cfg = fake_ctx.guild_config(_SECOND_GUILD)
+    assert second_cfg.mod_role_ids == frozenset({424242})
+
+    member = MagicMock()
+    member.roles = [MagicMock(id=424242)]
+    # Mod in the second guild...
+    assert second_cfg.member_is_mod(member) is True
+    # ...but NOT in the home guild (no mod roles configured there).
+    assert fake_ctx.guild_config(fake_ctx.guild_id).member_is_mod(member) is False
+
+
+# ── GET /api/guess/audit ───────────────────────────────────────────────
+
+
+def test_guess_audit_returns_events_for_active_guild(authed_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        insert_audit_event(
+            conn, guild_id=fake_ctx.guild_id, actor_id=42,
+            action="submit", round_id=1, details={"difficulty": "hard"},
+        )
+        insert_audit_event(
+            conn, guild_id=fake_ctx.guild_id, actor_id=43,
+            action="delete", round_id=1, details={"by_mod": True},
+        )
+
+    resp = authed_client.get("/api/guess/audit")
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    assert len(events) == 2
+    assert events[0]["action"] == "delete"  # newest first
+    assert events[1]["action"] == "submit"
+    assert events[0]["actor_id"] == "43"  # IDs serialized as strings
+
+
+def test_guess_audit_filter_by_action(authed_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        insert_audit_event(
+            conn, guild_id=fake_ctx.guild_id, actor_id=1,
+            action="submit", round_id=1,
+        )
+        insert_audit_event(
+            conn, guild_id=fake_ctx.guild_id, actor_id=1,
+            action="solve", round_id=1,
+        )
+
+    resp = authed_client.get("/api/guess/audit?action=solve")
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    assert len(events) == 1
+    assert events[0]["action"] == "solve"
+
+
+def test_guess_audit_rejects_invalid_action(authed_client):
+    resp = authed_client.get("/api/guess/audit?action=hax")
+    assert resp.status_code == 400
+
+
+# ── GET /api/config ───────────────────────────────────────────────────
+
+
+def test_get_config_returns_expected_sections(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    data = resp.json()
+    for section in ("global", "welcome", "xp", "prune", "moderation", "roles", "auto_delete"):
+        assert section in data, f"missing section: {section}"
+
+
+def test_get_config_requires_auth(fake_ctx):
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+    from fastapi.testclient import TestClient
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/api/config")
+    assert resp.status_code in (401, 403)
+    client.close()
+
+
+# ── PUT /api/config/global ────────────────────────────────────────────
+
+
+def test_update_global_tz_offset(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/global", json={"tz_offset_hours": -5.0})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "tz_offset_hours", "0", fake_ctx.guild_id)
+    assert float(val) == -5.0
+
+
+def test_update_global_mod_channel(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/global", json={"mod_channel_id": "9999"})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "mod_channel_id", "0", fake_ctx.guild_id)
+    assert val == "9999"
+
+
+def test_update_global_bypass_roles(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/global", json={"bypass_role_ids": ["111", "222"]})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_id_set
+        ids = get_config_id_set(conn, "bypass_role_ids", fake_ctx.guild_id)
+    assert ids == {111, 222}
+
+
+def test_update_global_requires_auth(fake_ctx):
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+    from fastapi.testclient import TestClient
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.put("/api/config/global", json={"tz_offset_hours": 0.0})
+    assert resp.status_code in (401, 403)
+    client.close()
+
+
+# ── PUT /api/config/welcome ───────────────────────────────────────────
+
+
+def test_update_welcome_message(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/welcome", json={"welcome_message": "Hello {name}!"})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "welcome_message", "", fake_ctx.guild_id)
+    assert val == "Hello {name}!"
+
+
+def test_update_welcome_channel(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/welcome", json={"welcome_channel_id": "5001"})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "welcome_channel_id", "0", fake_ctx.guild_id)
+    assert val == "5001"
+
+
+def test_update_welcome_greeter_arrival_message(authed_client, fake_ctx):
+    """The greeter arrival line is editable, and an empty box means 'post
+    nothing' — it must survive as an empty string, not snap back to default."""
+    from bot_modules.core.db_utils import get_config_value
+
+    resp = authed_client.put(
+        "/api/config/welcome",
+        json={"greeter_arrival_message": "{member_name} just walked in"},
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(
+            conn, "greeter_arrival_message", "", fake_ctx.guild_id
+        ) == "{member_name} just walked in"
+
+    assert authed_client.put(
+        "/api/config/welcome", json={"greeter_arrival_message": ""}
+    ).status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(
+            conn, "greeter_arrival_message", "unset", fake_ctx.guild_id
+        ) == ""
+
+    body = authed_client.get("/api/config").json()["welcome"]
+    assert body["greeter_arrival_message"] == ""
+
+
+def test_get_config_welcome_defaults_the_arrival_line(authed_client):
+    """An untouched guild still reads back the historical @here line."""
+    from bot_modules.onboarding.welcome.service import DEFAULT_ARRIVAL_MESSAGE
+
+    body = authed_client.get("/api/config").json()["welcome"]
+    assert body["greeter_arrival_message"] == DEFAULT_ARRIVAL_MESSAGE
+
+
+def test_update_welcome_invalidates_guild_config_cache(authed_client, fake_ctx):
+    """Prime the per-guild cache, edit welcome via the API, confirm the next
+    read reflects the edit (cache was dropped)."""
+    primed = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert primed.welcome_channel_id == 0
+
+    resp = authed_client.put(
+        "/api/config/welcome", json={"welcome_channel_id": "8888"}
+    )
+    assert resp.status_code == 200
+
+    fresh = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert fresh is not primed  # cache entry replaced
+    assert fresh.welcome_channel_id == 8888
+
+
+# ── PUT /api/config/xp ────────────────────────────────────────────────
+
+
+def test_update_xp_role_ids(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/xp", json={
+        "level_5_role_id": "3001",
+        "level_up_log_channel_id": "4001",
+    })
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "xp_level_5_role_id", "0", fake_ctx.guild_id) == "3001"
+        assert get_config_value(conn, "xp_level_up_log_channel_id", "0", fake_ctx.guild_id) == "4001"
+
+
+def test_update_xp_promotion_review_roles(authed_client, fake_ctx):
+    """Grant role and ping role are separate keys — one must not write the other."""
+    resp = authed_client.put("/api/config/xp", json={
+        "promotion_review_grant_role_id": "5001",
+        "promotion_review_ping_role_id": "5002",
+    })
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "promotion_review_grant_role_id", "0", fake_ctx.guild_id) == "5001"
+        assert get_config_value(conn, "promotion_review_ping_role_id", "0", fake_ctx.guild_id) == "5002"
+
+
+def test_update_xp_excluded_channels(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/xp", json={"xp_excluded_channel_ids": ["7001", "7002"]})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_id_set
+        ids = get_config_id_set(conn, "xp_excluded_channel_ids", fake_ctx.guild_id)
+    assert ids == {7001, 7002}
+
+
+def test_update_xp_coefficient(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/xp", json={"message_word_xp": 0.75})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        from bot_modules.core.xp_system import _XP_COEFF_PREFIX
+        val = get_config_value(conn, f"{_XP_COEFF_PREFIX}message_word_xp", "0", fake_ctx.guild_id)
+    assert float(val) == 0.75
+
+
+def test_xp_event_retention_setting_is_gone(authed_client, fake_ctx):
+    """The Event Retention dial was removed, not hidden.
+
+    The section no longer carries it, and a save that still sends it is
+    refused by the model rather than quietly writing a config row nothing
+    reads (CLAUDE.md: never a toggle that isn't enforced).
+    """
+    section = authed_client.get("/api/config").json()["xp"]
+    assert not [k for k in section if k.startswith("xp_retention")]
+
+    resp = authed_client.put("/api/config/xp", json={"xp_retention_enabled": "1"})
+    assert resp.status_code == 422
+    with open_db(fake_ctx.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM config WHERE key = 'xp_retention_enabled'"
+        ).fetchone()[0] == 0
+
+
+def test_update_xp_rejects_zero_voice_interval(authed_client, fake_ctx):
+    # A 0-second interval divides by zero in completed_voice_intervals and
+    # would kill voice XP guild-wide — the model must reject it (422).
+    resp = authed_client.put("/api/config/xp", json={"voice_interval_seconds": 0})
+    assert resp.status_code == 422
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        from bot_modules.core.xp_system import _XP_COEFF_PREFIX
+        # Nothing persisted.
+        assert get_config_value(
+            conn, f"{_XP_COEFF_PREFIX}voice_interval_seconds", "", fake_ctx.guild_id
+        ) == ""
+
+
+def test_reaction_given_xp_coefficient_roundtrips(authed_client):
+    # Default surfaces on GET before any write.
+    before = authed_client.get("/api/config")
+    assert before.status_code == 200
+    assert before.json()["xp"]["reaction_given_xp"] == 0.34
+
+    put = authed_client.put("/api/config/xp", json={"reaction_given_xp": 0.5})
+    assert put.status_code == 200
+
+    after = authed_client.get("/api/config")
+    assert after.status_code == 200
+    assert after.json()["xp"]["reaction_given_xp"] == 0.5
+
+
+# ── PUT /api/config/prune ─────────────────────────────────────────────
+
+
+def test_update_prune_rule(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/prune", json={"role_id": "8001", "inactivity_days": 30})
+    assert resp.status_code == 200
+    from bot_modules.inactive.prune_service import get_prune_rule
+    rule = get_prune_rule(fake_ctx.db_path, fake_ctx.guild_id)
+    assert rule is not None
+    assert rule["role_id"] == 8001
+    assert rule["inactivity_days"] == 30
+
+
+def test_clear_prune_rule(authed_client, fake_ctx):
+    authed_client.put("/api/config/prune", json={"role_id": "8001", "inactivity_days": 30})
+    resp = authed_client.put("/api/config/prune", json={"role_id": "0", "inactivity_days": 0})
+    assert resp.status_code == 200
+    from bot_modules.inactive.prune_service import get_prune_rule
+    assert get_prune_rule(fake_ctx.db_path, fake_ctx.guild_id) is None
+
+
+def test_prune_exemption_add_and_remove(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/prune/exemptions/9001")
+    assert resp.status_code == 200
+    from bot_modules.inactive.prune_service import get_prune_exception_ids
+    assert 9001 in get_prune_exception_ids(fake_ctx.db_path, fake_ctx.guild_id)
+
+    resp = authed_client.delete("/api/config/prune/exemptions/9001")
+    assert resp.status_code == 200
+    assert 9001 not in get_prune_exception_ids(fake_ctx.db_path, fake_ctx.guild_id)
+
+
+# ── PUT /api/config/moderation ────────────────────────────────────────
+
+
+def test_update_moderation_fields(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/moderation", json={
+        "jailed_role_id": "6001",
+        "log_channel_id": "6002",
+        "warning_threshold": 5,
+    })
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "jailed_role_id", "0", fake_ctx.guild_id) == "6001"
+        assert get_config_value(conn, "log_channel_id", "0", fake_ctx.guild_id) == "6002"
+        assert get_config_value(conn, "warning_threshold", "3", fake_ctx.guild_id) == "5"
+
+
+def test_update_moderation_invalidates_guild_config_cache(authed_client, fake_ctx):
+    """Editing mod_role_ids via the API must drop the cached snapshot so
+    subsequent permission checks see the new roles."""
+    primed = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert primed.mod_role_ids == frozenset()
+
+    resp = authed_client.put(
+        "/api/config/moderation",
+        json={"mod_role_ids": "100,101", "admin_role_ids": "200"},
+    )
+    assert resp.status_code == 200
+
+    fresh = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert fresh is not primed
+    assert fresh.mod_role_ids == frozenset({100, 101})
+    assert fresh.admin_role_ids == frozenset({200})
+
+
+def test_moderation_lists_the_channel_staff_pings(authed_client):
+    from bot_modules.moderation.settings import staff_ping_service
+
+    body = authed_client.get("/api/config").json()["moderation"]
+    assert body["staff_ping_channel_id"] == "0"
+    assert [p["key"] for p in body["staff_pings"]] == [
+        e.key for e in staff_ping_service.CHANNEL_PINGS
+    ]
+
+
+def test_update_moderation_writes_staff_pings(authed_client, fake_ctx):
+    from bot_modules.core.db_utils import get_config_value
+
+    resp = authed_client.put("/api/config/moderation", json={
+        "staff_ping_channel_id": "6100",
+        "staff_ping_roles": {"staff_ping_tickets_role_id": "6101"},
+    })
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(conn, "staff_ping_channel_id", "0", fake_ctx.guild_id) == "6100"
+        assert get_config_value(conn, "staff_ping_tickets_role_id", "", fake_ctx.guild_id) == "6101"
+
+
+@pytest.mark.parametrize(
+    "body, redraws",
+    [
+        pytest.param({"staff_ping_channel_id": "6100"}, True, id="channel"),
+        pytest.param({"staff_ping_qotd_deadline_hour": "18"}, True, id="qotd-deadline"),
+        pytest.param({"ticket_notify_on_create": "1"}, True, id="tickets-dial"),
+        pytest.param({"warning_threshold": 3}, False, id="unrelated"),
+    ],
+)
+def test_update_moderation_redraws_the_mod_settings_panel(authed_client, fake_ctx, body, redraws):
+    """The posted Mod Settings panel lists the jobs that are set up, so a
+    save that can change that list pokes the cog to redraw it."""
+    fake_ctx.bot = MagicMock()
+    assert authed_client.put("/api/config/moderation", json=body).status_code == 200
+    calls = [
+        c.args for c in fake_ctx.bot.dispatch.call_args_list
+        if c.args[0] == "staff_pings_config_change"
+    ]
+    assert calls == ([("staff_pings_config_change", fake_ctx.guild_id)] if redraws else [])
+
+
+@pytest.mark.parametrize(
+    "url, body, redraws",
+    [
+        pytest.param("/api/config/xp", {"level_5_log_channel_id": "6200"}, True, id="promotion-channel"),
+        pytest.param("/api/config/xp", {"level_up_log_channel_id": "6201"}, False, id="xp-unrelated"),
+        pytest.param("/api/config/bump-tracker", {"enabled": True}, False, id="bump-tracker-offers-no-job"),
+    ],
+)
+def test_other_saves_that_change_the_offered_jobs_redraw(authed_client, fake_ctx, url, body, redraws):
+    """Each staff job is offered only while its feature runs, and those
+    features are set up on other pages."""
+    fake_ctx.bot = MagicMock()
+    assert authed_client.put(url, json=body).status_code == 200
+    calls = [
+        c.args for c in fake_ctx.bot.dispatch.call_args_list
+        if c.args[0] == "staff_pings_config_change"
+    ]
+    assert calls == ([("staff_pings_config_change", fake_ctx.guild_id)] if redraws else [])
+
+
+def test_moderation_qotd_deadline_round_trips_and_clears(authed_client):
+    assert authed_client.get("/api/config").json()["moderation"][
+        "staff_ping_qotd_deadline_hour"
+    ] == ""
+    assert authed_client.put(
+        "/api/config/moderation", json={"staff_ping_qotd_deadline_hour": "18"}
+    ).status_code == 200
+    body = authed_client.get("/api/config").json()["moderation"]
+    assert body["staff_ping_qotd_deadline_hour"] == "18"
+    assert authed_client.put(
+        "/api/config/moderation", json={"staff_ping_qotd_deadline_hour": ""}
+    ).status_code == 200
+    body = authed_client.get("/api/config").json()["moderation"]
+    assert body["staff_ping_qotd_deadline_hour"] == ""
+
+
+@pytest.mark.parametrize("hour", ["24", "-1", "noon"])
+def test_moderation_refuses_a_bad_qotd_deadline(authed_client, hour):
+    resp = authed_client.put(
+        "/api/config/moderation", json={"staff_ping_qotd_deadline_hour": hour}
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        pytest.param({"jailed_role_id": "6101"}, id="not-a-staff-ping"),
+        pytest.param({"staff_ping_tickets_role_id": "abc"}, id="malformed-id"),
+    ],
+)
+def test_update_moderation_refuses_bad_staff_ping_roles(authed_client, fake_ctx, roles):
+    from bot_modules.core.db_utils import get_config_value
+
+    resp = authed_client.put("/api/config/moderation", json={"staff_ping_roles": roles})
+    assert resp.status_code == 400
+    with open_db(fake_ctx.db_path) as conn:
+        for key in roles:
+            assert get_config_value(conn, key, "unset", fake_ctx.guild_id) == "unset"
+
+
+# ── PUT /api/config/roles/{grant_name} ───────────────────────────────
+
+
+def test_create_and_delete_role_grant(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/roles/vip", json={
+        "label": "VIP",
+        "role_id": "5555",
+        "log_channel_id": "6666",
+        "announce_channel_id": "7777",
+        "grant_message": "Welcome to VIP!",
+    })
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_grant_roles
+        roles = get_grant_roles(conn, fake_ctx.guild_id)
+    assert "vip" in roles
+    assert roles["vip"]["role_id"] == 5555
+
+    resp = authed_client.delete("/api/config/roles/vip")
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_grant_roles
+        roles = get_grant_roles(conn, fake_ctx.guild_id)
+    assert "vip" not in roles
+
+
+# ── PUT /api/config/auto-react/{channel_id} ──────────────────────────
+
+
+def test_auto_react_rule_with_tips_and_rungs(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/auto-react/4242",
+        json={
+            "emojis": ["🔥", "💎"],
+            "enabled": True,
+            "tips_enabled": True,
+            "rungs": {"🔥": 5, "💎": 25},
+        },
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.economy.reaction_tip_service import get_rungs
+
+    assert get_rungs(fake_ctx.db_path, fake_ctx.guild_id, 4242) == {"🔥": 5, "💎": 25}
+
+    section = authed_client.get("/api/config").json()["auto_react"]
+    rule = next(r for r in section if r["channel_id"] == "4242")
+    assert rule["tips_enabled"] is True
+    assert rule["rungs"] == {"🔥": 5, "💎": 25}
+
+
+def test_auto_react_rejects_a_one_coin_rung(authed_client):
+    # After the 1-coin minimum rake a 1-coin rung delivers the poster nothing,
+    # so it's refused rather than silently declining every tap.
+    resp = authed_client.put(
+        "/api/config/auto-react/4242",
+        json={"emojis": ["🔥"], "tips_enabled": True, "rungs": {"🔥": 1}},
+    )
+    assert resp.status_code == 400
+
+
+def test_auto_react_drops_rungs_for_removed_emoji(authed_client, fake_ctx):
+    from bot_modules.economy.reaction_tip_service import get_rungs
+
+    authed_client.put(
+        "/api/config/auto-react/4242",
+        json={"emojis": ["🔥", "💎"], "tips_enabled": True, "rungs": {"🔥": 5, "💎": 25}},
+    )
+    # 💎 drops off the rule — its price must not linger and stay chargeable.
+    authed_client.put(
+        "/api/config/auto-react/4242",
+        json={"emojis": ["🔥"], "tips_enabled": True, "rungs": {"🔥": 5}},
+    )
+
+    assert get_rungs(fake_ctx.db_path, fake_ctx.guild_id, 4242) == {"🔥": 5}
+
+
+def test_get_config_includes_guess_section(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    v = resp.json()["guess"]
+    assert v["channel_id"] == "0"
+    assert v["role_id"] == "0"
+    assert v["crop_difficulty"] == "medium"
+    assert v["guess_cooldown_seconds"] == 60
+    assert v["min_image_dimension_px"] == 400
+    assert v["max_image_size_mb"] == 10
+    assert v["submit_max_per_window"] == 5
+    assert v["submit_window_seconds"] == 3600
+    assert v["max_guesses_per_round"] == 5
+    assert v["round_lifetime_days"] == 0  # ships dark: rounds never time out
+
+
+# ── PUT /api/config/auto-delete/{channel_id} ─────────────────────────
+
+
+def test_auto_delete_rule_upsert_and_delete(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/auto-delete/3001", json={
+        "max_age_seconds": 86400,
+        "interval_seconds": 3600,
+    })
+    assert resp.status_code == 200
+
+    from bot_modules.auto_delete.service import list_auto_delete_rules_for_guild
+    rules = list_auto_delete_rules_for_guild(fake_ctx.db_path, fake_ctx.guild_id)
+    assert 3001 in [r["channel_id"] for r in rules]
+
+    resp = authed_client.delete("/api/config/auto-delete/3001")
+    assert resp.status_code == 200
+    rules = list_auto_delete_rules_for_guild(fake_ctx.db_path, fake_ctx.guild_id)
+    assert 3001 not in [r["channel_id"] for r in rules]
+
+
+@pytest.mark.parametrize("payload", [
+    pytest.param({"max_age_seconds": 0, "interval_seconds": 3600}, id="age-zero"),
+    pytest.param({"max_age_seconds": 86400, "interval_seconds": 0}, id="interval-zero"),
+    pytest.param({"max_age_seconds": -1, "interval_seconds": 3600}, id="age-negative"),
+])
+def test_auto_delete_rule_rejects_non_positive_durations(authed_client, fake_ctx, payload):
+    # The panel's own floor is 1 second; without a server-side floor a direct
+    # PUT of 0 makes the rule due every tick with every message eligible.
+    from bot_modules.auto_delete.service import list_auto_delete_rules_for_guild
+
+    resp = authed_client.put("/api/config/auto-delete/3003", json=payload)
+    assert resp.status_code == 422
+    rules = list_auto_delete_rules_for_guild(fake_ctx.db_path, fake_ctx.guild_id)
+    assert 3003 not in [r["channel_id"] for r in rules]
+
+
+def test_auto_delete_media_only_round_trips(authed_client, fake_ctx):
+    from bot_modules.auto_delete.service import list_auto_delete_rules_for_guild
+
+    # media_only defaults to False when omitted.
+    authed_client.put("/api/config/auto-delete/3002", json={
+        "max_age_seconds": 86400,
+        "interval_seconds": 3600,
+    })
+    rules = {r["channel_id"]: r for r in list_auto_delete_rules_for_guild(
+        fake_ctx.db_path, fake_ctx.guild_id
+    )}
+    assert bool(rules[3002]["media_only"]) is False
+
+    # Setting it persists, and the config payload surfaces it.
+    authed_client.put("/api/config/auto-delete/3002", json={
+        "max_age_seconds": 86400,
+        "interval_seconds": 3600,
+        "media_only": True,
+    })
+    config = authed_client.get("/api/config").json()
+    entry = next(e for e in config["auto_delete"] if e["channel_id"] == "3002")
+    assert entry["media_only"] is True
+
+
+# ── PUT /api/config/guess ──────────────────────────────────────────────
+
+
+def test_update_guess_channel(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/guess", json={"channel_id": "555"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "guess_channel_id", "0", fake_ctx.guild_id)
+    assert val == "555"
+
+
+def test_update_guess_crop_difficulty_hard(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/guess", json={"crop_difficulty": "hard"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        val = get_config_value(conn, "guess_crop_difficulty", "medium", fake_ctx.guild_id)
+    assert val == "hard"
+
+
+def test_update_guess_invalid_difficulty_returns_error(authed_client):
+    resp = authed_client.put("/api/config/guess", json={"crop_difficulty": "insane"})
+    assert resp.status_code == 400
+    assert "crop_difficulty" in resp.json()["detail"]
+
+
+def test_update_guess_rate_limit_fields(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/guess",
+        json={
+            "submit_max_per_window": 2,
+            "submit_window_seconds": 600,
+            "max_guesses_per_round": 3,
+            "round_lifetime_days": 7,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "guess_submit_max_per_window", "5", fake_ctx.guild_id) == "2"
+        assert get_config_value(conn, "guess_submit_window_seconds", "3600", fake_ctx.guild_id) == "600"
+        assert get_config_value(conn, "guess_max_guesses_per_round", "5", fake_ctx.guild_id) == "3"
+        assert get_config_value(conn, "guess_round_lifetime_days", "0", fake_ctx.guild_id) == "7"
+
+
+def test_update_guess_round_lifetime_out_of_range_is_refused(authed_client):
+    assert authed_client.put("/api/config/guess", json={"round_lifetime_days": -1}).status_code == 422
+    assert authed_client.put("/api/config/guess", json={"round_lifetime_days": 366}).status_code == 422
+
+
+# ── Multi-guild safety ───────────────────────────────────────────────
+#
+# The prelaunch fix removed ``_require_primary_guild`` from every config
+# endpoint — the multi-guild migration moved each feature's state into
+# per-guild storage, so a session active on guild N can edit guild N's
+# config independently from the home guild. The previous version of this
+# test asserted 403s that no longer exist by design; the replacement
+# below verifies the new contract: non-primary edits succeed AND don't
+# corrupt the home guild's flat ctx fields.
+
+
+def _non_primary_client(fake_ctx, *, other_guild_id: int = 999):
+    """Build a TestClient whose session's active guild is NOT the primary."""
+    from fastapi.testclient import TestClient
+
+    from web_server.auth import DiscordOAuthAuth, SESSION_COOKIE
+    from web_server.server import create_app
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app)
+    cookie = auth.create_session_cookie(
+        user_id=1,
+        username="tester",
+        access_token="token",
+        permission_bits=0x8,  # admin
+        guild_id=other_guild_id,
+        guilds=[
+            {"id": fake_ctx.guild_id, "name": "Home", "icon": None},
+            {"id": other_guild_id, "name": "Other", "icon": None},
+        ],
+    )
+    client.cookies.set(SESSION_COOKIE, cookie)
+    return client
+
+
+def test_birthday_edit_from_non_primary_guild_lands_at_that_guild(fake_ctx):
+    """A non-primary edit writes to the active guild's bucket, not home's."""
+    from bot_modules.birthday.service import list_channels
+
+    client = _non_primary_client(fake_ctx, other_guild_id=999)
+    resp = client.put("/api/config/birthday/8888", json={"message": "Hi {mention}"})
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        assert [c.channel_id for c in list_channels(conn, 999)] == [8888]
+        # Home guild untouched.
+        assert list_channels(conn, fake_ctx.guild_id) == []
+    client.close()
+
+
+def test_starboard_edit_from_non_primary_guild_isolates_to_that_guild(fake_ctx):
+    """Each guild has its own starboard config — a non-primary edit must
+    not bleed into the home guild's starboard."""
+    from bot_modules.starboard.service import get_starboard_config
+
+    client = _non_primary_client(fake_ctx, other_guild_id=999)
+    resp = client.put("/api/config/starboard", json={"threshold": 9})
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        other_cfg = get_starboard_config(conn, 999)
+        home_cfg = get_starboard_config(conn, fake_ctx.guild_id)
+    assert other_cfg is not None
+    assert int(other_cfg["threshold"]) == 9
+    # The home guild has no starboard row (nothing was written there).
+    assert home_cfg is None
+    client.close()
+
+
+# ── /config/starboard ────────────────────────────────────────────────
+
+
+def test_update_starboard_persists_fields(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/starboard",
+        json={
+            "channel_id": "777",
+            "threshold": 7,
+            "emoji": "🔥",
+            "enabled": True,
+            "excluded_channels": ["100", "200"],
+        },
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.starboard.service import get_starboard_config
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = get_starboard_config(conn, fake_ctx.guild_id)
+    assert cfg is not None
+    assert int(cfg["channel_id"]) == 777
+    assert int(cfg["threshold"]) == 7
+    assert cfg["emoji"] == "🔥"
+    assert int(cfg["enabled"]) == 1
+
+
+def test_update_starboard_rejects_threshold_below_one(authed_client):
+    resp = authed_client.put("/api/config/starboard", json={"threshold": 0})
+    assert resp.status_code == 400
+    assert "Threshold" in resp.json()["detail"]
+
+
+def test_update_starboard_rejects_empty_emoji(authed_client):
+    resp = authed_client.put("/api/config/starboard", json={"emoji": "   "})
+    assert resp.status_code == 400
+
+
+# ── /config/needle ───────────────────────────────────────────────────
+#
+# The "require an upload" dial (migration 246) ships off: a save that doesn't
+# mention it must leave it off, and only an explicit true turns it on.
+
+
+def _needle_channel(authed_client, channel_id: str) -> dict:
+    section = authed_client.get("/api/config").json()["needle"]
+    return next(c for c in section["channels"] if c["channel_id"] == channel_id)
+
+
+def test_needle_require_attachment_defaults_off_and_persists(authed_client):
+    resp = authed_client.put("/api/config/needle/6060", json={})
+    assert resp.status_code == 200
+    assert _needle_channel(authed_client, "6060")["require_attachment"] is False
+
+    resp = authed_client.put(
+        "/api/config/needle/6060", json={"require_attachment": True}
+    )
+    assert resp.status_code == 200
+    assert _needle_channel(authed_client, "6060")["require_attachment"] is True
+
+    # An unticked box on the next save turns the rule back off.
+    resp = authed_client.put(
+        "/api/config/needle/6060", json={"require_attachment": False}
+    )
+    assert resp.status_code == 200
+    assert _needle_channel(authed_client, "6060")["require_attachment"] is False
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        pytest.param(None, 1440, id="omitted-is-one-day"),
+        pytest.param(10080, 10080, id="one-week-sticks"),
+        pytest.param(60, 60, id="one-hour-sticks"),
+        pytest.param(90, 1440, id="not-a-discord-choice-stored-as-one-day"),
+        pytest.param(0, 1440, id="zero-stored-as-one-day"),
+    ],
+)
+def test_needle_auto_archive_minutes_persists_only_discord_values(authed_client, sent, stored):
+    body = {} if sent is None else {"auto_archive_minutes": sent}
+    resp = authed_client.put("/api/config/needle/6070", json=body)
+    assert resp.status_code == 200
+    assert _needle_channel(authed_client, "6070")["auto_archive_minutes"] == stored
+
+
+class _NeedleStubChannel:
+    def __init__(self, channel_id: int, *, manage_messages: bool):
+        self.id = channel_id
+        self._manage_messages = manage_messages
+
+    def permissions_for(self, _member):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(manage_messages=self._manage_messages)
+
+
+class _NeedleAdminMember:
+    """With a bot attached, auth reads live guild membership instead of the
+    session's permission bits, so the session user must be on the guild."""
+
+    def __init__(self, member_id: int):
+        from types import SimpleNamespace
+
+        self.id = member_id
+        self.bot = False
+        self.display_name = f"member-{member_id}"
+        self.roles = ()
+        self.guild_permissions = SimpleNamespace(
+            value=0x8, administrator=True, manage_guild=True
+        )
+
+
+def test_needle_warns_when_the_bot_cannot_delete_in_a_ticked_channel(
+    authed_client, live_guild
+):
+    """Review finding, 2026-09-29: without Manage Messages the ticked box
+    removed nothing and the dashboard gave no sign of it."""
+    from types import SimpleNamespace
+
+    guild = live_guild([_NeedleAdminMember(1)])
+    # GET /config also reads the bot's nickname for another section.
+    guild.me = SimpleNamespace(
+        id=999, nick=None, display_avatar=SimpleNamespace(url="")
+    )
+    guild.channels = [
+        _NeedleStubChannel(6061, manage_messages=False),
+        _NeedleStubChannel(6062, manage_messages=True),
+    ]
+
+    # Unticked: the permission is not needed, so nothing to warn about.
+    resp = authed_client.put("/api/config/needle/6061", json={})
+    assert resp.json() == {"ok": True, "removal_blocked": False}
+
+    # Ticked where the bot can't delete: the save itself says so.
+    resp = authed_client.put(
+        "/api/config/needle/6061", json={"require_attachment": True}
+    )
+    assert resp.json() == {"ok": True, "removal_blocked": True}
+    assert _needle_channel(authed_client, "6061")["removal_blocked"] is True
+
+    # Ticked where the bot can delete.
+    resp = authed_client.put(
+        "/api/config/needle/6062", json={"require_attachment": True}
+    )
+    assert resp.json() == {"ok": True, "removal_blocked": False}
+    assert _needle_channel(authed_client, "6062")["removal_blocked"] is False
+
+
+def test_needle_warns_about_nothing_while_the_bot_is_down(authed_client, fake_ctx):
+    fake_ctx.bot = None
+    resp = authed_client.put(
+        "/api/config/needle/6063", json={"require_attachment": True}
+    )
+    assert resp.json() == {"ok": True, "removal_blocked": False}
+    assert _needle_channel(authed_client, "6063")["removal_blocked"] is False
+
+
+# ── /config/birthday ─────────────────────────────────────────────────
+#
+# Any number of announcement channels (migration 200) — an add/upsert/delete
+# per-channel-id endpoint plus a settings endpoint for the one guild-wide
+# dial, same shape as Auto-Thread's /config/needle/{channel_id}.
+
+
+def test_update_birthday_persists_channel_and_message(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/birthday/5050",
+        json={"message": "Happy bday {name}!", "pin": True},
+    )
+    assert resp.status_code == 200
+    from bot_modules.birthday.service import list_channels
+    with open_db(fake_ctx.db_path) as conn:
+        rows = list_channels(conn, fake_ctx.guild_id)
+    assert len(rows) == 1
+    assert rows[0].channel_id == 5050
+    assert rows[0].message == "Happy bday {name}!"
+    assert rows[0].pin is True
+
+
+def test_update_birthday_rejects_empty_message(authed_client):
+    resp = authed_client.put(
+        "/api/config/birthday/5050", json={"message": "   "}
+    )
+    assert resp.status_code == 400
+
+
+def test_birthday_announces_to_any_number_of_channels(authed_client, fake_ctx):
+    """Billy: "could we have an arbitrary number of channels?" — not capped
+    at a fixed main + second."""
+    from bot_modules.birthday.service import list_channels
+
+    for channel_id in (111, 222, 333, 444):
+        resp = authed_client.put(
+            f"/api/config/birthday/{channel_id}",
+            json={"message": f"Channel {channel_id} says hi {{mention}}"},
+        )
+        assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        rows = list_channels(conn, fake_ctx.guild_id)
+    assert [r.channel_id for r in rows] == [111, 222, 333, 444]
+
+    sec = authed_client.get("/api/config").json()["birthday"]
+    assert [c["channel_id"] for c in sec["channels"]] == ["111", "222", "333", "444"]
+
+
+def test_birthday_channel_upsert_is_idempotent(authed_client, fake_ctx):
+    """Re-adding the same channel (the Add form and a card's own Save both
+    post here) edits it in place instead of duplicating the row."""
+    from bot_modules.birthday.service import list_channels
+
+    authed_client.put("/api/config/birthday/5050", json={"message": "First"})
+    resp = authed_client.put(
+        "/api/config/birthday/5050", json={"message": "Second", "pin": True}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        rows = list_channels(conn, fake_ctx.guild_id)
+    assert len(rows) == 1
+    assert rows[0].message == "Second"
+    assert rows[0].pin is True
+
+
+def test_delete_birthday_channel_removes_it(authed_client, fake_ctx):
+    from bot_modules.birthday.service import list_channels
+
+    authed_client.put("/api/config/birthday/5050", json={"message": "Hi"})
+    resp = authed_client.delete("/api/config/birthday/5050")
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert list_channels(conn, fake_ctx.guild_id) == []
+
+
+def test_delete_birthday_channel_404s_when_not_configured(authed_client):
+    resp = authed_client.delete("/api/config/birthday/999999")
+    assert resp.status_code == 404
+
+
+def test_update_birthday_persists_announce_hour(authed_client, fake_ctx):
+    """The announce hour was a code constant; it is a per-guild dial now."""
+    from bot_modules.birthday.service import announce_hour
+
+    # Untouched guild reads back the historical 09:00.
+    assert authed_client.get("/api/config").json()["birthday"][
+        "birthday_announce_hour"
+    ] == 9
+
+    resp = authed_client.put(
+        "/api/config/birthday/settings", json={"birthday_announce_hour": 18}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        # The loop reads it through the same helper.
+        assert announce_hour(conn, fake_ctx.guild_id) == 18
+    assert authed_client.get("/api/config").json()["birthday"][
+        "birthday_announce_hour"
+    ] == 18
+
+    # Midnight is a real choice, not "unset".
+    assert authed_client.put(
+        "/api/config/birthday/settings", json={"birthday_announce_hour": 0}
+    ).status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert announce_hour(conn, fake_ctx.guild_id) == 0
+
+
+@pytest.mark.parametrize("hour", [-1, 24, 99])
+def test_update_birthday_rejects_an_impossible_hour(authed_client, hour):
+    """422 — the same code every other out-of-range dial answers with.
+
+    This one refused before too, but with a hand-rolled 400 from inside the
+    handler. The bound is declared on the model now, so the panel gets one
+    error shape from every dial it saves.
+    """
+    resp = authed_client.put(
+        "/api/config/birthday/settings", json={"birthday_announce_hour": hour}
+    )
+    assert resp.status_code == 422
+
+
+def test_get_config_includes_risky_section_defaults(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    r = resp.json()["risky"]
+    assert r["ping_role_id"] == "0"
+    assert r["min_game_seconds"] == 0
+    assert r["max_games_per_channel"] == 10
+
+
+def test_get_config_includes_pen_pals_timer_defaults(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    pp = resp.json()["pen_pals"]
+    assert pp["session_seconds"] == 86400
+    assert pp["match_cooldown_seconds"] == 2592000
+    assert pp["max_question_swaps"] == 3
+    assert pp["warn_seconds"] == 3600
+    assert pp["question_suppress_seconds"] == 7200
+    # Reply reminders ship off — a guild only starts nudging once a mod says so.
+    assert pp["reply_reminder_seconds"] == 0
+
+
+def test_update_pen_pals_timers_persists(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals/timers",
+        json={
+            "session_seconds": 1800,
+            "match_cooldown_seconds": 86400,
+            "max_question_swaps": 1,
+            "warn_seconds": 300,
+            "question_suppress_seconds": 600,
+            "reply_reminder_seconds": 21600,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    resp2 = authed_client.get("/api/config")
+    pp = resp2.json()["pen_pals"]
+    assert pp["session_seconds"] == 1800
+    assert pp["match_cooldown_seconds"] == 86400
+    assert pp["max_question_swaps"] == 1
+    assert pp["warn_seconds"] == 300
+    assert pp["question_suppress_seconds"] == 600
+    assert pp["reply_reminder_seconds"] == 21600
+
+
+def test_update_pen_pals_timers_rejects_a_negative_reply_reminder(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals/timers",
+        json={
+            "session_seconds": 1800,
+            "match_cooldown_seconds": 86400,
+            "max_question_swaps": 1,
+            "warn_seconds": 300,
+            "question_suppress_seconds": 600,
+            "reply_reminder_seconds": -60,
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_get_config_pen_pals_room_visibility_defaults_to_admins_only(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    assert resp.json()["pen_pals"]["room_visibility"] == "admin"
+
+
+def test_update_pen_pals_config_persists_room_visibility(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "room_visibility": "everyone"},
+    )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert pp["room_visibility"] == "everyone"
+
+
+def test_update_pen_pals_config_normalizes_bad_room_visibility(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "room_visibility": "nonsense"},
+    )
+    assert resp.status_code == 200
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert pp["room_visibility"] == "admin"
+
+
+def test_get_config_pen_pals_round_schedule_defaults(authed_client):
+    """The scheduled round's day and hour are dials now, not a hard-coded 8am
+    Eastern — so the panel has to be able to read them back."""
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert pp["auto_round_dow"] == -1  # every day
+    assert pp["auto_round_hour"] == 12
+
+
+def test_update_pen_pals_config_persists_the_round_schedule(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "auto_round_dow": 3, "auto_round_hour": 8},
+    )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert (pp["auto_round_dow"], pp["auto_round_hour"]) == (3, 8)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"auto_round_dow": 7}, id="dow-too-high"),
+        pytest.param({"auto_round_dow": -2}, id="dow-too-low"),
+        pytest.param({"auto_round_hour": 24}, id="hour-out-of-day"),
+        pytest.param({"auto_round_hour": -1}, id="hour-negative"),
+    ],
+)
+def test_update_pen_pals_config_rejects_an_impossible_round_time(
+    authed_client, fake_ctx, body
+):
+    resp = authed_client.put(
+        "/api/config/pen-pals", json={"enabled": True, **body},
+    )
+    assert resp.status_code == 400
+
+
+def test_update_pen_pals_config_leaves_the_round_schedule_alone_when_omitted(
+    authed_client, fake_ctx
+):
+    """A save from a page that doesn't carry the two fields (an older cached
+    panel) must not silently reset the admin's chosen round time."""
+    authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "auto_round_dow": 5, "auto_round_hour": 9},
+    )
+    resp = authed_client.put("/api/config/pen-pals", json={"enabled": True})
+    assert resp.status_code == 200
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert (pp["auto_round_dow"], pp["auto_round_hour"]) == (5, 9)
+
+
+def test_get_config_pen_pals_intro_message_defaults_to_empty(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    assert resp.json()["pen_pals"]["intro_message"] == ""
+
+
+def test_update_pen_pals_config_persists_intro_message(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "intro_message": "  Be kind to your pen pal!  "},
+    )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert pp["intro_message"] == "Be kind to your pen pal!"
+
+
+def test_pen_pals_pool_events_are_newest_first(authed_client, fake_ctx):
+    """The history behind the Pool Activity list. Without it the dashboard can
+    only show who is waiting right now, so a pool that has gone flat looks the
+    same as one nobody ever joined."""
+    from bot_modules.pen_pals.cog import _record_pool_event
+
+    with fake_ctx.open_db() as conn:
+        _record_pool_event(conn, fake_ctx.guild_id, 4242, "join", "panel", at=100.0)
+        _record_pool_event(conn, fake_ctx.guild_id, 4242, "leave", "matched", at=200.0)
+
+    events = authed_client.get("/api/config/pen-pals/pool-events").json()["events"]
+
+    assert [(e["action"], e["reason"]) for e in events] == [
+        ("leave", "matched"),
+        ("join", "panel"),
+    ]
+    # Snowflakes cross as strings so JS float math can't round them.
+    assert events[0]["user_id"] == "4242"
+
+
+def test_pen_pals_pool_events_carry_the_current_opt_outs(authed_client, fake_ctx):
+    """The log says a member stopped being re-pooled; only this says they will
+    stay that way. Read-only — there is deliberately no route for staff to
+    clear a member's own opt-out."""
+    from bot_modules.pen_pals.cog import _set_opt_out
+
+    with fake_ctx.open_db() as conn:
+        _set_opt_out(conn, fake_ctx.guild_id, 4242, at=100.0)
+        _set_opt_out(conn, fake_ctx.guild_id + 1, 77, at=200.0)  # another guild
+
+    optouts = authed_client.get("/api/config/pen-pals/pool-events").json()["optouts"]
+
+    assert optouts == [{"user_id": "4242", "at": 100.0}]
+
+
+def test_pen_pals_pool_events_are_scoped_to_the_active_guild(authed_client, fake_ctx):
+    from bot_modules.pen_pals.cog import _record_pool_event
+
+    with fake_ctx.open_db() as conn:
+        _record_pool_event(conn, fake_ctx.guild_id + 1, 99, "join", "panel", at=100.0)
+
+    assert authed_client.get("/api/config/pen-pals/pool-events").json()["events"] == []
+
+
+def test_update_pen_pals_config_rejects_oversized_intro_message(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/pen-pals",
+        json={"enabled": True, "intro_message": "x" * 1001},
+    )
+    assert resp.status_code == 400
+
+
+def test_update_pen_pals_timers_rejects_invalid_session_seconds(authed_client):
+    resp = authed_client.put(
+        "/api/config/pen-pals/timers",
+        json={
+            "session_seconds": 0,
+            "match_cooldown_seconds": 0,
+            "max_question_swaps": 0,
+            "warn_seconds": 0,
+            "question_suppress_seconds": 0,
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_update_pen_pals_separations_persists_normalized(authed_client):
+    # Big snowflake-ish ids to confirm they round-trip as strings.
+    a, b = "1469000000000000123", "1469000000000000456"
+    resp = authed_client.put(
+        "/api/config/pen-pals/separations",
+        json={"separations": [{"user_a": b, "user_b": a}]},  # entered high→low
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    pp = authed_client.get("/api/config").json()["pen_pals"]
+    assert pp["separations"] == [{"user_a": a, "user_b": b}]  # normalized low→high
+
+    # Sending an empty list clears them.
+    resp2 = authed_client.put("/api/config/pen-pals/separations", json={"separations": []})
+    assert resp2.status_code == 200
+    assert authed_client.get("/api/config").json()["pen_pals"]["separations"] == []
+
+
+def test_update_pen_pals_separations_rejects_self_pair(authed_client):
+    resp = authed_client.put(
+        "/api/config/pen-pals/separations",
+        json={"separations": [{"user_a": "42", "user_b": "42"}]},
+    )
+    assert resp.status_code == 400
+
+
+# ── /config/risky — in-memory state must be updated ──────────────────
+
+
+def test_update_risky_persists_and_updates_in_memory_state(authed_client, fake_ctx):
+    """The risky_roll in-memory `state.ping_roles` dict must reflect the write."""
+    from bot_modules.games.risky_roll import state as rr_state
+
+    rr_state.ping_roles.pop(fake_ctx.guild_id, None)
+    rr_state.min_game_seconds.pop(fake_ctx.guild_id, None)
+    rr_state.max_games_per_channel.pop(fake_ctx.guild_id, None)
+
+    resp = authed_client.put(
+        "/api/config/risky",
+        json={"ping_role_id": "5555", "min_game_seconds": 90, "max_games_per_channel": 4},
+    )
+    assert resp.status_code == 200
+
+    assert rr_state.ping_roles[fake_ctx.guild_id] == 5555
+    assert rr_state.min_game_seconds[fake_ctx.guild_id] == 90
+    assert rr_state.max_games_per_channel[fake_ctx.guild_id] == 4
+
+
+def test_update_risky_rejects_max_games_below_one(authed_client):
+    resp = authed_client.put(
+        "/api/config/risky", json={"max_games_per_channel": 0}
+    )
+    assert resp.status_code == 400
+
+
+def test_update_risky_zero_values_clear_in_memory_state(authed_client, fake_ctx):
+    """ping_role_id=0 and min_game_seconds=0 mean 'clear' — must drop from state."""
+    from bot_modules.games.risky_roll import state as rr_state
+
+    rr_state.ping_roles[fake_ctx.guild_id] = 1234
+    rr_state.min_game_seconds[fake_ctx.guild_id] = 60
+
+    resp = authed_client.put(
+        "/api/config/risky",
+        json={"ping_role_id": "0", "min_game_seconds": 0},
+    )
+    assert resp.status_code == 200
+    assert fake_ctx.guild_id not in rr_state.ping_roles
+    assert fake_ctx.guild_id not in rr_state.min_game_seconds
+
+
+def test_update_risky_rejects_negative_min_seconds(authed_client):
+    resp = authed_client.put(
+        "/api/config/risky", json={"min_game_seconds": -1}
+    )
+    assert resp.status_code == 400
+
+
+# ── /config/policy ───────────────────────────────────────────────────
+
+
+def test_update_policy_persists_timeout(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/policy", json={"vote_timeout_hours": 72}
+    )
+    assert resp.status_code == 200
+    from bot_modules.core.db_utils import get_config_value
+    with open_db(fake_ctx.db_path) as conn:
+        val = get_config_value(conn, "policy_vote_timeout_hours", "0", fake_ctx.guild_id)
+    assert val == "72"
+
+
+def test_update_policy_rejects_below_one(authed_client):
+    resp = authed_client.put("/api/config/policy", json={"vote_timeout_hours": 0})
+    assert resp.status_code == 400
+
+
+# ── /config/whisper ──────────────────────────────────────────────────
+
+
+def test_update_whisper_persists_fields(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/whisper",
+        json={"channel_id": "7000", "role_id": "8000", "log_channel_id": "9000"},
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.whisper.repo import get_whisper_config
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = get_whisper_config(conn, fake_ctx.guild_id)
+    assert cfg.channel_id == 7000
+    assert cfg.role_id == 8000
+    assert cfg.log_channel_id == 9000
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        pytest.param(5, 5, id="raised"),
+        pytest.param(1, 1, id="floor"),
+        pytest.param(10, 10, id="ceiling"),
+    ],
+)
+def test_update_whisper_persists_the_guess_cap(authed_client, fake_ctx, sent, stored):
+    """The recipient's guess allowance was fixed at three by the schema with no
+    control anywhere; it's a dial now, over a playable range."""
+    resp = authed_client.put(
+        "/api/config/whisper", json={"guesses_per_whisper": sent},
+    )
+    assert resp.status_code == 200
+    assert authed_client.get("/api/config").json()["whisper"][
+        "guesses_per_whisper"
+    ] == stored
+
+
+def test_get_config_whisper_guess_cap_defaults_to_three(authed_client):
+    assert authed_client.get("/api/config").json()["whisper"][
+        "guesses_per_whisper"
+    ] == 3
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        pytest.param(True, True, id="on"),
+        pytest.param(False, False, id="off"),
+    ],
+)
+def test_update_whisper_persists_the_sender_feedback_dial(
+    authed_client, fake_ctx, sent, stored
+):
+    """The sender-feedback DM ships dark (2026-09 review, rotation-rooms-159):
+    it reads False until an admin flips it, and round-trips both ways."""
+    assert authed_client.get("/api/config").json()["whisper"]["sender_feedback"] is False
+    resp = authed_client.put("/api/config/whisper", json={"sender_feedback": sent})
+    assert resp.status_code == 200
+    assert authed_client.get("/api/config").json()["whisper"]["sender_feedback"] is stored
+
+
+def test_update_whisper_pokes_the_bot(authed_client, fake_ctx):
+    """The launcher's on_message fast path only knows the guilds read at
+    boot, so a save dispatches to the cog to republish and re-stick."""
+    fake_ctx.bot = MagicMock()
+    resp = authed_client.put("/api/config/whisper", json={"channel_id": "8001"})
+    assert resp.status_code == 200
+    fake_ctx.bot.dispatch.assert_called_once_with(
+        "whisper_config_change", fake_ctx.guild_id
+    )
+
+
+# ── /config/dms ──────────────────────────────────────────────────────
+
+
+def test_update_dms_persists_channels(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/dms",
+        json={"audit_channel_id": "1200"},
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.dm.perms.service import load_audit_channels
+    assert load_audit_channels(fake_ctx.db_path).get(fake_ctx.guild_id) == 1200
+
+
+def test_update_dms_persists_request_limits(authed_client, fake_ctx):
+    """The expiry window and the pending cap are dials, not constants — what the
+    panel saves is what the request flow enforces."""
+    from bot_modules.dm.perms.service import get_request_limits
+
+    resp = authed_client.put(
+        "/api/config/dms",
+        json={"request_expiry_hours": 48, "max_pending_requests": 2},
+    )
+    assert resp.status_code == 200
+
+    limits = get_request_limits(fake_ctx.db_path, fake_ctx.guild_id)
+    assert limits == {"expiry_hours": 48, "max_pending": 2}
+
+    section = authed_client.get("/api/config").json()["dms"]
+    assert section["request_expiry_hours"] == 48
+    assert section["max_pending_requests"] == 2
+
+
+@pytest.mark.parametrize(
+    ("payload", "id_"),
+    [
+        pytest.param({"request_expiry_hours": 0}, "expiry-below-1", id="expiry-low"),
+        pytest.param({"request_expiry_hours": 721}, "expiry-above-720", id="expiry-high"),
+        pytest.param({"max_pending_requests": 0}, "pending-below-1", id="pending-low"),
+        pytest.param({"max_pending_requests": 9999}, "pending-above-50", id="pending-high"),
+    ],
+)
+def test_update_dms_refuses_absurd_request_limits(
+    authed_client, fake_ctx, payload, id_
+):
+    """422, and nothing is stored.
+
+    The service keeps its own clamp — it parses stored strings too, where a
+    corrupt row should degrade rather than break the DM loop. This is about
+    the typed value: 9999 used to save green and serve 50.
+    """
+    from bot_modules.dm.perms.service import get_request_limits
+
+    before = get_request_limits(fake_ctx.db_path, fake_ctx.guild_id)
+    resp = authed_client.put("/api/config/dms", json=payload)
+    assert resp.status_code == 422, id_
+    assert get_request_limits(fake_ctx.db_path, fake_ctx.guild_id) == before
+
+
+def test_update_dms_accepts_the_edges_of_the_request_limits(authed_client, fake_ctx):
+    """1 hour / 1 pending and 720 / 50 are the panel's own end stops."""
+    from bot_modules.dm.perms.service import get_request_limits
+
+    resp = authed_client.put(
+        "/api/config/dms",
+        json={"request_expiry_hours": 720, "max_pending_requests": 1},
+    )
+    assert resp.status_code == 200
+    limits = get_request_limits(fake_ctx.db_path, fake_ctx.guild_id)
+    assert limits == {"expiry_hours": 720, "max_pending": 1}
+
+
+def test_update_dms_persists_mode_roles(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/dms",
+        json={"open_role_id": "500", "ask_role_id": "0", "closed_role_id": "600"},
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.dm.perms.service import get_dm_mode_role_ids
+    assert get_dm_mode_role_ids(fake_ctx.db_path, fake_ctx.guild_id) == {
+        "open": 500,
+        "ask": 0,
+        "closed": 600,
+    }
+
+    # Partial update: only one field changes, the rest are preserved.
+    resp = authed_client.put("/api/config/dms", json={"ask_role_id": "550"})
+    assert resp.status_code == 200
+    assert get_dm_mode_role_ids(fake_ctx.db_path, fake_ctx.guild_id) == {
+        "open": 500,
+        "ask": 550,
+        "closed": 600,
+    }
+
+
+# ── /config/confessions (PUT + block/unblock) ────────────────────────
+
+
+def test_update_confessions_creates_config_when_missing(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/confessions",
+        json={
+            "dest_channel_id": "3000",
+            "log_channel_id": "3001",
+            "cooldown_seconds": 120,
+            "max_chars": 500,
+            "replies_enabled": True,
+            "per_day_limit": 5,
+        },
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.confessions.service import get_config
+    cfg = get_config(fake_ctx.db_path, fake_ctx.guild_id)
+    assert cfg is not None
+    assert cfg.dest_channel_id == 3000
+    assert cfg.log_channel_id == 3001
+    assert cfg.cooldown_seconds == 120
+    assert cfg.replies_enabled is True
+
+
+def test_confessions_approval_defaults_off(authed_client, fake_ctx):
+    """The dial ships dark: a guild that never touches it keeps posting
+    straight through."""
+    authed_client.put(
+        "/api/config/confessions",
+        json={"dest_channel_id": "3000", "log_channel_id": "0"},
+    )
+
+    from bot_modules.confessions.service import get_config
+    cfg = get_config(fake_ctx.db_path, fake_ctx.guild_id)
+    assert cfg is not None and cfg.require_approval is False
+
+
+def test_update_confessions_toggles_mod_approval(authed_client, fake_ctx):
+    from bot_modules.confessions.service import get_config
+
+    authed_client.put(
+        "/api/config/confessions",
+        json={"dest_channel_id": "3000", "log_channel_id": "0",
+              "require_approval": True},
+    )
+    assert get_config(fake_ctx.db_path, fake_ctx.guild_id).require_approval is True
+
+    authed_client.put(
+        "/api/config/confessions", json={"require_approval": False}
+    )
+    assert get_config(fake_ctx.db_path, fake_ctx.guild_id).require_approval is False
+
+
+def test_confessions_snapshot_reports_the_approval_dial(authed_client):
+    authed_client.put(
+        "/api/config/confessions",
+        json={"dest_channel_id": "3000", "log_channel_id": "0",
+              "require_approval": True},
+    )
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    assert resp.json()["confessions"]["require_approval"] is True
+
+
+def test_confessions_block_user_requires_existing_config(authed_client):
+    """Block call must 404 if confessions isn't configured yet."""
+    resp = authed_client.put("/api/config/confessions/block/42")
+    assert resp.status_code == 404
+
+
+def test_confessions_block_and_unblock_round_trip(authed_client, fake_ctx):
+    # Seed a config so block/unblock have something to mutate
+    authed_client.put(
+        "/api/config/confessions",
+        json={"dest_channel_id": "3000", "log_channel_id": "3001"},
+    )
+
+    authed_client.put("/api/config/confessions/block/42")
+
+    from bot_modules.confessions.service import get_config
+    cfg = get_config(fake_ctx.db_path, fake_ctx.guild_id)
+    assert cfg is not None
+    assert 42 in cfg.blocked_set()
+
+    authed_client.delete("/api/config/confessions/block/42")
+    cfg = get_config(fake_ctx.db_path, fake_ctx.guild_id)
+    assert cfg is not None
+    assert 42 not in cfg.blocked_set()
+
+
+# ── /config/confessions/post-button — deleted 2026-09-16 ─────────────
+
+
+def test_confessions_post_button_route_is_gone(authed_client):
+    """The bespoke launcher route folded into the shared panel registry.
+
+    It was gated on the game-host role while its page was adminOnly, so no game
+    host could reach the button it guarded (docs/plans/
+    moderator-dashboard-access.md § F). Posting now goes through
+    ``POST /api/panels/confessions/post``, which owns the channel check, the
+    bot-permission check and one admin gate for every panel. A revert that
+    brings the endpoint back fails here.
+    """
+    resp = authed_client.post(
+        "/api/config/confessions/post-button", json={"channel_id": "1"}
+    )
+    assert resp.status_code == 404
+
+
+# ── /config/dms/post-panel — web→Discord ─────────────────────────────
+
+
+def test_dms_post_panel_503_when_bot_unavailable(authed_client):
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "1"}
+    )
+    assert resp.status_code == 503
+
+
+def test_dms_post_panel_503_when_cog_missing(authed_client, fake_ctx):
+    from unittest.mock import MagicMock
+
+    bot = MagicMock()
+    bot.get_cog = MagicMock(return_value=None)
+    fake_ctx.bot = bot
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "1"}
+    )
+    assert resp.status_code == 503
+
+
+def test_dms_post_panel_503_when_guild_missing(authed_client, fake_ctx):
+    from unittest.mock import MagicMock
+
+    cog = MagicMock()
+    bot = MagicMock()
+    bot.get_cog = MagicMock(return_value=cog)
+    bot.get_guild = MagicMock(return_value=None)
+    fake_ctx.bot = bot
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "1"}
+    )
+    assert resp.status_code == 503
+
+
+def _dms_panel_guild(fake_ctx, *, perms=None, channel=None):
+    """Build the bot/guild/channel mock scaffolding for post-panel tests."""
+    import discord
+    from unittest.mock import AsyncMock, MagicMock
+
+    cog = MagicMock()
+    cog.post_panel = AsyncMock(return_value=88888)
+    cog.panel_settings = {}
+
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    if channel is None:
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.name = "general"
+        channel.permissions_for = MagicMock(
+            return_value=perms
+            if perms is not None
+            else discord.Permissions(
+                view_channel=True, send_messages=True, embed_links=True
+            )
+        )
+    guild.get_channel = MagicMock(return_value=channel)
+
+    bot = MagicMock()
+    bot.get_cog = MagicMock(return_value=cog)
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+    return cog, guild
+
+
+def test_dms_post_panel_invokes_post_panel_and_persists_ids(authed_client, fake_ctx):
+    """Happy path: cog.post_panel(guild, channel_id) is
+    awaited; the returned message_id is persisted via set_panel_settings; and
+    the cog's in-memory panel_settings dict is updated."""
+    cog, guild = _dms_panel_guild(fake_ctx)
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 200
+    cog.post_panel.assert_awaited_once_with(guild, 5000)
+    # In-memory cache
+    assert cog.panel_settings[fake_ctx.guild_id] == {
+        "panel_channel_id": 5000,
+        "panel_message_id": 88888,
+    }
+    # DB row
+    from bot_modules.dm.perms.service import load_panel_settings
+    persisted = load_panel_settings(fake_ctx.db_path).get(fake_ctx.guild_id)
+    assert persisted is not None
+    assert persisted["panel_channel_id"] == 5000
+    assert persisted["panel_message_id"] == 88888
+
+
+def test_dms_post_panel_400_when_channel_not_text(authed_client, fake_ctx):
+    """get_channel returns a non-TextChannel (or None) → 400, no send."""
+    from unittest.mock import MagicMock
+
+    cog, guild = _dms_panel_guild(fake_ctx, channel=MagicMock())
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 400
+    cog.post_panel.assert_not_awaited()
+
+
+def test_dms_post_panel_400_names_missing_permissions(authed_client, fake_ctx):
+    """Bot lacks send/embed in the channel → 400 whose detail names the
+    missing permissions, and nothing is posted or persisted."""
+    import discord
+
+    cog, guild = _dms_panel_guild(
+        fake_ctx, perms=discord.Permissions(view_channel=True)
+    )
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "Send Messages" in detail
+    assert "Embed Links" in detail
+    assert "View Channel" not in detail
+    cog.post_panel.assert_not_awaited()
+    assert cog.panel_settings == {}
+
+
+def test_dms_post_panel_502_when_discord_rejects_send(authed_client, fake_ctx):
+    """Perms look fine but the actual send still fails (post_panel → None):
+    the route must report an error instead of a false success."""
+    cog, guild = _dms_panel_guild(fake_ctx)
+    cog.post_panel.return_value = None
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 502
+    assert cog.panel_settings == {}
+
+
+# ── /config/welcome/preview — admin-only render ──────────────────────
+
+
+def test_welcome_preview_503_when_bot_unavailable(authed_client):
+    resp = authed_client.post("/api/config/welcome/preview", json={})
+    assert resp.status_code == 503
+
+
+def _welcome_preview_guild(fake_ctx):
+    """Wire a minimal bot/guild/member mock good enough for the preview route."""
+    from unittest.mock import MagicMock
+
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.name = "Test"
+    guild.member_count = 5
+
+    auth_user = MagicMock()
+    auth_user.id = 1
+    auth_user.bot = False
+    auth_user.display_name = "tester"
+    auth_user.name = "tester"
+    auth_user.mention = "<@1>"
+    auth_user.guild = guild  # back-ref needed by build_*_embed
+    auth_user.guild_permissions = MagicMock(value=0x8)
+    auth_user.avatar = None
+    role = MagicMock(id=0, name="@everyone")
+    role.is_default = MagicMock(return_value=True)
+    auth_user.roles = [role]
+    auth_user.created_at = MagicMock()
+    auth_user.created_at.strftime = MagicMock(return_value="2026-01-01")
+
+    guild.get_member = MagicMock(return_value=auth_user)
+    guild.me = auth_user
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+    return guild
+
+
+def _post_preview(authed_client, payload):
+    import discord
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "bot_modules.core.branding.resolve_accent_color",
+        new=AsyncMock(return_value=discord.Color(0x123456)),
+    ):
+        return authed_client.post("/api/config/welcome/preview", json=payload)
+
+
+def test_welcome_preview_renders_with_bot_member(authed_client, fake_ctx):
+    """When the bot guild and the auth user are reachable, preview returns
+    rendered embed dicts for both welcome and leave."""
+    _welcome_preview_guild(fake_ctx)
+
+    resp = _post_preview(authed_client, {})
+    # 200 happy path; the route's build_*_embed helpers are exercised. If the
+    # preview shape changes later, this is a useful regression bait.
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "welcome" in body
+    assert "leave" in body
+
+
+def test_welcome_preview_uses_posted_values_over_stored(authed_client, fake_ctx):
+    """W-C3: the preview must reflect the form's current (unsaved) edits, not
+    the stored config — posted welcome/leave messages win over saved ones."""
+    from bot_modules.core.db_utils import set_config_value
+
+    _welcome_preview_guild(fake_ctx)
+
+    # Store different values so we can tell which source the preview used.
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_message", "STORED WELCOME", fake_ctx.guild_id)
+        set_config_value(conn, "leave_message", "STORED LEAVE", fake_ctx.guild_id)
+
+    resp = _post_preview(
+        authed_client,
+        {
+            "welcome_message": "UNSAVED WELCOME {member_name}",
+            "leave_message": "UNSAVED LEAVE",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "UNSAVED WELCOME" in body["welcome"]["description"]
+    assert "STORED WELCOME" not in body["welcome"]["description"]
+    assert "UNSAVED LEAVE" in body["leave"]["description"]
+    # Placeholders in posted values still resolve.
+    assert "tester" in body["welcome"]["description"]
+
+
+def test_welcome_preview_falls_back_to_stored_values(authed_client, fake_ctx):
+    """Fields omitted from the POST body fall back to the saved config."""
+    from bot_modules.core.db_utils import set_config_value
+
+    _welcome_preview_guild(fake_ctx)
+
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "welcome_message", "STORED WELCOME", fake_ctx.guild_id)
+
+    resp = _post_preview(authed_client, {"leave_message": "UNSAVED LEAVE"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "STORED WELCOME" in body["welcome"]["description"]
+    assert "UNSAVED LEAVE" in body["leave"]["description"]
+
+
+# ── PUT /api/config/guess — channel selection ──────────────────────────
+#
+# Guess accepts SFW and NSFW submissions alike, so the channel is NOT required
+# to be age-gated: the age-gate check that used to live here was removed with
+# SFW support, and placement is a moderator call. The runtime has had no
+# is_nsfw() recheck since 47ca6a5, so this route was the last holdout. Only the
+# channel's existence is still validated.
+
+
+def _attach_guess_bot(fake_ctx, *, nsfw: bool):
+    channel = MagicMock()
+    channel.is_nsfw = MagicMock(return_value=nsfw)
+    guild = MagicMock()
+    guild.get_channel = MagicMock(return_value=channel)
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+
+@pytest.mark.parametrize("nsfw", [True, False], ids=["age_gated", "sfw"])
+def test_update_guess_channel_saves_regardless_of_age_gate(authed_client, fake_ctx, nsfw):
+    """Both an age-gated and a plain SFW channel save.
+
+    The SFW row is the regression: it returned 400 "Guess only posts in
+    age-gated channels" before SFW submissions were supported.
+    """
+    _attach_guess_bot(fake_ctx, nsfw=nsfw)
+
+    resp = authed_client.put("/api/config/guess", json={"channel_id": "555"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "guess_channel_id", "0", fake_ctx.guild_id) == "555"
+
+
+def test_update_guess_channel_disabled_sentinel_saves(authed_client, fake_ctx):
+    # "0" is the "(disabled)" option; it must persist without tripping the
+    # channel-not-found lookup that a real channel id would.
+    _attach_guess_bot(fake_ctx, nsfw=False)
+
+    resp = authed_client.put("/api/config/guess", json={"channel_id": "0"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+        assert get_config_value(conn, "guess_channel_id", "x", fake_ctx.guild_id) == "0"
+
+
+def test_update_guess_channel_rejects_unknown_channel(authed_client, fake_ctx):
+    guild = MagicMock()
+    guild.get_channel = MagicMock(return_value=None)
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+    resp = authed_client.put("/api/config/guess", json={"channel_id": "555"})
+    assert resp.status_code == 400
+    assert "not found" in resp.json()["detail"].lower()
+
+
+# ── Bot-identity avatar_url SSRF guard ────────────────────────────────
+#
+# POST /config/bot-identity fetches a caller-supplied avatar_url server-side.
+# Without a scheme allowlist + private-range rejection, file://, loopback and
+# link-local (cloud-metadata) URLs all reach the fetch — a classic SSRF.
+
+
+def test_reject_unsafe_avatar_url_blocks_non_http_scheme():
+    import pytest
+    from fastapi import HTTPException
+
+    from web_server.routes.config import _reject_unsafe_avatar_url
+
+    with pytest.raises(HTTPException) as exc:
+        _reject_unsafe_avatar_url("file:///etc/passwd")
+    assert exc.value.status_code == 400
+
+
+def test_reject_unsafe_avatar_url_blocks_loopback_and_link_local():
+    import pytest
+    from fastapi import HTTPException
+
+    from web_server.routes.config import _reject_unsafe_avatar_url
+
+    for bad in (
+        "http://127.0.0.1/x.png",
+        "http://169.254.169.254/latest/meta-data/",  # cloud metadata
+        "http://10.0.0.5/x.png",
+        "http://[::1]/x.png",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _reject_unsafe_avatar_url(bad)
+        assert exc.value.status_code == 400, bad
+
+
+def test_reject_unsafe_avatar_url_allows_public_ip():
+    # A public literal must pass the guard (no exception raised).
+    from web_server.routes.config import _reject_unsafe_avatar_url
+
+    _reject_unsafe_avatar_url("https://93.184.216.34/avatar.png")
+
+
+async def test_download_avatar_bytes_rejects_loopback():
+    import pytest
+    from fastapi import HTTPException
+
+    from web_server.routes.config import _download_avatar_bytes
+
+    with pytest.raises(HTTPException) as exc:
+        await _download_avatar_bytes("http://127.0.0.1:80/evil.png")
+    assert exc.value.status_code == 400
+
+
+# ── Birthday calendar anchors on the guild-local date ─────────────────
+#
+# The calendar's "today" must come from the guild's tz offset, not the host's
+# clock — otherwise days_until flips at host midnight instead of the guild's.
+
+
+def test_birthday_calendar_uses_guild_local_today(authed_client, fake_ctx):
+    from datetime import date
+
+    from bot_modules.core.db_utils import set_config_value
+
+    # A large offset (>1 full day) shifts guild-local "today" deterministically
+    # ahead of the host date, avoiding any midnight-window flakiness.
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, "tz_offset_hours", "50", fake_ctx.guild_id)  # +2d2h
+        host_today = date.today()
+        conn.execute(
+            "INSERT INTO member_birthdays"
+            " (guild_id, user_id, birth_month, birth_day, set_by, set_at, preference)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 4242, host_today.month, host_today.day, 1, 0.0, "public"),
+        )
+
+    resp = authed_client.get("/api/birthday/calendar", params={"days": 400})
+    assert resp.status_code == 200
+    entries = {int(e["user_id"]): e for e in resp.json()}
+    assert 4242 in entries
+    # Guild-local today is ~2 days ahead of the host date, so a birthday on the
+    # host date already passed this year → it rolls to next year (~363 days).
+    # With the buggy host-date anchor this would be 0.
+    assert entries[4242]["days_until"] >= 360
+
+
+
+# ── /api/config/intake ────────────────────────────────────────────────
+
+
+def test_intake_config_defaults_in_get(authed_client):
+    resp = authed_client.get("/api/config")
+    assert resp.status_code == 200
+    intake = resp.json()["intake"]
+    assert intake["enabled"] is False
+    assert intake["channel_id"] == "0"
+    assert intake["verified_role_id"] == "0"
+    # Derived, read-only: nothing configured → no channel counts as greeting.
+    assert intake["greet_channel_id"] == "0"
+    assert intake["stale_hours"] == 24
+    # Effective (default) step list is surfaced so the editor never starts blank.
+    keys = [s["key"] for s in intake["steps"]]
+    assert keys == [
+        "greeted", "verified", "member_role",
+        "sfw_questions", "nsfw_role", "nsfw_questions",
+    ]
+    # Snowflake-ish ids come back as strings.
+    assert all(isinstance(s["role_id"], str) for s in intake["steps"])
+
+
+def test_update_intake_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/intake", json={
+        "enabled": True,
+        "channel_id": "5551234",
+        "verified_role_id": "903888888888888888",
+        "completion_code": "  DK-7734  ",
+        "stale_hours": 6,
+        "steps": [
+            {"key": "", "label": "Greeted", "auto": "greeted", "role_id": "0"},
+            {"key": "", "label": "Member role", "auto": "role_gained", "role_id": "901"},
+            {"key": "", "label": "SFW questions asked", "auto": "", "role_id": "0"},
+        ],
+    })
+    assert resp.status_code == 200
+    resp = authed_client.get("/api/config")
+    intake = resp.json()["intake"]
+    assert intake["enabled"] is True
+    assert intake["channel_id"] == "5551234"
+    assert intake["completion_code"] == "DK-7734"  # stored stripped
+    # Snowflake round-trips as a string — never through parseInt/JSON number.
+    assert intake["verified_role_id"] == "903888888888888888"
+    assert intake["stale_hours"] == 6
+    assert [s["key"] for s in intake["steps"]] == [
+        "greeted", "member_role", "sfw_questions_asked",
+    ]
+    assert intake["steps"][1]["role_id"] == "901"
+
+    # The bot-side reader sees the same effective steps.
+    from bot_modules.onboarding.intake import service as svc
+    with open_db(fake_ctx.db_path) as conn:
+        assert svc.is_enabled(conn, fake_ctx.guild_id) is True
+        assert [s.key for s in svc.step_config(conn, fake_ctx.guild_id)] == [
+            "greeted", "member_role", "sfw_questions_asked",
+        ]
+        # …and reads the saved verified role as a verification signal.
+        assert svc.verification_signalled(
+            conn, fake_ctx.guild_id, [903888888888888888], False
+        ) is True
+
+
+def test_update_intake_rejects_bad_steps(authed_client):
+    base = {"steps": [{"key": "", "label": "", "auto": "", "role_id": "0"}]}
+    assert authed_client.put("/api/config/intake", json=base).status_code == 422
+    # role_gained without a role would be an inert step — rejected, not stored.
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [{"key": "", "label": "NSFW", "auto": "role_gained", "role_id": "0"}],
+    })
+    assert resp.status_code == 422
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [{"key": "", "label": "X", "auto": "telepathy", "role_id": "0"}],
+    })
+    assert resp.status_code == 422
+    assert authed_client.put(
+        "/api/config/intake", json={"steps": []}
+    ).status_code == 422
+    assert authed_client.put(
+        "/api/config/intake", json={"stale_hours": 0}
+    ).status_code == 422
+
+
+def test_update_intake_roundtrips_step_codes(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/intake", json={
+        "completion_code": "DK-DONE",
+        "steps": [
+            {"key": "", "label": "SFW questions", "code": "  DK-SFW  "},
+            {"key": "", "label": "NSFW questions", "code": "DK-NSFW"},
+            {"key": "", "label": "Greeted", "auto": "greeted"},
+        ],
+    })
+    assert resp.status_code == 200
+    intake = authed_client.get("/api/config").json()["intake"]
+    assert [s["code"] for s in intake["steps"]] == ["DK-SFW", "DK-NSFW", ""]
+
+    from bot_modules.onboarding.intake import service as svc
+    with open_db(fake_ctx.db_path) as conn:
+        assert [s.code for s in svc.step_config(conn, fake_ctx.guild_id)] == [
+            "DK-SFW", "DK-NSFW", "",
+        ]
+
+
+def test_update_intake_rejects_codes_that_contain_each_other(authed_client, fake_ctx):
+    # Codes match by containment, so posting "DK-SFW-DONE" would silently tick
+    # a "DK-SFW" step too.
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [
+            {"key": "", "label": "SFW questions", "code": "DK-SFW"},
+            {"key": "", "label": "SFW wrap-up", "code": "dk-sfw-done"},
+        ],
+    })
+    assert resp.status_code == 422
+    assert "SFW wrap-up" in resp.json()["detail"]
+    # Nothing was written — the reject lands before any config write.
+    from bot_modules.onboarding.intake import service as svc
+    with open_db(fake_ctx.db_path) as conn:
+        assert svc.step_config(conn, fake_ctx.guild_id) == list(svc.DEFAULT_STEPS)
+
+    # A step code clashing with the guild-wide completion code is rejected too,
+    # whether the completion code arrives in the same request…
+    assert authed_client.put("/api/config/intake", json={
+        "completion_code": "DK",
+        "steps": [{"key": "", "label": "SFW", "code": "DK-SFW"}],
+    }).status_code == 422
+    # …or is already stored from an earlier save.
+    assert authed_client.put(
+        "/api/config/intake", json={"completion_code": "DK"}
+    ).status_code == 200
+    assert authed_client.put("/api/config/intake", json={
+        "steps": [{"key": "", "label": "SFW", "code": "DK-SFW"}],
+    }).status_code == 422
+    # An over-long code is rejected rather than silently truncated.
+    assert authed_client.put("/api/config/intake", json={
+        "steps": [{"key": "", "label": "SFW", "code": "x" * 81}],
+    }).status_code == 422
+
+
+def test_update_intake_guards_a_completion_code_only_save(authed_client, fake_ctx):
+    # Regression: the clash check used to run only when the body carried
+    # steps, so setting just the completion code walked a clash straight in —
+    # and a completion code containing a step's code is the worst kind, since
+    # pasting that step's message closes the card and skips everything else.
+    assert authed_client.put("/api/config/intake", json={
+        "steps": [{"key": "", "label": "SFW questions", "code": "DK-SFW"}],
+    }).status_code == 200
+    resp = authed_client.put("/api/config/intake", json={"completion_code": "DK"})
+    assert resp.status_code == 422
+    assert "DK-SFW" in resp.json()["detail"]
+
+    from bot_modules.onboarding.intake import service as svc
+    with open_db(fake_ctx.db_path) as conn:
+        assert svc.completion_code(conn, fake_ctx.guild_id) == ""
+    # A non-overlapping completion code still saves fine.
+    assert authed_client.put(
+        "/api/config/intake", json={"completion_code": "ALL-WELCOMED"}
+    ).status_code == 200
+
+
+def test_update_intake_dedupes_generated_keys(authed_client):
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [
+            {"key": "", "label": "Questions", "auto": "", "role_id": "0"},
+            {"key": "", "label": "Questions", "auto": "", "role_id": "0"},
+        ],
+    })
+    assert resp.status_code == 200
+    intake = authed_client.get("/api/config").json()["intake"]
+    assert [s["key"] for s in intake["steps"]] == ["questions", "questions_2"]
+
+
+# ── /api/config/intake/reference ──────────────────────────────────────
+
+
+def test_intake_reference_roundtrips_without_bot(authed_client):
+    blocks = [
+        {"kind": "text", "title": "How it works", "body": "Greet them."},
+        {"kind": "questions", "title": "SFW", "body": "Q1?\nQ2?"},
+    ]
+    resp = authed_client.put("/api/config/intake/reference", json={
+        "channel_id": "424242",
+        "blocks": blocks,
+    })
+    assert resp.status_code == 200
+    # FakeCtx has no bot — config is saved, sync gracefully skipped.
+    assert resp.json()["sync"]["synced"] is False
+
+    intake = authed_client.get("/api/config").json()["intake"]
+    assert intake["reference_channel_id"] == "424242"
+    assert intake["reference_blocks"] == blocks
+
+
+def test_intake_reference_rejects_bad_blocks(authed_client):
+    resp = authed_client.put("/api/config/intake/reference", json={
+        "blocks": [{"kind": "telepathy", "title": "x", "body": "y"}],
+    })
+    assert resp.status_code == 422
+    resp = authed_client.put("/api/config/intake/reference", json={
+        "blocks": [{"kind": "questions", "title": "t", "body": "  \n "}],
+    })
+    assert resp.status_code == 422
+
+
+def test_intake_reference_import_requires_bot(authed_client):
+    resp = authed_client.post("/api/config/intake/reference/import", json={
+        "channel_id": "424242",
+    })
+    assert resp.status_code == 503  # FakeCtx has no connected bot
+
+
+def test_update_intake_normalizes_keys_for_button_dispatch(authed_client):
+    # Keys land in persistent-button custom_ids and must fullmatch the
+    # dispatch template [\w-]{1,64} after a restart — long label slugs are
+    # capped and bad charsets normalized (regression: 80-char labels made
+    # buttons dead after restart).
+    import re as _re
+    long_label = "x" * 80
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [
+            {"key": "", "label": long_label, "auto": "", "role_id": "0"},
+            {"key": "has:colon and spaces", "label": "Colons", "auto": "", "role_id": "0"},
+            {"key": "", "label": long_label + "b", "auto": "", "role_id": "0"},
+        ],
+    })
+    assert resp.status_code == 200
+    keys = [s["key"] for s in authed_client.get("/api/config").json()["intake"]["steps"]]
+    assert all(_re.fullmatch(r"[\w-]{1,64}", k) for k in keys)
+    assert len(set(keys)) == 3  # dedupe survived the cap
+# ── Bump Tracker ──────────────────────────────────────────────────────
+#
+# The reminder loop is driven entirely by this config, and until the dashboard
+# panel shipped these routes had no coverage at all. They are the only way to
+# set up the feature, so the round-trip is worth pinning.
+
+
+def test_bump_tracker_config_round_trip(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/bump-tracker", json={
+        "channel_id": "7001", "role_id": "7002", "enabled": True,
+    })
+    assert resp.status_code == 200
+
+    section = authed_client.get("/api/config").json()["bump_tracker"]
+    assert section["configured"] is True
+    assert section["enabled"] is True
+    # Snowflakes must survive as strings — a bare JSON number loses precision.
+    assert section["channel_id"] == "7001"
+    assert section["role_id"] == "7002"
+    assert isinstance(section["channel_id"], str)
+
+
+def test_bump_tracker_site_add_update_and_delete(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/bump-tracker/sites/disboard", json={
+        "cooldown_hours": 2, "detector_bot_id": "302050872383242240",
+    })
+    assert resp.status_code == 200
+
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    site = next(s for s in sites if s["site_name"] == "disboard")
+    assert site["cooldown_seconds"] == 7200
+    assert site["detector_bot_id"] == "302050872383242240"
+    # Never bumped: the panel shows it as ready to bump right now.
+    assert site["bumped_at"] is None
+    assert site["ready"] is True
+
+    # Re-PUT is an update, not a duplicate row.
+    authed_client.put("/api/config/bump-tracker/sites/disboard", json={"cooldown_hours": 6})
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    matching = [s for s in sites if s["site_name"] == "disboard"]
+    assert len(matching) == 1
+    assert matching[0]["cooldown_seconds"] == 21600
+
+    resp = authed_client.delete("/api/config/bump-tracker/sites/disboard")
+    assert resp.status_code == 200
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    assert not [s for s in sites if s["site_name"] == "disboard"]
+
+
+def test_bump_tracker_site_save_preserves_patterns_it_omits(authed_client, fake_ctx):
+    """An omitted pattern must survive the save.
+
+    A dashboard tab left open across a restart still runs the pre-137 JS, which
+    sends no failure_pattern at all. Clearing it on save would turn the listing
+    bot's "already bumped recently" refusal back into a recorded bump.
+    """
+    authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 24,
+        "detector_bot_id": "1222548162741538938",
+        "detector_pattern": "bump done",
+        "failure_pattern": "already bumped recently",
+    })
+
+    # The old panel's payload shape: cooldown and bot id only.
+    resp = authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 12, "detector_bot_id": "1222548162741538938",
+    })
+    assert resp.status_code == 200
+
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    site = next(s for s in sites if s["site_name"] == "discadia")
+    assert site["cooldown_seconds"] == 43200
+    assert site["detector_pattern"] == "bump done"
+    assert site["failure_pattern"] == "already bumped recently"
+
+
+def test_bump_tracker_site_save_can_still_clear_a_pattern(authed_client, fake_ctx):
+    """Omitted means keep, but an explicit empty string still clears."""
+    authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 24, "failure_pattern": "already bumped recently",
+    })
+    authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 24, "failure_pattern": "",
+    })
+
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    site = next(s for s in sites if s["site_name"] == "discadia")
+    assert site["failure_pattern"] == ""
+
+
+def test_bump_tracker_detector_route_preserves_the_failure_veto(authed_client, fake_ctx):
+    """The detector route predates failure_pattern; no caller sends one."""
+    authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 24, "failure_pattern": "already bumped recently",
+    })
+
+    resp = authed_client.put("/api/config/bump-tracker/sites/discadia/detector", json={
+        "detector_bot_id": "1222548162741538938",
+    })
+    assert resp.status_code == 200
+
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    site = next(s for s in sites if s["site_name"] == "discadia")
+    assert site["detector_bot_id"] == "1222548162741538938"
+    assert site["failure_pattern"] == "already bumped recently"
+
+
+def test_bump_tracker_rejects_an_overlong_pattern(authed_client, fake_ctx):
+    """Patterns are substring-matched against every bot message; bound them."""
+    resp = authed_client.put("/api/config/bump-tracker/sites/discadia", json={
+        "cooldown_hours": 24, "failure_pattern": "x" * 201,
+    })
+    assert resp.status_code == 422
+
+
+def test_bump_tracker_log_starts_the_cooldown(authed_client, fake_ctx):
+    authed_client.put("/api/config/bump-tracker/sites/discadia", json={"cooldown_hours": 24})
+
+    resp = authed_client.post("/api/config/bump-tracker/sites/discadia/log")
+    assert resp.status_code == 200
+
+    sites = authed_client.get("/api/config").json()["bump_tracker"]["sites"]
+    site = next(s for s in sites if s["site_name"] == "discadia")
+    assert site["bumped_at"] is not None
+    assert site["ready"] is False
+    # Just bumped, so nearly the whole 24h should remain.
+    assert 23 * 3600 < site["seconds_remaining"] <= 24 * 3600
+
+
+def test_bump_tracker_rejects_unknown_site(authed_client, fake_ctx):
+    assert authed_client.post("/api/config/bump-tracker/sites/nope/log").status_code == 404
+    resp = authed_client.put(
+        "/api/config/bump-tracker/sites/nope/detector",
+        json={"detector_bot_id": "123"},
+    )
+    assert resp.status_code == 404
+
+
+# ── Branding: per-guild product names ──────────────────────────────────
+#
+# The casino's and the AI assistant's names used to be hardcoded, which showed
+# the home server's branding to every other guild. They're branding_config
+# columns now; blank means "use the built-in default".
+
+
+def test_branding_section_reports_names_and_defaults(authed_client):
+    br = authed_client.get("/api/config").json()["branding"]
+    # Nothing set yet — empty overrides, defaults advertised for the placeholder.
+    assert br["casino_name"] == ""
+    assert br["assistant_name"] == ""
+    assert br["default_casino_name"] == "Golden Meadow"
+    assert br["default_assistant_name"] == "Billy-bot"
+
+
+def test_branding_put_round_trips_names(authed_client):
+    resp = authed_client.put(
+        "/api/config/branding",
+        json={"casino_name": "  Neon Pines  ", "assistant_name": "Sam-bot"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["casino_name"] == "Neon Pines"  # trimmed
+    assert resp.json()["assistant_name"] == "Sam-bot"
+
+    br = authed_client.get("/api/config").json()["branding"]
+    assert br["casino_name"] == "Neon Pines"
+    assert br["assistant_name"] == "Sam-bot"
+
+
+def test_branding_put_blank_name_falls_back_to_default(authed_client, fake_ctx):
+    from bot_modules.core.branding_service import (
+        DEFAULT_CASINO_NAME,
+        resolve_casino_name,
+    )
+
+    authed_client.put("/api/config/branding", json={"casino_name": "Neon Pines"})
+    resp = authed_client.put("/api/config/branding", json={"casino_name": "   "})
+    assert resp.status_code == 200
+    assert resp.json()["casino_name"] == ""
+
+    assert authed_client.get("/api/config").json()["branding"]["casino_name"] == ""
+    # And the bot-side resolver is back on the built-in name.
+    assert resolve_casino_name(fake_ctx.db_path, fake_ctx.guild_id) == DEFAULT_CASINO_NAME
+
+
+def test_branding_put_names_leave_the_accent_alone(authed_client):
+    authed_client.put(
+        "/api/config/branding", json={"accent_mode": "custom", "accent_hex": "#112233"}
+    )
+    authed_client.put("/api/config/branding", json={"casino_name": "Neon Pines"})
+
+    br = authed_client.get("/api/config").json()["branding"]
+    assert br["accent_mode"] == "custom"
+    assert br["accent_hex"] == "#112233"
+    assert br["casino_name"] == "Neon Pines"
+
+
+def test_branding_put_rejects_an_overlong_name(authed_client):
+    resp = authed_client.put(
+        "/api/config/branding", json={"assistant_name": "x" * 200}
+    )
+    assert resp.status_code == 400
+
+
+def test_branding_names_are_per_guild(fake_ctx):
+    from bot_modules.core.branding_service import (
+        DEFAULT_CASINO_NAME,
+        resolve_casino_name,
+    )
+
+    client = _second_guild_client(fake_ctx)
+    assert client.put(
+        "/api/config/branding", json={"casino_name": "Neon Pines"}
+    ).status_code == 200
+
+    assert resolve_casino_name(fake_ctx.db_path, _SECOND_GUILD) == "Neon Pines"
+    # The home guild keeps the built-in name.
+    assert resolve_casino_name(fake_ctx.db_path, fake_ctx.guild_id) == DEFAULT_CASINO_NAME
+# ── branding: hub panel banner ─────────────────────────────────────────
+# The image over the guild's channel hub panels. Stored verbatim — a banner is
+# wide on purpose and an animated one must keep its frames, so none of the
+# doc-image portrait padding — and served from the public /static mount.
+
+
+def _wide_png(w: int = 1200, h: int = 400) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (200, 160, 40)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def banner_dir(tmp_path, monkeypatch):
+    from web_server.routes import config as config_routes
+
+    d = tmp_path / "panel-banners"
+    monkeypatch.setattr(config_routes, "_BANNER_DIR", d)
+    return d
+
+
+#: (route slot, JSON / BrandingConfig field, PanelArt attribute).
+ART_SLOTS = [
+    pytest.param("banner", "panel_banner_url", id="banner"),
+    pytest.param("footer", "panel_footer_url", id="footer"),
+    pytest.param("header", "panel_header_url", id="lobby-header"),
+    pytest.param("card_header", "panel_card_header_url", id="card-header"),
+    pytest.param("card_footer", "panel_card_footer_url", id="card-footer"),
+]
+
+
+@pytest.mark.parametrize("slot, field", ART_SLOTS)
+def test_art_is_unset_by_default(authed_client, slot, field):
+    assert authed_client.get("/api/config").json()["branding"][field] == ""
+
+
+@pytest.mark.parametrize("slot, field", ART_SLOTS)
+def test_art_upload_stores_the_image_verbatim_and_dispatches(
+    authed_client, fake_ctx, banner_dir, slot, field
+):
+    from bot_modules.core.branding_service import resolve_panel_art_conn
+
+    fake_ctx.bot = MagicMock()
+    png = _wide_png()
+    r = authed_client.post(
+        f"/api/config/branding/{slot}", files={"file": ("art.png", png)}
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()[field]
+    (saved,) = banner_dir.iterdir()
+    assert saved.read_bytes() == png  # no padding, no re-encode
+    assert saved.suffix == ".png"
+    assert url.endswith(f"/static/panel-banners/{saved.name}")
+    assert authed_client.get("/api/config").json()["branding"][field] == url
+    with open_db(fake_ctx.db_path) as conn:
+        assert getattr(resolve_panel_art_conn(conn, fake_ctx.guild_id), slot) == url
+    fake_ctx.bot.dispatch.assert_called_with("panel_art_change", fake_ctx.guild_id)
+
+
+@pytest.mark.parametrize("slot, field", ART_SLOTS)
+def test_art_replace_deletes_the_old_file(authed_client, banner_dir, slot, field):
+    authed_client.post(f"/api/config/branding/{slot}", files={"file": ("a.png", _wide_png())})
+    (first,) = banner_dir.iterdir()
+    r = authed_client.post(
+        f"/api/config/branding/{slot}", files={"file": ("b.png", _wide_png(900, 300))}
+    )
+    assert r.status_code == 200
+    (second,) = banner_dir.iterdir()
+    assert second.name != first.name
+
+
+@pytest.mark.parametrize("slot, field", ART_SLOTS)
+def test_art_remove_clears_and_deletes_the_file(
+    authed_client, fake_ctx, banner_dir, slot, field
+):
+    authed_client.post(f"/api/config/branding/{slot}", files={"file": ("a.png", _wide_png())})
+    fake_ctx.bot = MagicMock()
+    r = authed_client.delete(f"/api/config/branding/{slot}")
+    assert r.status_code == 200
+    assert list(banner_dir.iterdir()) == []
+    assert authed_client.get("/api/config").json()["branding"][field] == ""
+    fake_ctx.bot.dispatch.assert_called_with("panel_art_change", fake_ctx.guild_id)
+
+
+def test_banner_and_footer_come_and_go_independently(authed_client, banner_dir):
+    """One slot's upload or removal never touches the other's image or file."""
+    banner = authed_client.post(
+        "/api/config/branding/banner", files={"file": ("a.png", _wide_png())}
+    ).json()["panel_banner_url"]
+    footer = authed_client.post(
+        "/api/config/branding/footer", files={"file": ("b.png", _wide_png(1200, 200))}
+    ).json()["panel_footer_url"]
+    assert len(list(banner_dir.iterdir())) == 2
+    authed_client.delete("/api/config/branding/banner")
+    branding = authed_client.get("/api/config").json()["branding"]
+    assert (branding["panel_banner_url"], branding["panel_footer_url"]) == ("", footer)
+    assert [p.name for p in banner_dir.iterdir()] == [footer.rsplit("/", 1)[-1]]
+    assert banner != footer
+
+
+@pytest.mark.parametrize("slot, field", ART_SLOTS)
+def test_art_survives_a_names_save(authed_client, banner_dir, slot, field):
+    url = authed_client.post(
+        f"/api/config/branding/{slot}", files={"file": ("a.png", _wide_png())}
+    ).json()[field]
+    authed_client.put("/api/config/branding", json={"casino_name": "Neon Pines"})
+    assert authed_client.get("/api/config").json()["branding"][field] == url
+
+
+@pytest.mark.parametrize("slot", ["banner", "footer"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"<svg xmlns='http://www.w3.org/2000/svg'/>", id="svg"),
+        pytest.param(b"not an image at all", id="text"),
+    ],
+)
+def test_art_upload_refuses_non_raster(authed_client, banner_dir, payload, slot):
+    r = authed_client.post(f"/api/config/branding/{slot}", files={"file": ("x.png", payload)})
+    assert r.status_code == 400
+    assert not banner_dir.exists() or list(banner_dir.iterdir()) == []
+
+
+def test_title_switch_saves_and_repaints_the_hubs(authed_client, fake_ctx):
+    assert authed_client.get("/api/config").json()["branding"]["panel_banner_title"] is False
+    fake_ctx.bot = MagicMock()
+    r = authed_client.put("/api/config/branding", json={"panel_banner_title": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["panel_banner_title"] is True
+    assert authed_client.get("/api/config").json()["branding"]["panel_banner_title"] is True
+    fake_ctx.bot.dispatch.assert_called_with("panel_art_change", fake_ctx.guild_id)
+
+
+def test_a_names_save_leaves_the_title_switch_and_the_hubs_alone(authed_client, fake_ctx):
+    authed_client.put("/api/config/branding", json={"panel_banner_title": True})
+    fake_ctx.bot = MagicMock()
+    authed_client.put("/api/config/branding", json={"assistant_name": "Helper"})
+    assert authed_client.get("/api/config").json()["branding"]["panel_banner_title"] is True
+    assert ("panel_art_change", fake_ctx.guild_id) not in [
+        c.args for c in fake_ctx.bot.dispatch.call_args_list
+    ]
+
+
+def test_removing_the_banner_deletes_its_drawn_titles(authed_client, banner_dir):
+    url = authed_client.post(
+        "/api/config/branding/banner", files={"file": ("a.png", _wide_png())}
+    ).json()["panel_banner_url"]
+    stem = url.rsplit("/", 1)[-1].split(".")[0]
+    titled = banner_dir / "titled"
+    titled.mkdir()
+    (titled / f"{stem}-abcdef012345.webp").write_bytes(b"x")
+    (titled / f"{'a' * 32}-abcdef012345.webp").write_bytes(b"x")  # another upload's
+    authed_client.delete("/api/config/branding/banner")
+    assert [p.name for p in titled.iterdir()] == [f"{'a' * 32}-abcdef012345.webp"]
+
+
+@pytest.mark.parametrize("slot", ["banner", "footer"])
+def test_art_routes_are_admin_only(noperms_client, banner_dir, slot):
+    r = noperms_client.post(
+        f"/api/config/branding/{slot}", files={"file": ("a.png", _wide_png())}
+    )
+    assert r.status_code == 403
+    assert noperms_client.delete(f"/api/config/branding/{slot}").status_code == 403
+
+
+# ── anonymity-config gating ────────────────────────────────────────────
+# Confessions and Whisper both take a log_channel_id, and both logs record the
+# author behind the anonymous message. Only an admin may point those logs
+# somewhere — a game-host role holder redirecting them would de-anonymise
+# every confession and whisper in the server.
+
+
+def _game_host_client(fake_ctx, host_role_id: int = 4242) -> TestClient:
+    """A non-admin caller holding the configured game-host role."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO games_editor_role (guild_id, role_id) VALUES (?, ?)",
+            (fake_ctx.guild_id, host_role_id),
+        )
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app)
+    client.cookies.set(
+        SESSION_COOKIE,
+        auth.create_session_cookie(
+            user_id=2,
+            username="host",
+            access_token="token",
+            permission_bits=0,  # explicitly not an administrator
+            role_ids=[host_role_id],
+            guild_id=fake_ctx.guild_id,
+            guilds=[{"id": fake_ctx.guild_id, "name": "Test Guild", "icon": None}],
+        ),
+    )
+    return client
+
+
+def test_game_host_cannot_redirect_the_confessions_log(fake_ctx):
+    client = _game_host_client(fake_ctx)
+    try:
+        resp = client.put("/api/config/confessions", json={"log_channel_id": "9999"})
+        assert resp.status_code == 403
+    finally:
+        client.close()
+
+
+def test_game_host_cannot_redirect_the_whisper_log(fake_ctx):
+    client = _game_host_client(fake_ctx)
+    try:
+        resp = client.put("/api/config/whisper", json={"log_channel_id": "9999"})
+        assert resp.status_code == 403
+    finally:
+        client.close()
+
+
+def test_game_host_can_still_edit_guess_config(fake_ctx):
+    """The games-editor role keeps its legitimate reach — this isn't a blanket lockout."""
+    client = _game_host_client(fake_ctx)
+    try:
+        resp = client.put("/api/config/guess", json={"enabled": True})
+        assert resp.status_code != 403
+    finally:
+        client.close()
+
+
+# ── Greeting Watch: extra greeting words round-trip ────────────────────
+
+
+def test_greeting_watch_extra_words_roundtrip_and_bot_side_read(
+    authed_client, fake_ctx
+):
+    """PUT normalizes the CSV (trim/lowercase/dedupe), GET returns the stored
+    form, and the bot-side GuildConfig picks the tuple up after the cache
+    invalidation the route performs."""
+    resp = authed_client.put(
+        "/api/config/greeting-watch",
+        json={"extra_words": " Henlo ,henlo, GOOD Yawn ,\n o7 ,"},
+    )
+    assert resp.status_code == 200
+
+    section = authed_client.get("/api/config").json()["greeting_watch"]
+    assert section["extra_words"] == "henlo, good yawn, o7"
+
+    cfg = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert cfg.greeting_watch_extra_words == ("henlo", "good yawn", "o7")
+
+
+def test_greeting_watch_has_no_dm_list_any_more(authed_client, fake_ctx):
+    """The alert is the Staff · Greetings ping (2026-09-30). A stale client
+    still sending the list is refused rather than silently storing member ids
+    nothing reads."""
+    assert "notify_user_ids" not in authed_client.get("/api/config").json()["greeting_watch"]
+
+    resp = authed_client.put(
+        "/api/config/greeting-watch", json={"notify_user_ids": "424242"}
+    )
+    assert resp.status_code == 422
+    with open_db(fake_ctx.db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM config WHERE key LIKE 'greeting_watch_notify%'"
+        ).fetchone() is None
+
+
+def test_greeting_watch_save_redraws_the_mod_settings_panel(authed_client, fake_ctx):
+    """Greeting Watch running is what puts Staff · Greetings on the panel."""
+    from unittest.mock import MagicMock
+
+    from bot_modules.moderation.settings import staff_ping_service
+
+    fake_ctx.bot = MagicMock()
+    resp = authed_client.put(
+        "/api/config/greeting-watch", json={"enabled": True, "channel_ids": "10"}
+    )
+    assert resp.status_code == 200
+    fake_ctx.bot.dispatch.assert_called_once_with(
+        staff_ping_service.CONFIG_CHANGE_EVENT, fake_ctx.guild_id
+    )
+
+
+def test_greeting_watch_extra_words_empty_string_clears(authed_client, fake_ctx):
+    authed_client.put(
+        "/api/config/greeting-watch", json={"extra_words": "henlo"}
+    )
+    resp = authed_client.put("/api/config/greeting-watch", json={"extra_words": ""})
+    assert resp.status_code == 200
+
+    section = authed_client.get("/api/config").json()["greeting_watch"]
+    assert section["extra_words"] == ""
+    cfg = fake_ctx.guild_config(fake_ctx.guild_id)
+    assert cfg.greeting_watch_extra_words == ()
+
+
+# ── inactive channel setup + sweep (replaced /inactive panel|sweep) ──
+
+
+def _inactive_bot(fake_ctx, *, channel_ok=True):
+    """A live-bot stand-in with a text channel the setup route can reach."""
+    import discord
+
+    guild = MagicMock()
+    guild.me = MagicMock()
+    channel = MagicMock(spec=discord.TextChannel) if channel_ok else MagicMock(
+        spec=discord.VoiceChannel
+    )
+    channel.name = "inactive"
+    guild.get_channel.return_value = channel
+    bot = MagicMock()
+    bot.get_guild.return_value = guild
+    fake_ctx.bot = bot
+    return bot, guild, channel
+
+
+def test_inactive_channel_setup_delegates_to_the_service(authed_client, fake_ctx, monkeypatch):
+    """The route is plumbing; the four-step setup (persist, ensure role, grant
+    access, revoke the old channel, post the panel) lives in the service so the
+    auto-sweep and the dashboard can't drift apart."""
+    import bot_modules.inactive.sweep_service as svc
+
+    _inactive_bot(fake_ctx)
+    called = {}
+
+    async def _fake(ctx, guild, channel):
+        called["hit"] = True
+        return True, ""
+
+    monkeypatch.setattr(svc, "setup_inactive_channel", _fake)
+    r = authed_client.post("/api/config/inactive/channel", json={"channel_id": "5"})
+    assert r.status_code == 200, r.text
+    assert called["hit"]
+
+
+def test_inactive_channel_setup_surfaces_the_failure_reason(authed_client, fake_ctx, monkeypatch):
+    """"Missing Manage Roles" is fixable; a generic 500 isn't."""
+    import bot_modules.inactive.sweep_service as svc
+
+    _inactive_bot(fake_ctx)
+
+    async def _fake(ctx, guild, channel):
+        return False, "Missing **Manage Roles** — can't create the Inactive role."
+
+    monkeypatch.setattr(svc, "setup_inactive_channel", _fake)
+    r = authed_client.post("/api/config/inactive/channel", json={"channel_id": "5"})
+    assert r.status_code == 400
+    assert "Manage Roles" in r.json()["detail"]
+
+
+def test_inactive_channel_setup_refuses_a_non_text_channel(authed_client, fake_ctx):
+    _inactive_bot(fake_ctx, channel_ok=False)
+    r = authed_client.post("/api/config/inactive/channel", json={"channel_id": "5"})
+    assert r.status_code == 400
+    assert "text channel" in r.json()["detail"].lower()
+
+
+def test_running_the_sweep_needs_a_configured_channel(authed_client, fake_ctx):
+    """Otherwise it would strip roles and move nobody anywhere."""
+    _inactive_bot(fake_ctx)
+    r = authed_client.post("/api/config/inactive/sweep")
+    assert r.status_code == 400
+    assert "no inactive channel" in r.json()["detail"].lower()
+
+
+def test_running_the_sweep_reports_what_it_moved(authed_client, fake_ctx, monkeypatch):
+    import bot_modules.inactive.sweep_service as svc
+
+    _inactive_bot(fake_ctx)
+    monkeypatch.setattr(svc, "read_inactive_channel_id", lambda ctx, gid: 99)
+
+    async def _fake(ctx, guild, actor):
+        return 3, 5, 2
+
+    monkeypatch.setattr(svc, "run_inactive_sweep", _fake)
+    r = authed_client.post("/api/config/inactive/sweep")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # considered and overflow both reported: "moved 3" alone hides that two
+    # more qualified but were held back by the per-run cap.
+    assert (body["moved"], body["considered"], body["overflow"]) == (3, 5, 2)
+
+
+def test_inactive_channel_setup_leaves_the_old_channel_alone_when_posting_fails(
+    authed_client, fake_ctx, monkeypatch
+):
+    """Nothing destructive may run before the last thing that can fail.
+
+    The revoke used to happen before the panel post, so a failed post (missing
+    Embed Links, say) returned an error *after* the old channel's @Inactive
+    access was already gone — reported as a failure while leaving the guild with
+    no working inactive channel at all.
+    """
+    import asyncio
+
+    import discord
+
+    import bot_modules.inactive.sweep_service as svc
+
+    guild = MagicMock()
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.name = "new-inactive"
+    channel.set_permissions = AsyncMock()
+    channel.send = AsyncMock(
+        side_effect=discord.HTTPException(MagicMock(status=403), "no embeds")
+    )
+    old_channel = MagicMock(spec=discord.TextChannel)
+    old_channel.set_permissions = AsyncMock()
+    guild.id = fake_ctx.guild_id
+    guild.get_channel.side_effect = lambda cid: (
+        channel if cid == 5 else old_channel
+    )
+
+    # setup_inactive_channel imports these inside the function, so patch them
+    # where they're defined rather than on the calling module.
+    monkeypatch.setattr(
+        "bot_modules.inactive.apply.ensure_inactive_role",
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        "bot_modules.inactive.logic.stale_inactive_channel_id",
+        lambda prev, new: 999,
+    )
+    monkeypatch.setattr(
+        "bot_modules.core.branding.resolve_accent_color", AsyncMock(return_value=None)
+    )
+
+    ok, note = asyncio.run(svc.setup_inactive_channel(fake_ctx, guild, channel))
+
+    assert ok is False
+    assert "info panel" in note
+    # The old channel keeps its access; the admin's previous setup still works.
+    old_channel.set_permissions.assert_not_awaited()
+
+
+# ── /config/dms/post-panel — the sticky-collision guard ───────────────
+
+
+def _occupy_casino(fake_ctx, channel_id: int) -> None:
+    """Put the casino hub — a bot-chasing panel — in a channel."""
+    from bot_modules.core.db_utils import open_db
+
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO config (guild_id, key, value) VALUES (?, ?, ?)",
+            (fake_ctx.guild_id, "casino_panel_channel_id", str(channel_id)),
+        )
+
+
+def _occupy_pen_pals(fake_ctx, channel_id: int) -> None:
+    """Put the pen pals panel — human-message-only — in a channel."""
+    from bot_modules.core.db_utils import open_db
+
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO pen_pals_config (guild_id, panel_channel_id) VALUES (?, ?)",
+            (fake_ctx.guild_id, channel_id),
+        )
+
+
+def test_dms_post_panel_refuses_a_bot_chasing_channel(authed_client, fake_ctx):
+    """The DM panel is the only route to a member's own DM settings, so
+    burying it under a panel that re-takes the bottom on every repaint would
+    take that surface away with nothing visible to explain it."""
+    cog, _ = _dms_panel_guild(fake_ctx)
+    _occupy_casino(fake_ctx, 5000)
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 400
+    assert "casino hub panel" in resp.json()["detail"]
+    cog.post_panel.assert_not_awaited()
+
+
+def test_dms_post_panel_warns_beside_a_human_only_panel(authed_client, fake_ctx):
+    cog, _ = _dms_panel_guild(fake_ctx)
+    _occupy_pen_pals(fake_ctx, 5000)
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 200
+    assert "pen pals panel" in resp.json()["warning"]
+    cog.post_panel.assert_awaited_once()
+
+
+def test_dms_post_panel_is_not_refused_on_account_of_itself(authed_client, fake_ctx):
+    """Re-posting into the channel it already occupies is how an admin moves a
+    panel that has drifted out of view."""
+    cog, _ = _dms_panel_guild(fake_ctx)
+    authed_client.post("/api/config/dms/post-panel", json={"channel_id": "5000"})
+
+    resp = authed_client.post(
+        "/api/config/dms/post-panel", json={"channel_id": "5000"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["warning"] is None
+
+
+# ── Voice transcription: the model has to be downloaded first ──────────
+#
+# The panel promises "a model has to read Downloaded", and the bot loads models
+# offline (local_files_only) — an un-downloaded one raises on every voice
+# message and the failure is swallowed into the log. So the promise is enforced
+# on the way in rather than discovered later as silence.
+
+
+def _vt_env(monkeypatch, *, available=True, cached=True):
+    monkeypatch.setattr("web_server.routes.config._vt_is_available", lambda: available)
+    monkeypatch.setattr(
+        "web_server.routes.config._vt_model_is_cached", lambda name: cached
+    )
+
+
+def _vt_saved(fake_ctx):
+    from bot_modules.voice.transcription.service import get_config
+
+    with open_db(fake_ctx.db_path) as conn:
+        return get_config(conn, fake_ctx.guild_id)
+
+
+def test_voice_transcription_refuses_to_enable_an_undownloaded_model(
+    authed_client, fake_ctx, monkeypatch
+):
+    _vt_env(monkeypatch, cached=False)
+    resp = authed_client.put(
+        "/api/config/voice-transcription",
+        json={"enabled": True, "model_name": "base.en", "channel_ids": []},
+    )
+    assert resp.status_code == 400
+    assert "download" in resp.json()["detail"].lower()
+    assert _vt_saved(fake_ctx) is None  # nothing written
+
+
+def test_voice_transcription_enables_a_downloaded_model(
+    authed_client, fake_ctx, monkeypatch
+):
+    _vt_env(monkeypatch, cached=True)
+    resp = authed_client.put(
+        "/api/config/voice-transcription",
+        json={"enabled": True, "model_name": "tiny.en", "channel_ids": ["5000"]},
+    )
+    assert resp.status_code == 200
+    saved = _vt_saved(fake_ctx)
+    assert saved is not None
+    assert saved.enabled is True
+    assert saved.model_name == "tiny.en"
+
+
+def test_voice_transcription_round_trips_the_delete_dial(
+    authed_client, fake_ctx, monkeypatch
+):
+    """The GET must return the dial in both branches. When it did not, the
+    panel's checkbox loaded as undefined and the next Save posted it back off —
+    the Income Sources clobber, in miniature."""
+    _vt_env(monkeypatch, cached=True)
+    body = authed_client.get("/api/config").json()["voice_transcription"]
+    assert body["delete_after_transcribe"] is False  # unset guild, not missing
+
+    resp = authed_client.put(
+        "/api/config/voice-transcription",
+        json={
+            "enabled": True, "model_name": "base.en",
+            "channel_ids": ["5000"], "delete_after_transcribe": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert _vt_saved(fake_ctx).delete_after_transcribe is True
+    body = authed_client.get("/api/config").json()["voice_transcription"]
+    assert body["delete_after_transcribe"] is True
+
+
+def test_voice_transcription_can_always_be_turned_off(
+    authed_client, fake_ctx, monkeypatch
+):
+    """A wiped model cache must not trap an admin in a setting they can't
+    switch off — the gate only guards turning transcription on."""
+    _vt_env(monkeypatch, cached=False)
+    resp = authed_client.put(
+        "/api/config/voice-transcription",
+        json={"enabled": False, "model_name": "base.en", "channel_ids": []},
+    )
+    assert resp.status_code == 200
+    saved = _vt_saved(fake_ctx)
+    assert saved is not None and saved.enabled is False
+
+
+def test_voice_transcription_gate_is_skipped_without_faster_whisper(
+    authed_client, fake_ctx, monkeypatch
+):
+    """Nothing is cached when the package is missing; the panel already says
+    nothing gets transcribed, so saving still works."""
+    _vt_env(monkeypatch, available=False, cached=False)
+    resp = authed_client.put(
+        "/api/config/voice-transcription",
+        json={"enabled": True, "model_name": "base.en", "channel_ids": []},
+    )
+    assert resp.status_code == 200
+    assert _vt_saved(fake_ctx).enabled is True
+
+
+# ── Config Problems: stopped loops and paused deliveries ──────────────
+
+
+def test_channel_health_reports_stopped_loops_and_paused_deliveries(
+    open_client, fake_ctx, live_guild, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from bot_modules.core import background
+
+    monkeypatch.setattr(background, "_GAVE_UP", {})
+    background.record_give_up(
+        "coin_drops_loop", crashes=11, error=RuntimeError("database is locked")
+    )
+    streak = background.FailureStreak(
+        "chat revive", threshold=1, retry_after=3600, paused_note="probed hourly"
+    )
+    try:
+        raise RuntimeError("403 Forbidden")
+    except RuntimeError:
+        streak.failed((fake_ctx.guild_id, 71), where="#general")
+        streak.failed((fake_ctx.guild_id + 1, 72), where="elsewhere")
+    guild = live_guild()
+    guild.channels.append(SimpleNamespace(id=71, name="general"))
+
+    body = open_client.get("/api/config/channel-health").json()
+    titles = [p["title"] for p in body["system"]]
+    assert "Background job coin_drops_loop has stopped" in titles
+    assert "Chat revive can't post in #general" in titles
+    assert not any("72" in p["code"] for p in body["system"])  # other guild's
+
+    fake_ctx.bot = None  # bot down: the stopped loop still shows
+    body = open_client.get("/api/config/channel-health").json()
+    assert body["available"] is False
+    assert "Background job coin_drops_loop has stopped" in [
+        p["title"] for p in body["system"]
+    ]
+
+
+# ── intake stage 2 (docs/plans/intake-two-stage.md) ───────────────────
+
+
+def test_intake_stage2_defaults_in_get(authed_client):
+    intake = authed_client.get("/api/config").json()["intake"]
+    assert intake["stage2_enabled"] is False
+    assert intake["stage2_optin_role_id"] == "0"  # unset: every Grant opens it
+    # The NSFW grant is a built-in line on the card, not a configured step.
+    assert [s["key"] for s in intake["stage2_steps"]] == ["questions_finished"]
+
+
+def test_update_intake_stage2_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put("/api/config/intake", json={
+        "stage2_enabled": True,
+        "stage2_optin_role_id": "903888888888888888",
+        "stage2_steps": [
+            {"label": "NSFW granted", "auto": "grant", "role_id": "902888888888888888"},
+            {"label": "Questions finished", "code": "DK-DONE2"},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+    intake = authed_client.get("/api/config").json()["intake"]
+    assert intake["stage2_enabled"] is True
+    assert intake["stage2_optin_role_id"] == "903888888888888888"
+    assert intake["stage2_steps"][0]["auto"] == "grant"
+    assert intake["stage2_steps"][0]["role_id"] == "902888888888888888"
+    # Stage 1 is untouched by a stage 2 save.
+    assert intake["steps"][0]["key"] == "greeted"
+
+    from bot_modules.onboarding.intake import service as svc
+    with open_db(fake_ctx.db_path) as conn:
+        steps = svc.step_config(conn, fake_ctx.guild_id, svc.STAGE_LEVEL5)
+        assert [(s.key, s.auto_kind, s.code) for s in steps] == [
+            ("nsfw_granted", "grant", ""),
+            ("questions_finished", "", "DK-DONE2"),
+        ]
+
+
+@pytest.mark.parametrize("field", ["steps", "stage2_steps"])
+def test_update_intake_grant_step_needs_a_role(authed_client, field):
+    resp = authed_client.put("/api/config/intake", json={
+        field: [{"label": "Grant", "auto": "grant", "role_id": "0"}],
+    })
+    assert resp.status_code == 422
+    assert "needs a role" in resp.json()["detail"]
+
+
+def test_update_intake_role_and_grant_steps_may_share_a_role(authed_client):
+    # The go-live join list: "Found their way in" ticks when the main-chat
+    # role lands, and "Main chat" is the button that gives that same role.
+    role = "901888888888888888"
+    resp = authed_client.put("/api/config/intake", json={
+        "steps": [
+            {"label": "Found their way in", "auto": "role_gained", "role_id": role},
+            {"label": "Main chat", "auto": "grant", "role_id": role},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+    steps = authed_client.get("/api/config").json()["intake"]["steps"]
+    assert [(s["key"], s["auto"], s["role_id"]) for s in steps] == [
+        ("found_their_way_in", "role_gained", role),
+        ("main_chat", "grant", role),
+    ]
+
+
+def test_update_intake_rejects_a_code_clash_across_stages(authed_client):
+    assert authed_client.put("/api/config/intake", json={
+        "steps": [{"label": "SFW", "code": "DK"}],
+    }).status_code == 200
+    resp = authed_client.put("/api/config/intake", json={
+        "stage2_steps": [{"label": "Done", "code": "DK-DONE2"}],
+    })
+    assert resp.status_code == 422
+    assert "Stage 2: Done" in resp.json()["detail"]

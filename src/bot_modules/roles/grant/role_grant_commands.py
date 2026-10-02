@@ -1,0 +1,270 @@
+"""Role grant commands — single /grant command driven from the grant_roles DB table."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING
+
+import discord
+
+from bot_modules.core.role_safety import role_block_reason
+from bot_modules.core.utils import (
+    allow_pings,
+    format_user_for_log,
+    get_bot_member,
+    template_pings,
+)
+from bot_modules.shared.replies import NO_PERMISSION
+from bot_modules.roles.grant.logic import (
+    GATE_MISSING_PREREQUISITE,
+    GATE_NO_PERMISSION,
+    GATE_PREREQUISITE_DELETED,
+    grant_refusal,
+)
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import AppContext
+
+log = logging.getLogger("dungeonkeeper.role_grant")
+
+
+def _resolve_grant_message(
+    template: str,
+    member: discord.Member,
+    role: discord.Role,
+    actor: discord.Member | None,
+    interaction: discord.Interaction,
+) -> str:
+    """Render the announcement an admin wrote for this grant.
+
+    The result is sent as plain message content, so every mention in it is
+    live and ``{member_name}`` — a display name the member picks — is
+    escaped the way ``welcome_service.render_arrival_message`` escapes its
+    own — ``escape_markdown`` over ``escape_mentions``, in that order and for
+    two different reasons. The admin's template may legitimately carry an
+    ``@everyone``; a member renaming themselves ``@everyone`` must not be able
+    to ride it, and a member renaming themselves ``**@everyone**`` must not be
+    able to reformat the announcement either.
+    The allow-list is derived from the template rather than from this
+    string (``core.utils.template_pings``), so the escape is the second of
+    two guards, not the only one.
+    """
+    return (
+        template.replace("{member}", member.mention)
+        .replace(
+            "{member_name}",
+            discord.utils.escape_markdown(
+                discord.utils.escape_mentions(member.display_name)
+            ),
+        )
+        .replace("{role}", role.mention)
+        .replace("{role_name}", role.name)
+        .replace("{actor}", actor.mention if actor else interaction.user.mention)
+    )
+
+
+async def _execute_grant(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    role_id: int,
+    log_channel_id: int,
+    announce_channel_id: int,
+    grant_message: str,
+    ctx: AppContext,
+    required_role_id: int = 0,
+    actor_may_grant: bool = True,
+) -> None:
+    """Shared grant logic for all role-grant commands.
+
+    ``actor_may_grant`` is the caller's allow-list answer, refused **here**
+    rather than before the call so the member's own state can outrank it —
+    see :func:`~bot_modules.roles.grant.logic.grant_refusal`. It
+    defaults True because every refusal it guards is this function's to make;
+    a caller that omits it is asking for the grant to be attempted.
+    """
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command only works in a server.", ephemeral=True
+        )
+        return
+
+    actor = ctx.get_interaction_member(interaction)
+
+    if member.bot:
+        await interaction.response.send_message(
+            "Bots can't receive this role.", ephemeral=True
+        )
+        return
+
+    if actor is not None and member.id == actor.id and not ctx.is_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You can't grant this role to yourself.", ephemeral=True
+        )
+        return
+
+    if role_id <= 0:
+        await interaction.response.send_message(
+            "This role is not configured yet.", ephemeral=True
+        )
+        return
+
+    role = guild.get_role(role_id)
+    if role is None:
+        await interaction.response.send_message(
+            "The configured role no longer exists.", ephemeral=True
+        )
+        return
+
+    # Ahead of the prerequisite gate on purpose: a member who already holds
+    # the role needs no grant, and reporting that as "they need @Verified
+    # first" reads as a failure. The predictable reaction is to hand-add the
+    # prerequisite in Discord — the exact manual bypass the gate exists to
+    # prevent — so the no-op case has to report itself as a no-op.
+    if role in member.roles:
+        await interaction.response.send_message(
+            f"{member.mention} already has {role.mention}.", ephemeral=True
+        )
+        return
+
+    actor_is_admin = ctx.is_admin(interaction)
+    req_role = guild.get_role(required_role_id) if required_role_id > 0 else None
+    gate = grant_refusal(
+        actor_may_grant=actor_may_grant,
+        required_role_id=required_role_id,
+        required_role_exists=req_role is not None,
+        target_has_required=req_role in member.roles,
+        actor_is_admin=actor_is_admin,
+    )
+    if required_role_id > 0 and actor_is_admin and req_role is None:
+        # The bypass means the one person who can repair the config is the
+        # only one who never sees the refusal. Say it out loud instead.
+        log.warning(
+            "Grant %s requires role %s, which no longer exists in guild %s; "
+            "%s bypassed the gate as an administrator.",
+            role.name,
+            required_role_id,
+            guild.id,
+            format_user_for_log(actor, interaction.user.id),
+        )
+    if gate == GATE_PREREQUISITE_DELETED:
+        await interaction.response.send_message(
+            "This grant is misconfigured — the required role no longer exists. Contact an admin.",
+            ephemeral=True,
+        )
+        return
+    if gate == GATE_MISSING_PREREQUISITE:
+        assert req_role is not None  # GATE_MISSING_PREREQUISITE implies it exists
+        await interaction.response.send_message(
+            f"{member.mention} needs {req_role.mention} before they can receive {role.mention}.",
+            ephemeral=True,
+        )
+        return
+    if gate == GATE_NO_PERMISSION:
+        await interaction.response.send_message(NO_PERMISSION, ephemeral=True)
+        return
+
+    bot_member = get_bot_member(guild)
+    if bot_member is None:
+        await interaction.response.send_message(
+            "Bot member context is unavailable right now.", ephemeral=True
+        )
+        return
+
+    if not bot_member.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "❌ I need the Manage Roles permission to do that.", ephemeral=True
+        )
+        return
+
+    # Hierarchy plus elevated/managed/@everyone: a grant definition is config,
+    # and /grant never hands out mod-level permissions (2026-09-14).
+    blocked = role_block_reason(role, bot_member)
+    if blocked is not None:
+        await interaction.response.send_message(
+            f"❌ I can't grant {role.mention}: {blocked}.", ephemeral=True
+        )
+        return
+
+    # Defer before the slow add_roles API call to avoid the 3-second timeout.
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await member.add_roles(
+            role, reason=f"Granted by {interaction.user} via slash command"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"I couldn't grant {role.mention}. Check my role hierarchy and permissions.",
+            ephemeral=True,
+        )
+        return
+
+    from bot_modules.core.xp_system import log_role_event
+    from bot_modules.roles.grant.audit_service import mark_restored
+
+    guild_id = guild.id
+    member_id = member.id
+    role_name = role.name
+    granted_role_id = role.id
+
+    def _do_log() -> None:
+        with ctx.open_db() as db_conn:
+            log_role_event(db_conn, guild_id, member_id, role_name, "grant")
+            # A re-grant closes any open prune event so the grant-audit panel
+            # stops listing this member as stripped-but-not-restored.
+            mark_restored(db_conn, guild_id, member_id, granted_role_id, time.time())
+
+    await asyncio.to_thread(_do_log)
+
+    log.info(
+        "%s granted %s to %s.",
+        format_user_for_log(actor, interaction.user.id),
+        role.name,
+        format_user_for_log(member),
+    )
+    # Public (an ephemeral defer does not make its followups ephemeral), so
+    # this is the message the grant announces itself with. It notified the
+    # member and the role before the suppressive default landed; the
+    # allow-list keeps that exactly as it was.
+    await interaction.followup.send(
+        f"{member.mention} has been granted {role.mention}.",
+        allowed_mentions=allow_pings(users=[member], roles=[role]),
+    )
+
+    if announce_channel_id > 0 and grant_message:
+        announce_channel = guild.get_channel(announce_channel_id)
+        if isinstance(announce_channel, discord.TextChannel):
+            await announce_channel.send(
+                _resolve_grant_message(grant_message, member, role, actor, interaction),
+                allowed_mentions=template_pings(
+                    grant_message,
+                    users=[member, actor or interaction.user],
+                    roles=[role],
+                ),
+            )
+
+    if log_channel_id > 0:
+        log_channel = guild.get_channel(log_channel_id)
+        if isinstance(log_channel, discord.TextChannel):
+            audit_embed = discord.Embed(
+                description=(
+                    f"{discord.utils.escape_markdown(member.display_name)} "
+                    f"was granted {role.name} by "
+                    f"{discord.utils.escape_markdown(interaction.user.display_name)}."
+                ),
+                color=discord.Color.green(),
+            )
+            await log_channel.send(
+                embed=audit_embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+
+# The old /grant_missing audit view moved to the web dashboard's Grant Audit
+# panel (GET /api/reports/grant-audit), backed by
+# bot_modules.roles.grant.audit_service, which posts the same buckets
+# as an auto-updating channel card. The /grant_audit command that used to post
+# it from here was removed once nothing called it.

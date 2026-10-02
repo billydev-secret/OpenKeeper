@@ -1,0 +1,322 @@
+# Jail & Ticket System — Feature Spec
+
+Two of the most emotionally charged moderator workflows, disciplining a member and answering a help request, share one system. Jail places a member into a private channel with their roles stripped while mods talk to them. Tickets open a private channel between a member and the mod team. Both flows produce a transcript on close and feed a unified `/modinfo` history view. A companion warning system creates a paper trail without auto-acting.
+
+## Commands
+
+### Slash & context-menu
+
+| Command | Type | Permission | Purpose |
+|---|---|---|---|
+| `/jail <user> [duration] [reason]` | Slash | Mod | Jail a member, optionally with a duration like `24h` or `7d` |
+| `/unjail <user> [reason]` | Slash | Mod | Release a jailed member. Takes a *user*, not a member, so someone who left the server can be released by ID |
+| Release hold | Web (dashboard) | Mod | Moderation → Jails, Release button on an active hold; same flow as `/unjail`, and flags subjects who have left |
+| `Jail User` | User context menu | Mod | Modal for duration + reason, then runs the jail flow |
+| Support Ticket Panel | Web (dashboard) | Admin | Moderation → Tickets posts the persistent "Open Ticket" button into a chosen channel. There is no `/ticket panel` command |
+| `/ticket open [description]` | Slash | Everyone | Open a ticket directly from chat |
+| `Open Ticket About This Message` | Message context menu | Everyone | Open a ticket that links the source message |
+| `/ticket close [reason]` | Slash | Mod | Lock a ticket channel (still readable) |
+| `/ticket reopen` | Slash | Mod | Unlock a closed ticket |
+| `/ticket delete` | Slash | Mod | Permanently delete a closed ticket (generates transcript) |
+| `/ticket claim` | Slash | Mod | Subscribe to DM alerts on new activity in this ticket |
+| `/ticket escalate [reason]` | Slash | Mod | Bring admin roles into the ticket |
+| `/policy open title:<title> [description]` | Slash | Admin | Open a policy proposal channel; title is required and capped at 200 chars (longer titles are trimmed with an ellipsis). Always starts **mods-only** |
+| Open to Members / Make Mods-Only | Button (proposal card) | Admin | Toggle whether members can see this proposal channel. Opening confirms first, naming how many messages become readable. See **Proposal visibility** |
+| `/policy vote` | Slash | Mod / Admin | Start the formal vote on the current policy proposal (opens a modal). Cannot reach a community ballot's ticket, since those carry status `ballot`, which `get_policy_ticket_by_channel` deliberately does not match |
+| `/policy ballot` | Slash | Admin | Open a **community ballot**: a thread in the current channel with Yes/No/Abstain buttons, voted on by anyone who can see it. A modal takes the question. Admin-gated at **runtime**; the `default_permissions` decorator on a subcommand is inert (see Permissions) |
+| `/policy close [reason]` | Slash | Admin | Close a policy proposal without voting. Run inside a ballot thread it **cancels that ballot** instead: the counts are frozen but no result is declared |
+| `/policy list` | Slash | Mod / Admin | List all passed policies. Kept in Discord deliberately: the dashboard's Policy Tickets panel covers the proposal workflow (`policy_tickets`), but adopted policies live in a separate `policies` table no web route reads |
+| `/pull <user>` | Slash | Mod | Add a user into the current jail or ticket channel |
+| `/remove <user>` | Slash | Mod | Remove a previously pulled user |
+| `/warn <user> [reason]` | Slash | Mod | Record a warning and DM the member |
+| `/revokewarn <user> <warning_id>` | Slash | Mod | Soft-delete a warning |
+| `/modinfo <user>` | Slash | Mod | Unified view: jail status, jail history, warnings, ticket history |
+
+### Web dashboard
+
+The dashboard mirrors the moderator surface.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/moderation/stats` | Counts, averages, top moderators |
+| `GET` | `/api/moderation/jails` | List jail records |
+| `POST` | `/api/moderation/jails/{id}/release` | Release a jail; routes through the same `_do_unjail` flow as `/unjail`, departed members included |
+| `GET` | `/api/moderation/tickets` | List tickets (filter by status) |
+| `GET` | `/api/moderation/tickets/{id}` | Single-ticket detail |
+| `POST` | `/api/moderation/tickets/{id}/claim` | Claim a ticket |
+| `POST` | `/api/moderation/tickets/{id}/close` | Close (lock the channel) |
+| `POST` | `/api/moderation/tickets/{id}/reopen` | Reopen a closed ticket |
+| `POST` | `/api/moderation/tickets/{id}/dismiss` | Dismiss with no action |
+| `POST` | `/api/moderation/tickets/{id}/escalate` | Escalate to senior mods |
+| `POST` | `/api/moderation/tickets/{id}/warn` | Issue a warning from the ticket |
+| `POST` | `/api/moderation/tickets/{id}/jail` | Jail the ticket subject |
+| `POST` | `/api/moderation/tickets/{id}/note` | Add an internal mod-only note |
+| `GET` | `/api/moderation/warnings` | List warnings |
+| `POST` | `/api/moderation/warnings/{id}/revoke` | Revoke a warning (mod) |
+| `DELETE` | `/api/moderation/warnings/{id}` | Erase a warning outright (**admin**) |
+| `GET` | `/api/moderation/policy-tickets` | List policy proposals (moderator) |
+| `GET` | `/api/moderation/policy-ballots` | List community ballots with their tallies and full roll call (moderator). Read-only; a ballot is opened, voted in and closed in Discord |
+| `GET` | `/api/moderation/transcript` | Fetch a transcript |
+| `GET` | `/api/moderation/audit` | List audit log entries |
+
+Discord and dashboard actions are *intended* to produce identical side-effects
+(role changes, channel ops, DMs, transcripts, audit entries), and some do:
+`POST .../jail` routes through the same `apply_jail` flow as the slash command
+(real role + jail channel + DM), and `.../warn` and `.../claim` match their
+Discord counterparts (record-only).
+
+**Known gap (verified against `routes/moderation.py`):** the ticket-lifecycle routes
+`POST .../close`, `.../reopen`, `.../dismiss`, and `.../escalate` are currently
+**DB-only**: they flip the ticket row and write an audit entry but do **not**
+reach Discord. Closing (or dismissing/reopening/escalating) a ticket from the
+dashboard leaves the Discord channel untouched: the embed still shows its old
+status, the Close↔Reopen/Delete buttons don't swap, the channel isn't
+locked/unlocked, no note is posted, the creator isn't DM'd, and escalate
+neither adds admin roles nor pings them. The bridge to fix this exists
+(`ctx.bot` on the web server's event loop, as `.../jail` uses); wiring it up is
+deferred. Until then, drive close/reopen/escalate from **Discord** if you need
+the channel-side effects.
+
+## Behavior
+
+### First-run setup
+
+First-run configuration is **Config → Moderation & Safety → Moderation & Privacy** on the dashboard: mod roles, admin roles, jail category, ticket category, log channel, transcript channel. There is no `/setup` wizard. The bot auto-creates a `@Jailed` role with server-wide Deny View Channel and Deny Send Messages overrides; that role must sit below the bot's top role. This runs on the shared provisioner (`bot_modules/core/role_provision.py`): an existing role named exactly `Jailed` is **adopted** rather than twinned when the configured id is unset or stale, the server-wide denies are laid down only for a genuinely new role (an adopted one is already configured), and a role that was configured and has since been deleted is remade with a note to the mod channel and an audit row, since the replacement is empty. Two rules from `docs/specs/role_provisioning_spec.md`: the jail provisions through `ensure_config_role`, so a guild that inherits `jailed_role_id` from the legacy `guild_id = 0` row is not told on its first jail that a role it never had was deleted; and adopt-by-name skips a same-named role that is integration-managed or sits **above** the bot's own top role, since adopting one of those stored an id every `add_roles` would 403 on. Because a jailed member keeps `@everyone`, those per-channel denies are what actually hide the server; the bot keeps them current after setup too. Every channel or category created while the bot is online is stamped with the `@Jailed` view+send deny as it appears (an `on_guild_channel_create` listener), and a one-shot sweep at startup backfills any channel that leaked while the bot was offline. Without this, a channel created after the `@Jailed` role existed would carry no deny and stay visible to jailed members. Two separate categories are used (jail and ticket); both deny `@everyone` view. A persistent "Open Ticket" button is published into the ticket panel channel from Moderation → Tickets.
+
+### Jail flow
+
+Mod runs `/jail`, the right-click "Jail User" menu, or the dashboard. Rejects if the target is a bot, already jailed, or a mod. The flow snapshots every current role, strips them, assigns `@Jailed`, and creates a fresh private channel named `jail-{username}-{timestamp}` visible to the target and mod roles only. The `@Jailed` role itself is denied view on this channel so jailed users can't see each other's channels. The bot posts an intake embed in the channel and DMs the member: who jailed them, why, and how long the hold lasts (or "indefinite" if no duration was given). Tone is firm but neutral: "you've been placed in a moderation hold." Durations accept `30m`, `2h`, `1d`, `7d`, `1w`; no value means indefinite.
+
+The jail record (with the role snapshot) is written to the database the instant the roles are stripped (*before* the channel is created), so restoration is never lost. **A jail absorbs a Take a Break**: if the member is on a break, the snapshot is the break's saved roles plus anything else they hold (minus @On a Break and Spicy Lite), and the break row is deleted in the same write as the jail row, so unjailing gives back their pre-break roles rather than the break role ([take_a_break_spec.md](take_a_break_spec.md)). If channel creation then fails (missing **Manage Channels**), the member stays jailed with an intact record: the auto-release loop and `/unjail` (Discord or the dashboard's Release button) both still work, and a mod only needs to grant the permission. The channel id is filled in on the same row once the channel exists.
+
+A background task checks once a minute for expired jails and runs the unjail flow automatically with reason "Jail duration expired." A 24-hour jail set at 11 pm Friday actually ends at 11 pm Saturday even if no mod is online.
+
+### Leaving and returning
+
+Leaving the server is not an escape. The jail record survives, and if the user rejoins they're re-jailed automatically: roles re-stripped, `@Jailed` re-assigned, channel access restored, with a note posted in the jail channel that they returned. When a jailed member leaves, the bot posts a note in their jail channel, **saves the channel as a transcript and deletes it**, then writes a `jail_member_left` audit row and a mod-log line. The hold itself is left standing. `on_member_remove` also fires for kicks and bans, so the ban list is checked first: a banned member gets different copy (the hold is moot, they can't return) and a `banned: true` audit flag, rather than a promise of automatic re-jailing that could never happen. Leaves, kicks and bans all lose the channel the same way.
+
+**Deleting the channel on departure.** The channel is not kept for a returning member to appeal in: the rebuild-on-rejoin path below covers that (a returning member gets a fresh channel), and an empty room for someone who may never return buys nothing. The departure path follows the ticket auto-delete's rule: the note is posted first so the departure is in the transcript, the transcript is saved (stored, posted to the transcript channel, DMed to the member if the bot still shares a server with them, tagged `transcript_stage: member left` / `member banned`), and **if storing it fails the channel is kept** with a "Jail Channel Kept" mod-log warning. Storing and posting are separate steps (`_save_transcript` / `_post_transcript`): once the transcript is in the database, a failed post to the transcript channel only earns a "Jail Transcript Not Posted" warning pointing mods at the dashboard copy, and the channel is still deleted. Ticket deletion still runs both steps as one and keeps the channel if either fails. Presence is re-checked after the save: a member who rejoined while it ran had `check_jail_rejoin` reuse the old channel, so it is left alone. A failed delete posts "Jail Channel Not Deleted" rather than raising. The audit row records `channel_deleted`. The jail row's `channel_id` is left pointing at the deleted channel: a stale id already means "rebuild on rejoin", while `0` means "Manage Channels was missing at jail time", and the two shouldn't be conflated. There is no dial. Jailed leavers remain held by departure auto-anonymise (`departure_erasure_service`, `HOLD_JAILED`); this path deletes a channel, never member data.
+
+**One jail, several transcripts.** A member who leaves, rejoins into a rebuilt channel and is later released is archived twice under the same jail id. `get_transcripts` returns every save oldest first, and the dashboard's transcript viewer shows each as a numbered part, so the pre-departure half of a hold isn't hidden behind the release transcript.
+
+If the jail channel is gone when they return (deleted while they were away, or never created because the original jail hit a missing **Manage Channels**), it's recreated on rejoin and the new channel id is written back to the jail row. Without that the member is re-jailed into a server the `@Jailed` role hides completely, with no room and no notice. If recreation also fails on permissions, the hold still applies and a mod-log line reports the missing channel.
+
+`on_member_join` can't fire for someone who rejoins while the bot is offline, so a startup sweep reconciles active jails against present members and re-applies any lapsed hold. It acts only where the member demonstrably **rejoined after the hold was imposed** (`joined_at` later than the jail's `created_at`) and the hold hasn't expired in the meantime. Anything else (a member missing `@Jailed` with no fresh join) is left strictly alone with a mismatch notice for a human, because it most likely means a moderator released them by hand and re-jailing would strip every role they hold.
+
+Role count can't make that call, and an early version of this that tried it had the logic exactly backwards: jailing strips every non-managed role, so a hand-released member (mod removes `@Jailed`, nothing else) is indistinguishable by roles from a fresh rejoiner. Only the join timestamp separates the two.
+
+Re-applying a hold uses remove/add rather than a wholesale role set, for the same reason jailing does: a member holding an integration-managed role (Nitro Booster, which Discord re-grants automatically on rejoin) would otherwise 403. If the role application fails anyway, the bot says so in the mod log rather than posting "jail has been re-applied" over a hold that didn't stick.
+
+### Unjail flow
+
+Restores every snapshotted role (logging any that were deleted in the meantime), removes `@Jailed`, generates a transcript of the jail channel, posts the transcript file to the transcript log channel, DMs the transcript to the member, then deletes the jail channel. The member's DM tells them they've been released and reattaches the transcript so they have the conversation record.
+
+**Releasing someone who has left** works through the same path: `/unjail` takes a user rather than a member, so a departed user resolves by ID, and the dashboard's Release button and the expiry loop both route through it. Role restoration is the only step skipped: there's no member to restore to, and because a later rejoin finds no active hold, the snapshotted roles are dropped for good. The command says so explicitly, and the dashboard warns before committing. Everything else still runs: transcript, channel cleanup, DM (delivered if the bot shares another server with them), and an audit row carrying `note: user_left_guild`. If Discord can't resolve the account at all, the row is closed out with `note: user_unresolvable` rather than left active forever.
+
+### Ticket flow
+
+A member opens a ticket via the persistent panel button, `/ticket open`, or the message context menu. The button opens a description modal; the slash command takes an optional description argument; the context menu both prompts for a description and embeds a jump link to the source message. A private channel named `ticket-{username}-{timestamp}` is created, visible to the creator, mod roles, and the bot. The bot posts a ticket embed with Opened By / Source / Description / Created At fields and a red "Close Ticket" button, DMs the creator confirming the ticket, and, when `ticket_notify_on_create` ("Notify moderators when a ticket is opened") is on, tells the moderators. Every path posts the **staff ticket ping** (`@Staff · Tickets` in the staff ping channel, ticket number and channel only; [staff_pings_spec.md](staff_pings_spec.md)) once some moderator holds that role. The panel-button path also has the older notice, a DM with a jump link to every member of a mod role, and it now sends those DMs only when the staff ping did not post, so they stop the moment a moderator opts in, and come back if everyone opts out, the channel is unset or Discord refuses the post. The slash command and context-menu paths never DMed and still don't. With the switch off neither goes out.
+
+No cap on concurrent open tickets per user.
+
+**Every ticket DM names the server** (bug #270). The created, closed and reopened notices carry the server's name and icon in the embed footer whichever surface sent them (button, modal or slash command). `_dm_user` brands only when its caller passes `guild=`, so a test fails on any `_dm_user(embed=...)` call in the jail package that omits `guild=` or `db_path=`; the file-only transcript DM carries no embed and is exempt.
+
+### Close, reopen, delete
+
+Tickets pass through three states: **Open → Closed → Deleted**. Close locks the channel: the creator can still read everything but can't post; the embed updates to a "🔒 Closed" status with the closing mod and reason; the Close button is replaced with green "🔓 Reopen" and red "🗑️ Delete" buttons. Reopen restores send permissions and swaps the buttons back. Delete is permanent and runs through a final confirm; it generates the transcript, posts it to the transcript channel, DMs it to the creator, then deletes the channel.
+
+The intermediate Closed state exists so that a "wait, one more thing" message after close doesn't require opening a new ticket; the mod just clicks Reopen.
+
+A ticket left **closed for 24 hours** is deleted automatically. An hourly background sweep finds tickets whose close time is more than 24 h in the past and runs the same delete path as the button: it generates the transcript, posts it to the transcript channel, DMs it to the creator, then deletes the channel. Reopening resets the clock: reopen clears the close timestamp, so a reopened ticket drops out of the sweep until it's closed again (and a re-close starts a fresh 24 h). If the transcript can't be generated, the channel is left intact and the sweep retries on its next pass, so a ticket is never destroyed without an archive. Manual `/ticket delete` (or the Delete button) still works at any time for an immediate, mod-triggered delete.
+
+### Claim & escalate
+
+`/ticket claim` subscribes the claiming mod to DM alerts whenever someone other than them posts in the ticket; alerts are coalesced with a 5-minute cooldown so a flurry of messages produces one DM. Claiming is advisory: it doesn't lock other mods out, it just signals ownership and routes alerts. Another mod can reassign with a confirmation prompt. The claimer's name lands on the ticket embed and the final transcript summary.
+
+`/ticket escalate` adds admin roles to the channel's viewer list, swaps the embed status to "⚠️ Escalated", pings admin roles in-channel, and writes an audit entry. The ping is its own channel message, posted *after* the overwrites land (Discord doesn't notify a role member who can't yet see the channel, and the overwrites take one REST call per role, too many to fit before the interaction's 3 s answer), so the mod who ran it gets a private "Ticket escalated." instead of a public reply. After escalation an admin can run `/ticket claim` to layer admin-level alerts on top of the original mod claim, so both get DM'd on new activity. A ticket can be escalated only once.
+
+### Pull & remove
+
+`/pull <user>` and `/remove <user>` add or revoke per-user view + send overwrites inside a jail or ticket channel. Pulled users appear in the transcript's participant list and are not assigned `@Jailed`; they're observers, not subjects. The primary user (the jailed member or ticket creator) cannot be removed.
+
+### Transcripts
+
+Generated when a jail channel is closed via unjail or when a ticket is **deleted** (not just closed). Captures every message in order (author, content, embeds, attachment names + URLs, timestamps), plus participant list, duration, moderator, reason, and outcome. The file lands in three places: stored as JSON in the database (for the dashboard), posted to the transcript log channel with a summary embed, and DM'd to the affected member.
+
+Transcripts are delivered as Markdown (`.md`) files. They're readable in any text editor without rendering, copy-paste cleanly, and survive archival in plain-text tools without losing structure.
+
+**Reading one leaves a receipt.** Opening a transcript on the dashboard writes a `transcript_view` audit row naming the reader and the record: it is members' words from a private channel, so who read it is worth a line. A lookup that finds nothing writes nothing. The row is recorded but not listed: `transcript_` is outside the moderation feed's prefixes on purpose, since reading isn't an action on a member and would otherwise count as moderation work on the Home tile.
+
+**Naming voters (both cards).** Neither the mod vote nor the ballot renders `<@id>`. An embed mention is resolved by the *reading* client from its own cache, so it degrades to a bare number for anyone who has not seen that member, including a voter who has since left the guild. Both cards route every id through `build_name_fn`.
+
+Both show the **name alone**, not ``Name (`id`)``, the copyable-id form `docs/embed_style_guide.md` gives a card only mods can see. Two things rule that form out here. Nothing in the policy flow takes a user id (the Yes / No / Abstain buttons carry the *policy* id, and no `/policy` subcommand accepts a member), so the eighteen digits per voter were noise across the four busiest fields on the card. And **a policy ticket is not reliably mod-only**: it is run privately among mods or opened to the general public, proposal by proposal. `/policy open` creates the channel with `@everyone` denied `view_channel` and grants only the mod and admin roles, so the *default* is private; opening one up is a manual change to the overwrites, invisible to the embed builder. The card therefore has to render as if a member is reading it, because sometimes one is. A test pins the name-only form on both cards.
+
+Both truncate their voter lists on accumulated **characters**, not on a fixed entry count. A fixed entry cap would work only while `<@id>` has a predictable width; with real display names, 25 long nicknames blow past Discord's 1024-character field ceiling and the whole field is dropped. The awaiting roster is sorted at the call site, since it comes off a set difference.
+
+### Proposal visibility
+
+`/policy open` always creates the channel private: `@everyone` is denied
+`view_channel` and the mod and admin roles are granted. A proposal is
+sometimes meant for the general public, though (it is a mod-or-public
+surface, proposal by proposal), so the proposal card
+carries an admin-gated **Open to Members** / **Make Mods-Only** toggle, and
+`policy_tickets.visibility` (migration 219, `'mods'` | `'public'`) remembers
+which it is.
+
+Opening grants `@everyone` `view_channel`, `read_message_history` **and**
+`send_messages`: the reason to open a proposal is member input, and a
+read-only version would duplicate `/policy ballot`, which already exists for
+a silent public vote.
+
+**Opening asks first, closing doesn't.** The overwrites come back off on a
+second press, but what members read while it was open, they have read, so
+the button counts the channel's backlog (capped at 500, rendered `500+`) and
+shows an ephemeral confirm naming the figure and spelling out "including
+anything said before now". The mistake being guarded is a mod opening a
+channel while thinking about the proposal and forgetting the candid
+discussion above it. Closing needs no confirm: nothing is exposed by it.
+A confirm nobody answers expires after a minute and says so: cancel and
+timeout are the same outcome, so an unanswered prompt opens nothing.
+
+Three things fall out of this being a permission change rather than a
+cosmetic one:
+
+- **The gate is a runtime check.** Once the channel is open a member can see
+  the card, so the button refuses non-admins on press rather than relying on
+  being hidden, the same reasoning as the ballot's Close button.
+- **Jailed members stay out either way, and opening re-asserts it.** A role
+  deny beats an `@everyone` allow, so the explicit
+  `@Jailed → view_channel=False` overwrite is what keeps them out, but the
+  create listener that stamps it is best-effort by design (a channel the bot
+  lacked Manage Roles on at creation is logged and skipped), which left this
+  guarantee resting on something that can silently not have happened. So the
+  press that widens the audience re-stamps the deny *before* granting
+  `@everyone` view, and **refuses to open at all** if it can't write it,
+  telling the mod to check Manage Roles. Failing the other way would expose
+  the channel to jailed members while the admin guide promises it cannot.
+- **The proposal card names its proposer, never mentions them.** An embed
+  mention resolves from the *reading* client's cache, so a public card would
+  show digits to anyone who hadn't seen the proposer. The card resolves
+  through `build_name_fn`, like the vote and ballot cards.
+
+The state is stated on the card ("🔒 Mods only" / "🌐 Open to members") and
+the button is labelled for the action ("Open to Members"), so a reader is
+never left guessing whether a label is describing the situation or offering
+to change it. A change also posts a line in the channel (everyone already
+in the room needs to know the audience changed under them) and an entry to
+the mod audit log.
+
+Visibility is per proposal: opening one never opens another. Nothing is
+retroactive: the toggle appears on proposal cards posted from migration 219
+onward, and an older open proposal is changed by editing the channel
+overwrites by hand.
+
+### Community ballots
+
+`/policy ballot` (admin) is the members' counterpart to the mod team's policy vote. It opens a **thread in the channel it was run in** and posts one card with Yes / No / Abstain buttons plus a moderator-only **Close Ballot**. A modal takes the question, and that question is the only string the ballot carries (no proposal description, no transcript, nothing from a private policy channel), which is what stops "widen the vote" from also meaning "widen the deliberation". The private mod channel is not involved in a community ballot at all.
+
+**Electorate:** anyone who can see the thread. There is no role dial and no eligibility snapshot: a veterans-only ballot is a ballot launched in a veterans-only channel, and a member's visibility is re-read from Discord on every press, so losing access stops them voting from that moment (a vote already cast stands) and gaining it lets them in.
+
+**Arithmetic:** a simple majority of the votes that took a side. Abstentions count toward neither. **Ties fail** (`yes > no`, strictly), so a 20–20 ballot and a ballot nobody voted in both fail rather than hanging. There is no minimum turnout, deliberately: a first ballot drawing nine votes and failing a quorum reads as a rejection of something the room never saw.
+
+**Public by decision.** The card names every Yes, No and Abstain voter, using resolved display names, never `<@id>`, since an embed mention degrades to a bare number for any reader who has not seen that member. Nothing about a ballot is anonymous, and the copy must never say it is. The accepted cost: two members who have blocked each other appear in the same list. That holds because a ballot is a one-to-many broadcast with no pairing, no directed edge, no DM and no reply, and both members can already post in the channel. **A ballot must never send a DM, ping a member, or grow a per-pair surface**, since any of those would create a contact edge and reopen the no-contact question for real.
+
+**Lifetime:** a ballot is recorded as a `policy_tickets` row carrying status `ballot`, outside the `('open','voting')` pair `get_policy_ticket_by_channel` matches, so `/policy vote` can never start the unanimity mod-vote on a ballot thread (that vote's finalizer archives and deletes the channel it runs in). It runs for the guild's `policy_vote_timeout_hours`, closes on the same 60-second sweep the mod vote uses, or early on the Close button; at 0 hours it has no deadline and waits for the button. `/policy close` inside the thread cancels it. Closing freezes the yes/no/abstain counts and the outcome onto the ballot row, strips the buttons, posts the result into the thread and the audit channel, and closes the ticket. **A passed ballot is recorded, not enacted**: nothing is written to `policies`; turning one into a policy is a later human act.
+
+Because the result is frozen at close, an erasure can safely delete a member's individual ballot vote: it cannot move a decision that was already announced. See `docs/data_register.md`.
+
+### Warnings
+
+`/warn` records a warning, DMs the member with the reason and their current active warning count, and writes an audit embed. When a member's active warning count **reaches** the configured threshold (default 3) the bot posts a highlighted alert in the log channel that pings admin roles. **The threshold never auto-jails**: it escalates to humans, who decide what happens next. A member's warning history (active and revoked, with dates, reasons, and the issuing mod) is on the dashboard's Warnings page (`GET /api/moderation/warnings`); there is no `/warnings` command. `/revokewarn` stays in Discord as a deliberate manual soft-delete with no timed expiry, and takes the numeric ID shown on that page. That page also acts: each warning's detail carries a **Revoke** button (moderator, optional reason prompt, same soft-delete as `/revokewarn`) and, for admins only, a confirm-gated **Delete** that erases the row outright. Revoke is hidden on an already-revoked warning (the endpoint 409s on a second revoke).
+
+### Modinfo
+
+`/modinfo <user>` produces one embed with current jail status, jail history, active warnings, total warnings issued, and ticket counts with the most recent ticket summary. It's the single tool that answers "what's the history with this person?" without an investigation across DMs.
+
+### Auditing & DMs
+
+Every state-changing action (jail, unjail, ticket open/close/reopen/delete, pull/remove, warn/revoke, claim, escalate, config change) writes an audit embed to the configured log channel and stores a record in the database. The member receives a DM at each major step (jailed, unjailed with transcript, ticket created/closed/reopened/deleted, warning issued). If a DM fails (member has DMs off), the bot posts a note in the relevant channel so the mod isn't left guessing.
+
+**Cards name members, never mention them.** The audit embeds, the ticket "Opened by" card, the jail-channel Moderation Hold card, the rejoin cards and the left-while-jailed note all render resolved display names. An embed mention resolves from the *reading* client's cache, and these cards are mostly read about someone who has left or whom the reader has never seen, which is exactly when `<@id>` degrades to a bare number. Ids that may have left go through `build_name_fn` (falling back to the stored name); a member still in hand uses `resolve_name_from`. Channel mentions stay, and message `content=` pings are unchanged.
+
+### Restart recovery
+
+After a restart, persistent ticket panel buttons and per-ticket Close / Reopen / Delete buttons re-attach to their stored messages, the expiry sweep catches up on any jails that lapsed while the bot was offline, and channel IDs are validated, so manually deleted channels mark their record closed.
+
+## Permissions
+
+**Bot needs:** Manage Roles (to assign / strip / restore roles and create `@Jailed`), Manage Channels (jail and ticket channel creation, lock/unlock, permission overwrites), View Channels and Send Messages in the configured log channels, Read Message History and Embed Links for embeds, Attach Files for transcript delivery. The bot's top role must sit above `@Jailed` for role-strip to work.
+
+**A note on Discord-side gates:** every `@app_commands.default_permissions(...)` decorator on a `/policy` subcommand is **inert**. discord.py emits `default_member_permissions` only for top-level commands (`Command.to_dict` guards it behind `self.parent is None`) and the `/policy` group carries none, so every member already sees the whole group in the picker. The runtime `_is_admin` / `_is_mod` checks are the only gates that exist, and each has a test behind it. The same applies to the ballot's Close button, which sits on a card everyone in the thread can see.
+
+**User needs:**
+- Mod role (configured on the dashboard): `/jail`, `/unjail`, `/ticket close|reopen|delete|claim|escalate`, `/pull`, `/remove`, `/warn`, `/revokewarn`, `/modinfo`, `/policy vote`, `/policy list`, and the dashboard moderation routes.
+- Admin role: `/policy open`, `/policy ballot`, `/policy close`, the proposal card's visibility toggle, dashboard config writes, and deleting a warning outright (`DELETE /api/moderation/warnings/{id}`). Admin roles are also the ones pinged on warning threshold and ticket escalation.
+- Everyone: `/ticket open`, the panel button, and the "Open Ticket About This Message" menu.
+
+## User-visible errors
+
+| When | The user sees |
+|---|---|
+| Non-mod tries to close a ticket | "Only moderators can close tickets." |
+| Bot lacks a required permission | A descriptive message identifying the missing permission, before any state changes |
+| DM fails (recipient has DMs off) | Channel note: "(Couldn't DM {member} — they have DMs disabled.)" |
+| Jail target is a bot, a mod, or already jailed | "Can't jail that user: {reason}" |
+| Roles were deleted while a member was jailed | Restored roles are applied; the missing ones are noted in the audit entry |
+| Jail or ticket category is full (Discord's 50-channel cap) | "That category is full — please archive a channel or pick a new category." |
+| User tries to remove the primary user from their own ticket / jail | "You can't remove the {creator|jailed member} from their own channel." |
+| Action runs in a channel that isn't a jail or ticket | "This command only works inside a jail or ticket channel." |
+| `/ticket reopen` or `/ticket delete` on an open ticket | "This ticket isn't closed." |
+| `/ticket escalate` runs twice | "This ticket has already been escalated." |
+| `/revokewarn` warning_id not found | "I couldn't find that warning." |
+
+## Non-goals
+
+- **No auto-jail.** Warning thresholds never trigger jail automatically; they ping admins.
+- **A community ballot never enacts anything.** A passed ballot writes no `policies` row and changes no setting; it is a recorded result a moderator may act on. There is therefore no binding/advisory distinction, no veto, and no cooling-off timer to build.
+- **No ballot notifications.** No DMs, no role pings, no member mentions, no reminders to people who haven't voted. See Community ballots for why that line is load-bearing rather than a convenience call.
+- **No eligibility dial for ballots.** The channel's own permissions are the electorate; a role picker would be a second, drifting answer to a question Discord already answers.
+- **No auto-revoke for warnings.** Warnings only clear when a mod manually revokes them.
+- **Deleting a warning is the exception, not the correction.** Revoking is what a mod
+  reaches for when a warning shouldn't count any more: the row stays, marked revoked.
+  Deletion exists only for a warning that should never have existed (wrong member, a test
+  row), so it's admin-gated, confirm-first, and has no Discord command. The `warnings` row
+  goes, but a `warning_delete` audit entry keeps what it held, so the deletion itself is
+  never a silent gap in the record.
+- **No appeal system.** There's no member-facing "appeal my jail" flow; the jail channel itself is the conversation.
+- **No web-side ticket delete.** That destructive action happens only in Discord. (Jail release is available from the dashboard (see the Release hold row above) and routes through the same `/unjail` flow.)
+- **No per-user ticket cap.** A member can open as many tickets as they want.
+- **No spectator visibility on tickets or jails.** Only the primary user, mods, pulled participants, and (after escalation) admins can see the channel.
+
+## Configuration
+
+Every key is set on the web dashboard (Config → Moderation & Safety → Moderation & Privacy; the ticket panel from Moderation → Tickets).
+
+| Key | Purpose | Default |
+|---|---|---|
+| `mod_role_ids` | Roles granting moderator access | unset |
+| `admin_role_ids` | Senior staff roles: receive escalation pings and warning threshold alerts | unset |
+| `jail_category_id` | Category where jail channels are created | unset |
+| `ticket_category_id` | Category where ticket channels are created | unset |
+| `log_channel_id` | Channel for audit log embeds | unset |
+| `transcript_channel_id` | Channel where transcript files are posted | unset |
+| `jailed_role_id` | The `@Jailed` role | auto-created |
+| `posted_panels` rows, key `ticket-panel` | Where the persistent ticket buttons live | written when the panel is posted from Moderation → Tickets; the panel refresher redraws each one on restart and art changes, and posting again into the same channel moves it to the bottom. Migration 240 folded the old `ticket_panels` table (migration 023) into it. The old `ticket_panel_channel_id` / `ticket_panel_message_id` config rows survive on live servers but nothing reads them, and they are listed in `settings_registry.DEAD_KEYS` so no advisor pass proposes a write that would do nothing |
+| `ticket_notify_on_create` | Notify moderators on every new ticket (the staff ticket ping, with the panel-button DMs as its fallback). Read against the guild the ticket was opened in, matching how the dashboard writes it | on |
+| `policy_vote_timeout_hours` | How long a policy vote **or a community ballot** runs before it resolves itself; `0` turns auto-resolution off (a ballot then waits for its Close button). One dial for both, deliberately: a second deadline would be a second thing to keep in step. Per guild, and the sweep covers every guild the bot is in | 72 |
+| `warning_threshold` | Active-warning count that triggers an admin alert | 3 |
+| `api_port` / `api_secret` | Dashboard API port and shared secret | platform defaults |
+
+## Stored data
+
+A community ballot keeps two rows of its own: the ballot (question, opener, window, and the yes/no/abstain counts + outcome frozen at close, naming no voter) and one row per member per ballot recording their choice. Both carry `guild_id` directly. The frozen counts are what make the individual votes safely erasable; see `docs/data_register.md`.
+
+A policy ticket also records its `visibility` (migration 219), whether the proposal channel is mods-only or open to members. It describes a channel rather than a person and names no member; `policy_tickets` is already registered in `docs/data_register.md` and preserved as part of the mod record.
+
+The system keeps per-guild records of every jail, ticket, warning, audit action, and transcript. Jail records carry the snapshotted role list so an unjail can restore the member exactly as they were. Tickets track creator, opener source, current state, claim assignment, and (after escalation) the escalating mod and admin claimer. Warnings store the issuing mod, reason, and active/revoked status; revocation is soft so history stays intact for `/modinfo`. Transcripts are stored as JSON for the dashboard and also written as files in the transcript channel and the member's DMs.
+
+Audit entries cover every state change (jail/unjail, ticket lifecycle, pull/remove, warn/revoke, claim, escalate, config update) with actor, target, and contextual details, plus a `transcript_view` receipt whenever a moderator opens a transcript on the dashboard. The audit log is the system of record for "what happened and who did it."
+
+No DM content is persisted beyond what's already in the channel the DM was sent from; transcript files attached to DMs are the same files written to the transcript channel and database.
+
+See also: [[dm-perms-spec]], [[whisper-spec]], [[confessions-spec]] for adjacent moderator surfaces that share the same `/api/moderation/` namespace.

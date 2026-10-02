@@ -1,0 +1,388 @@
+# Dungeon Keeper — Bios Cog Specification
+
+**Stack:** Python · discord.py · sync `sqlite3` via `ctx.open_db` · existing DK web dashboard (Discord OAuth)
+**Status:** Reference. Describes the built feature's behavior (verified against the code), not its implementation details.
+
+---
+
+## 1. Overview
+
+A wizard-driven member bio system for The Golden Meadow.
+
+A member triggers the wizard, the bot creates a private, single-use channel, and walks them one step at a time through a community-authored set of profile fields plus a rotating pool of icebreaker questions. On completion the bot renders a styled embed and posts it to the bios channel, then destroys the wizard channel. Bios are edited in place on update; when a member leaves the embed is deleted and the bio archived for rejoin resurrection, purged for good after 12 months away.
+
+Profile fields and the icebreaker pool are not hardcoded; they are managed entirely through the DK web dashboard.
+
+---
+
+## 2. Core principles
+
+1. **Fully data-driven.** There is no hardcoded profile field set. The active template defines every field, and the cog renders whatever is configured. The only fixed concept is *which* field is designated the headline (see §7).
+2. **Snapshot on answer.** Field labels and question text are stored alongside the user's answers at the moment they answer. Editing the template or retiring a question later never silently rewrites an already-posted bio.
+3. **Edit in place.** Updating a bio edits the existing message, preserving its position in the channel. The bot reposts only as a fallback when the original message is gone (404).
+4. **Ephemeral wizard state.** Nothing is written to the bios tables until the wizard completes successfully. An abandoned, cancelled, or timed-out wizard leaves no database rows, so there are no half-bios.
+5. **Create and destroy the venue.** The wizard runs in a throwaway private channel that exists only for the duration of one session, then is deleted.
+
+---
+
+## 3. Data model
+
+All tables are guild-aware, in the existing `dungeonkeeper.db` (accessed with the project's sync `sqlite3` helper, `ctx.open_db`). Foreign keys are referenced for clarity; enforcement is in application logic, as PRAGMA foreign_keys is not enabled project-wide.
+
+### 3.1 `bio_templates`
+One template per guild, versioned. The active version defines the current field set.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `guild_id` | INTEGER | |
+| `version` | INTEGER | increments on field-set change |
+| `active` | INTEGER | 0/1; exactly one active per guild |
+| `created_at` | TEXT | ISO 8601 |
+
+### 3.2 `bio_fields`
+The profile fields belonging to a template, rendered in order.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `template_id` | INTEGER | FK → bio_templates.id |
+| `key` | TEXT | stable internal identifier, e.g. `gender`, `dms` |
+| `label` | TEXT | display label, e.g. "How you found The Golden Meadow" |
+| `field_type` | TEXT | `short` \| `paragraph` \| `choice` |
+| `choices` | TEXT | JSON array; used only when `field_type = choice` |
+| `required` | INTEGER | 0/1 |
+| `is_headline` | INTEGER | 0/1; exactly one field per template flagged 1 (see §7) |
+| `sort_order` | INTEGER | render + wizard order |
+| `active` | INTEGER | 0/1; soft-retire, never hard-delete |
+| `max_len` | INTEGER | per-field char cap, default 1024 |
+| `hint` | TEXT | optional example/helper shown under the wizard prompt (default `''`) |
+
+### 3.3 `bio_questions`
+The rotating icebreaker pool. Guild-scoped, independent of templates.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `guild_id` | INTEGER | |
+| `prompt` | TEXT | the question text |
+| `active` | INTEGER | 0/1; soft-retire |
+| `created_at` | TEXT | |
+
+### 3.4 `bios`
+Tracks each posted embed message.
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | INTEGER | |
+| `guild_id` | INTEGER | |
+| `message_id` | INTEGER | the posted embed; 0/0 sentinel while archived |
+| `channel_id` | INTEGER | the bios channel at post time |
+| `created_at` | TEXT | |
+| `updated_at` | TEXT | |
+| `archived_at` | TEXT | NULL while live; stamped on member-leave archive, cleared on resurrection (§8) |
+| | | PK (`user_id`, `guild_id`); one bio per user per guild |
+
+### 3.5 `bio_field_values`
+A user's answers to template fields. Label snapshotted.
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | INTEGER | |
+| `guild_id` | INTEGER | |
+| `field_id` | INTEGER | FK → bio_fields.id |
+| `field_label` | TEXT | snapshot at answer time |
+| `value` | TEXT | |
+| | | PK (`user_id`, `guild_id`, `field_id`) |
+
+### 3.6 `bio_answers`
+A user's answers to rotating questions. Keyed by stable **slot** index so a per-slot re-roll is a clean overwrite and embed order stays stable. Question text snapshotted.
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | INTEGER | |
+| `guild_id` | INTEGER | |
+| `slot` | INTEGER | 0..N-1, stable display order |
+| `question_id` | INTEGER | FK → bio_questions.id |
+| `question_text` | TEXT | snapshot at answer time |
+| `answer` | TEXT | |
+| | | PK (`user_id`, `guild_id`, `slot`) |
+
+---
+
+## 4. Per-guild configuration
+
+Stored in the cog's config (reuse DK's existing per-guild config mechanism; these are the keys the cog reads, all prefixed `bios_` in the shared config table, per `BiosConfig.load`):
+
+| Key | Purpose | Suggested default |
+|---|---|---|
+| `bios_channel_id` | where embeds are posted | — (required) |
+| `bios_wizard_category_id` | category under which wizard channels are created | — (required) |
+| `bios_questions_per_bio` | N questions drawn per bio | 3 |
+| `bios_embed_color` | single ember accent, identical across all bios | `0xC8763E` |
+| `bios_wizard_timeout` | idle minutes before auto-cancel | 15 |
+| `bios_archive_grace` | seconds after completion before the wizard channel is deleted | 60 |
+
+The dashboard's Settings tab and the `GET`/`PUT /api/bios/config` payloads expose
+these unprefixed (`wizard_category_id`, `questions_per_bio`, `embed_color`,
+`wizard_timeout`, `archive_grace`); the route maps to/from the prefixed
+config-table keys above.
+
+---
+
+## 5. Wizard flow
+
+### 5.1 Trigger
+- `/bio` slash command, **or**
+- a persistent **"Create / Update Bio"** button posted in the bios channel. The button uses a fixed `custom_id` and its View is re-registered on cog load so it survives bot restarts.
+- The button's embed **title and body are admin-configurable** (config keys
+  `bios_trigger_title` / `bios_trigger_body`, edited on the dashboard's Config →
+  Members → Bios → Settings tab), falling back to the built-in defaults when unset or blank.
+  Editing the copy updates future posts; re-post the button to refresh the
+  live message.
+
+### 5.2 Session setup
+- **One active session per user.** Re-triggering while a session is live prompts the user to resume or restart, and never spawns a second wizard channel.
+- On trigger, look up the user's `bios` row for this guild → determines **new** vs **edit** mode.
+- Create a **private text channel** under `wizard_category_id`:
+  - Named `bio-{user_id}` (collision-free and identifiable for orphan cleanup).
+  - Permission overwrites: deny `@everyone` view; allow the triggering user and the bot to view and send. No one else can see it.
+- Initialize in-memory session state: mode, ordered active field list (by `sort_order`), drawn question slots, current step index, collected answers so far, and (edit mode) the user's existing values/answers for pre-fill.
+
+### 5.3 Question draw
+- The member picks up to `questions_per_bio` questions from the active pool, no duplicates within the session.
+- In **edit** mode, do **not** re-draw. Load the user's existing answered questions from `bio_answers` into their original slots.
+
+### 5.4 Stepping through fields
+Walk the active field list in `sort_order`. Behavior per `field_type`:
+
+- **`short` / `paragraph`**: post the field label as a prompt; capture the user's next message in the channel via `wait_for("message", check=...)` scoped to this channel + this author.
+- **`choice`**: post the field label with a selection control: **buttons if ≤5 choices, a select menu otherwise**. Capture via the component interaction.
+
+The prompt carries warm, type-aware guidance (not a bare "reply with…" line) and, when the field's `hint` is set, an italicized **💡 For example** line beneath it so members aren't left guessing what to write. Optional fields phrase Skip reassuringly rather than as a terse "(optional)".
+
+Per-step controls (rendered as buttons on the prompt):
+- **Skip**: offered only when the field is not `required`. A required field will not advance until answered.
+- **Back**: return to the previous step to re-answer.
+- **Cancel**: abort: delete the channel, discard all in-memory state, write nothing.
+
+Validation: enforce `max_len` at input; if exceeded, re-prompt with the limit noted. Long input is caught here so the embed-side truncation (§6.2) is only a safety net.
+
+### 5.5 Stepping through questions
+After the last field, step through the drawn question slots in order. Each slot has the same **Skip / Back / Cancel** controls, plus:
+
+- **Re-roll (🎲)**: discards the current slot's question and draws a fresh one from the active pool, excluding every question already drawn this session (all other slots) and the slot's current question. The user then answers the new question.
+  - If the active pool offers no distinct alternative (pool too small / all drawn), the re-roll control is disabled with a brief inline note ("No other questions available right now").
+
+### 5.6 Edit mode: showing the current answer, and warning that it will be replaced
+There is **no pre-fill**. Text answers are captured as a plain channel message
+(`wait_for("message", …)`), not through a modal, so there is no input box to
+seed with the stored value, so nothing about the step is
+self-evidently destructive. Members read the prompt as "add to your bio" and
+lose the answer they had. The prompt therefore has to say so in words:
+
+- A **field step** in edit mode with a stored value shows it as a
+  **Current answer** embed field and leads the description with an explicit
+  warning that whatever they send next *replaces* it rather than adding to it,
+  naming **Keep** as the way to move on unchanged. A `choice` field is answered
+  by a control rather than a message, so its warning says "Picking a new
+  option" instead of "Whatever you send next".
+- A **question step** for an already-answered question (reached by re-picking
+  a ✏️ row from the browse list) shows the same **Current answer** field and
+  the same warning. This step has no **Keep** button; **Back** is its
+  non-destructive exit (it drops the pending question without saving), so the
+  warning names **Back**.
+- With nothing stored yet, neither prompt shows the field or the warning: a
+  first answer overwrites nothing, and a warning there would be noise.
+
+Both prompts are built by pure functions in `bios/embeds.py`
+(`build_field_prompt_embed`, `build_question_prompt_embed`) rather than by the
+wizard session, so the copy is assertable without a live wizard.
+
+### 5.7 Timeout
+If the session is idle longer than `wizard_timeout`, auto-cancel: delete the channel, discard state, and (if possible) notify the user briefly via the triggering context.
+
+Every way of answering a step (the step views' buttons and selects, and the
+message listener) stays live for `wizard_timeout + 30s`
+(`logic.input_timeout_seconds`), so the idle watchdog always fires first. That
+ordering is the point: the watchdog is the only path that tells the member
+what happened, so a control must never die before it runs. The step views
+take `timeout` as a **required** argument (a hardcoded 900s would strand
+members at any wizard timeout above 15 minutes: every button would return "This
+interaction failed" while the watchdog slept on), so the two can't drift apart.
+
+A step's view is stopped once its action is consumed, so a tap on a
+scrolled-back earlier prompt can't push an action that the current step
+consumes as its own.
+
+### 5.8 Completion
+- Render the embed (§6).
+- **New:** post to the bios channel; insert the `bios` row, all `bio_field_values` rows, and all `bio_answers` rows. Wrap the writes so a posting failure does not leave partial rows.
+- **Edit:** fetch the stored `message_id`; rebuild the embed; edit the message in place; overwrite the user's `bio_field_values` and `bio_answers` rows; update `bios.updated_at`. On **404** (message gone), repost to the bios channel and update `message_id` + `channel_id`.
+- Post a confirmation in the wizard channel with a jump link to the posted bio.
+- After `archive_grace` seconds, delete the wizard channel.
+
+---
+
+## 6. Embed rendering
+
+The embed is built **from the user's snapshotted values/answers**, never from live template lookups, so a posted bio always reflects exactly what the user entered, even if the template or question pool changed afterward.
+
+### 6.1 Structure
+- **Author line:** member display name, with the member avatar as the author icon.
+- **Title:** the value of the field flagged `is_headline` (the name/nickname field).
+- **Thumbnail:** member avatar.
+- **Color:** the guild's configured `embed_color`, identical across every bio so the channel reads as one cohesive set. Not per-user.
+- **Profile fields:** rendered in `sort_order`.
+  - `short` and `choice` fields → **inline** (`inline=True`); Discord packs up to 3 inline fields per row, producing a tidy stat row.
+  - `paragraph` fields → **full-width** (`inline=False`), each its own labeled block.
+  - Skipped / empty optional fields → **omitted entirely** (no blank labels).
+  - Values render as **raw Discord markdown** with no sanitizing, no escaping. The member's own emoji, smart quotes, ellipses, and formatting pass through untouched; that is where the personality lives.
+- **Icebreakers:** grouped after the profile fields. Each answered question is a full-width field: the question text is the field **name** (prefixed with a leading `›` glyph to distinguish it from profile labels), the answer is the field **value**. **Plain text**, with no blockquote, no special font (Discord embeds can't change fonts anyway).
+- **Footer:** **timestamp only**: set `embed.timestamp = created_at`. No footer text, no footer icon, no server name.
+
+### 6.2 Length handling
+- Cap each field value at **1024 chars** (Discord's embed field limit); truncate with a trailing `…`. Because the wizard enforces `max_len` at input, this is a rarely-hit safety net.
+- If total embed content approaches the **6000-char** ceiling, truncate the longest `paragraph` fields first until under budget.
+- A question renders as `logic.QUESTION_NAME_PREFIX` + its text, both as the posted bio's field name and as the wizard's own prompt title. The text is capped at **254** chars so the prefixed result lands on Discord's 256-char limit rather than two past it, and `logic.question_field_name` is the single place that applies it. This is not a theoretical cap: `bio_questions.prompt` accepts **512** chars through the dashboard, and an over-long name makes Discord reject the whole embed with a 400, which, inside the wizard's step loop, becomes a silent `cancel("error")` that deletes the member's channel with nothing saved.
+
+---
+
+## 7. Headline field designation
+
+The template must know which field supplies the embed title. Use an explicit **`is_headline`** boolean on `bio_fields` rather than positional convention, so admins control it directly from the dashboard. Exactly one active field per template should be flagged. If none is flagged (misconfiguration), fall back to the first active field by `sort_order` and surface a dashboard warning.
+
+---
+
+## 8. Member leave handling: archive, resurrect, purge
+
+An `on_member_remove` listener:
+1. Look up the leaving member's `bios` row for that guild.
+2. Delete the posted message (ignore 404: already gone).
+3. **Archive** the bio (`archive_user_bio`): zero out `message_id` /
+   `channel_id` as the archived sentinel and stamp `archived_at`. The
+   snapshotted `bio_field_values` and `bio_answers` rows are kept.
+
+If no `bios` row exists, do nothing.
+
+**Resurrection on rejoin** (`bios/resurrect.py`): when something needs the
+member's bio link (e.g. `onboarding/welcome/service.py`'s `{member_bio_link}`) and the row
+is archived, the embed is rebuilt from the snapshot, reposted to the bios
+channel, and the row is repointed at the new message, clearing
+`archived_at`, which stops the purge clock. Re-running the wizard over an
+archived row does the same via the upsert.
+
+**Stale-archive purge**: a daily `tasks.loop` on the cog calls
+`purge_stale_archived_bios` (default window 12 months). Bios archived for
+longer than the window (the member never came back) are permanently
+deleted (`bios` row + field values + answers), exactly what
+`delete_user_bio` removes. Live bios are never touched regardless of age.
+A member who returns after the purge simply has no bio and rebuilds one
+through the wizard. Migration 149 added `archived_at`; pre-existing
+archived rows were stamped at migration time, so their window starts
+then, not at their original leave date.
+
+---
+
+## 9. Orphan channel cleanup
+
+Because the wizard venue is a real channel (not a self-archiving thread), a bot crash or restart mid-wizard can leave a stranded private channel. Mitigation:
+
+- **On cog load**, sweep `wizard_category_id` and delete any `bio-*` channel that has no matching live in-memory session. This clears anything orphaned by a crash or restart.
+- The `wizard_timeout` (§5.7) still handles idle-but-alive sessions during normal operation.
+
+---
+
+## 10. Web dashboard management
+
+Slots into the existing self-hosted DK dashboard (Discord OAuth, admin-gated). Three editors:
+
+### 10.1 Field / template editor
+- List the active template's fields with an `active` toggle.
+- Add / edit / **soft-retire** fields: set `active = 0`, never hard-delete, to preserve referential integrity for already-posted bios.
+- Editable per field: `label`, `field_type`, `choices` (choice type only), `required`, `max_len`, `is_headline`, `sort_order`, `hint`.
+- Reorder fields via drag → updates `sort_order`.
+- Editing the field set creates/updates the active **template version**.
+- Enforce exactly one `is_headline` field; warn if zero.
+
+### 10.2 Question editor
+- List questions with an `active` toggle.
+- Add / edit / **soft-retire** questions.
+- Editable per question: `prompt`.
+
+### 10.3 Config editor
+- `bios_channel_id`, `wizard_category_id`, `questions_per_bio`, `embed_color`, `wizard_timeout`, `archive_grace`, plus the trigger button's `trigger_title` / `trigger_body` (§5.1).
+
+### 10.4 Channel health warnings
+`GET /api/bios/config` returns a `channel_issues` list alongside the settings,
+computed from live Discord state (empty when the bot client is down; an
+unknown state is not reported as a fault). The panel renders it as an error
+banner above the form, and `POST /api/bios/post-trigger-button` returns the
+same messages in a `warnings` list so posting the button into a channel nobody
+can open reports as a failure rather than a clean success.
+
+Checked for `bios_channel_id` (`diagnose_channel`): the channel is missing,
+isn't a channel that takes messages, the bot can't post (View / Send / Embed
+Links), or **no non-bot member can see it**. Checked for `wizard_category_id`
+(`diagnose_category`): missing, not a category, or the bot lacks Manage
+Channels. Categories deliberately use different rules: being message-less and
+member-invisible is correct for the wizard category and a fault for the bios
+channel.
+
+The "nobody can see it" rule exists because of a live outage: on 2026-07-19 a
+role holding the only overwrite granting `view_channel` was deleted, which
+silently removes its channel overwrite. `bios_channel_id` still pointed at a
+real text channel, the bot held Administrator and could post fine, and no
+config value changed, but for nine days no member could see the channel, the
+trigger button, or any posted bio. Zero is the threshold rather than a small
+share: a channel restricted on purpose still has its staff, so it lands on a
+small number, never none. Measured against the live server, a share threshold
+would have flagged eleven channels to catch the one real fault.
+
+The same rules run across every channel setting in `settings_registry` for the
+dashboard Home panel's **Configuration Problems** card
+(`GET /api/config/channel-health`), so a feature that registers a channel
+setting is covered automatically. Settings sharing one channel group into a
+single row (one channel, one fault, one fix).
+
+The card's `system` list carries the faults that are not a channel setting:
+backup staleness (`admin/db_backup.gather_backup_health`), a background loop the
+restart supervisor gave up on (`core/background.gave_up`, recorded by
+`Bot._resilient_task` under the coroutine's name), and a delivery into the
+active guild that a `FailureStreak` has paused (`stalled_deliveries`: a
+sticky panel, coin drops or chat revive). `analytics/delivery_health_logic`
+turns the last two into rows. A probed pause is a warning, since it heals once
+the channel works; a sticky panel's pause and a stopped loop are errors. All
+of it is in-memory state of the process the dashboard shares with the bot, so
+it is gone after a restart, which is also what revives a stopped loop and
+lifts every pause.
+
+---
+
+## 11. Implementation defaults (as built)
+
+- **Headline mechanism:** explicit `is_headline` flag (chosen over positional convention).
+- **Choice control threshold:** ≤5 choices → buttons; >5 → select menu.
+- **Wizard channel naming:** `bio-{user_id}`.
+- **Archive grace:** 60 seconds after completion before channel deletion.
+- **Capture mechanism:** `wait_for` scoped to (wizard channel, author) for text steps; component interaction for choice and control steps.
+- **Selection:** the member chooses from the active pool; there is no weighting.
+
+---
+
+## 12. Edge cases & guarantees checklist
+
+- Re-trigger during a live session → resume/restart prompt, no second channel.
+- Cancel / timeout / crash → no DB rows written, channel cleaned up (immediately on cancel/timeout, on next cog load for crash).
+- Question pool smaller than `questions_per_bio` → draw as many distinct as exist; re-roll disables when no alternative.
+- Template field retired after a user posted → their posted bio is unaffected (snapshotted label/value); it simply isn't re-asked on their next edit.
+- Question retired after a user answered it → unaffected in their posted bio (snapshotted text); re-roll/redraw won't surface it again.
+- Posted message manually deleted → next edit hits 404 → repost + update `message_id`.
+- Member leaves → bio message deleted, row archived (snapshot kept for
+  rejoin resurrection); archived 12+ months → all rows purged.
+- Optional field skipped → omitted from embed, no empty label.
+- Member with no bio leaves → no-op.
+
+---
+
+*End of specification.*

@@ -1,0 +1,899 @@
+"""Tests for /api/economy/config endpoints."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.economy.service import load_econ_settings
+from web_server.auth import DiscordOAuthAuth, SESSION_COOKIE
+from web_server.routes.economy import EconomyConfigUpdate
+from web_server.server import create_app
+from tests.paths import REPO_ROOT
+
+
+def _seed_rollup(fake_ctx, iso_week: str, *, median: float, **cols) -> None:
+    """Insert one econ_metrics_weekly row for the fixture guild."""
+    row = {
+        "guild_id": fake_ctx.guild_id,
+        "iso_week": iso_week,
+        "median_income": median,
+        "p90_income": cols.get("p90_income", median * 2),
+        "active_members": cols.get("active_members", 10),
+        "earners": cols.get("earners", 6),
+        "minted": cols.get("minted", 1000),
+        "burned": cols.get("burned", 400),
+        "faucet_mix": cols.get("faucet_mix", '{"logins": 0.5, "activity": 0.3, '
+        '"quests": 0.1, "games": 0.1, "grants": 0.0}'),
+        "rental_holders": cols.get("rental_holders", 3),
+        "rentals_live": cols.get("rentals_live", 4),
+        "rentals_ended": cols.get("rentals_ended", 1),
+        "streaks_7plus": cols.get("streaks_7plus", 5),
+        "grace_used": cols.get("grace_used", 2),
+        "computed_at": cols.get("computed_at", 1_700_000_000.0),
+    }
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            f"INSERT INTO econ_metrics_weekly ({', '.join(row)}) "
+            f"VALUES ({', '.join('?' for _ in row)})",
+            tuple(row.values()),
+        )
+        conn.commit()
+
+
+def _non_admin_client(fake_ctx) -> TestClient:
+    """A session that is a guild member but holds no admin bit."""
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    client = TestClient(create_app(fake_ctx, auth=auth), raise_server_exceptions=False)
+    cookie = auth.create_session_cookie(
+        user_id=42,
+        username="rando",
+        access_token="token",
+        permission_bits=0,  # no admin / moderator / manage_server
+        guild_id=fake_ctx.guild_id,
+        guilds=[{"id": fake_ctx.guild_id, "name": "Test Guild", "icon": None}],
+    )
+    client.cookies.set(SESSION_COOKIE, cookie)
+    return client
+
+
+# ── GET /api/economy/config ────────────────────────────────────────────
+
+
+def test_get_economy_config_returns_defaults(authed_client):
+    resp = authed_client.get("/api/economy/config")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["enabled"] is False
+    assert data["currency_name"] == "Coin"
+    assert data["currency_plural"] == "Coins"
+    assert data["booster_multiplier"] == 1.5
+    assert data["xp_per_coin"] == 0.0  # XP→coin faucet ships off (dormant knob)
+    # Snowflakes leave as strings (see test_get_config_emits_snowflakes_as_
+    # strings) — including the 0 sentinel, so the picker always sees one type.
+    assert data["bank_channel_id"] == "0"
+    assert data["default_channel_id"] == "0"
+    assert data["price_role_color"] == 50
+    # The QOTD panel reads this straight off the GET — absent means the picker
+    # silently renders undefined.
+    assert data["qotd_ping_role_id"] == "0"
+    assert data["qotd_spicy_role_id"] == "0"
+
+
+def test_get_economy_config_requires_admin(fake_ctx):
+    client = _non_admin_client(fake_ctx)
+    resp = client.get("/api/economy/config")
+    assert resp.status_code == 403
+    client.close()
+
+
+# ── PUT /api/economy/config ────────────────────────────────────────────
+
+
+def test_put_partial_update_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "enabled": True,
+            "currency_name": "Gem",
+            "currency_plural": "Gems",
+            "booster_multiplier": 2.0,
+            "bank_channel_id": 555,
+            "manager_role_id": 777,
+            "reward_qotd": 25,
+            "reward_photo_post": 8,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.enabled is True
+    assert cfg.currency_name == "Gem"
+    assert cfg.currency_plural == "Gems"
+    assert cfg.booster_multiplier == 2.0
+    assert cfg.bank_channel_id == 555
+    assert cfg.manager_role_id == 777
+    assert cfg.reward_qotd == 25
+    assert cfg.reward_photo_post == 8
+    # Untouched fields keep their defaults.
+    assert cfg.wallet_name == "Wallet"
+
+
+def test_put_default_channel_id_roundtrips_and_leaves_others_untouched(
+    authed_client, fake_ctx
+):
+    """Setting the Default Channel is its own field — it must not silently
+    populate an already-unset per-feature channel from the route/service
+    layer. That's dashboard pre-fill behavior only; the stored config for a
+    feature nobody has configured stays at 0 until an explicit save writes it."""
+    resp = authed_client.put(
+        "/api/economy/config", json={"default_channel_id": 4242}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.default_channel_id == 4242
+    assert cfg.drops_channel_id == 0
+    assert cfg.pin_channel_id == 0
+    assert cfg.theme_channel_id == 0
+    assert cfg.bounty_channel_id == 0
+
+
+def test_put_voice_style_price_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config", json={"price_voice_style": 30}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.price_voice_style == 30
+
+
+def test_put_raffle_fields_roundtrip(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "raffle_enabled": True,
+            "price_raffle_ticket": 15,
+            "raffle_max_tickets": 5,
+        },
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.raffle_enabled is True
+    assert cfg.price_raffle_ticket == 15
+    assert cfg.raffle_max_tickets == 5
+
+
+def test_put_emoji_sponsor_fields_roundtrip(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "price_emoji": 80,
+            "price_emoji_animated": 120,
+            "emoji_sponsor_slots": 3,
+            "emoji_sponsor_expire_days": 7,
+        },
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.price_emoji == 80
+    assert cfg.price_emoji_animated == 120
+    assert cfg.emoji_sponsor_slots == 3
+    assert cfg.emoji_sponsor_expire_days == 7
+
+
+def test_put_streak_shield_price_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config", json={"price_streak_shield": 45}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.price_streak_shield == 45
+
+
+@pytest.mark.parametrize("key", ["price_qotd_sponsor", "qotd_sponsor_expire_days"])
+def test_put_refuses_the_retired_qotd_sponsor_dials(authed_client, fake_ctx, key):
+    # The sponsored question went with /qotd (migration 250). A stale page
+    # still sending either dial is told so, rather than writing a config row
+    # nothing reads.
+    resp = authed_client.put("/api/economy/config", json={key: 25})
+    assert resp.status_code == 422
+    with open_db(fake_ctx.db_path) as conn:
+        stored = conn.execute(
+            "SELECT COUNT(*) FROM config WHERE key = ?", (f"econ_{key}",)
+        ).fetchone()[0]
+    assert stored == 0
+
+
+def test_put_auction_dials_roundtrip(authed_client, fake_ctx):
+    """Audit finding 67: the four live-auction guard-rails are enforced by the
+    auction service but were absent from the whitelist, so the only way to move
+    them was a hand-written row in the config table."""
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "auction_min_bid": 25,
+            "auction_min_increment": 10,
+            "auction_soft_close_seconds": 600,
+            "auction_max_duration_hours": 72,
+        },
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.auction_min_bid == 25
+    assert cfg.auction_min_increment == 10
+    assert cfg.auction_soft_close_seconds == 600
+    assert cfg.auction_max_duration_hours == 72
+
+
+@pytest.mark.parametrize(
+    ("payload"),
+    [
+        pytest.param({"auction_min_bid": 0}, id="min-bid-of-zero"),
+        pytest.param({"auction_min_increment": 0}, id="raise-of-zero"),
+        pytest.param({"auction_soft_close_seconds": 3601}, id="anti-snipe-over-an-hour"),
+        pytest.param({"auction_max_duration_hours": 0}, id="zero-length-auction"),
+        pytest.param({"auction_max_duration_hours": 169}, id="auction-over-a-week"),
+    ],
+)
+def test_put_refuses_an_auction_dial_the_service_would_clamp(authed_client, payload):
+    """The service floors these itself; the panel must refuse rather than let an
+    admin save a number that is silently ignored."""
+    assert authed_client.put("/api/economy/config", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "days",
+    [
+        pytest.param(5, id="a-review-window"),
+        pytest.param(0, id="zero-disables-the-sweep"),
+    ],
+)
+def test_put_shop_item_expire_days_roundtrips(authed_client, fake_ctx, days):
+    """Audit finding 68: the custom-item order sweep read this hourly, but every
+    sibling review window was editable and this one was not."""
+    resp = authed_client.put(
+        "/api/economy/config", json={"shop_item_expire_days": days}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.shop_item_expire_days == days
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [
+        pytest.param("price_text_room", id="text-room-price"),
+        pytest.param("price_voice_room", id="voice-room-price"),
+        pytest.param("quest_board_monthly", id="monthly-board-size"),
+    ],
+)
+def test_put_refuses_the_dropped_dials(authed_client, dropped):
+    """Findings 44 and 57: private rooms were never built and monthly became a
+    single guild-wide goal, so these three bought and sized nothing. The
+    whitelist kept accepting them, which is how a stored value went on looking
+    like a live setting."""
+    assert authed_client.put(
+        "/api/economy/config", json={dropped: 5}
+    ).status_code == 422
+
+
+def test_put_partial_leaves_other_fields_unset(authed_client, fake_ctx):
+    """Only the sent key is written — empty icon URL is settable, and the rest
+    of the settings are not persisted."""
+    resp = authed_client.put(
+        "/api/economy/config", json={"currency_icon_url": ""}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.core.db_utils import get_config_value
+
+        # currency_name was never written, so no econ_ row exists for it.
+        assert get_config_value(
+            conn, "econ_currency_name", "SENTINEL", fake_ctx.guild_id
+        ) == "SENTINEL"
+
+
+def test_put_qotd_ping_role_roundtrips(authed_client, fake_ctx):
+    """The QOTD page's only knob — settable, and clearable back to no ping."""
+    resp = authed_client.put("/api/economy/config", json={"qotd_ping_role_id": 4242})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).qotd_ping_role_id == 4242
+
+    resp = authed_client.put("/api/economy/config", json={"qotd_ping_role_id": 0})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).qotd_ping_role_id == 0
+
+
+def test_put_rejects_negative_number(authed_client):
+    resp = authed_client.put("/api/economy/config", json={"reward_qotd": -1})
+    assert resp.status_code == 422
+
+
+def test_put_rejects_overlong_string(authed_client):
+    resp = authed_client.put(
+        "/api/economy/config", json={"currency_name": "x" * 33}
+    )
+    assert resp.status_code == 422
+
+
+def test_put_rejects_unknown_field(authed_client):
+    resp = authed_client.put(
+        "/api/economy/config", json={"nonsense_field": 1}
+    )
+    assert resp.status_code == 422
+
+
+def test_put_accepts_zero_host_bounty_cap(authed_client, fake_ctx):
+    """0 is a legal cap — economy.logic.host_bounty_amount reads a non-positive
+    cap as "pays nothing", which is how the bounty ships dark. The route used to
+    demand ge=1 and 422 the one row in Automatic Payments that couldn't be
+    switched off from the page that owns it."""
+    resp = authed_client.put("/api/economy/config", json={"host_bounty_cap": 0})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).host_bounty_cap == 0
+
+
+def test_put_rejects_negative_host_bounty_cap(authed_client):
+    resp = authed_client.put("/api/economy/config", json={"host_bounty_cap": -1})
+    assert resp.status_code == 422
+
+
+def test_put_auction_guard_rails_roundtrip(authed_client, fake_ctx):
+    """The four auction dials are enforced on every bid but had no write path:
+    absent from the whitelist and from every panel, they could only be changed
+    by hand-editing the config table."""
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "auction_min_bid": 25,
+            "auction_min_increment": 10,
+            "auction_soft_close_seconds": 120,
+            "auction_max_duration_hours": 72,
+        },
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        cfg = load_econ_settings(conn, fake_ctx.guild_id)
+    assert cfg.auction_min_bid == 25
+    assert cfg.auction_min_increment == 10
+    assert cfg.auction_soft_close_seconds == 120
+    assert cfg.auction_max_duration_hours == 72
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"auction_max_duration_hours": 0}, id="duration-zero"),
+        # The ceiling is 168h: `/bank auction start` caps `hours` there, so a
+        # higher dial would silently do nothing.
+        pytest.param({"auction_max_duration_hours": 169}, id="duration-over-a-week"),
+        pytest.param({"auction_min_bid": -1}, id="negative-min-bid"),
+    ],
+)
+def test_put_rejects_out_of_range_auction_dials(authed_client, payload):
+    assert authed_client.put("/api/economy/config", json=payload).status_code == 422
+
+
+def test_every_pricing_panel_box_is_writable_and_readable(authed_client):
+    """Each numeric box on Pricing must be a field the PUT accepts *and* the GET
+    returns — a box the model rejects 422s the whole Save, and one the GET omits
+    renders blank and then refuses to submit."""
+    import re
+
+    src = (
+        REPO_ROOT
+        / "src"
+        / "web_server"
+        / "static"
+        / "js"
+        / "panels"
+        / "pricing.js"
+    ).read_text(encoding="utf-8")
+    keys: set[str] = set()
+    for block in re.findall(r"const [A-Z_]+_FIELDS = \[(.*?)\n\];", src, re.S):
+        keys |= set(re.findall(r'\["([a-z0-9_]+)"', block))
+    assert "auction_min_bid" in keys and "shop_item_expire_days" in keys
+    model_fields = set(EconomyConfigUpdate.model_fields)
+    assert not keys - model_fields, (
+        f"Pricing boxes the config PUT would reject: {sorted(keys - model_fields)}"
+    )
+    cfg = authed_client.get("/api/economy/config").json()
+    assert not keys - set(cfg), (
+        f"Pricing boxes the config GET never returns: {sorted(keys - set(cfg))}"
+    )
+
+
+def test_put_rejects_booster_multiplier_below_one(authed_client):
+    resp = authed_client.put(
+        "/api/economy/config", json={"booster_multiplier": 0.5}
+    )
+    assert resp.status_code == 422
+
+
+def test_put_requires_admin(fake_ctx):
+    client = _non_admin_client(fake_ctx)
+    resp = client.put("/api/economy/config", json={"enabled": True})
+    assert resp.status_code == 403
+    client.close()
+
+
+# ── GET /api/economy/metrics ───────────────────────────────────────────
+
+
+def test_metrics_empty_state(authed_client):
+    """No rollups yet → empty weeks, no hints, zero median."""
+    resp = authed_client.get("/api/economy/metrics")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["weeks"] == []
+    assert data["hints"] == {}
+    assert data["median_income"] == 0.0
+
+
+def test_metrics_returns_weeks_newest_first(authed_client, fake_ctx):
+    """Two seeded weeks come back newest-first with faucet_mix left a string."""
+    _seed_rollup(fake_ctx, "2026-W01", median=40.0, minted=500, burned=300)
+    _seed_rollup(fake_ctx, "2026-W02", median=100.0, minted=1200, burned=400)
+
+    resp = authed_client.get("/api/economy/metrics")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    weeks = data["weeks"]
+    assert len(weeks) == 2
+    # Newest ISO week first.
+    assert weeks[0]["iso_week"] == "2026-W02"
+    assert weeks[1]["iso_week"] == "2026-W01"
+    assert weeks[0]["median_income"] == 100.0
+    assert weeks[0]["minted"] == 1200
+    assert weeks[0]["burned"] == 400
+    # faucet_mix stays a JSON string (the tile parses it client-side).
+    assert isinstance(weeks[0]["faucet_mix"], str)
+
+
+def test_metrics_hints_from_latest_week_only(authed_client, fake_ctx):
+    """Hints derive from the latest week's median (100), not the older (40)."""
+    _seed_rollup(fake_ctx, "2026-W01", median=40.0)
+    _seed_rollup(fake_ctx, "2026-W02", median=100.0)
+
+    resp = authed_client.get("/api/economy/metrics")
+    data = resp.json()
+
+    assert data["median_income"] == 100.0
+    hints = data["hints"]
+    # Factors anchored to the spec defaults at median 100.
+    assert hints["price_role_color"] == 50
+    assert hints["price_role_name"] == 35
+    assert hints["price_role_icon"] == 75
+    # The palette undercuts the free-form gradient, which rose to 240 when the
+    # curated colours arrived (todo #76) — the hints track the spec defaults.
+    assert hints["price_role_preset"] == 80
+    assert hints["price_role_gradient"] == 240
+    # The two private-room prices used to be hinted here for a stage that was
+    # never built — a suggestion for something nobody could ever buy.
+    assert "price_text_room" not in hints
+    assert "price_voice_room" not in hints
+
+def test_metrics_requires_admin(fake_ctx):
+    client = _non_admin_client(fake_ctx)
+    resp = client.get("/api/economy/metrics")
+    assert resp.status_code == 403
+    client.close()
+
+
+# ── snowflake precision (ids above 2**53) ────────────────────────────────────
+
+# A real snowflake from the guild that hit this bug. As a JS number it becomes
+# 1526000000000000000 — parseInt and JSON.parse both round it — which is how
+# econ_game_role_id came to point at a role that never existed.
+BIG_ROLE_ID = 1526000000000000013
+BIG_CHANNEL_ID = 1526999999999999584
+
+
+def test_get_config_emits_snowflakes_as_strings(authed_client, fake_ctx):
+    """A bare JSON number would be rounded by the browser's JSON.parse before
+    any panel code could defend against it, so ids must leave as strings."""
+    with open_db(fake_ctx.db_path) as conn:
+        from bot_modules.economy.service import save_econ_settings
+
+        save_econ_settings(
+            conn,
+            fake_ctx.guild_id,
+            {
+                "game_role_id": BIG_ROLE_ID,
+                "bank_channel_id": BIG_CHANNEL_ID,
+                "default_channel_id": BIG_CHANNEL_ID,
+            },
+        )
+
+    data = authed_client.get("/api/economy/config").json()
+
+    assert data["game_role_id"] == str(BIG_ROLE_ID)
+    assert data["bank_channel_id"] == str(BIG_CHANNEL_ID)
+    assert data["default_channel_id"] == str(BIG_CHANNEL_ID)
+    # No precision lost: the exact digits survive.
+    assert int(data["game_role_id"]) == BIG_ROLE_ID
+    # Non-id numerics stay numbers — only snowflakes are stringified.
+    assert data["reward_qotd"] == 10
+    assert data["booster_multiplier"] == 1.5
+
+
+def test_put_accepts_snowflake_as_string_losslessly(authed_client, fake_ctx):
+    """The panel sends ids as strings; pydantic must coerce without rounding."""
+    resp = authed_client.put(
+        "/api/economy/config",
+        json={
+            "game_role_id": str(BIG_ROLE_ID),
+            "manager_role_id": str(BIG_ROLE_ID),
+            "bank_channel_id": str(BIG_CHANNEL_ID),
+            "qotd_ping_role_id": str(BIG_ROLE_ID),
+        },
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+    assert settings.game_role_id == BIG_ROLE_ID
+    assert settings.manager_role_id == BIG_ROLE_ID
+    assert settings.bank_channel_id == BIG_CHANNEL_ID
+    assert settings.qotd_ping_role_id == BIG_ROLE_ID
+
+
+def test_snowflake_survives_a_get_put_round_trip(authed_client, fake_ctx):
+    """The whole loop the panel performs: read the config, save it back
+    unchanged, and the ids must be byte-identical. This is the cycle that
+    silently corrupted three settings in production."""
+    authed_client.put(
+        "/api/economy/config", json={"game_role_id": str(BIG_ROLE_ID)}
+    )
+    fetched = authed_client.get("/api/economy/config").json()
+
+    # Echo it back exactly as the panel would.
+    resp = authed_client.put(
+        "/api/economy/config", json={"game_role_id": fetched["game_role_id"]}
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+    assert settings.game_role_id == BIG_ROLE_ID
+
+
+def test_no_panel_parses_a_snowflake_with_parseint():
+    """Guard the browser half of the fix.
+
+    There is no Node in this repo, so the panel JS can't be unit-tested; this
+    reads the source instead. `parseInt` on a 19-digit id silently rounds it,
+    and that is how three settings in production came to point at objects that
+    don't exist. Snowflakes must be sent as strings — the server coerces them.
+    """
+    import re
+    from pathlib import Path
+
+    panels = Path("src/web_server/static/js/panels")
+    # parseInt(...) applied to anything that looks like an id source.
+    offender = re.compile(r"parseInt\([^)]*(?:getValue\(\)|_id)[^)]*\)")
+    hits = []
+    for path in sorted(panels.glob("*.js")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if offender.search(line):
+                hits.append(f"{path.name}:{lineno}: {line.strip()}")
+
+    assert not hits, (
+        "snowflake ids must be sent as strings, not parseInt'd:\n"
+        + "\n".join(hits)
+    )
+
+
+# ── the approvals channel and its exposure warning ──────────────────────
+#
+# The cards posted there name the member, show what they paid and quote their
+# unreviewed submission. Nothing in the code can tell a staff channel from a
+# public one, so the route *warns* and still saves — refusing would make the
+# bot the arbiter of a Discord permission choice.
+
+
+class _AdminMember:
+    """The live-member shape ``auth.resolve`` reads.
+
+    Attaching a bot switches auth from the session's permission bits to live
+    guild membership, so the session user has to exist on the stub guild with
+    a permissions *value* (0x8 = administrator) and a role list.
+    """
+
+    def __init__(self, member_id: int):
+        self.id = member_id
+        self.bot = False
+        self.display_name = f"member-{member_id}"
+        self.roles = ()
+        self.guild_permissions = SimpleNamespace(
+            value=0x8, administrator=True, manage_guild=True
+        )
+
+
+class _StubChannel:
+    """A channel whose @everyone permissions the route can compute."""
+
+    def __init__(self, channel_id: int, name: str, *, public: bool, parent=None):
+        self.id = channel_id
+        self.name = name
+        self.parent = parent
+        self._public = public
+
+    def permissions_for(self, _role):
+        return SimpleNamespace(read_messages=self._public, view_channel=self._public)
+
+
+def _with_channel(fake_ctx, live_guild, channel=None) -> None:
+    """Attach a live guild carrying ``channel``.
+
+    The session user has to be on it as an admin: with ``ctx.bot`` present the
+    auth layer re-derives permissions from live guild membership, so a guild
+    with no members 401s every request.
+    """
+    guild = live_guild([_AdminMember(1)])
+    if channel is not None:
+        guild.channels.append(channel)
+    guild.default_role = SimpleNamespace(id=fake_ctx.guild_id)
+    # The save pokes the casino cog on every economy config write; StubBot has
+    # no dispatch because no other test on this route attaches a bot at all.
+    fake_ctx.bot.dispatch = lambda *args, **kwargs: None
+
+
+def test_the_approvals_channel_roundtrips(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 909090}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).approvals_channel_id == 909090
+
+
+def test_it_ships_dark(authed_client, fake_ctx):
+    """Unset means the channel surface is off, not that anything is broken."""
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).approvals_channel_id == 0
+
+
+def test_a_public_channel_saves_but_warns(authed_client, fake_ctx, live_guild):
+    _with_channel(
+        fake_ctx, live_guild, _StubChannel(4242, "general", public=True)
+    )
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 4242}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True  # saved anyway — the admin keeps the decision
+    assert "everyone can read #general" in body["warning"]
+    with open_db(fake_ctx.db_path) as conn:
+        assert load_econ_settings(conn, fake_ctx.guild_id).approvals_channel_id == 4242
+
+
+def test_a_staff_only_channel_saves_quietly(authed_client, fake_ctx, live_guild):
+    _with_channel(
+        fake_ctx, live_guild, _StubChannel(4243, "mod-review", public=False)
+    )
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 4243}
+    )
+    assert resp.status_code == 200
+    assert "warning" not in resp.json()
+
+
+def test_a_thread_is_judged_by_the_channel_it_hangs_off(
+    authed_client, fake_ctx, live_guild
+):
+    """A thread inherits its parent's audience; its own overwrites say little."""
+    parent = _StubChannel(4244, "general", public=True)
+    thread = _StubChannel(4245, "requests", public=False, parent=parent)
+    _with_channel(fake_ctx, live_guild, thread)
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 4245}
+    )
+    assert resp.status_code == 200
+    # Warned because of the parent's audience, but named for the thread the
+    # admin actually picked — that's the thing they need to go change.
+    assert "everyone can read #requests" in resp.json()["warning"]
+
+
+def test_clearing_the_dial_never_warns(authed_client, fake_ctx, live_guild):
+    _with_channel(fake_ctx, live_guild, _StubChannel(4242, "general", public=True))
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 0}
+    )
+    assert resp.status_code == 200
+    assert "warning" not in resp.json()
+
+
+def test_a_channel_the_bot_cannot_see_saves_without_a_verdict(
+    authed_client, fake_ctx, live_guild
+):
+    """"Don't know" must never be rendered as "safe" — so it says nothing."""
+    _with_channel(fake_ctx, live_guild)
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": 999999}
+    )
+    assert resp.status_code == 200
+    assert "warning" not in resp.json()
+
+
+def test_a_negative_channel_id_is_rejected(authed_client):
+    resp = authed_client.put(
+        "/api/economy/config", json={"approvals_channel_id": -1}
+    )
+    assert resp.status_code == 422
+
+
+def test_the_field_is_on_the_update_model():
+    assert "approvals_channel_id" in EconomyConfigUpdate.model_fields
+
+
+# ── GET /api/economy/approvals — the unified queue ─────────────────────
+
+
+def _pending_theme(fake_ctx, user_id=501, title="Cursed Cooking"):
+    with fake_ctx.open_db() as conn:
+        conn.execute(
+            "INSERT INTO econ_theme_submissions (guild_id, user_id, title, blurb,"
+            " state, price, created_at) VALUES (?, ?, ?, 'x', 'pending', 300, 1000.0)",
+            (fake_ctx.guild_id, user_id, title),
+        )
+
+
+def _pending_claim(fake_ctx, user_id=502, title="Host a hangout", reward=75):
+    with fake_ctx.open_db() as conn:
+        conn.execute(
+            "INSERT INTO econ_quests (guild_id, title, qtype, reward, signoff,"
+            " active, created_at) VALUES (?, ?, 'daily', ?, 1, 1, 1000.0)",
+            (fake_ctx.guild_id, title, reward),
+        )
+        quest_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO econ_quest_claims (quest_id, guild_id, user_id, period,"
+            " state, created_at) VALUES (?, ?, ?, '2026-09-03', 'pending', 900.0)",
+            (quest_id, fake_ctx.guild_id, user_id),
+        )
+
+
+def test_unified_approvals_is_empty_when_nothing_waits(authed_client):
+    body = authed_client.get("/api/economy/approvals").json()
+    assert body["approvals"] == []
+
+
+def test_unified_approvals_merges_products_from_different_tables(
+    authed_client, fake_ctx
+):
+    """The whole point: one request answers "is anyone waiting on us?"."""
+    _pending_theme(fake_ctx)
+    _pending_claim(fake_ctx)
+    rows = authed_client.get("/api/economy/approvals").json()["approvals"]
+    assert {r["kind"] for r in rows} == {"theme", "claim"}
+
+
+def test_unified_approvals_is_oldest_first(authed_client, fake_ctx):
+    """A work list: the longest wait is handled next."""
+    _pending_theme(fake_ctx)           # created_at 1000.0
+    _pending_claim(fake_ctx)           # created_at  900.0
+    rows = authed_client.get("/api/economy/approvals").json()["approvals"]
+    assert [r["kind"] for r in rows] == ["claim", "theme"]
+
+
+def test_unified_approvals_returns_user_ids_as_strings(authed_client, fake_ctx):
+    """A Discord id is larger than a JS number holds exactly."""
+    _pending_theme(fake_ctx, user_id=1526000000000000013)
+    row = authed_client.get("/api/economy/approvals").json()["approvals"][0]
+    assert row["user_id"] == "1526000000000000013"
+
+
+def test_unified_approvals_never_renders_a_bare_id_as_the_name(
+    authed_client, fake_ctx
+):
+    """resolve_names falls back to "User <id>" so the panel can't print a raw int."""
+    _pending_theme(fake_ctx, user_id=777)
+    row = authed_client.get("/api/economy/approvals").json()["approvals"][0]
+    assert row["user_name"]
+
+
+def test_unified_approvals_rejects_an_unauthenticated_caller(fake_ctx):
+    client = TestClient(
+        create_app(fake_ctx, auth=DiscordOAuthAuth("s", fake_ctx.guild_id)),
+        raise_server_exceptions=False,
+    )
+    assert client.get("/api/economy/approvals").status_code in (401, 403)
+
+
+def test_unified_approvals_rejects_a_plain_member(fake_ctx):
+    client = _non_admin_client(fake_ctx)
+    assert client.get("/api/economy/approvals").status_code == 403
+
+
+def test_shop_orders_admit_the_economy_manager_role(fake_ctx):
+    """Widened from admin-only 2026-09-03.
+
+    The orders queue sits on shop-approvals, which is deliberately NOT
+    adminOnly, so an admin-only gate rendered a permissions error box exactly
+    where the orders should have been. Asserting on the resolved dependency
+    rather than a live 200, because a manager session needs a configured
+    manager role and this file has no fixture for one — what matters is that
+    the route no longer demands the admin bit.
+    """
+    import inspect
+
+    from web_server.deps import require_economy_manager
+    from web_server.routes import economy as economy_routes
+
+    for fn in (economy_routes.list_shop_orders, economy_routes.refund_shop_order):
+        deps = [
+            p.default.dependency
+            for p in inspect.signature(fn).parameters.values()
+            if hasattr(p.default, "dependency")
+        ]
+        assert require_economy_manager in deps, fn.__name__
+
+
+@pytest.mark.parametrize(
+    "body, redraws",
+    [
+        pytest.param({"qotd_spicy_role_id": "1470999999999999999"}, True, id="spicy-role"),
+        pytest.param({"qotd_ping_role_id": "1470999999999999877"}, False, id="regular-role"),
+    ],
+)
+def test_saving_the_spicy_qotd_role_redraws_the_mod_settings_panel(
+    authed_client, fake_ctx, body, redraws
+):
+    """The spicy role is half of what offers Staff · Spicy QOTD, so saving it
+    pokes the posted Mod Settings panel like the deadline save does."""
+    fake_ctx.bot = MagicMock()
+    assert authed_client.put("/api/economy/config", json=body).status_code == 200
+    calls = [
+        c.args for c in fake_ctx.bot.dispatch.call_args_list
+        if c.args[0] == "staff_pings_config_change"
+    ]
+    assert calls == ([("staff_pings_config_change", fake_ctx.guild_id)] if redraws else [])
+    got = authed_client.get("/api/economy/config").json()
+    for key, value in body.items():
+        assert got[key] == value
+
+
+@pytest.mark.parametrize(
+    "stored, body, ok",
+    [
+        pytest.param({}, {"qotd_ping_role_id": "11", "qotd_spicy_role_id": "11"}, False,
+                     id="same-in-one-save"),
+        pytest.param({"qotd_ping_role_id": "11"}, {"qotd_spicy_role_id": "11"}, False,
+                     id="spicy-matches-stored-regular"),
+        pytest.param({"qotd_spicy_role_id": "11"}, {"qotd_ping_role_id": "11"}, False,
+                     id="regular-matches-stored-spicy"),
+        pytest.param({}, {"qotd_ping_role_id": "11", "qotd_spicy_role_id": "12"}, True,
+                     id="different-roles"),
+        pytest.param({}, {"qotd_ping_role_id": "0", "qotd_spicy_role_id": "0"}, True,
+                     id="both-none"),
+    ],
+)
+def test_one_role_cannot_be_both_qotd_roles(authed_client, fake_ctx, stored, body, ok):
+    if stored:
+        assert authed_client.put("/api/economy/config", json=stored).status_code == 200
+    resp = authed_client.put("/api/economy/config", json=body)
+    assert resp.status_code == (200 if ok else 422)
+    if not ok:
+        # Refused whole: nothing in the body was written.
+        got = authed_client.get("/api/economy/config").json()
+        for key in body:
+            assert got[key] == stored.get(key, "0")

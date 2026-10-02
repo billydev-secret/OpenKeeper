@@ -1,0 +1,773 @@
+"""The one piece of `/ask` glue that is itself a control, not just wiring.
+
+The Apply click is documented as the prompt-injection defence, so the admin has
+to be able to read the whole of what they are confirming. The button label
+truncates at 80 characters and the embed description is the model's own prose —
+so the proposal fields the cog appends are the only complete, non-model-authored
+account of a pending write. Everything else in this cog is exercised through
+the service layer.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.advisor import cog as advisor_cog
+from bot_modules.advisor import chat_logic as advisor_chat_logic
+from bot_modules.advisor.cog import _proposal_fields
+
+from bot_modules.advisor.actions import ConfigProposal
+from bot_modules.advisor.service import AdvisorResult, disclosure_line
+@pytest.fixture(autouse=True)
+def _fresh_cooldown():
+    """Every test starts with an empty rate-limit bucket.
+
+    /ask, the Ask panel and Reply now share one per-member bucket (three doors,
+    one billed brain), so without this the first /ask test cools the member down
+    for the next one — module state leaking between tests as a spurious refusal.
+    """
+    advisor_cog._REPLY_COOLDOWN._last.clear()
+    advisor_cog._chat_gen.clear()
+    yield
+    advisor_cog._REPLY_COOLDOWN._last.clear()
+    advisor_cog._chat_gen.clear()
+
+
+# Taken before the autouse fixture below stubs it, for the one test of the read.
+_REAL_DAILY_CAP = advisor_cog._daily_cap
+
+
+@pytest.fixture(autouse=True)
+def _no_daily_cap(monkeypatch):
+    """The daily cap reads the guild's dial from the DB, which these mocked
+    interactions don't have; its own tests below set a cap explicitly."""
+    monkeypatch.setattr(advisor_chat_logic, "DAILY_ASK_CAP", advisor_chat_logic.DailyAskCap())
+    monkeypatch.setattr(advisor_cog, "_daily_cap", lambda _i: 0)
+
+
+
+def _embed():
+    return discord.Embed(title="🤖 Billy-bot", description="Sure, here you go.")
+
+
+def test_full_value_is_disclosed_even_when_the_button_label_truncates():
+    long_value = "Welcome to the NSFW side {member}! " + "please read the rules " * 7
+    prop = ConfigProposal(
+        key="grant_message",
+        value=long_value,
+        display=f"NSFW grant message → {long_value}",
+        target="grant_role",
+        grant_name="nsfw",
+    )
+    embed = _embed()
+    _proposal_fields(embed, [prop])
+
+    button_label = f"Apply: {prop.display}"[:80]
+    assert long_value not in button_label  # the gap this closes
+
+    field = embed.fields[0]
+    assert long_value in field.value
+    assert "nsfw role grant" in field.value
+    assert "grant_message" in field.value
+
+
+def test_every_queued_proposal_gets_its_own_field():
+    props = [
+        ConfigProposal("welcome_channel_id", "1", "Welcome channel → #welcome"),
+        ConfigProposal("welcome_ping_member", "1", "Ping the new member → on"),
+    ]
+    embed = _embed()
+    _proposal_fields(embed, props)
+
+    assert len(embed.fields) == 2
+    assert "Welcome channel → #welcome" in embed.fields[0].value
+    assert "Ping the new member → on" in embed.fields[1].value
+    # A config-table change says so, so "grant" in a field means a grant.
+    assert "server setting" in embed.fields[0].value
+
+
+def test_disclosure_never_exceeds_discord_field_limits():
+    props = [
+        ConfigProposal(f"k{i}", "v", "L → " + "x" * 400) for i in range(6)
+    ]
+    embed = _embed()
+    _proposal_fields(embed, props)
+
+    assert len(embed.fields) == 4  # _MAX_PROPOSALS — same slice the view takes
+    assert all(len(f.value) <= 1024 for f in embed.fields)
+
+
+# ── public posting: the gate on what reaches the channel ────────────────────
+#
+# The public path is the second control in this cog. Everything a mod can see
+# that the room can't — staff channel names and topics, live settings, Apply
+# buttons — has to be stripped *before* the answer is generated, so these
+# assert on what the cog hands the service, not on the prose that comes back.
+
+
+def _member(**perms):
+    m = MagicMock(spec=discord.Member)
+    m.id = 7
+    m.display_name = "Mod Molly"
+    m.guild_permissions = discord.Permissions(**perms)
+    return m
+
+
+def _interaction(user):
+    i = MagicMock(spec=discord.Interaction)
+    i.user = user
+    i.guild = MagicMock(spec=discord.Guild, id=123)
+    i.channel = MagicMock(spec=discord.TextChannel, id=456, name="general")
+    i.response = MagicMock()
+    i.response.defer = AsyncMock()
+    i.followup = MagicMock()
+    i.followup.send = AsyncMock()
+    i.response.edit_message = AsyncMock()
+    i.edit_original_response = AsyncMock()
+    return i
+
+
+def _cog():
+    ctx = MagicMock()
+    ctx.db_path = ":memory:"
+    return SimpleNamespace(bot=SimpleNamespace(ctx=ctx))
+
+
+@contextlib.contextmanager
+def _patched(monkeypatch, *, answer="1. Run /daily.\n2. Spend it.", ok=True):
+    """Everything around the ask, with both guild toggles ON.
+
+    Context and tools enabled is the worst case for a public post: it's the
+    configuration where a private ask *would* get the admin path.
+    """
+    mod = advisor_cog
+    monkeypatch.setattr(mod, "open_db", lambda p: contextlib.nullcontext(object()))
+    monkeypatch.setattr(mod, "resolve_advisor_model", lambda *a, **k: "model-x")
+    monkeypatch.setattr(mod, "resolve_assistant_name_conn", lambda *a, **k: "Billy-bot")
+    monkeypatch.setattr(mod, "get_advisor_context_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "get_advisor_tools_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "safe_resolve_accent", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "build_asker_context", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(mod, "_make_tools", MagicMock(name="_make_tools"))
+    monkeypatch.setattr(
+        mod, "answer_advisor", AsyncMock(return_value=AdvisorResult(ok, answer))
+    )
+    yield mod
+
+
+async def test_public_ask_is_refused_for_a_plain_member(monkeypatch):
+    """The refusal lands before the model call — nothing is generated, and the
+    member is told how to get their answer privately instead."""
+    with _patched(monkeypatch) as mod:
+        interaction = _interaction(_member())
+        await mod.AdvisorCog.ask.callback(
+            _cog(), interaction, "how do I earn coins?", public=True
+        )
+    mod.answer_advisor.assert_not_awaited()
+    msg = interaction.followup.send.await_args.args[0]
+    assert "Only mods" in msg
+    assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
+async def test_public_ask_drops_tools_and_the_askers_own_context(monkeypatch):
+    """Even for an administrator with both toggles on: an answer the room will
+    read is built at @everyone visibility, with no config tools behind it."""
+    with _patched(monkeypatch) as mod:
+        interaction = _interaction(_member(administrator=True))
+        await mod.AdvisorCog.ask.callback(
+            _cog(), interaction, "how do I earn coins?", public=True
+        )
+
+    mod._make_tools.assert_not_called()  # so no Apply button can exist
+    kwargs = mod.answer_advisor.await_args.kwargs
+    assert kwargs["tools"] is None
+    assert kwargs["public_tutorial"] is True
+
+    ctx_call = mod.build_asker_context.call_args
+    assert ctx_call.args[1] is None  # viewer=None → @everyone visibility
+    assert ctx_call.kwargs["include_config"] is False
+
+
+async def test_private_ask_still_gets_the_admin_path(monkeypatch):
+    """The public branch must not have taken the config tools away from a
+    normal admin ask."""
+    with _patched(monkeypatch) as mod:
+        interaction = _interaction(_member(administrator=True))
+        await mod.AdvisorCog.ask.callback(_cog(), interaction, "is welcome on?")
+
+    mod._make_tools.assert_called_once()
+    kwargs = mod.answer_advisor.await_args.kwargs
+    assert kwargs["public_tutorial"] is False
+    assert mod.build_asker_context.call_args.args[1] is not None  # the asker
+
+
+async def test_public_ask_previews_instead_of_posting(monkeypatch):
+    """Nothing reaches the channel from the command itself — the mod gets an
+    ephemeral preview carrying the Post button."""
+    with _patched(monkeypatch) as mod:
+        interaction = _interaction(_member(manage_messages=True))
+        await mod.AdvisorCog.ask.callback(
+            _cog(), interaction, "how do I earn coins?", public=True
+        )
+
+    interaction.channel.send.assert_not_called()
+    kwargs = interaction.followup.send.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert isinstance(kwargs["view"], advisor_cog._PublicPostView)
+    assert kwargs["embed"].title == "🤖 how do I earn coins?"
+
+
+async def test_a_failed_answer_is_never_offered_for_posting(monkeypatch):
+    """An 'I couldn't reach the model' notice must not come with a Post button."""
+    with _patched(monkeypatch, answer="I couldn't reach Billy-bot", ok=False) as mod:
+        interaction = _interaction(_member(manage_messages=True))
+        await mod.AdvisorCog.ask.callback(
+            _cog(), interaction, "how do I earn coins?", public=True
+        )
+    assert "view" not in interaction.followup.send.await_args.kwargs
+
+
+async def test_post_button_publishes_the_previewed_embed(monkeypatch):
+    """What posts is the object that was previewed — not a re-render, and not
+    a re-run of the model."""
+    channel = MagicMock(spec=discord.TextChannel, name="general")
+    channel.send = AsyncMock()
+    embed = advisor_cog._answer_embed(
+        question="how do I earn coins?",
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+        asker=_member(),
+    )
+    view = advisor_cog._PublicPostView(channel=channel, embed=embed, asker_id=7)
+    interaction = _interaction(_member(manage_messages=True))
+
+    await view.post.callback(interaction)
+
+    assert channel.send.await_args.kwargs["embed"] is embed
+    assert channel.send.await_args.kwargs["allowed_mentions"].everyone is False
+    assert all(c.disabled for c in view.children)
+    # Acknowledged before the send, so a slow channel can't blow the 3s window.
+    interaction.response.defer.assert_awaited_once()
+    assert "Posted" in interaction.edit_original_response.await_args.kwargs["content"]
+
+
+async def test_post_button_survives_a_missing_permission(monkeypatch):
+    """A channel the bot can't write in says so, instead of raising into the
+    generic error handler and looking like the answer was lost."""
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(status=403), "nope")
+    )
+    view = advisor_cog._PublicPostView(
+        channel=channel, embed=discord.Embed(title="x"), asker_id=7
+    )
+    interaction = _interaction(_member(manage_messages=True))
+
+    await view.post.callback(interaction)
+
+    content = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "can't post" in content
+    assert all(c.disabled for c in view.children)
+
+
+async def test_only_the_asker_can_press_post():
+    view = advisor_cog._PublicPostView(
+        channel=MagicMock(), embed=discord.Embed(title="x"), asker_id=7
+    )
+    someone_else = _member(administrator=True)
+    someone_else.id = 99
+    interaction = _interaction(someone_else)
+    interaction.response.send_message = AsyncMock()
+    interaction.response.is_done = MagicMock(return_value=False)  # a fresh press
+
+    assert await view.interaction_check(interaction) is False
+    assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True
+
+
+def test_the_question_titles_every_answer():
+    """Public or private, the card says what it is answering."""
+    private = advisor_cog._answer_embed(
+        question="how do I earn coins?",
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+    )
+    assert private.title == "🤖 how do I earn coins?"
+    # The one-shot answer is a chat session of its own, so the AUP disclosure
+    # rides its footer too — the same sentence as the panel and chat window.
+    assert private.footer.text == disclosure_line("Billy-bot")
+    assert "/ask" not in private.description  # no nudge on a private reply
+
+    public = advisor_cog._answer_embed(
+        question="how do I earn coins?",
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+        asker=_member(),
+    )
+    assert public.footer.text == f"Asked by Mod Molly • {disclosure_line('Billy-bot')}"
+    assert "Ask your own question with `/ask`." in public.description
+
+
+def test_a_long_question_fits_discords_title_cap():
+    embed = advisor_cog._answer_embed(
+        question="how do I " + "really " * 60 + "earn coins?",
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+    )
+    assert len(embed.title) <= 256
+    assert embed.title.endswith("…")
+
+
+def test_a_markdown_dense_question_title_is_escaped_before_its_cut():
+    """/ask's question option has no max_length, so a member can hand
+    ``_answer_embed`` a title-worth of pure markdown. escape_markdown can
+    DOUBLE that text (every ``_ \\ ~ | * ` `` becomes a two-char escape
+    pair), which turned the old ``title[:255]`` — a slice of the
+    already-escaped string — into a cut that could land inside a pair and
+    leave a bare backslash right before the appended ellipsis. Escaping
+    first and fitting second (``escape_to_fit``) is the only order that
+    can't split a pair, however markdown-dense the question is.
+    """
+    embed = advisor_cog._answer_embed(
+        question="*" * 4000,
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+    )
+    assert embed.title is not None
+    assert len(embed.title) <= 256, (
+        f"title is {len(embed.title)} chars, over Discord's 256-char embed "
+        "title cap — an over-long title reaches the API and 400s the whole embed"
+    )
+    assert not embed.title.rstrip("…").endswith("\\")
+    assert "\\*" in embed.title  # it was really escaped, not just truncated
+
+    # A future "simplification" that truncates instead of escaping would let
+    # the member's own markdown render as formatting in the title.
+    styled = advisor_cog._answer_embed(
+        question="**bold** __underline__",
+        answer="1. Run /daily.",
+        assistant_name="Billy-bot",
+        color=None,
+    )
+    assert "**bold**" not in styled.title
+    assert "bold" in styled.title
+
+
+async def test_public_ask_is_refused_where_the_mod_cannot_speak(monkeypatch):
+    """A read-only #rules is exactly the channel a mod can see but shouldn't
+    post in — the bot must not be the way round that."""
+    with _patched(monkeypatch) as mod:
+        interaction = _interaction(_member(manage_messages=True))
+        interaction.channel.permissions_for = MagicMock(
+            return_value=discord.Permissions(send_messages=False)
+        )
+        await mod.AdvisorCog.ask.callback(
+            _cog(), interaction, "how do I earn coins?", public=True
+        )
+    mod.answer_advisor.assert_not_awaited()
+    assert "can't post in this channel" in interaction.followup.send.await_args.args[0]
+
+
+async def test_post_button_ignores_a_second_press():
+    """The buttons stay live in the client until the edit lands, so an
+    impatient double-click would otherwise post the tutorial twice."""
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    view = advisor_cog._PublicPostView(
+        channel=channel, embed=discord.Embed(title="x"), asker_id=7
+    )
+    interaction = _interaction(_member(manage_messages=True))
+
+    await view.post.callback(interaction)
+    await view.post.callback(interaction)
+
+    assert channel.send.await_count == 1
+
+
+async def test_post_button_rechecks_the_mod_power_at_click_time():
+    """A mod stripped of their role mid-preview holds a live Post button for
+    the rest of the window otherwise — the Apply buttons re-check too."""
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    view = advisor_cog._PublicPostView(
+        channel=channel, embed=discord.Embed(title="x"), asker_id=7
+    )
+    demoted = _member()  # same person, no powers left
+    interaction = _interaction(demoted)
+
+    await view.post.callback(interaction)
+
+    channel.send.assert_not_called()
+    assert "no longer" in interaction.response.edit_message.await_args.kwargs["content"]
+    assert all(c.disabled for c in view.children)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "dispatched", "invalidated"),
+    [
+        pytest.param("whisper", True, True, id="applied-change-wakes-the-feature-cog"),
+        pytest.param(None, False, True, id="grant-role-write-has-no-listener"),
+        pytest.param(ValueError("gone"), False, False, id="refused-change-dispatches-nothing"),
+    ],
+)
+async def test_apply_click_dispatches_the_feature_config_change(
+    monkeypatch, outcome, dispatched, invalidated
+):
+    """The dashboard's PUT dispatches ``<feature>_config_change`` so cogs that
+    cache config at boot (the whisper launcher's known-guild set) pick a new
+    channel up without a restart. An advisor Apply is the same write through
+    a different door, so it has to send the same signal — and drop the bot's
+    cached ``GuildConfig``, which holds welcome/leave/greeter/mod-channel keys
+    the advisor can set and every grant role. Without it the bot kept the old
+    value until the next restart."""
+    mod = advisor_cog
+    applied = MagicMock(
+        side_effect=outcome if isinstance(outcome, Exception) else None,
+        return_value=outcome,
+    )
+    monkeypatch.setattr(mod, "apply_config_change", applied)
+    monkeypatch.setattr(mod, "can_see_config", lambda m: True)
+    monkeypatch.setattr(mod, "is_server_admin", lambda m: True)
+    bot = MagicMock()
+    guild = MagicMock(spec=discord.Guild, id=123)
+    prop = ConfigProposal("whisper_channel_id", "456", "Whisper channel → #w")
+    view = mod._ApplyConfigView(bot, ":memory:", guild, [prop])
+
+    await view.children[0].callback(_interaction(_member(administrator=True)))
+
+    applied.assert_called_once()
+    if invalidated:
+        bot.ctx.invalidate_guild_config.assert_called_once_with(123)
+    else:
+        bot.ctx.invalidate_guild_config.assert_not_called()
+    if dispatched:
+        bot.dispatch.assert_called_once_with("whisper_config_change", 123)
+    else:
+        bot.dispatch.assert_not_called()
+
+# ── Ask panel: the chat window's glue ────────────────────────────────
+#
+# The transcript logic itself is covered in tests/advisor/test_advisor_chat_logic.py.
+# What can only break *here* is the seam: the logic renders (name, value)
+# pairs, but what a Reply click actually reads back is a real
+# ``discord.Embed``'s fields. If those two ever stop lining up, the model
+# silently receives a different conversation from the one on screen.
+
+
+def test_the_chat_embed_reads_back_as_the_conversation_it_drew():
+    history = [
+        {"role": "user", "content": "how do I earn coins?"},
+        {"role": "assistant", "content": "Chatting earns XP, paid out daily."},
+        {"role": "user", "content": "and the casino?"},
+        {"role": "assistant", "content": "`/casino` has three games."},
+    ]
+
+    embed = advisor_cog._chat_embed(history, "Billy-bot", None)
+    read_back = advisor_chat_logic.history_from_fields(
+        [(f.name, f.value) for f in embed.fields]
+    )
+
+    assert read_back == history
+
+
+async def test_the_chat_hands_the_model_the_words_the_member_actually_typed(
+    monkeypatch,
+):
+    """The deliberate anomaly: the Ask *chat* does not escape markdown, and a
+    cleanup pass that "fixes" that to match the rest of the bot breaks the
+    model's copy of the question.
+
+    The transcript is the store here — an ephemeral message has no id, so the
+    rendered fields are read back as ``history`` on the next reply — which
+    means one string has to serve both the member's eyes and the model's
+    prompt. Escaping it sends ``\\*\\*bold\\*\\*`` to a model that was asked
+    about **bold**, and escaping at render instead compounds a backslash per
+    turn. Raw wins because the cost is confined: this window is ephemeral and
+    only its author reads it. Assert both halves — what the model got, and
+    that two turns round-trip byte-identical.
+    """
+    with _patched(monkeypatch, answer="**bold** reply") as mod:
+        first = _interaction(_member())
+        first.client = _cog().bot
+        modal = mod._AskModal(history=None)
+        modal.question._value = "how do I write **bold** text?"
+        await modal.on_submit(first)
+        # The prompt the model saw — no backslashes the member didn't type.
+        assert mod.answer_advisor.await_args.args[0] == (
+            "how do I write **bold** text?"
+        )
+
+    embed = first.followup.send.await_args.kwargs["embed"]
+    assert [f.value for f in embed.fields] == [
+        "how do I write **bold** text?",
+        "**bold** reply",
+    ]
+
+    history = advisor_chat_logic.history_from_fields(
+        [(f.name, f.value) for f in embed.fields]
+    )
+
+    with _patched(monkeypatch, answer="fine") as mod:
+        second = _interaction(_member())
+        second.client = _cog().bot
+        reply_modal = mod._AskModal(history=history)
+        reply_modal.question._value = "and *italic*?"
+        await reply_modal.on_submit(second)
+        # Turn 2 re-sends turn 1 as history; a render-time escape would have
+        # added a backslash to it here, and another on every turn after.
+        assert mod.answer_advisor.await_args.args[1] == history
+
+    reply_embed = second.edit_original_response.await_args.kwargs["embed"]
+    assert [f.value for f in reply_embed.fields] == [
+        "how do I write **bold** text?",
+        "**bold** reply",
+        "and *italic*?",
+        "fine",
+    ]
+
+
+def test_the_chat_footer_never_loses_the_grounding_caveat():
+    """It is the only place the member is told the answer can be wrong — and
+    (AUP) the only place every chat turn is told the assistant is AI, not a
+    person, since the panel embed with that disclosure isn't shown again once
+    the chat is open."""
+    embed = advisor_cog._chat_embed(
+        [{"role": "user", "content": "hi"}], "Billy-bot", None
+    )
+
+    assert "can make mistakes" in (embed.footer.text or "")
+    assert disclosure_line("Billy-bot") in (embed.footer.text or "")
+
+
+def test_the_ask_panel_footer_carries_the_ai_disclosure():
+    """The panel is the very first thing a member sees before opening a chat,
+    so the AUP-required AI/human disclosure has to be on it too, not just on
+    the chat window it opens."""
+    embed = advisor_cog._ask_panel_embed("Billy-bot", None)
+
+    assert embed.footer.text == disclosure_line("Billy-bot")
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_reply_is_disabled_exactly_when_the_chat_is_spent(full):
+    view = advisor_cog._ChatView(7, full=full)
+
+    reply = view.children[0]
+    assert reply.custom_id == "advisor_chat:reply:7"
+    assert reply.item.disabled is full  # DynamicItem wraps the button
+
+
+async def test_the_panel_posts_a_button_that_survives_a_restart(monkeypatch):
+    """A stateless custom_id is what lets an already-posted panel keep working
+    after a restart — nothing about the panel is stored anywhere."""
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    guild = MagicMock(spec=discord.Guild, id=123)
+    cog = advisor_cog.AdvisorCog.__new__(advisor_cog.AdvisorCog)
+    cog.bot = SimpleNamespace(ctx=MagicMock(db_path=":memory:"))
+    monkeypatch.setattr(
+        advisor_cog, "safe_resolve_accent", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        advisor_cog, "open_db", lambda p: contextlib.nullcontext(object())
+    )
+    monkeypatch.setattr(
+        advisor_cog, "resolve_assistant_name_conn", lambda *a, **k: "Billy-bot"
+    )
+
+    await cog.post_ask_panel(guild, channel)
+
+    view = channel.send.await_args.kwargs["view"]
+    assert [c.custom_id for c in view.children] == ["advisor_panel:ask"]
+    assert "Billy-bot" in channel.send.await_args.kwargs["embed"].title
+
+
+async def test_opening_a_fresh_chat_is_rate_limited_like_replying(monkeypatch):
+    """Regression: the panel button used to go straight to the modal.
+
+    Guarding only Reply leaves the guard unarmed on the path members actually
+    use — MAX_EXCHANGES caps one window, and a new window is one click away, so
+    a member could open chat after chat as fast as they could type, each one a
+    billed call carrying the whole manual.
+    """
+    monkeypatch.setattr(
+        advisor_cog, "_REPLY_COOLDOWN", advisor_chat_logic.ReplyCooldown()
+    )
+    button = advisor_cog.AskPanelButton()
+    first, second = _interaction(_member()), _interaction(_member())
+    for i in (first, second):
+        i.response.send_modal = AsyncMock()
+        i.response.send_message = AsyncMock()
+
+    await button.callback(first)
+    await button.callback(second)
+
+    first.response.send_modal.assert_awaited_once()
+    second.response.send_modal.assert_not_called()
+    assert "sec" in second.response.send_message.await_args.args[0]
+
+
+async def test_the_two_entry_points_share_one_budget(monkeypatch):
+    """Opening a chat and replying inside one are both billed calls, so a
+    member cannot alternate between them to halve the wait."""
+    monkeypatch.setattr(
+        advisor_cog, "_REPLY_COOLDOWN", advisor_chat_logic.ReplyCooldown()
+    )
+    panel = _interaction(_member())
+    panel.response.send_modal = AsyncMock()
+    await advisor_cog.AskPanelButton().callback(panel)
+
+    reply = _interaction(_member())
+    reply.response.send_modal = AsyncMock()
+    reply.response.send_message = AsyncMock()
+    reply.message = MagicMock(embeds=[advisor_cog._chat_embed(
+        [{"role": "user", "content": "hi"}], "Billy-bot", None
+    )])
+
+    await advisor_cog.AskChatReplyButton(7).callback(reply)
+
+    reply.response.send_modal.assert_not_called()
+    assert "sec" in reply.response.send_message.await_args.args[0]
+
+
+async def test_the_daily_cap_refuses_past_the_guilds_limit(monkeypatch):
+    """Row 3.22: the cooldown bounds a member's rate, the cap their total —
+    and it is the same gate every door goes through."""
+    monkeypatch.setattr(advisor_cog, "_daily_cap", lambda _i: 1)
+    # A cooldown that never bites, so only the cap can refuse.
+    monkeypatch.setattr(
+        advisor_cog, "_REPLY_COOLDOWN", advisor_chat_logic.ReplyCooldown(seconds=0)
+    )
+    button = advisor_cog.AskPanelButton()
+    first, second = _interaction(_member()), _interaction(_member())
+    for i in (first, second):
+        i.response.send_modal = AsyncMock()
+        i.response.send_message = AsyncMock()
+
+    await button.callback(first)
+    await button.callback(second)
+
+    first.response.send_modal.assert_awaited_once()
+    second.response.send_modal.assert_not_called()
+    assert "daily limit" in second.response.send_message.await_args.args[0]
+
+
+async def test_a_press_the_cooldown_refuses_does_not_spend_the_allowance(monkeypatch):
+    monkeypatch.setattr(advisor_cog, "_daily_cap", lambda _i: 5)
+    button = advisor_cog.AskPanelButton()
+    for _ in range(3):
+        i = _interaction(_member())
+        i.response.send_modal = AsyncMock()
+        i.response.send_message = AsyncMock()
+        await button.callback(i)
+    assert advisor_chat_logic.DAILY_ASK_CAP._used == {(123, 7): 1}
+
+
+def test_the_cap_is_read_from_the_guilds_dial(tmp_path):
+    from db_template import migrated_db
+
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.advisor.service import set_advisor_daily_cap
+
+    db = migrated_db(tmp_path / "t.db")
+    with open_db(db) as conn:
+        set_advisor_daily_cap(conn, 12, 123)
+    i = _interaction(_member())
+    i.client = SimpleNamespace(ctx=SimpleNamespace(db_path=db))
+    assert _REAL_DAILY_CAP(i) == 12
+
+
+# ── Ask chat: two races on one window ─────────────────────────────────
+#
+# The chat's whole state is the message, so anything that writes the window
+# after a slow answer can undo work it never saw. Both of these were found in
+# review, and both are about the *seconds* an answer takes.
+
+
+def test_ending_a_chat_supersedes_an_answer_already_being_written():
+    """End chat must not be undone by a reply that was already in flight.
+
+    The reply's edit targets a message that still exists — clearing it did not
+    delete it — so without a guard the "closed" chat comes back with its
+    transcript and live buttons.
+    """
+    from bot_modules.advisor import cog as advisor_cog
+
+    advisor_cog._chat_gen.clear()
+    at_click = advisor_cog._chat_gen.get(7, 0)
+    advisor_cog._bump_chat_gen(7)  # the End press lands while the answer is written
+    assert advisor_cog._chat_gen.get(7, 0) != at_click
+
+
+def test_a_second_reply_supersedes_the_slower_first_one():
+    """Two replies in flight: the slower must not write over the faster.
+
+    Each carries the pre-edit transcript it read at click time, so the loser
+    would otherwise paste a history that is missing the winner's turn.
+    """
+    from bot_modules.advisor import cog as advisor_cog
+
+    advisor_cog._chat_gen.clear()
+    slow_click = advisor_cog._chat_gen.get(7, 0)
+    fast_click = advisor_cog._chat_gen.get(7, 0)
+    advisor_cog._bump_chat_gen(7)  # the fast reply completes first
+    assert advisor_cog._chat_gen.get(7, 0) == fast_click + 1
+    assert advisor_cog._chat_gen.get(7, 0) != slow_click
+
+
+def test_an_untouched_chat_is_not_treated_as_superseded():
+    """The common case, and what a restart looks like: no entry means proceed."""
+    from bot_modules.advisor import cog as advisor_cog
+
+    advisor_cog._chat_gen.clear()
+    assert advisor_cog._chat_gen.get(7, 0) == 0
+
+
+# ── Ask chat: the ownership gate proves it denies ─────────────────────
+#
+# design_guide.md Part 4: every gate has a test that proves it *denies*. Both
+# buttons carry the asker's id in their custom_id precisely so the check does
+# not rest on the message being ephemeral — which makes this the only thing
+# between a stray click and another member's private conversation.
+
+
+@pytest.mark.asyncio
+async def test_reply_refuses_a_clicker_who_is_not_the_asker():
+    button = advisor_cog.AskChatReplyButton(7)
+    someone_else = _member(administrator=True)
+    someone_else.id = 99
+    interaction = _interaction(someone_else)
+    interaction.response.send_message = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+
+    await button.callback(interaction)
+
+    assert interaction.response.send_modal.await_count == 0
+    assert advisor_cog._CHAT_NOT_YOURS in interaction.response.send_message.await_args.args
+    assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_chat_refuses_a_clicker_who_is_not_the_asker():
+    button = advisor_cog.AskChatEndButton(7)
+    someone_else = _member(administrator=True)
+    someone_else.id = 99
+    interaction = _interaction(someone_else)
+    interaction.response.send_message = AsyncMock()
+    interaction.response.edit_message = AsyncMock()
+
+    await button.callback(interaction)
+
+    # The window is untouched — a foreign click must not close someone's chat.
+    assert interaction.response.edit_message.await_count == 0
+    assert advisor_cog._CHAT_NOT_YOURS in interaction.response.send_message.await_args.args
+    assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True

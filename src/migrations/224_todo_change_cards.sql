@@ -1,0 +1,34 @@
+-- Migration 224: cursors for the todo board's change cards (2026-09-12, todo #210).
+--
+-- The sticky board is edited in place, which is exactly why it was asked for:
+-- an edit does not mark a channel unread, so a change to the board is invisible
+-- until somebody happens to look at it. The fix is to post a small card above
+-- the board when something new lands — a real message, so the channel shows as
+-- modified, and a permanent one, so the channel is also the history.
+--
+-- Two columns, both on the table that already holds one row per guild's board:
+--
+--   change_cursor_at  the created_at high-water mark of what has been
+--                     announced. Everything pending and newer than this is
+--                     what the next card says.
+--   digest_at         when the last noon digest posted, so the recurring-chore
+--                     summary fires once a day and not once a minute.
+--
+-- BOTH ARE NULLABLE AND BOTH SHIP NULL, which is the dark launch. NULL means
+-- "never announced", and the first tick that sees one does NOT announce the
+-- backlog — it writes the clock into the column and says nothing. Without that
+-- rule, turning the dial on in a guild carrying a queue would dump every
+-- pending sign-off into the channel as its first act. The interesting default
+-- is therefore "not configured", not zero: a 0 cursor would read as an epoch
+-- timestamp and mean "announce everything ever".
+--
+-- No dial column here. The on/off switch is the `todo_change_cards` config key
+-- (absent = off), where the dashboard's other per-guild dials live; these two
+-- are runtime state, not configuration, and a mod flipping the dial off and on
+-- again should not lose the cursor.
+--
+-- NOTHING IS BACKFILLED and nothing changes on restart. A guild with no board
+-- posted is never polled at all, and a guild with one gets cards only once an
+-- admin ticks the dial on the Todo panel.
+ALTER TABLE todo_board ADD COLUMN change_cursor_at REAL;
+ALTER TABLE todo_board ADD COLUMN digest_at REAL;

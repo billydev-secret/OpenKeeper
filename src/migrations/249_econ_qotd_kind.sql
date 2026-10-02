@@ -1,0 +1,16 @@
+-- Migration 249: a registered question of the day has a kind (2026-09-30).
+--
+-- Ben: "in the mod settings we have a qotd reminder, can we extend that to
+-- the nsfw qotd?" The server runs a second, spicy QOTD under its own ping
+-- role. A manager tagging that role in an age-gated channel now registers
+-- the message the same way the regular QOTD role does, and replies pay the
+-- same reward. The staff QOTD reminder, and the chore sign-off, have to tell
+-- the two apart, so each registered row says which one it is:
+--
+--   'qotd'   the regular question (every row before this migration)
+--   'spicy'  the spicy question, econ_qotd_spicy_role_id
+--
+-- Live effect on the next restart: none. Every existing row reads 'qotd',
+-- and nothing registers as 'spicy' until the spicy role dial is set on the
+-- dashboard.
+ALTER TABLE econ_qotd ADD COLUMN kind TEXT NOT NULL DEFAULT 'qotd';

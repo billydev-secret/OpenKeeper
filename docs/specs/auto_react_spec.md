@@ -1,0 +1,65 @@
+# Auto React — Feature Spec
+
+Automatically adds a configured set of emoji reactions to image posts in specific channels. Each rule is per-channel: when a non-bot member posts a message containing an image in a channel with an enabled rule, the bot reacts with every emoji in that rule's list. Reactions arrive without anyone lifting a finger and (via the starboard's reaction thresholds) give visual content a head start.
+
+## Commands
+
+None. The feature has no slash commands or context menus. It is a pure `on_message` listener, configured out-of-band (see Configuration).
+
+## Behavior
+
+The listener fires on every message and bails early unless all of the following hold:
+
+- Author is not a bot.
+- Message is in a guild (DMs ignored).
+- Message **contains an image**: an attachment whose `content_type` starts with `image/` (or, when Discord serves it without a `content_type`, whose filename ends in a known image extension), or an embed of type `image`, `gifv`, or `rich` that carries an image or thumbnail. The attachment half is `post_monitoring.attachment_is_image`, the predicate XP uses too. There is no size cap: the 25 MB one belonged to the image classifier, which downloaded what it matched, and went with it (2026-09-15).
+- The channel has a rule row and that rule's `enabled` flag is set. Lookup is exact on `(guild_id, channel_id)`: threads and forum posts don't inherit their parent channel's rule.
+
+When a rule matches, all of its emojis are added concurrently (`asyncio.gather`). A failing emoji (deleted custom emoji, missing Add Reactions permission, invalid string) is logged as a warning and does **not** block the others; each reaction succeeds or fails independently.
+
+Embeds are inspected as they exist at message-creation time. Link previews that Discord attaches to a message afterwards (via message edit) are not seen, so a bare image URL usually won't trigger a reaction; uploaded attachments always will.
+
+### Tipping rules
+
+A rule with `tips_enabled` behaves differently, because in a tipping channel the emoji the bot places are **live payment buttons** ([[economy-spec]]) rather than decoration. Emoji are therefore only placed on a post that qualified:
+
+1. The channel must be **age-gated** (`is_age_gated_channel`: the channel's flag or its category's); Discord's own age gate is the rail. A tipping rule on a non-age-gated channel places nothing at all.
+2. **Attachments only.** Embeds don't qualify (their images live on arbitrary external hosts), so a tipping rule places nothing on an embed-only post, unlike a plain rule.
+
+Nothing about the picture itself is judged: every image attachment in an age-gated tipping channel gets the emoji. There is no image classifier (see [post_monitoring_spec.md](post_monitoring_spec.md)).
+
+When emoji are placed, a **placement receipt** is recorded, listing exactly which emoji were attached. Only emoji named on that receipt can be tipped (the tip path checks the emoji against it, not merely that the message has a receipt), so an emoji that failed to attach can't be hand-placed by a member and charged; see [[economy-spec]]. A receipt failure is logged loudly but never breaks the listener; the post simply isn't tippable.
+
+Rules **without** `tips_enabled` are entirely unaffected by any of the above: same embeds, same channels, no receipts.
+
+## Configuration
+
+Managed through the web dashboard's admin API (admin scope required); there is no in-Discord configuration.
+
+- Current rules are returned in the `auto_react` section of `GET /api/config`, one entry per channel with `channel_id`, `emojis` (list), `enabled`, `tips_enabled`, and `rungs` (a per-emoji price map; an emoji with no rung, or a rung of 0, is placed but free).
+- `PUT /api/config/auto-react/{channel_id}` with body `{"emojis": [...], "enabled": true, "tips_enabled": false, "rungs": {...}}` creates or replaces the channel's rule (upsert; the emoji list is replaced wholesale, not merged). `tips_enabled` defaults to false, so turning a channel into a tipping channel is always an explicit act. `rungs` is optional; when sent, only emoji still in the rule's list keep a price.
+- `DELETE /api/config/auto-react/{channel_id}` removes the rule **and its tip prices**: the rungs go in the same transaction, so a price can't survive as an orphan with no dashboard surface and be inherited by a rule created later for the same channel.
+
+Emojis are free-form strings: Unicode emoji or full custom-emoji syntax (`<:name:id>`). No validation happens at write time; a bad entry simply fails (with a log warning) when a reaction is attempted.
+
+The **Auto-React** panel (Config → Channels & Messages) manages rules: channel picker, comma-separated emoji list, enabled toggle, a tipping toggle, and, when tipping is on, a price field per emoji. The price fields are hidden until tipping is switched on, since they're meaningless otherwise. A rung of 1 is rejected client- and server-side: after the 1-coin minimum rake it would deliver the poster nothing.
+
+Removing an emoji from a rule clears its price, so a dropped emoji can never linger as chargeable.
+
+**Tipping is read at charge time, not stamped on the receipt.** Every tip re-checks that the placement's channel still has a rule and that the rule still has `tips_enabled`, so deleting the rule or unchecking the tipping toggle stops the emoji the bot *already placed* on older posts from charging, not just future ones. Without that check a receipt plus a surviving price would keep an old post a live payment button after an admin believed they had switched tipping off.
+
+## Stored data
+
+One SQLite table, `auto_react_config` (migration `043_auto_react.sql`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `guild_id` | INTEGER | Part of primary key |
+| `channel_id` | INTEGER | Part of primary key |
+| `emojis` | TEXT | Comma-separated emoji list (default `''`) |
+| `enabled` | INTEGER | 1 = active, 0 = paused without deleting the rule (default 1) |
+| `tips_enabled` | INTEGER | 1 = the placed emoji are live tip buttons (default 0, migration `142_auto_react_tips.sql`) |
+
+`auto_react_placements` (migration `142_auto_react_tips.sql`) records what the bot placed on a tipping post: `guild_id`, `channel_id`, `message_id`, `author_id` (the tip recipient, resolved at placement time), the emoji actually attached, and a timestamp. Plain non-tipping rules write nothing here, so no per-message state is stored for them.
+
+The receipt exists rather than checking `reaction.me` on the message because that would cost an API round trip on every reaction event at ~1,050 events/day, and this table doubles as the record of which posts qualified.

@@ -1,0 +1,1132 @@
+"""Tests for games_external.parser — Gamebot CAH + Connect 4 parsing (#70).
+
+Fixtures mirror the real /games track sample: standings (`<@id>: N`),
+submission status (`✅ <@id> Submitted!`), round wins, and the terminal
+`Game over!` embed (`<@id> is the winner!`) for CAH; the join-phase start
+embed, the `Time's up!` recap, and the terminal `Game over!` embed
+(`<@id> has won!`) for Connect 4.
+
+Gamebot rewrote every CAH string on 2026-08-15 and payouts stopped. The
+"format change" section at the bottom covers the new vocabulary alongside the
+old, and runs against two whole real games pulled out of the prod archive
+(`tests/data/gamebot_cah_{old,new}_format.json`) so the shapes are Gamebot's
+rather than our guess at them.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from bot_modules.games.external import parser
+from tests.paths import REPO_ROOT
+
+ALICE, BOB, CAROL = 111, 222, 333
+
+
+def _standings(scores: dict[int, int]) -> dict:
+    desc = "\n".join(f"<@{uid}>: {n}" for uid, n in scores.items())
+    return {"embeds": [{"title": "Current Standings", "description": desc}]}
+
+
+def _submissions(uids: list[int]) -> dict:
+    desc = "\n".join(f"✅ <@{uid}> Submitted!" for uid in uids)
+    return {"embeds": [{"title": "Submission status", "description": desc}]}
+
+
+def _round_win(uid: int) -> dict:
+    return {"embeds": [{"description": (
+        f"The winning card is **Judge Judy.** which belonged to <@{uid}>!\n\n"
+        f"<@{uid}> has earned a point."
+    )}]}
+
+
+def _game_over(winner: int) -> dict:
+    return {"embeds": [{"title": "Game over!", "description": (
+        f"<@{winner}> is the winner!\nVote for Gamebot on top.gg!"
+    )}]}
+
+
+# ── Connect 4 fixtures ─────────────────────────────────────────────────────────
+
+def _c4_start(host: int, joined: list[int]) -> dict:
+    return {"embeds": [{
+        "title": f"host{host} is starting a Connect 4 game!",
+        "description": 'Click "Join" below to join in the next **120 seconds**.',
+        "fields": [{
+            "name": "Joined Players",
+            "value": ", ".join(f"<@{u}>" for u in joined),
+            "inline": False,
+        }],
+    }]}
+
+
+def _c4_times_up(joined: list[int]) -> dict:
+    desc = ", ".join(f"<@{u}>" for u in joined) + " joined the game!"
+    return {"embeds": [{"title": "Time's up!", "description": desc}]}
+
+
+def _c4_move() -> dict:
+    return {"embeds": [{"description": (
+        "First to 4 in a row wins!\n```board```\n<@111> 🔴, select a column between 1-7!"
+    )}]}
+
+
+def _c4_game_over(winner: int) -> dict:
+    return {"embeds": [{"title": "Game over!", "description": f"<@{winner}> has won! ```board```"}]}
+
+
+def test_players_from_standings():
+    embeds = _standings({ALICE: 5, BOB: 1, CAROL: 0})["embeds"]
+    assert parser.players_from_standings(embeds) == {ALICE, BOB, CAROL}
+
+
+def test_scores_from_standings():
+    embeds = _standings({ALICE: 5, BOB: 1, CAROL: 0})["embeds"]
+    assert parser.scores_from_standings(embeds) == {ALICE: 5, BOB: 1, CAROL: 0}
+
+
+def test_players_from_submissions():
+    embeds = _submissions([ALICE, BOB])["embeds"]
+    assert parser.players_from_submissions(embeds) == {ALICE, BOB}
+
+
+def test_winner_and_is_game_over():
+    embeds = _game_over(ALICE)["embeds"]
+    assert parser.winner_from_game_over(embeds) == ALICE
+    assert parser.is_game_over(embeds) is True
+
+
+def test_round_win_is_not_game_over():
+    # A per-round point ("has earned a point") must not end/settle the game.
+    embeds = _round_win(ALICE)["embeds"]
+    assert parser.is_game_over(embeds) is False
+    assert parser.winner_from_game_over(embeds) is None
+
+
+def test_is_terminal_true_for_either_games_over_embed():
+    # Both games share the "Game over!" title — is_terminal is title-only,
+    # unlike is_game_over which is CAH's "is the winner" phrasing specifically.
+    assert parser.is_terminal(_game_over(ALICE)["embeds"]) is True
+    assert parser.is_terminal(_c4_game_over(ALICE)["embeds"]) is True
+    assert parser.is_terminal(_round_win(ALICE)["embeds"]) is False
+
+
+def test_is_game_over_does_not_match_connect4s_game_over():
+    # Connect 4's "<@id> has won!" must not be mistaken for CAH's finish.
+    assert parser.is_game_over(_c4_game_over(ALICE)["embeds"]) is False
+
+
+def test_extract_cah_game_unions_roster_and_finds_winner():
+    window = [
+        _submissions([ALICE, BOB, CAROL]),
+        _round_win(BOB),
+        _standings({ALICE: 5, BOB: 1, CAROL: 1}),
+        _game_over(ALICE),
+    ]
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {ALICE: 5, BOB: 1, CAROL: 1}
+    assert winners == [ALICE]
+
+
+def test_extract_cah_game_last_standings_supersedes_earlier_ones():
+    # Current Standings is a cumulative snapshot each time — later posts
+    # replace earlier scores for the same player rather than merging with them.
+    window = [
+        _standings({ALICE: 2, BOB: 0}),
+        _standings({ALICE: 5, BOB: 1}),
+        _game_over(ALICE),
+    ]
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {ALICE: 5, BOB: 1}
+    assert winners == [ALICE]
+
+
+def test_extract_cah_game_submission_only_player_folded_in_at_zero():
+    # A player who submitted before the first standings post (or left before
+    # any standings) still counts as having played, at score 0.
+    window = [
+        _submissions([ALICE, BOB, CAROL]),
+        _standings({ALICE: 3, BOB: 1}),
+        _game_over(ALICE),
+    ]
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {ALICE: 3, BOB: 1, CAROL: 0}
+    assert winners == [ALICE]
+
+
+def test_current_game_window_bounds_on_previous_game_over():
+    # Two back-to-back games in one channel; the second must not inherit the
+    # first's roster.
+    DAVE = 444
+    parsed = [
+        _standings({ALICE: 5, BOB: 3}),   # 0: game A
+        _game_over(ALICE),                # 1: game A ends
+        _standings({CAROL: 5, DAVE: 2}),  # 2: game B
+        _game_over(CAROL),                # 3: game B ends
+    ]
+    window = parser.current_game_window(parsed, over_index=3)
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {CAROL: 5, DAVE: 2}
+    assert winners == [CAROL]
+
+
+def test_undeclared_winner_is_derived_from_the_top_score():
+    # No *Game over!* to name one — the case every post-2026-08-15 game is in,
+    # since Gamebot stopped declaring a winner. Top of the standings wins.
+    scores, winners = parser.extract_cah_game([_standings({ALICE: 5, BOB: 2})])
+    assert scores == {ALICE: 5, BOB: 2}
+    assert winners == [ALICE]
+
+
+def test_a_tied_lead_makes_every_tied_player_a_winner():
+    # CAH is first-to-N, so a game that finishes has a unique leader; a tie is
+    # what a game Gamebot dropped part-way leaves behind. Billy's call
+    # (2026-08-16): they all take the cap. The payout faucet already accepts a
+    # collection of winner ids, so this needs no special-casing downstream.
+    scores, winners = parser.extract_cah_game([_standings({ALICE: 3, BOB: 3, CAROL: 1})])
+    assert scores == {ALICE: 3, BOB: 3, CAROL: 1}
+    assert winners == [ALICE, BOB]
+
+
+def test_a_declared_winner_beats_the_top_score():
+    # Old format only. If Gamebot named someone, take its word rather than
+    # re-deriving — the standings can lag the final round.
+    window = [_standings({ALICE: 5, BOB: 4}), _game_over(BOB)]
+    _scores, winners = parser.extract_cah_game(window)
+    assert winners == [BOB]
+
+
+def test_nobody_wins_a_game_where_no_round_was_played():
+    # An all-zero standings is not a ten-way tie for first — a game that died
+    # before anyone took a point has no winner to pay a win bonus to.
+    scores, winners = parser.extract_cah_game([_standings({ALICE: 0, BOB: 0})])
+    assert scores == {ALICE: 0, BOB: 0}
+    assert winners == []
+
+
+# ── Connect 4 (#70 follow-up) ──────────────────────────────────────────────────
+
+def test_players_from_connect4_start_reads_joined_players_field():
+    embeds = _c4_start(999, [ALICE, BOB])["embeds"]
+    assert parser.players_from_connect4_start(embeds) == {ALICE, BOB}
+
+
+def test_players_from_connect4_start_reads_times_up_recap():
+    embeds = _c4_times_up([ALICE, BOB])["embeds"]
+    assert parser.players_from_connect4_start(embeds) == {ALICE, BOB}
+
+
+def test_players_from_connect4_ignores_unrelated_embeds():
+    # A move embed mentions the current player, but that's not a join signal.
+    assert parser.players_from_connect4_start(_c4_move()["embeds"]) == set()
+
+
+def test_winner_from_connect4_over():
+    embeds = _c4_game_over(ALICE)["embeds"]
+    assert parser.winner_from_connect4_over(embeds) == ALICE
+
+
+def test_extract_connect4_game_unions_roster_and_finds_winner():
+    window = [
+        _c4_start(999, [ALICE, BOB]),
+        _c4_times_up([ALICE, BOB]),
+        _c4_move(),
+        _c4_game_over(ALICE),
+    ]
+    roster, winner = parser.extract_connect4_game(window)
+    assert roster == {ALICE, BOB}
+    assert winner == ALICE
+
+
+def test_extract_connect4_game_folds_in_absent_winner():
+    roster, winner = parser.extract_connect4_game([_c4_game_over(ALICE)])
+    assert roster == {ALICE}
+    assert winner == ALICE
+
+
+def test_extract_connect4_game_unrecognised_finish_pays_participation_only():
+    # A draw's exact wording isn't confirmed yet — an unmatched "Game over!"
+    # must still credit the roster, just with no winner.
+    window = [
+        _c4_start(999, [ALICE, BOB]),
+        {"embeds": [{"title": "Game over!", "description": "It's a draw! ```board```"}]},
+    ]
+    roster, winner = parser.extract_connect4_game(window)
+    assert roster == {ALICE, BOB}
+    assert winner is None
+
+
+def test_current_game_window_bounds_across_mixed_game_types():
+    # A CAH game ends, then a Connect 4 game starts and ends in the same
+    # channel (same Gamebot account) — the Connect 4 window must not reach
+    # back into the CAH game's roster.
+    parsed = [
+        _standings({ALICE: 5, BOB: 3}),  # 0: CAH game A
+        _game_over(ALICE),               # 1: CAH game A ends
+        _c4_start(999, [BOB, CAROL]),    # 2: Connect 4 game B
+        _c4_game_over(BOB),              # 3: Connect 4 game B ends
+    ]
+    window = parser.current_game_window(parsed, over_index=3)
+    roster, winner = parser.extract_connect4_game(window)
+    assert roster == {BOB, CAROL}
+    assert winner == BOB
+
+
+# ── Cat Bot (#65) ─────────────────────────────────────────────────────────────
+
+_CATCH = (
+    "floorlampbeta cought <:nicecat:1279999999999999478> Nice cat!!!!1!\n"
+    "You now have 208 cats of dat type!!!\n"
+    "this fella was cought in 2 minutes 7.00 seconds!!!!"
+)
+_CATCH_DOUBLED = (
+    "hostowl cought <:wildcat:1279999999999999750> Wild cat!!!!1!\n"
+    "You now have 138 cats of dat type!!!\n"
+    "this fella was cought in 6 minutes 33.05 seconds!!!!\n"
+    "💫 rkay_41 blessed your catch and it got doubled!"
+)
+_CATCH_REVERSE = "!1!!!!cat Reverse <:reversecat:1279999999999999313> cought floorlampbeta"
+# Cat Bot markdown-escapes underscores in usernames, in both word orders.
+_CATCH_ESCAPED = (
+    "testingbits\\_0202 cought <:nicecat:1279999999999999478> Nice cat!!!!1!\n"
+    "You now have 2,505 cats of dat type!!!"
+)
+_CATCH_ESCAPED_REVERSE = (
+    "!1!!!!cat Reverse <:reversecat:1279999999999999313> cought testingbits\\_0202"
+)
+_SPAWN = "** A <:finecat:1279999999999999019> @Cats! has appeared**\nCatch Fine for cuddles!!"
+_BONUS = (
+    "🎁 **BONUS <:reversecat:1279999999999999313> REVERSE CAT!**\n"
+    "Anyone who cought this cat can play a minigame and potentially **get +3 more!**"
+)
+
+
+def test_rarity_coins_tiers():
+    assert parser.rarity_coins("fine") == 1       # common
+    assert parser.rarity_coins("wild") == 3       # uncommon (the *Rare* cat lives here too)
+    assert parser.rarity_coins("rare") == 3
+    assert parser.rarity_coins("reverse") == 11   # rare tier
+    assert parser.rarity_coins("legendary") == 35
+    assert parser.rarity_coins("mythic") == 102
+    assert parser.rarity_coins("egirl") == 300
+    assert parser.rarity_coins("frobnicate") == 1  # unknown -> common
+
+
+def test_parse_cat_catch_normal():
+    catch = parser.parse_cat_catch(_CATCH)
+    assert catch is not None
+    assert catch.username == "floorlampbeta"
+    assert catch.rarity == "nice"
+    assert catch.doubled is False
+    assert catch.coins == 1
+
+
+def test_parse_cat_catch_blessed_doubles_coins():
+    catch = parser.parse_cat_catch(_CATCH_DOUBLED)
+    assert catch is not None
+    assert catch.username == "hostowl"
+    assert catch.rarity == "wild"
+    assert catch.doubled is True
+    assert catch.coins == 6  # 3 (uncommon) x2
+
+
+def test_parse_cat_catch_reverse_cat():
+    catch = parser.parse_cat_catch(_CATCH_REVERSE)
+    assert catch is not None
+    assert catch.username == "floorlampbeta"   # the non-emoji token by "cought"
+    assert catch.rarity == "reverse"
+    assert catch.coins == 11
+
+
+@pytest.mark.parametrize(
+    "content", [_CATCH_ESCAPED, _CATCH_ESCAPED_REVERSE], ids=["normal", "reverse"]
+)
+def test_parse_cat_catch_unescapes_markdown_in_username(content):
+    """Cat Bot prints ``testingbits\\_0202``; the payout resolves the *real*
+    username by name, so the escapes have to come off or the catch pays nobody.
+    """
+    catch = parser.parse_cat_catch(content)
+    assert catch is not None
+    assert catch.username == "testingbits_0202"
+
+
+def test_spawn_and_bonus_are_not_catches():
+    assert parser.parse_cat_catch(_SPAWN) is None
+    assert parser.parse_cat_catch(_BONUS) is None
+    assert parser.parse_cat_catch("") is None
+
+
+# ── sub-game identification (2026-07-26) ─────────────────────────────────────
+#
+# Gamebot hosts CAH, Connect 4 and Anagrams in the same channel. CAH and
+# Anagrams end with the *identical* "<@id> is the winner!" wording, so the
+# terminal message can never tell them apart — the lobby embed is what names
+# the game, and everything dispatches off that.
+
+def _lobby(game: str, joined: list[int]) -> dict:
+    return {"embeds": [{
+        "title": f"host is starting a {game} game!",
+        "description": 'Click "Join" below to join in the next **120 seconds**.',
+        "fields": [{
+            "name": "Joined Players",
+            "value": ", ".join(f"<@{u}>" for u in joined),
+            "inline": False,
+        }],
+    }]}
+
+
+def _scoreboard(points: dict[str, int]) -> dict:
+    return {"embeds": [{
+        "title": "Scoreboard",
+        "fields": [
+            {"name": f"{name} - {n} POINTS", "value": "WORDS"}
+            for name, n in points.items()
+        ] + [{"name": "Pangram", "value": "The pangram was CLEANUP."}],
+    }]}
+
+
+def _not_enough_players() -> dict:
+    return {"embeds": [
+        {"title": "Time's up!", "description": "Not enough players joined the game!"}
+    ]}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Cards Against Humanity", parser.GAME_CAH),
+        ("Cards Against Humanity: Family Edition", parser.GAME_CAH),
+        ("Connect 4", parser.GAME_CONNECT4),
+        ("Anagrams", parser.GAME_ANAGRAMS),
+        ("Chess", None),          # a real Gamebot game we have no parser for
+        ("Poker", None),
+    ],
+)
+def test_game_from_start_reads_the_lobby_embed(name, expected):
+    embeds = _lobby(name, [ALICE])["embeds"]
+    assert parser.is_game_start(embeds) is True
+    assert parser.game_from_start(embeds) == expected
+
+
+def test_is_game_start_ignores_non_lobby_embeds():
+    assert parser.is_game_start(_standings({ALICE: 1})["embeds"]) is False
+    assert parser.game_from_start(_game_over(ALICE)["embeds"]) is None
+
+
+def test_identify_game_tells_anagrams_from_cah():
+    # The regression that mattered: both terminals say "is the winner!", so
+    # without the lobby every Anagrams game was credited as CAH.
+    cah = [_lobby("Cards Against Humanity", [ALICE]), _game_over(ALICE)]
+    ana = [_lobby("Anagrams", [ALICE]), _scoreboard({"alice": 900}), _game_over(ALICE)]
+    assert parser.identify_game(cah) == parser.GAME_CAH
+    assert parser.identify_game(ana) == parser.GAME_ANAGRAMS
+
+
+def test_identify_game_returns_none_for_an_unparsed_game():
+    window = [_lobby("Chess", [ALICE, BOB]),
+              {"embeds": [{"title": "Game over!", "description": "Good game!"}]}]
+    assert parser.identify_game(window) is None
+
+
+@pytest.mark.parametrize(
+    ("window", "expected"),
+    [
+        ([_standings({ALICE: 1}), _game_over(ALICE)], parser.GAME_CAH),
+        ([_scoreboard({"alice": 9}), _game_over(ALICE)], parser.GAME_ANAGRAMS),
+        ([_c4_game_over(ALICE)], parser.GAME_CONNECT4),
+        ([_game_over(ALICE)], parser.GAME_CAH),   # bare winner line: assume CAH
+        ([_round_win(ALICE)], None),              # nothing terminal at all
+    ],
+)
+def test_identify_game_falls_back_to_window_shape_without_a_lobby(window, expected):
+    # Only reachable when the banked slice starts after the game began.
+    assert parser.identify_game(window) == expected
+
+
+def test_current_game_window_stops_at_its_own_lobby():
+    # The previous game's standings sit in the same channel with no terminal
+    # between them (an abandoned run). Bounding on the lobby keeps them out.
+    parsed = [
+        _standings({CAROL: 9}),                        # 0: stale, previous run
+        _lobby("Cards Against Humanity", [ALICE, BOB]),  # 1: this game starts
+        _standings({ALICE: 5, BOB: 1}),                # 2
+        _game_over(ALICE),                             # 3
+    ]
+    window = parser.current_game_window(parsed, over_index=3)
+    assert parser.identify_game(window) == parser.GAME_CAH
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {ALICE: 5, BOB: 1}   # CAROL's 9 is not in this game
+    assert winners == [ALICE]
+
+
+def test_is_abandoned_flags_a_lobby_that_never_filled():
+    window = [
+        _lobby("Cards Against Humanity", [ALICE, BOB]),
+        _not_enough_players(),
+        {"embeds": [{"title": "Game over!", "description": "To play fun games…"}]},
+    ]
+    assert parser.is_abandoned(window) is True
+    # …and a real game isn't flagged.
+    assert parser.is_abandoned([_standings({ALICE: 1}), _game_over(ALICE)]) is False
+
+
+def test_join_phase_roster_is_gated_on_the_lobby_embed():
+    # The Joined Players field used to be read off *any* embed, so an abandoned
+    # CAH lobby fed its roster straight into the Connect 4 payout. A CAH lobby
+    # is still a lobby (same join phase), but an unrelated embed carrying that
+    # field name is not.
+    assert parser.players_from_join_phase(
+        _lobby("Cards Against Humanity", [ALICE, BOB])["embeds"]
+    ) == {ALICE, BOB}
+    stray = [{"title": "Scoreboard",
+              "fields": [{"name": "Joined Players", "value": f"<@{CAROL}>"}]}]
+    assert parser.players_from_join_phase(stray) == set()
+
+
+def test_times_up_recap_only_counts_when_players_actually_joined():
+    assert parser.players_from_join_phase(_c4_times_up([ALICE, BOB])["embeds"]) == {ALICE, BOB}
+    assert parser.players_from_join_phase(_not_enough_players()["embeds"]) == set()
+
+
+def test_standings_are_gated_on_the_embed_title():
+    # A stray "<@id>: N" in ordinary game chatter must not invent a score.
+    stray = [{"title": "This round's black card", "description": f"<@{ALICE}>: 99"}]
+    assert parser.scores_from_standings(stray) == {}
+
+
+# ── Anagrams ─────────────────────────────────────────────────────────────────
+
+def test_scores_from_scoreboard_reads_points_out_of_field_names():
+    embeds = _scoreboard({"hostowl": 900, "floorlampbeta": 500, "kit": 0})["embeds"]
+    assert parser.scores_from_scoreboard(embeds) == {
+        "hostowl": 900, "floorlampbeta": 500, "kit": 0,
+    }  # the trailing Pangram field carries no score and is skipped
+
+
+def test_extract_anagrams_game_pairs_usernames_with_the_mentioned_winner():
+    window = [
+        _lobby("Anagrams", [ALICE, BOB]),
+        _scoreboard({"alice": 900, "bob": 500}),
+        _game_over(ALICE),
+    ]
+    scores, winner = parser.extract_anagrams_game(window)
+    assert scores == {"alice": 900, "bob": 500}
+    assert winner == ALICE  # by mention, while the scores are by username
+
+
+def test_scoreboard_usernames_are_markdown_unescaped():
+    embeds = _scoreboard({r"digger\_state": 100})["embeds"]
+    assert parser.scores_from_scoreboard(embeds) == {"digger_state": 100}
+
+
+# ── Wordle (kind='wordle') ───────────────────────────────────────────────────
+#
+# One self-contained daily digest per group: no embeds, no lobby, nothing to
+# scan back for. Scoring is inverted (1/6 is best) and ties on the 👑 line are
+# normal, so there are usually several winners.
+
+def _digest(*lines: str) -> str:
+    return (
+        "**Your group is on a 9 day streak!** 🔥 Here are yesterday's results:\n"
+        + "\n".join(lines)
+    )
+
+
+def test_parse_wordle_results_inverts_the_guess_count():
+    r = parser.parse_wordle_results(
+        _digest(f"👑 1/6: <@{ALICE}>", f"4/6: <@{BOB}>", f"6/6: <@{CAROL}>")
+    )
+    assert r is not None
+    # Fewer guesses must pay more, so 1/6 is the top score and 6/6 the floor.
+    assert r.scores == {ALICE: 6, BOB: 3, CAROL: 1}
+    assert r.winners == frozenset({ALICE})
+
+
+def test_parse_wordle_results_failed_player_scores_zero_but_still_played():
+    r = parser.parse_wordle_results(_digest(f"👑 3/6: <@{ALICE}>", f"X/6: <@{BOB}>"))
+    assert r is not None
+    assert r.scores == {ALICE: 4, BOB: 0}  # BOB is in the roster at 0, not absent
+
+
+def test_parse_wordle_results_supports_tied_winners():
+    # "👑 3/6: <@a> <@b> <@c>" is a real and common shape — everyone on the
+    # crowned line won.
+    r = parser.parse_wordle_results(
+        _digest(f"👑 3/6: <@{ALICE}> <@{BOB}> <@{CAROL}>", "4/6: <@444>")
+    )
+    assert r is not None
+    assert r.winners == frozenset({ALICE, BOB, CAROL})
+    assert r.scores[444] == 3
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("👑 3/6: @Pomme", {"Pomme": 4}),
+        ("6/6: @Harlow @QuietRidge", {"Harlow": 1, "QuietRidge": 1}),
+        # A display name with a space would be shredded by whitespace splitting.
+        ("4/6: @shared turnip", {"shared turnip": 3}),
+    ],
+)
+def test_parse_wordle_results_splits_plain_names_on_the_at_sign(line, expected):
+    # Wordle prints some players as bare "@Name" rather than mentioning them;
+    # the caller resolves those by name.
+    r = parser.parse_wordle_results(_digest(line))
+    assert r is not None
+    assert r.named_scores == expected
+
+
+def test_parse_wordle_results_mixes_mentions_and_plain_names_on_one_line():
+    r = parser.parse_wordle_results(_digest(f"👑 4/6: @Pomme <@{ALICE}> <@{BOB}>"))
+    assert r is not None
+    assert r.scores == {ALICE: 3, BOB: 3}
+    assert r.named_scores == {"Pomme": 3}
+    assert r.winners == frozenset({ALICE, BOB})
+    assert r.named_winners == frozenset({"Pomme"})
+
+
+def test_wordle_chatter_is_not_a_digest():
+    assert parser.parse_wordle_results("smallprop07 is playing") is None
+    assert parser.parse_wordle_results("") is None
+    # A digest header with no result lines pays nobody rather than half-parsing.
+    assert parser.parse_wordle_results("Here are yesterday's results:") is None
+
+
+# ── Co-ordle (kind='coordle') ────────────────────────────────────────────────
+
+_COORDLE_EMPTY_ROW = "<:white_square:946999999999999402>" * 6
+
+
+def _coordle_cells(colours: list[str]) -> str:
+    return "".join(
+        f"<:{c}_{w}:94649999999999610{i}>"
+        for i, (c, w) in enumerate(zip(colours, "spirit"))
+    )
+
+
+def _coordle_row(n, colours, uid=None, pts=None, bonus=None) -> str:
+    row = f"**`{n}.`** {_coordle_cells(colours)}"
+    if uid is not None:
+        score = f"**+{pts}" + (f" (+{bonus})" if bonus else "") + "**"
+        row += f" <@!{uid}> {score}"
+    return row
+
+
+def _coordle_board(rows: list[str], ts: int = 1785103200) -> list[dict]:
+    return [{"title": f"Co-ordle for <t:{ts}:f>", "description": "\n".join(rows)}]
+
+
+_MISS = ["gray"] * 6
+_HIT = ["green"] * 6
+
+
+def test_coordle_board_is_recognised_and_keyed_on_its_round():
+    embeds = _coordle_board([_coordle_row(1, _MISS, ALICE, 4)], ts=1785103200)
+    assert parser.is_coordle_board(embeds) is True
+    # Keyed on the round's scheduled time, not a message id: Co-ordle posts a
+    # fresh board message for *every* guess, so a message-keyed payout would
+    # pay the same round once per guess.
+    assert parser.coordle_game_key(embeds) == 1785103200
+    assert parser.is_coordle_board(
+        [{"title": "Co-ordle Leaderboard for `The Golden Meadow`"}]
+    ) is False
+
+
+def test_extract_coordle_sums_the_bonus_into_each_players_points():
+    # "**+1 (+2)**" means the player earned 1+2 — verified against the bot's own
+    # cumulative leaderboard across consecutive snapshots.
+    embeds = _coordle_board([
+        _coordle_row(1, _MISS, ALICE, 1, bonus=2),
+        _coordle_row(2, _MISS, ALICE, 1),
+        _coordle_row(3, _MISS, BOB, 4),
+        _coordle_row(4, _HIT, BOB, 5),
+    ])
+    scores, winner, state = parser.extract_coordle_game(embeds)
+    assert scores == {ALICE: 4, BOB: 9}
+    assert winner == BOB              # whoever played the all-green solving row
+    assert state == parser.COORDLE_SOLVED
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ([_coordle_row(1, _HIT, ALICE, 5)], parser.COORDLE_SOLVED),
+        # Every row used and never solved.
+        ([_coordle_row(i, _MISS, ALICE, 1) for i in range(1, 8)],
+         parser.COORDLE_EXHAUSTED),
+        # Guesses so far but rows to spare — still running, must not pay.
+        ([_coordle_row(1, _MISS, ALICE, 1), f"**`2.`** {_COORDLE_EMPTY_ROW}"],
+         parser.COORDLE_OPEN),
+        # Nobody has guessed at all.
+        ([f"**`{i}.`** {_COORDLE_EMPTY_ROW}" for i in range(1, 8)],
+         parser.COORDLE_EMPTY),
+    ],
+    ids=["solved", "exhausted", "open", "empty"],
+)
+def test_extract_coordle_reads_finality_off_the_board(rows, expected):
+    # Co-ordle never posts a terminal message, so the board itself is the only
+    # signal that a round is over.
+    _scores, _winner, state = parser.extract_coordle_game(_coordle_board(rows))
+    assert state == expected
+
+
+def test_extract_coordle_unsolved_round_has_no_winner():
+    embeds = _coordle_board([_coordle_row(i, _MISS, ALICE, 1) for i in range(1, 8)])
+    scores, winner, state = parser.extract_coordle_game(embeds)
+    assert winner is None
+    assert state == parser.COORDLE_EXHAUSTED
+    assert scores == {ALICE: 7}
+
+
+# ── host attribution (2026-07-26) ────────────────────────────────────────────
+#
+# The lobby title is the only place an external game names who started it, and
+# it names them by username. External games paid no host bounty at all until
+# this was read out.
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("hostowl is starting a Cards Against Humanity game!", "hostowl"),
+        ("regalraven is starting a Connect 4 game!", "regalraven"),
+        ("hostowl is starting a Anagrams game!", "hostowl"),
+        # Usernames carry dots, underscores and spaces.
+        ("quietspyguy. is starting a Cards Against Humanity game!", "quietspyguy."),
+        ("wandering_nomad is starting a Cards Against Humanity game!", "wandering_nomad"),
+        ("some person is starting a Chess game!", "some person"),
+    ],
+)
+def test_host_from_lobby_reads_the_username_off_the_title(title, expected):
+    assert parser.host_from_lobby([{"title": title}]) == expected
+
+
+def test_host_from_lobby_ignores_non_lobby_embeds():
+    assert parser.host_from_lobby(_game_over(ALICE)["embeds"]) is None
+    assert parser.host_from_lobby(_standings({ALICE: 1})["embeds"]) is None
+
+
+def test_host_from_window_finds_the_lobby_anywhere_in_the_game():
+    window = [
+        _lobby("Cards Against Humanity", [ALICE, BOB]),
+        _standings({ALICE: 5, BOB: 1}),
+        _game_over(ALICE),
+    ]
+    assert parser.host_from_window(window) == "host"
+    # A window whose lobby aged out has no host to attribute.
+    assert parser.host_from_window([_standings({ALICE: 1}), _game_over(ALICE)]) is None
+
+
+# ── cat_catch tier dials (2026-08 review / retune round 2) ─────────────
+
+
+def test_parse_cat_catch_uses_guild_tier_overrides():
+    from bot_modules.games.external.parser import parse_cat_catch
+
+    msg = "billy cought <:finecat:123>"
+    default = parse_cat_catch(msg)
+    tuned = parse_cat_catch(msg, {"common": 0})
+    assert default is not None and default.coins == 1
+    assert tuned is not None and tuned.coins == 0
+
+
+def test_parse_cat_catch_partial_override_falls_back_to_defaults():
+    from bot_modules.games.external.parser import parse_cat_catch
+
+    # Divine cat with an override map that only names the common tier: the
+    # divine tier must keep its shipped default, not zero out.
+    msg = "billy cought <:divinecat:123>"
+    got = parse_cat_catch(msg, {"common": 0})
+    assert got is not None and got.coins == 300
+
+
+def test_econ_settings_carry_catcatch_dials_roundtrip(tmp_path):
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.economy.service import (
+        load_econ_settings,
+        save_econ_settings,
+    )
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "test.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        save_econ_settings(conn, 9, {"catcatch_coins_mythic": 40})
+        s = load_econ_settings(conn, 9)
+    assert s.catcatch_coins_mythic == 40
+    assert s.catcatch_coins_divine == 300  # untouched dial keeps its default
+
+
+# ── Gamebot's 2026-08-15 format change ───────────────────────────────────────
+#
+# Gamebot rewrote every CAH string overnight and DK stopped paying: the last
+# gamebot_cah payout is 2026-08-14. These run against two whole real games
+# lifted out of the prod archive — the last old-format one (08-14) and the
+# first new-format one (08-16) — so the shapes are Gamebot's, not ours. Only
+# the card text is redacted; every line the parser reads is byte-for-byte.
+
+_DATA = REPO_ROOT / "tests" / "data"
+
+
+def _load_game(name: str) -> list[dict]:
+    return json.loads((_DATA / name).read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def new_format_game() -> list[dict]:
+    """The real 2026-08-16 game: 10 players, Vex hosting, first to 5."""
+    return _load_game("gamebot_cah_new_format.json")
+
+
+@pytest.fixture
+def old_format_game() -> list[dict]:
+    """The real 2026-08-14 game: 6 players, hostowl hosting."""
+    return _load_game("gamebot_cah_old_format.json")
+
+
+# The real outcomes, read off the archived Final scores / Game over! embeds.
+NEW_SCORES = {
+    616199999999999926: 5, 1383999999999999910: 4, 1284999999999999995: 3,
+    1376999999999999998: 3, 1461999999999999914: 3, 776999999999999930: 3,
+    519299999999999923: 2, 1236999999999999993: 1, 884899999999999933: 0,
+    203899999999999916: 0,
+    # Joined at 03:02, took a point at 03:25, left at 03:33 — so Gamebot cut
+    # them from every later standings and they're absent from Final scores.
+    # Standings are accumulated, never pruned, so a leaver keeps the score
+    # they earned and gets paid for the eighteen rounds they played. That has
+    # always been the behaviour; the new format is just the first archived
+    # game where somebody actually left mid-run.
+    416899999999999921: 1,
+}
+NEW_WINNER = 616199999999999926
+OLD_SCORES = {
+    708199999999999928: 5, 1284999999999999995: 2, 1359999999999999997: 2,
+    1376999999999999998: 1, 674899999999999927: 1, 203899999999999916: 0,
+}
+OLD_WINNER = 708199999999999928
+
+
+@pytest.mark.parametrize(
+    "fixture, scores, winner",
+    [
+        pytest.param("old_format_game", OLD_SCORES, OLD_WINNER, id="old-2026-08-14"),
+        pytest.param("new_format_game", NEW_SCORES, NEW_WINNER, id="new-2026-08-16"),
+    ],
+)
+def test_a_whole_real_game_pays_its_players(request, fixture, scores, winner):
+    """End to end over a real archived game, both formats.
+
+    The guild can still have a pre-update game in flight, so the old strings
+    have to keep working — a fix that only speaks the new format would trade
+    one outage for another.
+    """
+    game = request.getfixturevalue(fixture)
+    over = next(i for i, m in enumerate(game) if parser.is_terminal(m["embeds"]))
+    window = parser.current_game_window(game, over_index=over)
+
+    assert parser.identify_game(window) == parser.GAME_CAH
+    assert parser.is_abandoned(window) is False
+    got_scores, winners = parser.extract_cah_game(window)
+    assert got_scores == scores
+    assert winners == [winner]
+
+
+def _new_standings(scores: dict[int, int], title: str = "Round winner") -> dict:
+    """A post-2026-08-15 standings post: a *Standings* field, scores bolded."""
+    return {"embeds": [{
+        "title": title,
+        "description": "**Some card.**\n\n<@1> takes the point.",
+        "fields": [{"name": "Standings",
+                    "value": "\n".join(f"<@{u}>: **{n}**" for u, n in scores.items())}],
+    }]}
+
+
+def _new_submissions(uids: list[int]) -> dict:
+    """A post-2026-08-15 *Play your card* embed. ⬜ means "not in yet"."""
+    return {"embeds": [{
+        "title": "Play your card",
+        "description": "<@999> is judging this round.",
+        "fields": [{"name": "Submissions",
+                    "value": "\n".join(f"{'✅' if i else '⬜'} <@{u}>"
+                                       for i, u in enumerate(uids))}],
+    }]}
+
+
+def _final_scores(scores: dict[int, int]) -> dict:
+    return _new_standings(scores, title="Final scores")
+
+
+def _crashed() -> dict:
+    return {"embeds": [{"title": "Something went wrong",
+                        "description": "This game ended unexpectedly. Sorry about that!"}]}
+
+
+@pytest.mark.parametrize(
+    "embeds",
+    [
+        pytest.param(_standings({ALICE: 5, BOB: 1, CAROL: 0})["embeds"], id="old"),
+        pytest.param(_new_standings({ALICE: 5, BOB: 1, CAROL: 0})["embeds"], id="new"),
+    ],
+)
+def test_standings_read_in_either_format(embeds):
+    assert parser.scores_from_standings(embeds) == {ALICE: 5, BOB: 1, CAROL: 0}
+
+
+@pytest.mark.parametrize(
+    "embeds",
+    [
+        pytest.param(_submissions([ALICE, BOB])["embeds"], id="old"),
+        # ⬜/✅ alike: both are players in the game, which is all this is for.
+        pytest.param(_new_submissions([ALICE, BOB])["embeds"], id="new"),
+    ],
+)
+def test_submissions_read_in_either_format(embeds):
+    assert parser.players_from_submissions(embeds) == {ALICE, BOB}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [pytest.param("Joined Players", id="old"), pytest.param("Players (6/12)", id="new")],
+)
+def test_lobby_roster_read_from_either_field_name(field_name):
+    embeds = [{
+        "title": "Vex is starting a Cards Against Humanity game!",
+        "description": f"Press **Join** to play. <@{CAROL}>, press **Start**.",
+        "fields": [{"name": field_name, "value": f"<@{ALICE}>, <@{BOB}>"}],
+    }]
+    assert parser.players_from_join_phase(embeds) == {ALICE, BOB, CAROL}
+
+
+@pytest.mark.parametrize(
+    "embeds, terminal, cah_finish",
+    [
+        pytest.param(_game_over(ALICE)["embeds"], True, True, id="old-game-over"),
+        pytest.param(_c4_game_over(ALICE)["embeds"], True, False, id="connect4-game-over"),
+        pytest.param(_final_scores({ALICE: 5})["embeds"], True, True, id="new-final-scores"),
+        # Ends a window, but is no evidence a CAH game happened inside it.
+        pytest.param(_crashed()["embeds"], True, False, id="new-crash"),
+        pytest.param(_new_standings({ALICE: 1})["embeds"], False, False, id="new-round-winner"),
+        pytest.param(_round_win(ALICE)["embeds"], False, False, id="old-round-win"),
+    ],
+)
+def test_terminal_and_finish_detection(embeds, terminal, cah_finish):
+    assert parser.is_terminal(embeds) is terminal
+    assert parser.is_game_over(embeds) is cah_finish
+
+
+def test_new_format_standings_are_gated_on_the_field_name():
+    # Same guarantee the old title gate gave: a stray "<@id>: N" in a field
+    # that isn't the standings must not invent a player or a score.
+    stray = [{"title": "Game settings",
+              "fields": [{"name": "Points to win", "value": f"<@{ALICE}>: 5"}]}]
+    assert parser.scores_from_standings(stray) == {}
+
+
+def test_a_game_gamebot_dropped_still_pays_the_rounds_that_were_played():
+    # No *Final scores* — Gamebot just fell over. Billy's call (2026-08-16):
+    # pay from the last standings anyway, since those rounds really happened.
+    window = [
+        _lobby("Cards Against Humanity", [ALICE, BOB, CAROL]),
+        _new_standings({ALICE: 1, BOB: 0, CAROL: 0}),
+        _new_standings({ALICE: 2, BOB: 2, CAROL: 0}),
+        _crashed(),
+    ]
+    assert parser.is_terminal(_crashed()["embeds"]) is True
+    assert parser.identify_game(window) == parser.GAME_CAH
+    assert parser.is_abandoned(window) is False
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {ALICE: 2, BOB: 2, CAROL: 0}
+    assert winners == [ALICE, BOB]        # dropped mid-game, so the lead tied
+
+
+def test_a_crash_after_a_clean_finish_pays_nobody_a_second_time(new_format_game):
+    """The real 08-16 tail: *Something went wrong* 1.4s after *Final scores*.
+
+    Both are terminal, so both fire a payout attempt, and each claims on its
+    own message id — the ledger can't dedupe them. What stops the double
+    payment is the window: bounding backwards from the crash stops at the
+    *Final scores* that precedes it, leaving a window of one message with no
+    standings in it, which the cog skips.
+    """
+    final = next(i for i, m in enumerate(new_format_game)
+                 if m["embeds"] and m["embeds"][0]["title"] == "Final scores")
+    crash = next(i for i, m in enumerate(new_format_game)
+                 if m["embeds"] and m["embeds"][0]["title"] == "Something went wrong")
+    assert crash == final + 1
+
+    window = parser.current_game_window(new_format_game, over_index=crash)
+    assert len(window) == 1
+    scores, winners = parser.extract_cah_game(window)
+    assert scores == {}      # the cog's `if not scores` short-circuit
+    assert winners == []
+
+
+# ── Gamebot's 2026-08-15 rewrite of Anagrams (photo-external-99) ─────────────
+#
+# The Scoreboard moved its scores out of the field names and into the
+# description ("**Name** — N points"), the winner line became "<@id> wins!",
+# and payouts silently stopped: three real games went unpaid. These shapes are
+# copied from the real 2026-08-22 18:51 window in the prod buffer.
+
+def _new_scoreboard(points: dict[str, int]) -> dict:
+    desc = "\n\n".join(
+        f"**{name}** — {n} points\n{'TRIP, SAME' if n else 'No words submitted.'}"
+        for name, n in points.items()
+    ) + "\n\n**Skipped words:** COLOGNE"
+    return {"embeds": [{"title": "Scoreboard", "description": desc}]}
+
+
+def _wins(winner: int) -> dict:
+    return {"embeds": [{"title": "Game over!", "description": (
+        f"<@{winner}> wins!\nVote for Gamebot on [top.gg](https://top.gg)!"
+    ), "fields": [{"name": "Vex", "value": "**[Level 30]** | +362 XP"}]}]}
+
+
+def test_new_scoreboard_reads_scores_out_of_the_description():
+    embeds = _new_scoreboard({"Vex": 1700, "Rollbaker": 0, "QuietRidge": 1300})["embeds"]
+    assert parser.scores_from_scoreboard(embeds) == {
+        "Vex": 1700, "Rollbaker": 0, "QuietRidge": 1300,
+    }  # "**Skipped words:** COLOGNE" carries no score and is not a player
+
+
+def test_the_real_2026_08_22_anagrams_window_pays_its_three_players():
+    window = [
+        _lobby("Anagrams", [ALICE, BOB, CAROL]),
+        _new_scoreboard({"Vex": 1700, "Rollbaker": 0, "QuietRidge": 1300}),
+        _wins(ALICE),
+    ]
+    assert parser.identify_game(window) == parser.GAME_ANAGRAMS
+    scores, winner = parser.extract_anagrams_game(window)
+    assert scores == {"Vex": 1700, "Rollbaker": 0, "QuietRidge": 1300}
+    assert winner == ALICE
+
+
+def test_winner_reader_accepts_both_phrasings():
+    assert parser.winner_from_game_over(_game_over(ALICE)["embeds"]) == ALICE
+    assert parser.winner_from_game_over(_wins(BOB)["embeds"]) == BOB
+    assert parser.is_game_over(_wins(BOB)["embeds"]) is True
+
+
+def test_a_bare_new_style_finish_is_not_assumed_to_be_cah():
+    # Pre-rewrite, a lone "<@id> is the winner!" was almost always CAH. The
+    # new "<@id> wins!" is Anagrams' and Survey Says' finish, and CAH itself
+    # no longer posts a Game over! — so a lobby-less window holding only that
+    # line pays nobody rather than paying a phantom one-player CAH game. Real
+    # case: Survey Says posts *Final scores* and then, 0.7s later, a Game
+    # over! that bounds into a window of its own.
+    assert parser.identify_game([_wins(ALICE)]) is None
+    assert parser.identify_game([_game_over(ALICE)]) == parser.GAME_CAH
+
+
+# ── Survey Says and Wisecracks (photo-external-101) ─────────────────────────
+#
+# Both finish with a *Final scores* embed whose description lists
+# "**Name**: N points" per player (display names, no mentions); Survey Says
+# adds a "<@id> reached 5 points!" line naming the winner, Wisecracks names
+# nobody. Shapes copied from the 2026-08-20 / 08-21 / 08-22 prod windows.
+
+def _named_final_scores(points: dict[str, int], reached: int | None = None) -> dict:
+    lines = [f"**{name}**: {n} points" for name, n in points.items()]
+    if reached is not None:
+        lines.append(f"<@{reached}> reached 5 points!")
+    return {"embeds": [{"title": "Final scores", "description": "\n".join(lines)}]}
+
+
+def _survey_results(points: dict[str, int]) -> dict:
+    lines = ["The actual number was **65.2%**!"]
+    lines += [f"{'✅' if n else '❌'} **{name}**: {n} points" for name, n in points.items()]
+    lines.append("First to 5 points wins!")
+    return {"embeds": [{"title": "Results", "description": "\n".join(lines)}]}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Survey Says", parser.GAME_SURVEY_SAYS),
+        ("Wisecracks", parser.GAME_WISECRACKS),
+    ],
+)
+def test_named_score_games_are_read_off_the_lobby(name, expected):
+    assert parser.game_from_start(_lobby(name, [ALICE])["embeds"]) == expected
+    assert parser.GAME_LABELS[expected] == name
+
+
+def test_survey_says_window_pays_by_final_scores_with_the_declared_winner():
+    window = [
+        _lobby("Survey Says", [ALICE, BOB, CAROL]),
+        _survey_results({"Vex": 1, "QuietRidge": 0, "Rollbaker": 0}),
+        _survey_results({"Vex": 4, "QuietRidge": 4, "Rollbaker": 2}),
+        _named_final_scores({"Vex": 5, "QuietRidge": 4, "Rollbaker": 2}, reached=ALICE),
+    ]
+    assert parser.identify_game(window) == parser.GAME_SURVEY_SAYS
+    scores, winner = parser.extract_named_scores_game(window)
+    assert scores == {"Vex": 5, "QuietRidge": 4, "Rollbaker": 2}
+    assert winner == ALICE
+
+
+def test_wisecracks_final_scores_declare_no_winner():
+    window = [
+        _lobby("Wisecracks", [ALICE, BOB]),
+        _named_final_scores({"QuietRidge": 1, "Vex": 0, "Finch Hollow 🌻": 2}),
+    ]
+    assert parser.identify_game(window) == parser.GAME_WISECRACKS
+    scores, winner = parser.extract_named_scores_game(window)
+    assert scores == {"QuietRidge": 1, "Vex": 0, "Finch Hollow 🌻": 2}
+    assert winner is None  # the caller derives the top scorer once names resolve
+
+
+def test_round_results_never_count_as_final_scores():
+    # Per-round *Results* carry the same "**Name**: N points" lines under a
+    # ✅/❌ prefix; only the *Final scores* embed is read, so a game Gamebot
+    # dropped mid-run pays nobody rather than paying a half-played round.
+    scores, winner = parser.extract_named_scores_game([
+        _lobby("Survey Says", [ALICE]), _survey_results({"Vex": 3}),
+    ])
+    assert scores == {}
+
+
+def test_a_lobby_less_named_final_scores_is_not_mistaken_for_cah():
+    # CAH's Final scores carries a *Standings* field; Survey Says' and
+    # Wisecracks' carry named lines. Without a lobby the two named games
+    # can't be told apart, so the fallback pays nobody rather than guessing.
+    assert parser.identify_game([_named_final_scores({"Vex": 5}, reached=ALICE)]) is None
+    assert parser.identify_game([_final_scores({ALICE: 5})]) == parser.GAME_CAH
+
+
+# ── window bounding reports whether it found a boundary (photo-external-110) ─
+
+def test_find_window_start_says_whether_the_window_is_bounded():
+    parsed = [_standings({ALICE: 1}), _standings({ALICE: 2}), _game_over(ALICE)]
+    assert parser.find_window_start(parsed, over_index=2) == (0, False)
+    parsed = [_lobby("Cards Against Humanity", [ALICE]), _standings({ALICE: 2}), _game_over(ALICE)]
+    assert parser.find_window_start(parsed, over_index=2) == (0, True)
+    parsed = [_game_over(BOB), _standings({ALICE: 2}), _game_over(ALICE)]
+    assert parser.find_window_start(parsed, over_index=2) == (1, True)
+
+
+# ── what the health signal counts as a payable finish (photo-external-100) ──
+
+@pytest.mark.parametrize(
+    ("window", "expected"),
+    [
+        pytest.param([_lobby("Cards Against Humanity", [ALICE]), _standings({ALICE: 3}), _game_over(ALICE)],
+                     parser.GAME_CAH, id="cah"),
+        pytest.param([_lobby("Cards Against Humanity", [ALICE]), _not_enough_players(),
+                      {"embeds": [{"title": "Game over!", "description": "To play…"}]}],
+                     None, id="abandoned-lobby"),
+        pytest.param([_crashed()], None, id="crash-after-a-clean-finish"),
+        pytest.param([_lobby("Chess", [ALICE, BOB]), _game_over(ALICE)], None, id="unparsed-game"),
+        pytest.param([_lobby("Anagrams", [ALICE]), _new_scoreboard({"Vex": 900}), _wins(ALICE)],
+                     parser.GAME_ANAGRAMS, id="anagrams"),
+        pytest.param([_lobby("Anagrams", [ALICE]),
+                      {"embeds": [{"title": "Game over!", "description": "Nobody won this one."}]}],
+                     None, id="solo-anagrams-run-nobody-won"),
+        pytest.param([_c4_start(ALICE, [ALICE, BOB]), _c4_game_over(ALICE)], parser.GAME_CONNECT4, id="connect4"),
+        pytest.param([_lobby("Survey Says", [ALICE]), _named_final_scores({"Vex": 5}, reached=ALICE)],
+                     parser.GAME_SURVEY_SAYS, id="survey-says"),
+        pytest.param([_wins(ALICE)], None, id="trailing-game-over-after-final-scores"),
+    ],
+)
+def test_payable_game_mirrors_what_the_cog_would_pay(window, expected):
+    assert parser.payable_game(window) == expected

@@ -1,0 +1,1090 @@
+"""Tests for /api/economy/* Bank Manager endpoints (require_economy_manager)."""
+
+from __future__ import annotations
+
+import datetime
+import sqlite3
+import time
+import types
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from fastapi.testclient import TestClient
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.economy import quests_service as quests_svc
+from bot_modules.economy.service import (
+    apply_credit,
+    get_balance,
+    get_ledger,
+    load_econ_settings,
+    save_econ_settings,
+)
+from web_server.auth import DiscordOAuthAuth, SESSION_COOKIE
+from web_server.server import create_app
+from tests.paths import REPO_ROOT
+
+MANAGER_ROLE = 9999
+
+
+def _client(fake_ctx, *, admin: bool, role_ids: list[int] | None = None) -> TestClient:
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    client = TestClient(
+        create_app(fake_ctx, auth=auth), raise_server_exceptions=False
+    )
+    cookie = auth.create_session_cookie(
+        user_id=42,
+        username="mgr",
+        access_token="token",
+        permission_bits=0x8 if admin else 0,
+        role_ids=role_ids or [],
+        guild_id=fake_ctx.guild_id,
+        guilds=[{"id": fake_ctx.guild_id, "name": "Test Guild", "icon": None}],
+    )
+    client.cookies.set(SESSION_COOKIE, cookie)
+    return client
+
+
+def _set_manager_role(fake_ctx, role_id: int = MANAGER_ROLE) -> None:
+    with open_db(fake_ctx.db_path) as conn:
+        save_econ_settings(conn, fake_ctx.guild_id, {"manager_role_id": role_id})
+
+
+def _enable_economy(fake_ctx) -> None:
+    with open_db(fake_ctx.db_path) as conn:
+        # Set bonuses zeroed — one-quest boards would pay the
+        # clear-the-board bonus on approval and skew exact balances.
+        save_econ_settings(
+            conn,
+            fake_ctx.guild_id,
+            {
+                "enabled": True,
+                "quest_set_bonus_daily": 0,
+                "quest_set_bonus_weekly": 0,
+            },
+        )
+
+
+def _make_quest(client, **overrides) -> dict:
+    body = {
+        "title": "Say hi",
+        "description": "Greet someone",
+        "qtype": "daily",
+        "reward": 15,
+        "signoff": False,
+        "criteria": "Post a greeting",
+    }
+    body.update(overrides)
+    resp = client.post("/api/economy/quests", json=body)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+# ── gating matrix ──────────────────────────────────────────────────────
+
+
+def test_admin_can_list(authed_client):
+    # authed_client is an admin (permission_bits 0x8).
+    assert authed_client.get("/api/economy/quests").status_code == 200
+
+
+def test_manager_role_can_list(fake_ctx):
+    _set_manager_role(fake_ctx)
+    client = _client(fake_ctx, admin=False, role_ids=[MANAGER_ROLE])
+    assert client.get("/api/economy/quests").status_code == 200
+    client.close()
+
+
+def test_plain_member_forbidden(fake_ctx):
+    _set_manager_role(fake_ctx)
+    client = _client(fake_ctx, admin=False, role_ids=[123])
+    assert client.get("/api/economy/quests").status_code == 403
+    client.close()
+
+
+def test_me_exposes_manager_role_id(authed_client, fake_ctx):
+    assert authed_client.get("/api/me").json()["economy_manager_role_id"] is None
+    _set_manager_role(fake_ctx, 4242)
+    assert (
+        authed_client.get("/api/me").json()["economy_manager_role_id"] == "4242"
+    )
+
+
+# ── quest CRUD ─────────────────────────────────────────────────────────
+
+
+def test_quest_crud_roundtrip(authed_client):
+    created = _make_quest(authed_client, title="Original")
+    qid = created["id"]
+    assert created["active"] is False
+    assert created["reward"] == 15
+
+    # list
+    listing = authed_client.get("/api/economy/quests").json()["quests"]
+    assert any(q["id"] == qid for q in listing)
+
+    # update
+    resp = authed_client.put(
+        f"/api/economy/quests/{qid}", json={"title": "Renamed", "reward": 18}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "Renamed"
+    assert resp.json()["reward"] == 18
+
+    # delete (no paid claims → ok)
+    assert authed_client.delete(f"/api/economy/quests/{qid}").status_code == 200
+    assert authed_client.get("/api/economy/quests").json()["quests"] == []
+
+
+def test_update_unknown_field_422(authed_client):
+    qid = _make_quest(authed_client)["id"]
+    # `active` is not an accepted update field (extra="forbid").
+    resp = authed_client.put(f"/api/economy/quests/{qid}", json={"active": True})
+    assert resp.status_code == 422
+
+
+def test_create_reward_band_not_enforced(authed_client):
+    # Reward well outside the daily band (10–20) still saves fine.
+    created = _make_quest(authed_client, qtype="daily", reward=500)
+    assert created["reward"] == 500
+
+
+# ── active toggle + slot rule ──────────────────────────────────────────
+
+
+def test_active_toggle(authed_client):
+    # Dailies form a pool the per-user board draws from, so several can be
+    # active at once (the pool cap → 409 is covered at the service layer).
+    first = _make_quest(authed_client, title="Daily A")["id"]
+    second = _make_quest(authed_client, title="Daily B")["id"]
+
+    for qid in (first, second):
+        resp = authed_client.post(
+            f"/api/economy/quests/{qid}/active", json={"active": True}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["active"] is True
+
+    # Toggling one back off still works.
+    resp = authed_client.post(
+        f"/api/economy/quests/{first}/active", json={"active": False}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["active"] is False
+
+
+# ── delete with paid claims ────────────────────────────────────────────
+
+
+def _seed_paid_claim(fake_ctx, quest_id: int, user_id: int) -> None:
+    with open_db(fake_ctx.db_path) as conn:
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+        quests_svc.set_quest_active(conn, fake_ctx.guild_id, quest_id, True)
+        quests_svc.claim_quest(
+            conn,
+            settings,
+            fake_ctx.guild_id,
+            quest_id,
+            user_id,
+            period="2026-07-10",
+            booster=False,
+        )
+
+
+def test_delete_with_paid_claims_409(authed_client, fake_ctx):
+    qid = _make_quest(authed_client, signoff=False, reward=10)["id"]
+    _seed_paid_claim(fake_ctx, qid, user_id=777)
+    resp = authed_client.delete(f"/api/economy/quests/{qid}")
+    assert resp.status_code == 409
+
+
+# ── claims: approve / deny ─────────────────────────────────────────────
+
+
+def _seed_pending_claim(fake_ctx, quest_id: int, user_id: int, period: str) -> int:
+    with open_db(fake_ctx.db_path) as conn:
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+        quests_svc.set_quest_active(conn, fake_ctx.guild_id, quest_id, True)
+        outcome = quests_svc.claim_quest(
+            conn,
+            settings,
+            fake_ctx.guild_id,
+            quest_id,
+            user_id,
+            period=period,
+            booster=False,
+        )
+        assert outcome.state == "pending"
+        return outcome.claim_id
+
+
+def test_approve_pays_and_flips_state(authed_client, fake_ctx):
+    qid = _make_quest(authed_client, signoff=True, reward=20)["id"]
+    claim_id = _seed_pending_claim(fake_ctx, qid, user_id=555, period="2026-07-10")
+
+    resp = authed_client.post(f"/api/economy/claims/{claim_id}/approve")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["paid"] == 20
+    assert body["announced"] is False  # no bot in tests
+
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 555) == 20
+        row = conn.execute(
+            "SELECT state FROM econ_quest_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+    assert row["state"] == "paid"
+
+    # Already-resolved second approve → 409.
+    assert (
+        authed_client.post(f"/api/economy/claims/{claim_id}/approve").status_code
+        == 409
+    )
+
+
+def test_a_dashboard_denial_announces_it_and_repaints_the_board(
+    authed_client, fake_ctx, monkeypatch
+):
+    """A claim resolved on the dashboard must land exactly where one resolved
+    in Discord does: the denial in the register channel, and the todo board
+    repainted so the row drops off it."""
+    from web_server.routes import economy_manager as mod
+
+    announced = AsyncMock(return_value=True)
+    repainted = AsyncMock()
+    monkeypatch.setattr(mod, "announce_signoff_outcome", announced)
+    monkeypatch.setattr(mod, "refresh_signoff_board", repainted)
+    bot = MagicMock()
+    bot.is_ready = MagicMock(return_value=True)
+    monkeypatch.setattr(fake_ctx, "bot", bot, raising=False)
+
+    qid = _make_quest(authed_client, signoff=True, reward=20)["id"]
+    claim_id = _seed_pending_claim(fake_ctx, qid, user_id=557, period="2026-07-10")
+    resp = authed_client.post(
+        f"/api/economy/claims/{claim_id}/deny", json={"reason": "Too blurry"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["announced"] is True
+    kwargs = announced.await_args.kwargs
+    assert kwargs["state"] == "denied"
+    assert kwargs["deny_reason"] == "Too blurry"
+    assert kwargs["user_id"] == 557
+    repainted.assert_awaited_once()
+
+
+def test_a_dashboard_approval_announces_nothing_itself(
+    authed_client, fake_ctx, monkeypatch
+):
+    """The credit writes ledger kind "quest" and the register drain posts it."""
+    from web_server.routes import economy_manager as mod
+
+    announced = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "announce_signoff_outcome", announced)
+    monkeypatch.setattr(mod, "refresh_signoff_board", AsyncMock())
+    bot = MagicMock()
+    bot.is_ready = MagicMock(return_value=True)
+    monkeypatch.setattr(fake_ctx, "bot", bot, raising=False)
+
+    qid = _make_quest(authed_client, signoff=True, reward=20)["id"]
+    claim_id = _seed_pending_claim(fake_ctx, qid, user_id=558, period="2026-07-10")
+    resp = authed_client.post(f"/api/economy/claims/{claim_id}/approve")
+
+    assert resp.status_code == 200
+    announced.assert_not_awaited()
+
+
+def test_deny_requires_reason_and_reclaimable(authed_client, fake_ctx):
+    qid = _make_quest(authed_client, signoff=True, reward=20)["id"]
+    claim_id = _seed_pending_claim(fake_ctx, qid, user_id=556, period="2026-07-10")
+
+    # Empty reason → 422.
+    assert (
+        authed_client.post(
+            f"/api/economy/claims/{claim_id}/deny", json={"reason": ""}
+        ).status_code
+        == 422
+    )
+
+    resp = authed_client.post(
+        f"/api/economy/claims/{claim_id}/deny", json={"reason": "Not enough detail"}
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT state, deny_reason FROM econ_quest_claims WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
+        assert row["state"] == "denied"
+        assert row["deny_reason"] == "Not enough detail"
+        # Member can re-claim the same period (a new pending row).
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+        again = quests_svc.claim_quest(
+            conn,
+            settings,
+            fake_ctx.guild_id,
+            qid,
+            556,
+            period="2026-07-10",
+            booster=False,
+        )
+        assert again.state == "pending"
+
+    # Second deny on the resolved claim → 409.
+    assert (
+        authed_client.post(
+            f"/api/economy/claims/{claim_id}/deny", json={"reason": "again"}
+        ).status_code
+        == 409
+    )
+
+
+def test_list_pending_claims(authed_client, fake_ctx):
+    qid = _make_quest(authed_client, signoff=True, reward=5)["id"]
+    _seed_pending_claim(fake_ctx, qid, user_id=600, period="2026-07-10")
+    claims = authed_client.get(
+        "/api/economy/claims", params={"state": "pending"}
+    ).json()["claims"]
+    assert len(claims) == 1
+    assert claims[0]["user_id"] == "600"
+    assert claims[0]["deny_count"] == 0
+
+
+# ── sponsored QOTD queue (retired) ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/economy/qotd-submissions"),
+        ("post", "/api/economy/qotd-submissions/1/approve"),
+        ("post", "/api/economy/qotd-submissions/1/deny"),
+        ("post", "/api/economy/qotd-submissions/1/withdraw"),
+    ],
+)
+def test_the_sponsored_qotd_routes_are_gone(authed_client, method, path):
+    """Retired with /qotd, the only thing that drained the queue (2026-09)."""
+    assert getattr(authed_client, method)(path).status_code == 404
+
+
+# ── community progress + settle ────────────────────────────────────────
+
+
+def _seed_active_members(fake_ctx, user_ids: list[int]) -> None:
+    now = time.time()
+    with open_db(fake_ctx.db_path) as conn:
+        for uid in user_ids:
+            conn.execute(
+                """
+                INSERT INTO member_activity
+                    (guild_id, user_id, last_channel_id, last_message_id, last_message_at)
+                VALUES (?, ?, 1, 1, ?)
+                """,
+                (fake_ctx.guild_id, uid, now),
+            )
+
+
+def test_progress_and_settle_idempotent(authed_client, fake_ctx):
+    qid = _make_quest(
+        authed_client, qtype="community", reward=30, community_target=100
+    )["id"]
+    _seed_active_members(fake_ctx, [111, 222])
+
+    # Progress below then reaching target.
+    r = authed_client.post(
+        f"/api/economy/quests/{qid}/progress", json={"current": 50}
+    )
+    assert r.json()["completed"] is False
+    r = authed_client.post(
+        f"/api/economy/quests/{qid}/progress", json={"current": 100}
+    )
+    assert r.json()["completed"] is True
+
+    # First settle pays both members.
+    r = authed_client.post(f"/api/economy/quests/{qid}/settle")
+    assert r.status_code == 200
+    assert r.json()["paid_count"] == 2
+
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 111) == 30
+        assert get_balance(conn, fake_ctx.guild_id, 222) == 30
+
+    # Second settle is idempotent — pays 0 new.
+    r = authed_client.post(f"/api/economy/quests/{qid}/settle")
+    assert r.json()["paid_count"] == 0
+
+
+def test_settle_rejected_for_non_community(authed_client):
+    qid = _make_quest(authed_client, qtype="daily")["id"]
+    resp = authed_client.post(f"/api/economy/quests/{qid}/settle")
+    assert resp.status_code == 422
+
+
+def test_progress_rejected_for_non_community(authed_client):
+    qid = _make_quest(authed_client, qtype="daily")["id"]
+    resp = authed_client.post(
+        f"/api/economy/quests/{qid}/progress", json={"current": 5}
+    )
+    assert resp.status_code == 422
+
+
+# ── grant + ledger ─────────────────────────────────────────────────────
+
+
+def test_grant_credits_and_ledgers(authed_client, fake_ctx):
+    _enable_economy(fake_ctx)
+    resp = authed_client.post(
+        "/api/economy/grant",
+        json={"member_id": 314, "amount": 42, "reason": "mvp"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["credited"] == 42
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 314) == 42
+
+
+def _member_cache_bot(guild_id: int, member_ids: set[int]):
+    """Bot stub whose guild member cache contains exactly ``member_ids``."""
+
+    class _Guild:
+        def get_member(self, uid):
+            if uid in member_ids:
+                # Enough surface for auth re-resolution (admin perms, no
+                # roles) and member_is_booster (premium_since).
+                return types.SimpleNamespace(
+                    guild_permissions=types.SimpleNamespace(value=0x8),
+                    roles=[],
+                    display_name=f"member-{uid}",
+                    premium_since=None,
+                )
+            return None
+
+    class _Bot:
+        def get_guild(self, gid):
+            return _Guild() if gid == guild_id else None
+
+    return _Bot()
+
+
+def test_grant_accepts_string_member_id(authed_client, fake_ctx):
+    # The panel sends member_id as a string — parseInt on a snowflake past
+    # 2^53 silently rounds to a wrong id. Pydantic coerces the string int
+    # losslessly, so a full-precision snowflake credits the right wallet.
+    _enable_economy(fake_ctx)
+    snowflake = 1234567890123456789  # > 2^53: unrepresentable as a JS number
+    # id 1 is authed_client's session user — auth re-checks it via the cache.
+    fake_ctx.bot = _member_cache_bot(fake_ctx.guild_id, {1, snowflake})
+    try:
+        resp = authed_client.post(
+            "/api/economy/grant",
+            json={"member_id": str(snowflake), "amount": 42, "reason": "mvp"},
+        )
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["credited"] == 42
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, snowflake) == 42
+
+
+def test_grant_rejects_non_member(authed_client, fake_ctx):
+    # A member_id absent from the guild's member cache must be refused —
+    # otherwise a corrupted snowflake credits a phantom wallet while the
+    # mod sees success.
+    _enable_economy(fake_ctx)
+    fake_ctx.bot = _member_cache_bot(fake_ctx.guild_id, {1, 314})
+    try:
+        resp = authed_client.post(
+            "/api/economy/grant",
+            json={"member_id": 999, "amount": 42, "reason": "mvp"},
+        )
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 404
+    assert "member" in resp.json()["detail"]
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 999) == 0
+
+
+def test_grant_rejects_zero_amount(authed_client):
+    resp = authed_client.post(
+        "/api/economy/grant", json={"member_id": 1, "amount": 0, "reason": ""}
+    )
+    assert resp.status_code == 422
+
+
+def test_grant_refused_when_economy_disabled(authed_client, fake_ctx):
+    # Economy is disabled by default; grant must mirror /bank grant's gate.
+    resp = authed_client.post(
+        "/api/economy/grant",
+        json={"member_id": 314, "amount": 42, "reason": "mvp"},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "economy disabled"
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 314) == 0
+
+
+def test_remove_debits_and_ledgers(authed_client, fake_ctx):
+    _enable_economy(fake_ctx)
+    authed_client.post(
+        "/api/economy/grant", json={"member_id": 314, "amount": 100, "reason": "mvp"}
+    )
+    resp = authed_client.post(
+        "/api/economy/remove",
+        json={"member_id": 314, "amount": 40, "reason": "miscount"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "ok": True, "removed": 40, "requested": 40, "balance": 60
+    }
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 314) == 60
+        rows = get_ledger(conn, fake_ctx.guild_id, 314)
+    assert rows[0]["amount"] == -40
+    assert rows[0]["kind"] == "admin_remove"
+
+
+def test_remove_clamps_at_zero_balance(authed_client, fake_ctx):
+    # Over-typing empties the wallet and reports the real figure; the panel
+    # shows "removed" rather than the requested amount because of this.
+    _enable_economy(fake_ctx)
+    authed_client.post(
+        "/api/economy/grant", json={"member_id": 314, "amount": 25, "reason": ""}
+    )
+    resp = authed_client.post(
+        "/api/economy/remove", json={"member_id": 314, "amount": 900, "reason": ""}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["removed"] == 25
+    assert resp.json()["requested"] == 900
+    assert resp.json()["balance"] == 0
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 314) == 0
+
+
+def test_remove_ignores_the_booster_multiplier(authed_client, fake_ctx):
+    # A grant of 100 to a booster credits 150; a remove of 100 takes exactly
+    # 100. A removal is a correction, not an earning.
+    _enable_economy(fake_ctx)
+
+    class _Guild:
+        def get_member(self, uid):
+            return types.SimpleNamespace(
+                guild_permissions=types.SimpleNamespace(value=0x8),
+                roles=[],
+                display_name=f"member-{uid}",
+                premium_since=datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc),
+            )
+
+    class _Bot:
+        def get_guild(self, gid):
+            return _Guild() if gid == fake_ctx.guild_id else None
+
+    fake_ctx.bot = _Bot()
+    try:
+        assert authed_client.post(
+            "/api/economy/grant",
+            json={"member_id": 314, "amount": 100, "reason": ""},
+        ).json()["credited"] == 150
+        resp = authed_client.post(
+            "/api/economy/remove",
+            json={"member_id": 314, "amount": 100, "reason": ""},
+        )
+    finally:
+        fake_ctx.bot = None
+    assert resp.json()["removed"] == 100
+    assert resp.json()["balance"] == 50
+
+
+def test_remove_accepts_string_member_id(authed_client, fake_ctx):
+    # Same snowflake-precision contract as grant: the panel posts a string.
+    _enable_economy(fake_ctx)
+    snowflake = 1234567890123456789  # > 2^53
+    fake_ctx.bot = _member_cache_bot(fake_ctx.guild_id, {1, snowflake})
+    try:
+        authed_client.post(
+            "/api/economy/grant",
+            json={"member_id": str(snowflake), "amount": 60, "reason": ""},
+        )
+        resp = authed_client.post(
+            "/api/economy/remove",
+            json={"member_id": str(snowflake), "amount": 10, "reason": ""},
+        )
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed"] == 10
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, snowflake) == 50
+
+
+def test_remove_rejects_non_member(authed_client, fake_ctx):
+    _enable_economy(fake_ctx)
+    fake_ctx.bot = _member_cache_bot(fake_ctx.guild_id, {1, 314})
+    try:
+        resp = authed_client.post(
+            "/api/economy/remove",
+            json={"member_id": 999, "amount": 5, "reason": ""},
+        )
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 404
+    assert "member" in resp.json()["detail"]
+
+
+def test_remove_rejects_zero_and_negative_amounts(authed_client):
+    for amount in (0, -5):
+        resp = authed_client.post(
+            "/api/economy/remove",
+            json={"member_id": 1, "amount": amount, "reason": ""},
+        )
+        assert resp.status_code == 422
+
+
+def test_remove_refused_when_economy_disabled(authed_client, fake_ctx):
+    # Economy disabled by default; remove mirrors grant's gate.
+    resp = authed_client.post(
+        "/api/economy/remove", json={"member_id": 314, "amount": 5, "reason": ""}
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "economy disabled"
+
+
+def test_ledger_filters_and_cap(authed_client, fake_ctx):
+    _enable_economy(fake_ctx)
+    authed_client.post(
+        "/api/economy/grant", json={"member_id": 10, "amount": 5, "reason": "a"}
+    )
+    authed_client.post(
+        "/api/economy/grant", json={"member_id": 20, "amount": 7, "reason": "b"}
+    )
+
+    # user filter
+    entries = authed_client.get(
+        "/api/economy/ledger", params={"user_id": 10}
+    ).json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["user_id"] == "10"
+    assert entries[0]["kind"] == "grant"
+
+    # kind filter (no matching kind → empty)
+    entries = authed_client.get(
+        "/api/economy/ledger", params={"kind": "quest"}
+    ).json()["entries"]
+    assert entries == []
+
+    # limit is bounded at 500, and asking past it is refused
+    assert (
+        authed_client.get("/api/economy/ledger", params={"limit": 100000}).status_code
+        == 422
+    )
+    assert (
+        authed_client.get("/api/economy/ledger", params={"limit": 500}).status_code
+        == 200
+    )
+
+
+# ── perk rentals ───────────────────────────────────────────────────────
+
+
+def _seed_rental(
+    fake_ctx,
+    *,
+    user_id: int,
+    perk: str = "role_color",
+    state: str = "active",
+    price: int = 50,
+    beneficiary_id: int | None = None,
+    next_bill_at: float | None = None,
+) -> int:
+    """Insert a rental row directly (bypasses the upfront charge) so tests can
+    put a rental into any state. Callers vary (user_id, perk, beneficiary) per
+    live row to respect the one-live-rental unique index."""
+    now = time.time()
+    beneficiary = user_id if beneficiary_id is None else beneficiary_id
+    nb = now + 7 * 86400 if next_bill_at is None else next_bill_at
+    with open_db(fake_ctx.db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO econ_rentals
+                (guild_id, user_id, perk, state, price, started_at,
+                 next_bill_at, beneficiary_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (fake_ctx.guild_id, user_id, perk, state, price, now, nb, beneficiary, now),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _rental_state(fake_ctx, rental_id: int) -> sqlite3.Row:
+    with open_db(fake_ctx.db_path) as conn:
+        return conn.execute(
+            "SELECT state, cancel_at_period_end FROM econ_rentals WHERE id = ?",
+            (rental_id,),
+        ).fetchone()
+
+
+def test_list_rentals_shape(authed_client, fake_ctx):
+    # An active self-rental and a gifted (beneficiary ≠ owner) grace-state one.
+    _seed_rental(fake_ctx, user_id=100, perk="role_color", state="active", price=50)
+    gift_id = _seed_rental(
+        fake_ctx,
+        user_id=200,
+        perk="role_color",
+        state="grace",
+        price=60,
+        beneficiary_id=201,
+    )
+    # A lapsed rental must NOT appear (default states = active + grace only).
+    _seed_rental(fake_ctx, user_id=300, perk="role_icon", state="lapsed")
+
+    rentals = authed_client.get("/api/economy/rentals").json()["rentals"]
+    assert len(rentals) == 2
+    by_id = {r["id"]: r for r in rentals}
+    gift = by_id[gift_id]
+    assert gift["user_id"] == "200"
+    assert gift["beneficiary_id"] == "201"
+    assert gift["perk"] == "role_color"
+    assert gift["state"] == "grace"
+    assert gift["price"] == 60
+    assert gift["suspended"] is False
+    assert gift["cancel_at_period_end"] is False
+    assert "next_bill_at" in gift
+
+
+def test_list_rentals_reports_suspended(authed_client, fake_ctx):
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_icon", state="active")
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "UPDATE econ_rentals SET suspended = 1, suspended_since = ? WHERE id = ?",
+            (time.time(), rid),
+        )
+    rentals = authed_client.get("/api/economy/rentals").json()["rentals"]
+    assert rentals[0]["suspended"] is True
+
+
+def test_cancel_active_marks_period_end(authed_client, fake_ctx):
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_color", state="active")
+    resp = authed_client.post(f"/api/economy/rentals/{rid}/cancel")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "active"  # stays live until the anniversary tick
+    assert body["cancel_at_period_end"] is True
+    row = _rental_state(fake_ctx, rid)
+    assert row["state"] == "active"
+    assert row["cancel_at_period_end"] == 1
+
+
+def test_cancel_grace_cancels_immediately(authed_client, fake_ctx):
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_color", state="grace")
+    resp = authed_client.post(f"/api/economy/rentals/{rid}/cancel")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "cancelled"
+    # No bot in tests → the de-projection is skipped and reported false, but the
+    # state change still lands.
+    assert body["role_updated"] is False
+    assert _rental_state(fake_ctx, rid)["state"] == "cancelled"
+
+
+def test_cancel_active_reports_role_updated_false(authed_client, fake_ctx):
+    # An active cancel only sets cancel_at_period_end — no de-projection.
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_color", state="active")
+    body = authed_client.post(f"/api/economy/rentals/{rid}/cancel").json()
+    assert body["role_updated"] is False
+
+
+def test_cancel_grace_deprojects_with_ready_bot(authed_client, fake_ctx):
+    """A grace cancel with a ready bot runs the best-effort de-projection.
+
+    The fake bot's ``get_guild`` returns None, so ``revoke_role_perks`` is a
+    no-op that still completes — the branch runs and ``role_updated`` is True.
+    A gifted rental confirms the beneficiary (not the payer) is targeted.
+    """
+
+    class _ReadyBot:
+        def is_ready(self):
+            return True
+
+        def get_guild(self, _guild_id):
+            return None
+
+    rid = _seed_rental(
+        fake_ctx,
+        user_id=200,
+        perk="role_color",
+        state="grace",
+        beneficiary_id=201,
+    )
+    fake_ctx.bot = _ReadyBot()
+    try:
+        body = authed_client.post(f"/api/economy/rentals/{rid}/cancel").json()
+    finally:
+        fake_ctx.bot = None
+    assert body["state"] == "cancelled"
+    assert body["role_updated"] is True
+    assert _rental_state(fake_ctx, rid)["state"] == "cancelled"
+
+
+def test_cancel_unknown_rental_409(authed_client):
+    assert authed_client.post("/api/economy/rentals/999999/cancel").status_code == 409
+
+
+def test_cancel_lapsed_rental_409(authed_client, fake_ctx):
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_color", state="lapsed")
+    assert authed_client.post(f"/api/economy/rentals/{rid}/cancel").status_code == 409
+
+
+def test_rentals_gated_to_manager(fake_ctx):
+    _set_manager_role(fake_ctx)
+    rid = _seed_rental(fake_ctx, user_id=100, perk="role_color", state="active")
+    client = _client(fake_ctx, admin=False, role_ids=[123])
+    assert client.get("/api/economy/rentals").status_code == 403
+    assert client.post(f"/api/economy/rentals/{rid}/cancel").status_code == 403
+    client.close()
+
+
+# ── statistics ──────────────────────────────────────────────────────────
+
+
+def _seed_stats_wallet(fake_ctx, user_id: int, balance: int) -> None:
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO econ_wallets "
+            "(guild_id, user_id, balance, created_at, updated_at) VALUES (?, ?, ?, 0, 0)",
+            (fake_ctx.guild_id, user_id, balance),
+        )
+        conn.execute(
+            "INSERT INTO econ_ledger "
+            "(guild_id, user_id, amount, kind, actor_id, meta, created_at) "
+            "VALUES (?, ?, 40, 'login', NULL, NULL, ?)",
+            (fake_ctx.guild_id, user_id, time.time() - 3600),
+        )
+        # The Statistics page is scoped to 30-day-active members, so a wallet
+        # only shows up if its owner has recent activity.
+        conn.execute(
+            "INSERT OR REPLACE INTO member_activity "
+            "(guild_id, user_id, last_channel_id, last_message_id, last_message_at) "
+            "VALUES (?, ?, 0, 0, ?)",
+            (fake_ctx.guild_id, user_id, time.time() - 3600),
+        )
+
+
+def test_stats_shape(authed_client, fake_ctx):
+    _seed_stats_wallet(fake_ctx, 100, 500)
+    _seed_stats_wallet(fake_ctx, 101, 50)
+    resp = authed_client.get("/api/economy/stats")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for key in (
+        "supply",
+        "distribution",
+        "flow_7d",
+        "income_sources",
+        "members",
+        "engagement",
+        "transfers_top",
+        "affordability",
+    ):
+        assert key in body
+    assert body["supply"]["holders"] == 2
+    assert len(body["income_sources"]["buckets"]) == 8
+    assert len(body["members"]) == 2
+
+
+def test_stats_limit_truncates_and_refuses_over_cap(authed_client, fake_ctx):
+    for uid in range(600, 606):
+        _seed_stats_wallet(fake_ctx, uid, uid)
+    # A small limit truncates the member table.
+    body = authed_client.get("/api/economy/stats", params={"limit": 2}).json()
+    assert len(body["members"]) == 2
+    # The cap is 500, and asking past it is refused rather than silently met.
+    assert authed_client.get(
+        "/api/economy/stats", params={"limit": 100000}
+    ).status_code == 422
+    body = authed_client.get("/api/economy/stats", params={"limit": 500}).json()
+    assert len(body["members"]) == 6
+
+
+def test_stats_gated_to_manager(fake_ctx):
+    _set_manager_role(fake_ctx)
+    client = _client(fake_ctx, admin=False, role_ids=[123])
+    assert client.get("/api/economy/stats").status_code == 403
+    client.close()
+
+
+# ── sponsored emojis (sinks round 3, stage 4) ─────────────────────────
+
+
+def _seed_emoji_submission(fake_ctx, tmp_path, *, name="party_blob", animated=False):
+    from bot_modules.economy import emoji_service as emoji_svc
+    from bot_modules.economy.service import (
+        load_econ_settings,
+        save_econ_settings,
+    )
+
+    img = tmp_path / f"{name}.png"
+    img.write_bytes(b"\x89PNG fake")
+    with open_db(fake_ctx.db_path) as conn:
+        save_econ_settings(conn, fake_ctx.guild_id, {"enabled": True})
+        settings = load_econ_settings(conn, fake_ctx.guild_id)
+        apply_credit(conn, fake_ctx.guild_id, 100, 500, "grant")
+        out = emoji_svc.submit_sponsorship(
+            conn, settings, fake_ctx.guild_id, 100,
+            name=name, image_path=str(img), animated=animated,
+            blocklist_patterns=[], taken_names=set(), guild_slots_free=True,
+        )
+    return out.submission_id
+
+
+def test_emoji_submissions_list_and_image(authed_client, fake_ctx, tmp_path):
+    sid = _seed_emoji_submission(fake_ctx, tmp_path)
+    subs = authed_client.get(
+        "/api/economy/emoji-submissions?state=pending"
+    ).json()["submissions"]
+    assert [s["id"] for s in subs] == [sid]
+    assert subs[0]["name"] == "party_blob"
+    assert subs[0]["user_id"] == "100"
+
+    img = authed_client.get(f"/api/economy/emoji-submissions/{sid}/image")
+    assert img.status_code == 200
+    assert img.content == b"\x89PNG fake"
+
+
+def test_emoji_deny_refunds_via_route(authed_client, fake_ctx, tmp_path):
+    from bot_modules.economy.service import get_balance
+
+    sid = _seed_emoji_submission(fake_ctx, tmp_path)
+    resp = authed_client.post(
+        f"/api/economy/emoji-submissions/{sid}/deny",
+        json={"reason": "not a fit"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "denied"
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 100) == 500
+
+
+def test_emoji_approve_uploads_and_goes_live(authed_client, fake_ctx, tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    sid = _seed_emoji_submission(fake_ctx, tmp_path)
+
+    uploaded = MagicMock()
+    uploaded.id = 424242
+    guild = MagicMock()
+    guild.create_custom_emoji = AsyncMock(return_value=uploaded)
+
+    class _ReadyBot:
+        def is_ready(self):
+            return True
+
+        def get_guild(self, _guild_id):
+            return guild
+
+    fake_ctx.bot = _ReadyBot()
+    try:
+        resp = authed_client.post(f"/api/economy/emoji-submissions/{sid}/approve")
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "state": "live"}
+    guild.create_custom_emoji.assert_awaited_once()
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM econ_emoji_submissions WHERE id = ?", (sid,)
+        ).fetchone()
+        rental = conn.execute(
+            "SELECT * FROM econ_rentals WHERE id = ?", (row["rental_id"],)
+        ).fetchone()
+    assert row["emoji_id"] == 424242
+    assert rental["perk"] == "emoji" and rental["state"] == "active"
+
+
+def test_emoji_approve_upload_failure_denies_and_refunds(
+    authed_client, fake_ctx, tmp_path
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot_modules.economy.service import get_balance
+
+    sid = _seed_emoji_submission(fake_ctx, tmp_path)
+    guild = MagicMock()
+    guild.create_custom_emoji = AsyncMock(side_effect=RuntimeError("no slots"))
+
+    class _ReadyBot:
+        def is_ready(self):
+            return True
+
+        def get_guild(self, _guild_id):
+            return guild
+
+    fake_ctx.bot = _ReadyBot()
+    try:
+        resp = authed_client.post(f"/api/economy/emoji-submissions/{sid}/approve")
+    finally:
+        fake_ctx.bot = None
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False and body["state"] == "denied"
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_balance(conn, fake_ctx.guild_id, 100) == 500  # refunded
+
+
+def test_emoji_approve_requires_connected_bot(authed_client, fake_ctx, tmp_path):
+    sid = _seed_emoji_submission(fake_ctx, tmp_path)
+    resp = authed_client.post(f"/api/economy/emoji-submissions/{sid}/approve")
+    assert resp.status_code == 503
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT state FROM econ_emoji_submissions WHERE id = ?", (sid,)
+        ).fetchone()
+    assert row["state"] == "pending"  # no claim burned
+
+
+# ── Income Sources: the faucet payload must cover every box the panel edits ──
+
+
+def _faucet_field_keys() -> list[str]:
+    """The keys ``economy-income-sources.js`` renders an input for."""
+    import re
+
+    src = (
+        REPO_ROOT
+        / "src"
+        / "web_server"
+        / "static"
+        / "js"
+        / "panels"
+        / "economy-income-sources.js"
+    ).read_text(encoding="utf-8")
+    block = src.split("const FAUCET_FIELDS = [", 1)[1].split("\n];", 1)[0]
+    return re.findall(r'\["([a-z0-9_]+)"', block)
+
+
+def test_income_sources_returns_every_faucet_the_panel_edits(authed_client):
+    """A key the panel renders but the GET omits shows as 0 and is saved as 0.
+
+    The host-bounty pair was exactly that: both boxes rendered "0" on load and
+    every faucet Save wrote a 0 over the guild's real rate, silently killing
+    host payouts.
+    """
+    body = authed_client.get("/api/economy/income-sources").json()
+    missing = [k for k in _faucet_field_keys() if k not in body["faucets"]]
+    assert not missing, f"faucet keys the panel edits but the GET omits: {missing}"
+
+
+def test_income_sources_faucets_report_stored_host_bounty(authed_client, fake_ctx):
+    """Round-trip: a configured host bounty comes back, so a Save re-sends it."""
+    with open_db(fake_ctx.db_path) as conn:
+        save_econ_settings(
+            conn,
+            fake_ctx.guild_id,
+            {"host_bounty_per_joiner": 100, "host_bounty_cap": 8},
+        )
+    faucets = authed_client.get("/api/economy/income-sources").json()["faucets"]
+    assert faucets["host_bounty_per_joiner"] == 100
+    assert faucets["host_bounty_cap"] == 8

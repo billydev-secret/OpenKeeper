@@ -1,0 +1,257 @@
+"""Integration tests for hot_potato/db.py using GamesDb + real SQLite."""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+
+from bot_modules.games.db import GamesDb
+from bot_modules.duels.hot_potato import db as hpdb
+from bot_modules.duels.db import CHALLENGE_RESPONSE_SECONDS
+
+
+@pytest_asyncio.fixture
+async def db(sync_db_path: Path) -> GamesDb:
+    return GamesDb(sync_db_path)
+
+
+GUILD = 9001
+CH = 100
+
+
+async def _create(db, **kwargs) -> int:
+    defaults = dict(
+        guild_id=GUILD,
+        channel_id=CH,
+        challenger_id=1,
+        target_id=2,
+        stakes_text=None,
+    )
+    defaults.update(kwargs)
+    return await hpdb.create_game(db, **defaults)
+
+
+# ── create / get ──────────────────────────────────────────────────────────────
+
+async def test_create_and_get_game(db):
+    gid = await _create(db)
+    game = await hpdb.get_game(db, gid)
+    assert game is not None
+    assert game.id == gid
+    assert game.state == "PENDING"
+    assert game.challenger_id == 1
+    assert game.target_id == 2
+    assert game.holder_id is None
+    assert game.pass_log == []
+
+
+async def test_get_game_missing_returns_none(db):
+    assert await hpdb.get_game(db, 99999) is None
+
+
+async def test_create_stores_stakes_text(db):
+    gid = await _create(db, stakes_text="loser buys dinner")
+    game = await hpdb.get_game(db, gid)
+    assert game.stakes_text == "loser buys dinner"
+
+
+# ── set_game_state ─────────────────────────────────────────────────────────────
+
+async def test_set_game_state_active_with_holder(db):
+    gid = await _create(db)
+    now = time.time()
+    log = json.dumps([{"holder_id": 1, "received_at": now, "passed_at": None}])
+    await hpdb.set_game_state(
+        db, gid, "ACTIVE",
+        holder_id=1, timer_seconds=30.0, started_at=now, pass_log=log, last_action_at=now
+    )
+    game = await hpdb.get_game(db, gid)
+    assert game.state == "ACTIVE"
+    assert game.holder_id == 1
+    assert game.timer_seconds == pytest.approx(30.0)
+    assert game.started_at == pytest.approx(now, abs=1)
+    assert len(game.pass_log) == 1
+    assert game.pass_log[0]["holder_id"] == 1
+
+
+async def test_set_game_state_resolved_sets_winner_loser(db):
+    gid = await _create(db)
+    now = time.time()
+    await hpdb.set_game_state(
+        db, gid, "RESOLVED",
+        winner_id=2, loser_id=1, resolved_at=now
+    )
+    game = await hpdb.get_game(db, gid)
+    assert game.state == "RESOLVED"
+    assert game.winner_id == 2
+    assert game.loser_id == 1
+
+
+async def test_set_game_state_void(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "VOID")
+    game = await hpdb.get_game(db, gid)
+    assert game.state == "VOID"
+
+
+# ── get_active_game_for_pair ──────────────────────────────────────────────────
+
+async def test_get_active_game_for_pair_found(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "ACTIVE")
+    result = await hpdb.get_active_game_for_pair(db, GUILD, 1, 2)
+    assert result is not None
+    assert result.id == gid
+
+
+async def test_get_active_game_for_pair_reversed_order(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "ACTIVE")
+    result = await hpdb.get_active_game_for_pair(db, GUILD, 2, 1)
+    assert result is not None
+    assert result.id == gid
+
+
+async def test_get_active_game_for_pair_not_found_after_void(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "VOID")
+    result = await hpdb.get_active_game_for_pair(db, GUILD, 1, 2)
+    assert result is None
+
+
+# ── get_pending_game_for_challenger ───────────────────────────────────────────
+
+async def test_get_pending_game_for_challenger_found(db):
+    gid = await _create(db)
+    result = await hpdb.get_pending_game_for_challenger(db, GUILD, CH, 1)
+    assert result is not None
+    assert result.id == gid
+
+
+async def test_get_pending_game_for_challenger_wrong_channel(db):
+    await _create(db)
+    result = await hpdb.get_pending_game_for_challenger(db, GUILD, 999, 1)
+    assert result is None
+
+
+# ── fetch helpers ──────────────────────────────────────────────────────────────
+
+async def test_fetch_active_games(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "ACTIVE")
+    games = await hpdb.fetch_active_games(db)
+    assert any(g.id == gid for g in games)
+
+
+async def test_fetch_resolved_games(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "RESOLVED")
+    games = await hpdb.fetch_resolved_games(db)
+    assert any(g.id == gid for g in games)
+
+
+async def _backdate(db, gid, seconds):
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(str(db._db_path)) as conn:
+        conn.execute(
+            "UPDATE hot_potato_games SET created_at = ? WHERE id = ?",
+            (time.time() - seconds, gid),
+        )
+        conn.commit()
+
+
+async def test_fetch_sweepable_pending(db):
+    gid = await _create(db)
+    await _backdate(db, gid, CHALLENGE_RESPONSE_SECONDS + 60)
+    games = await hpdb.fetch_sweepable_games(db, time.time())
+    assert any(g.id == gid for g in games)
+
+
+async def test_pending_challenge_stays_open_for_the_whole_window(db):
+    """Two minutes in used to be expired — the window is five minutes now."""
+    gid = await _create(db)
+    await _backdate(db, gid, 120)
+    games = await hpdb.fetch_sweepable_games(db, time.time())
+    assert not any(g.id == gid for g in games)
+
+
+async def test_fetch_sweepable_active_timeout(db):
+    gid = await _create(db)
+    old = time.time() - 700
+    await hpdb.set_game_state(db, gid, "ACTIVE", last_action_at=old)
+    games = await hpdb.fetch_sweepable_games(db, time.time())
+    assert any(g.id == gid for g in games)
+
+
+async def test_fetch_sweepable_excludes_fresh(db):
+    gid = await _create(db)
+    await hpdb.set_game_state(db, gid, "ACTIVE", last_action_at=time.time())
+    games = await hpdb.fetch_sweepable_games(db, time.time())
+    assert not any(g.id == gid for g in games)
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+async def test_get_config_defaults(db):
+    cfg = await hpdb.get_config(db, GUILD)
+    assert cfg["min_timer"] == pytest.approx(10.0)
+    assert cfg["max_timer"] == pytest.approx(45.0)
+    # duels-party-119: the group cog's anti-ping-pong wait, adopted by the duel.
+    assert cfg["min_hold"] == pytest.approx(2.0)
+
+
+async def test_min_hold_round_trips_through_the_table(db):
+    await hpdb.upsert_config(db, GUILD, min_hold=0.0)
+    cfg = await hpdb.get_config(db, GUILD)
+    assert cfg["min_hold"] == pytest.approx(0.0)
+
+
+async def test_upsert_config_updates_values(db):
+    await hpdb.upsert_config(db, GUILD, min_timer=5.0)
+    cfg = await hpdb.get_config(db, GUILD)
+    assert cfg["min_timer"] == pytest.approx(5.0)
+    assert cfg["max_timer"] == pytest.approx(45.0)  # untouched
+
+
+async def test_upsert_config_idempotent(db):
+    await hpdb.upsert_config(db, GUILD, min_timer=5.0)
+    await hpdb.upsert_config(db, GUILD, min_timer=8.0)
+    cfg = await hpdb.get_config(db, GUILD)
+    assert cfg["min_timer"] == pytest.approx(8.0)
+
+
+# ── style points ──────────────────────────────────────────────────────────────
+
+
+async def _style_points(db, guild_id: int, user_id: int) -> int:
+    row = await db.fetchone(
+        "SELECT total_points FROM hot_potato_style WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    )
+    return row["total_points"] if row else 0
+
+
+async def test_add_style_points_accumulates(db):
+    await hpdb.add_style_points(db, GUILD, 1, 15)
+    await hpdb.add_style_points(db, GUILD, 1, 10)
+    assert await _style_points(db, GUILD, 1) == 25
+
+
+async def test_add_style_points_separate_users(db):
+    await hpdb.add_style_points(db, GUILD, 1, 20)
+    await hpdb.add_style_points(db, GUILD, 2, 5)
+    assert await _style_points(db, GUILD, 1) == 20
+    assert await _style_points(db, GUILD, 2) == 5
+
+
+async def test_get_style_total_reads_the_running_total(db):
+    """The cumulative table was write-only until the result card started
+    quoting it (duels-party-119)."""
+    assert await hpdb.get_style_total(db, GUILD, 1) == 0
+    await hpdb.add_style_points(db, GUILD, 1, 15)
+    await hpdb.add_style_points(db, GUILD, 1, 10)
+    assert await hpdb.get_style_total(db, GUILD, 1) == 25
+    assert await hpdb.get_style_total(db, GUILD + 1, 1) == 0

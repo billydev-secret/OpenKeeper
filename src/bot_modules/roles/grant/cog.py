@@ -1,0 +1,104 @@
+"""Role grant commands."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from bot_modules.roles.grant.role_grant_commands import _execute_grant
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import Bot
+
+log = logging.getLogger("dungeonkeeper.role_grant")
+
+
+class RoleGrantCog(commands.Cog):
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        super().__init__()
+
+    async def _role_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        choices: list[app_commands.Choice[str]] = []
+        for key, cfg in self.bot.ctx.guild_config(interaction.guild_id or 0).grant_roles.items():
+            if (
+                current.lower() in key.lower()
+                or current.lower() in cfg["label"].lower()
+            ):
+                choices.append(app_commands.Choice(name=cfg["label"], value=key))
+        return choices[:25]
+
+    @app_commands.command(
+        name="grant", description="Give a configured community role to a member."
+    )
+    @app_commands.describe(
+        role="Role to grant (from your configured grant roles).",
+        member="Member to receive the role.",
+    )
+    @app_commands.autocomplete(role=_role_autocomplete)
+    async def grant_cmd(
+        self,
+        interaction: discord.Interaction,
+        role: str,
+        member: discord.Member,
+    ) -> None:
+        ctx = self.bot.ctx
+        # The allow-list answer is carried into the executor rather than
+        # refused here: a member who hasn't met the grant's prerequisite is
+        # the more useful thing to report, and only the executor has resolved
+        # the member far enough to know (role_grant_logic.grant_refusal).
+        actor_may_grant = ctx.can_use_grant_role(interaction, role)
+        cfg = ctx.guild_config(interaction.guild_id or 0).grant_roles.get(role)
+        if cfg is None:
+            await interaction.response.send_message(
+                "❌ This grant role is not configured.", ephemeral=True
+            )
+            return
+        await _execute_grant(
+            interaction,
+            member,
+            role_id=cfg["role_id"],
+            log_channel_id=cfg["log_channel_id"],
+            announce_channel_id=cfg["announce_channel_id"],
+            grant_message=cfg["grant_message"],
+            ctx=ctx,
+            required_role_id=cfg["required_role_id"],
+            actor_may_grant=actor_may_grant,
+        )
+
+    async def post_audit_card(
+        self, guild, channel, *, role_key: str = "nsfw", min_level: int = 5
+    ):
+        """Place the auto-updating grant-audit card.
+
+        Entry point for the dashboard's panel poster (``panel_registry``);
+        replaced /grant_audit on 2026-07-28. Unlike the other panels this one
+        takes options — which grant role, and the level at or above which
+        members are expected to hold it — so the registry declares them and the
+        route passes them through.
+
+        Raises ValueError with the reason when placement is refused, which the
+        route turns into a message naming the specific thing to fix.
+        """
+        from bot_modules.roles.grant.audit_service import (
+            place_grant_audit_card,
+        )
+
+        message, reason = await place_grant_audit_card(
+            self.bot.ctx, guild, channel, role_key=role_key, min_level=min_level
+        )
+        if message is None:
+            raise ValueError(reason)
+        return message
+
+
+async def setup(bot: Bot) -> None:
+    await bot.add_cog(RoleGrantCog(bot))

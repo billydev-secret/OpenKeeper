@@ -1,0 +1,503 @@
+// Daily feature rotation — the whole admin surface for the rotating rooms.
+// One room out of the pool is open each day; the rest are hidden by denying
+// view to @everyone in place (the channel keeps its category and position).
+// The pool table is the feature: every row is a channel plus the handful of
+// switches that decide how it behaves on the days it isn't the open one.
+import { api, apiPut, apiDelete, apiPost, esc } from "../api.js";
+import { clearFormDirty, loadChannels, guardForm, metaLoadFailed, mountAsync } from "../config-helpers.js";
+import { renderLoading, renderEmpty, renderError } from "../states.js";
+import { confirmDialog, toast } from "../ui.js";
+
+let channels = [];
+let triggerKinds = [];
+let launchableGames = [];
+
+function tzLabel(offset) {
+  const n = Number(offset) || 0;
+  if (!n) return "UTC";
+  const whole = Math.trunc(Math.abs(n));
+  const mins = Math.round((Math.abs(n) - whole) * 60);
+  return `UTC${n < 0 ? "-" : "+"}${whole}${mins ? `:${String(mins).padStart(2, "0")}` : ""}`;
+}
+
+function chanName(id) {
+  const c = channels.find((x) => String(x.id) === String(id));
+  return c ? `#${c.name}` : `#${id}`;
+}
+
+function chanOptions(selected, placeholder) {
+  const opts = channels
+    .map((c) => `<option value="${c.id}" ${String(c.id) === String(selected) ? "selected" : ""}>#${esc(c.name)}</option>`)
+    .join("");
+  return `<option value="0">${esc(placeholder)}</option>${opts}`;
+}
+
+function gameName(key) {
+  const g = launchableGames.find((x) => x.type === key);
+  return g ? `${g.icon} ${g.name}` : key;
+}
+
+// The "run a game here" controls, rendered into a room's expanded row. The
+// options come from the same SCHEDULE_OPTION_SCHEMA the scheduling panel uses,
+// so a field added to a game shows up in both places without new copy here.
+function gameControls(room) {
+  const chosen = room.launch_game || "";
+  const opts = launchableGames
+    .map((g) => `<option value="${esc(g.type)}"${g.type === chosen ? " selected" : ""}>${esc(g.icon)} ${esc(g.name)}</option>`)
+    .join("");
+  return `
+    <label style="display:block; margin-bottom:6px;">Run a game while this room is open
+      <select data-r="launch_game" style="margin-left:6px;">
+        <option value=""${chosen ? "" : " selected"}>— no game —</option>
+        ${opts}
+      </select>
+    </label>
+    <div class="field-hint">Starts at midnight when the room opens and closes when its day ends, with the recap posted and players paid.</div>
+    <div data-game-options="${room.channel_id}" style="margin-top:6px;">${gameOptionFields(room)}</div>`;
+}
+
+// Advisory copy for a game whose lifecycle has a wrinkle the dial can't show.
+// Guidance, never a block — the same stance the pool picker takes.
+const GAME_NOTES = {
+  risky_roll:
+    "Rounds also end at their own limits, often before midnight. Scheduled Risky Rolls in this channel add more.",
+};
+
+function gameNote(key) {
+  const note = GAME_NOTES[key];
+  return note ? `<div class="field-hint" style="margin-top:6px;">${esc(note)}</div>` : "";
+}
+
+function gameOptionFields(room, overrideKey) {
+  const key = overrideKey === undefined ? (room.launch_game || "") : overrideKey;
+  const game = launchableGames.find((g) => g.type === key);
+  if (!game) return "";
+  if (!(game.fields || []).length) return gameNote(key);
+  const values = room.launch_options || {};
+  const fields = game.fields
+    .map((f) => {
+      const v = values[f.name] !== undefined ? values[f.name] : f.default;
+      let control;
+      if (f.type === "choice") {
+        const choices = (f.choices || [])
+          .map((c) => `<option value="${esc(c.value)}"${String(v) === String(c.value) ? " selected" : ""}>${esc(c.label)}</option>`)
+          .join("");
+        control = `<select data-opt="${esc(f.name)}" data-opt-type="choice">${choices}</select>`;
+      } else if (f.type === "bool") {
+        control = `<input type="checkbox" data-opt="${esc(f.name)}" data-opt-type="bool"${v ? " checked" : ""}>`;
+      } else if (f.type === "int") {
+        const minA = f.min !== undefined ? ` min="${f.min}"` : "";
+        const maxA = f.max !== undefined ? ` max="${f.max}"` : "";
+        control = `<input type="number"${minA}${maxA} data-opt="${esc(f.name)}" data-opt-type="int" value="${esc(String(v ?? ""))}">`;
+      } else {
+        control = `<input type="text" data-opt="${esc(f.name)}" data-opt-type="str" value="${esc(String(v ?? ""))}">`;
+      }
+      return `<div style="flex:1; min-width:200px;"><label>${esc(f.label)} ${control}</label></div>`;
+    })
+    .join("");
+  return `<div style="display:flex; flex-wrap:wrap; gap:12px;">${fields}</div>${gameNote(key)}`;
+}
+
+function kindLabel(kind) {
+  const k = triggerKinds.find((t) => t.kind === kind);
+  return k ? k.label : kind;
+}
+
+// A room's quest kinds as chips; the blocked ones carry a marker because that
+// is the pair of facts an admin needs at a glance — what this room pays out
+// for, and which of those stop working when its door is shut.
+function kindChips(room) {
+  if (!room.quest_kinds.length) {
+    return `<span class="field-hint">No quests linked</span>`;
+  }
+  return room.quest_kinds
+    .map((k) => {
+      const blocked = room.blocked_kinds.includes(k);
+      return `<span class="chip ${blocked ? "chip-warning" : ""}" title="${esc(kindLabel(k))}${blocked ? " — needs the room open" : ""}">${esc(k)}${blocked ? " 🔒" : ""}</span>`;
+    })
+    .join(" ");
+}
+
+export function mount(container) {
+  container.innerHTML = `<div class="panel">${renderLoading("Loading feature rotation…")}</div>`;
+  return mountAsync(container, async () => {
+    channels = await loadChannels().catch(() => []);
+    render(container);
+    if (metaLoadFailed()) {
+      toast("Couldn’t load the channel list — reload before saving.", "error");
+    }
+    await refresh(container);
+  }, { errorMsg: "Couldn’t load the feature rotation settings." });
+}
+
+function render(container) {
+  container.innerHTML = `
+    <div class="panel">
+      <header style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div>
+          <h2>Daily Feature Rotation</h2>
+          <div class="subtitle">Opens one room from the pool each day, hides the rest, and announces the day’s feature.</div>
+        </div>
+        <!-- Re-runs the same moderator-readable GET the page loads on mount,
+             so it stays live on a page held read-only (dashboard_ia.md IA6). -->
+        <button class="btn" data-refresh data-readonly-ok>Refresh</button>
+      </header>
+
+      <section class="card">
+        <div class="section-label">Settings</div>
+        <div data-settings>${renderLoading("Loading settings…")}</div>
+        <div data-settings-status></div>
+      </section>
+
+      <section class="card">
+        <div class="section-label">Today</div>
+        <div data-today>${renderLoading("Loading…")}</div>
+      </section>
+
+      <section class="card">
+        <div class="section-label">The Pool</div>
+        <div class="field-hint">
+          Any channel can join. <strong>Hide When Off</strong> hides a room on days it isn’t featured; unticked, it stays visible.
+        </div>
+        <div data-pool>${renderLoading("Loading the pool…")}</div>
+      </section>
+
+      <section class="card">
+        <div class="section-label">Add A Channel</div>
+        <div data-add></div>
+      </section>
+    </div>`;
+
+  container.querySelector("[data-refresh]").addEventListener("click", () => refresh(container));
+}
+
+async function refresh(container) {
+  let data;
+  try {
+    data = await api("/api/feature-rotation");
+  } catch (err) {
+    container.querySelector("[data-settings]").innerHTML =
+      renderError(`Couldn’t load the rotation — try again. (${err.message})`);
+    container.querySelector("[data-today]").innerHTML = "";
+    container.querySelector("[data-pool]").innerHTML = "";
+    return;
+  }
+  triggerKinds = data.trigger_kinds || [];
+  launchableGames = data.launchable_games || [];
+  renderSettings(container, data);
+  renderToday(container, data);
+  renderPool(container, data);
+  renderAdd(container, data);
+}
+
+// ── settings ─────────────────────────────────────────────────────────
+
+function renderSettings(container, data) {
+  const cfg = data.config;
+  const host = container.querySelector("[data-settings]");
+  host.innerHTML = `
+    <div class="field-row">
+      <div class="field">
+        <label for="fr-enabled">Rotation</label>
+        <select data-f="enabled" id="fr-enabled">
+          <option value="1" ${cfg.enabled ? "selected" : ""}>On</option>
+          <option value="0" ${cfg.enabled ? "" : "selected"}>Off</option>
+        </select>
+        <div class="field-hint">Off stops the hiding and the announcement. Save, then press “Apply Now” to reopen rooms still hidden.</div>
+      </div>
+      <div class="field">
+        <label for="fr-announce-channel">Announce In</label>
+        <select data-f="announce_channel_id" id="fr-announce-channel">${chanOptions(cfg.announce_channel_id, "(don’t announce)")}</select>
+        <div class="field-hint">Never hidden, even if it’s in the pool. “(don’t announce)” posts nothing.</div>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="fr-announce-hour">Announce At (Hour, 0-23)</label>
+        <input data-f="announce_hour" id="fr-announce-hour" type="number" min="0" max="23" value="${cfg.announce_hour}" style="max-width:120px;">
+        <div class="field-hint">Rooms still change at midnight; only the announcement waits for this hour. Times are ${esc(tzLabel(cfg.tz_offset_hours))}, set on the <a href="#/config-global">Global</a> page.</div>
+      </div>
+      <div class="field">
+        <label for="fr-rooms-per-day">Rooms Open Per Day</label>
+        <input data-f="rooms_per_day" id="fr-rooms-per-day" type="number" min="1" max="10" value="${cfg.rooms_per_day}" style="max-width:120px;">
+        <div class="field-hint">With a bigger pool, raise this or each room only comes round rarely.</div>
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-primary" data-save-settings>Save Settings</button>
+      <button class="btn" data-apply-now>Apply Now</button>
+    </div>
+    <div class="field-hint">
+      “Apply Now” brings Discord into line with today’s plan straight away instead of waiting for midnight.
+    </div>`;
+
+  // Guard once: renderSettings re-runs on every refresh over the same host, so
+  // re-guarding would stack another listener triple each time.
+  const form = host.dataset.dkGuard ? host : guardForm(host);
+  host.querySelector("[data-save-settings]").addEventListener("click", async () => {
+    const body = {
+      enabled: host.querySelector('[data-f="enabled"]').value === "1",
+      // A snowflake is above 2^53: Number() would round it to a different channel.
+      announce_channel_id: String(host.querySelector('[data-f="announce_channel_id"]').value || "0"),
+      announce_hour: Number(host.querySelector('[data-f="announce_hour"]').value),
+      rooms_per_day: Number(host.querySelector('[data-f="rooms_per_day"]').value),
+    };
+    try {
+      await apiPut("/api/feature-rotation/config", body);
+      clearFormDirty(form);
+      toast("Settings saved.", "success");
+      await refresh(container);
+    } catch (err) {
+      toast(`Couldn’t save: ${err.message}`, "error");
+    }
+  });
+
+  host.querySelector("[data-apply-now]").addEventListener("click", async () => {
+    try {
+      const res = await apiPost("/api/feature-rotation/apply", {});
+      toast(`Applied — ${res.shown} opened, ${res.hidden} hidden.`, "success");
+      await refresh(container);
+    } catch (err) {
+      toast(`Couldn’t apply: ${err.message}`, "error");
+    }
+  });
+}
+
+// ── today ────────────────────────────────────────────────────────────
+
+function renderToday(container, data) {
+  const host = container.querySelector("[data-today]");
+  const t = data.today;
+  if (!data.config.enabled) {
+    host.innerHTML = `<div class="field-hint">The rotation is off. Every room is left exactly as it is.</div>`;
+    return;
+  }
+  if (!t.featured.length) {
+    host.innerHTML = renderEmpty("No channels in the pool yet. Add one below.");
+    return;
+  }
+  const featured = t.featured.map((c) => `<strong>${esc(chanName(c))}</strong>`).join(", ");
+  const hidden = t.hidden.length
+    ? t.hidden.map((c) => esc(chanName(c))).join(", ")
+    : "nothing";
+  const tomorrow = data.tomorrow.featured.length
+    ? data.tomorrow.featured.map((c) => esc(chanName(c))).join(", ")
+    : "—";
+  const blocked = t.blocked_quest_kinds.length
+    ? `<div class="field-hint">Quests held off today’s board: ${t.blocked_quest_kinds.map((k) => `<span class="chip chip-warning">${esc(k)}</span>`).join(" ")}</div>`
+    : `<div class="field-hint">Every quest still works today.</div>`;
+  host.innerHTML = `
+    <div>Open today (${esc(t.local_day)}): ${featured}</div>
+    <div class="field-hint">Hidden: ${hidden}</div>
+    <div class="field-hint">Next up: ${tomorrow}</div>
+    ${blocked}`;
+}
+
+// ── the pool table ───────────────────────────────────────────────────
+
+function roomRow(room) {
+  const state = room.featured_today
+    ? `<span class="chip chip-success">open today</span>`
+    : room.hidden_now
+      ? `<span class="chip">hidden</span>`
+      : `<span class="chip">visible</span>`;
+  const gameChip = room.launch_game
+    ? ` <span class="chip">${esc(gameName(room.launch_game))}</span>`
+    : "";
+  return `
+    <tr data-room="${room.channel_id}">
+      <td><input type="number" min="0" max="999" value="${room.position}" data-r="position" style="width:4.5em;"></td>
+      <td>
+        <div>${esc(chanName(room.channel_id))}</div>
+        <div>${state}${gameChip}</div>
+      </td>
+      <td><input type="text" value="${esc(room.label)}" data-r="label" placeholder="${esc(chanName(room.channel_id))}" style="width:9em;"></td>
+      <td style="text-align:center;"><input type="checkbox" data-r="in_rotation" ${room.in_rotation ? "checked" : ""}></td>
+      <td style="text-align:center;"><input type="checkbox" data-r="hide_when_off" ${room.hide_when_off ? "checked" : ""}></td>
+      <td style="text-align:center;"><input type="checkbox" data-r="announce" ${room.announce ? "checked" : ""}></td>
+      <td>${kindChips(room)}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-sm" data-edit>Setup</button>
+        <button class="btn btn-sm" data-save-room>Save</button>
+        <button class="btn btn-sm btn-danger" data-remove>Remove</button>
+      </td>
+    </tr>
+    <tr data-kinds-for="${room.channel_id}" hidden>
+      <td colspan="8">
+        <label style="display:block; margin-bottom:8px;">Blurb (shown under the announcement)
+          <input type="text" data-r="blurb" value="${esc(room.blurb)}" maxlength="300" placeholder="One line about what happens in here" style="width:100%; max-width:32em;">
+        </label>
+        <div style="margin-bottom:10px; padding-bottom:10px; border-bottom:1px solid var(--rule-soft);">
+          ${gameControls(room)}
+        </div>
+        <div class="field-hint">Tick the quests this room owns, then 🔒 those that need a message in the channel. They leave the board on hidden days.</div>
+        <div class="kind-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:4px; margin-top:6px;">
+          ${triggerKinds.map((t) => {
+            const owned = room.quest_kinds.includes(t.kind);
+            const blocked = room.blocked_kinds.includes(t.kind);
+            const ownId = `fr-k-${room.channel_id}-${t.kind}`;
+            const lockId = `fr-b-${room.channel_id}-${t.kind}`;
+            return `<div style="display:flex; align-items:center; gap:6px;">
+              <input type="checkbox" id="${esc(ownId)}" data-kind="${esc(t.kind)}" ${owned ? "checked" : ""}>
+              <label for="${esc(ownId)}" style="flex:1;">${esc(t.label)}</label>
+              <input type="checkbox" id="${esc(lockId)}" data-blocked="${esc(t.kind)}" ${blocked ? "checked" : ""}>
+              <label for="${esc(lockId)}" class="field-hint" style="white-space:nowrap;" title="Needs the room open">🔒</label>
+            </div>`;
+          }).join("")}
+        </div>
+      </td>
+    </tr>`;
+}
+
+function readRoom(tr, kindsRow) {
+  const val = (sel) => tr.querySelector(`[data-r="${sel}"]`);
+  const quest_kinds = [];
+  const blocked_kinds = [];
+  if (kindsRow) {
+    kindsRow.querySelectorAll("[data-kind]").forEach((el) => {
+      if (el.checked) quest_kinds.push(el.getAttribute("data-kind"));
+    });
+    kindsRow.querySelectorAll("[data-blocked]").forEach((el) => {
+      if (el.checked) blocked_kinds.push(el.getAttribute("data-blocked"));
+    });
+  }
+  // The blurb input lives in the expanded row, so read it from there.
+  const blurbEl = kindsRow ? kindsRow.querySelector('[data-r="blurb"]') : null;
+  const gameEl = kindsRow ? kindsRow.querySelector('[data-r="launch_game"]') : null;
+  const launch_options = {};
+  if (kindsRow) {
+    kindsRow.querySelectorAll("[data-opt]").forEach((el) => {
+      const name = el.getAttribute("data-opt");
+      const type = el.getAttribute("data-opt-type");
+      if (type === "bool") launch_options[name] = el.checked;
+      else if (type === "int") { if (el.value !== "") launch_options[name] = parseInt(el.value, 10); }
+      else launch_options[name] = el.value;
+    });
+  }
+  return {
+    position: Number(val("position").value || 0),
+    label: val("label").value,
+    blurb: blurbEl ? blurbEl.value : "",
+    in_rotation: val("in_rotation").checked,
+    hide_when_off: val("hide_when_off").checked,
+    announce: val("announce").checked,
+    launch_game: gameEl ? gameEl.value : "",
+    launch_options,
+    quest_kinds,
+    // A quest can only be "needs the room open" if the room owns it at all;
+    // otherwise an unticked-then-reticked box could smuggle in a stray kind.
+    blocked_kinds: blocked_kinds.filter((k) => quest_kinds.includes(k)),
+  };
+}
+
+function renderPool(container, data) {
+  const host = container.querySelector("[data-pool]");
+  const rooms = data.rooms || [];
+  if (!rooms.length) {
+    host.innerHTML = renderEmpty("No channels in the pool yet.");
+    return;
+  }
+  host.innerHTML = `
+    <div style="overflow-x:auto;">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>#</th><th>Channel</th><th>Name Shown</th>
+            <th title="Take part in the rotation at all">In Rotation</th>
+            <th title="Disappear on the days it isn't featured">Hide When Off</th>
+            <th title="Name this room in the daily announcement">Announce</th>
+            <th>Quests</th><th></th>
+          </tr>
+        </thead>
+        <tbody>${rooms.map(roomRow).join("")}</tbody>
+      </table>
+    </div>`;
+
+  host.querySelectorAll("tr[data-room]").forEach((tr) => {
+    const id = tr.getAttribute("data-room");
+    const kindsRow = host.querySelector(`tr[data-kinds-for="${id}"]`);
+
+    tr.querySelector("[data-edit]").addEventListener("click", () => {
+      kindsRow.hidden = !kindsRow.hidden;
+    });
+
+    // Swapping the game swaps its option fields. Passing the new key rather
+    // than re-reading the room means the fields follow the select immediately,
+    // before anything is saved.
+    const gameSel = kindsRow.querySelector('[data-r="launch_game"]');
+    if (gameSel) {
+      gameSel.addEventListener("change", () => {
+        const room = (data.rooms || []).find((r) => String(r.channel_id) === String(id));
+        const host = kindsRow.querySelector(`[data-game-options="${id}"]`);
+        if (room && host) host.innerHTML = gameOptionFields(room, gameSel.value);
+      });
+    }
+
+    tr.querySelector("[data-save-room]").addEventListener("click", async () => {
+      try {
+        await apiPut(`/api/feature-rotation/rooms/${id}`, readRoom(tr, kindsRow));
+        toast("Saved.", "success");
+        await refresh(container);
+      } catch (err) {
+        toast(`Couldn’t save: ${err.message}`, "error");
+      }
+    });
+
+    tr.querySelector("[data-remove]").addEventListener("click", async () => {
+      const ok = await confirmDialog(
+        `Take ${chanName(id)} out of the rotation? Its permissions are put back first, so it becomes visible again.`,
+      );
+      if (!ok) return;
+      try {
+        await apiDelete(`/api/feature-rotation/rooms/${id}`);
+        toast("Removed from the pool.", "success");
+        await refresh(container);
+      } catch (err) {
+        toast(`Couldn’t remove: ${err.message}`, "error");
+      }
+    });
+  });
+}
+
+// ── add ──────────────────────────────────────────────────────────────
+
+function renderAdd(container, data) {
+  const host = container.querySelector("[data-add]");
+  const inPool = new Set((data.rooms || []).map((r) => String(r.channel_id)));
+  const available = channels.filter((c) => !inPool.has(String(c.id)));
+  if (!available.length) {
+    host.innerHTML = `<div class="field-hint">Every channel is already in the pool.</div>`;
+    return;
+  }
+  host.innerHTML = `
+    <div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">
+      <label>Channel
+        <select data-add-channel>${available.map((c) => `<option value="${c.id}">#${esc(c.name)}</option>`).join("")}</select>
+      </label>
+      <button class="btn btn-primary" data-add-go>Add To Pool</button>
+    </div>
+    <div class="field-hint" style="margin-top:6px;">
+      A new room starts in rotation and hides on off days, with no game or quests. Use <strong>Setup</strong> on its row to add them.
+    </div>`;
+  host.querySelector("[data-add-go]").addEventListener("click", async () => {
+    const id = host.querySelector("[data-add-channel]").value;
+    try {
+      await apiPut(`/api/feature-rotation/rooms/${id}`, {
+        position: (data.rooms || []).length + 1,
+        label: "",
+        blurb: "",
+        in_rotation: true,
+        hide_when_off: true,
+        announce: true,
+        quest_kinds: [],
+        blocked_kinds: [],
+        launch_game: "",
+        launch_options: {},
+      });
+      toast("Added to the pool.", "success");
+      await refresh(container);
+    } catch (err) {
+      toast(`Couldn’t add: ${err.message}`, "error");
+    }
+  });
+}

@@ -1,0 +1,502 @@
+import { wGet, wPost, wPut, wDelete, esc, showStatus } from "../wellness-helpers.js";
+import { toast, confirmDialog } from "../ui.js";
+import { clearFormDirty, guardForm, mountAsync, guardedSubmit } from "../config-helpers.js";
+import { renderLoading, renderEmpty, showRetryableError } from "../states.js";
+import {
+  renderChartLegend, renderChartTable,
+  CHART_BAR, CHART_ACCENT, CHART_TEXT, CHART_GRID,
+} from "../charts.js";
+
+export function mount(container) {
+  container.innerHTML = `<div class="panel">${renderLoading("Loading your activity caps…")}</div>`;
+
+  let chart = null;
+  // The guarded histogram node. Held so it can be dropped from the dirty
+  // registry before load() destroys it — see clearFormDirty.
+  let histoForm = null;
+  // One observer for the panel's lifetime, not one per load(). load() re-runs
+  // on every mode/lookback change and after every save; each run used to build
+  // a fresh ResizeObserver and never disconnect the previous one, so they piled
+  // up and then outlived the panel entirely (F3b). `alignTarget` is repointed
+  // at whatever element the current render produced.
+  let resizeObserver = null;
+  let alignSliders = () => {};
+  let firstLoad = true;
+  let currentMode = "daily";
+  let currentDays = 30;
+  let bucketAvgs = [];
+  let sliderValues = [];
+  let existingHistoCap = null; // cap row with bucket_limits for current mode
+
+  async function load() {
+    // The FIRST load runs under mountAsync below, which turns a rejection into
+    // a full error state with a retry (F1). A *later* one — a mode or lookback
+    // change, a post-save refresh — lands here, and this is not the gentle
+    // in-place report it once claimed to be: the success path below rewrites
+    // `.panel` wholesale, so the failure path has to as well, taking the
+    // header, the sliders, the cap rows and the control that was just clicked
+    // with it. Same blank wall as a failed first load, so: same way out.
+    let caps, histo;
+    try {
+      [caps, histo] = await Promise.all([
+        wGet("/api/wellness/caps"),
+        wGet(`/api/wellness/activity-histogram?mode=${currentMode}&days=${currentDays}`),
+      ]);
+    } catch (e) {
+      if (firstLoad) throw e;
+      showRetryableError(
+        container.querySelector(".panel"),
+        `Couldn’t load your activity caps — try again. (${e.message})`,
+        load,
+      );
+      return;
+    } finally {
+      firstLoad = false;
+    }
+
+    bucketAvgs = histo.buckets.map(b => b.avg_messages);
+    const labels = histo.buckets.map(b => b.label);
+    const nBuckets = bucketAvgs.length;
+
+    // Find existing histogram cap for this mode's window
+    const histoWindow = currentMode === "daily" ? "daily" : "weekly";
+    existingHistoCap = caps.caps.find(c => c.bucket_limits && c.window === histoWindow) || null;
+
+    // Initialize sliders from existing cap or from averages (rounded up, min 1)
+    if (existingHistoCap) {
+      sliderValues = [...existingHistoCap.bucket_limits];
+    } else {
+      sliderValues = bucketAvgs.map(v => Math.max(1, Math.ceil(v)));
+    }
+
+    // Separate flat caps (no bucket_limits) for the legacy section
+    const flatCaps = caps.caps.filter(c => !c.bucket_limits);
+
+    const flatCapsHTML = flatCaps.length
+      ? flatCaps.map(c => `
+          <div class="w-row" data-cap-id="${c.id}">
+            <div class="w-row-main">
+              <strong>${esc(c.label)}</strong>
+              <span class="chip">${c.scope}</span>
+              <span class="chip">${c.window}</span>
+              <span class="chip">${c.limit} messages</span>
+              ${c.exclude_exempt ? '<span class="chip chip-neutral">Skips exempt channels</span>' : ""}
+            </div>
+            <div class="w-row-actions">
+              <input type="number" min="1" value="${c.limit}" style="width:70px" data-edit-limit
+                     aria-label="Message limit for ${esc(c.label)}" />
+              <button class="btn btn-sm" data-save-cap="${c.id}">Save</button>
+              <button class="btn btn-sm btn-danger" data-del-cap="${c.id}">Remove</button>
+              <span data-cap-status="${c.id}"></span>
+            </div>
+          </div>
+        `).join("")
+      : renderEmpty("No manual caps. The sliders above cover most needs — add a manual cap here only when you want a single flat limit for one channel or window.");
+
+    // Compute a good max for sliders
+    const maxAvg = Math.max(...bucketAvgs, 1);
+    const sliderMax = Math.max(Math.ceil(maxAvg * 3), 10);
+
+    // About to destroy the guarded node; forget it first or the registry keeps
+    // a detached element and reports unsaved edits on a form that is gone.
+    if (histoForm) { clearFormDirty(histoForm); histoForm = null; }
+    container.querySelector(".panel").innerHTML = `
+      <header>
+        <h2>Activity Caps</h2>
+        <div class="subtitle">Set your own message limits, shaped by how you actually post</div>
+      </header>
+
+      <div class="w-histo-help">
+        <p><strong>How it works:</strong> The gold bars show the average number of messages
+        you posted during each time period over the last <strong>${histo.days_covered} days</strong>.
+        Use the sliders below to set a message cap for each period &mdash; when you post
+        past a cap, the wellness system will gently nudge you based on your
+        enforcement level.</p>
+        <p class="field-hint">${currentMode === "daily"
+          ? "Each bar represents one hour of the day. Great for setting different limits for morning vs. evening — lower caps for late-night hours, higher caps during your normal active hours."
+          : "Each bar represents one day of the week. Useful for allowing more activity on weekends vs. weekdays, or the reverse."
+        }</p>
+      </div>
+
+      <div class="w-histo-controls">
+        <div class="field">
+          <label>Pattern
+            <select data-control="mode">
+              <option value="daily" ${currentMode === "daily" ? "selected" : ""}>Daily (one bar per hour)</option>
+              <option value="weekly" ${currentMode === "weekly" ? "selected" : ""}>Weekly (one bar per day)</option>
+            </select>
+          </label>
+        </div>
+        <div class="field">
+          <label>Based on the Last
+            <select data-control="days">
+              <option value="14" ${currentDays === 14 ? "selected" : ""}>2 weeks</option>
+              <option value="30" ${currentDays === 30 ? "selected" : ""}>30 days</option>
+              <option value="90" ${currentDays === 90 ? "selected" : ""}>90 days</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div data-histo-form>
+      <div class="chart-caption" data-histo-caption></div>
+      <div class="w-histo-chart-wrap">
+        <canvas data-histo-canvas></canvas>
+      </div>
+      <div data-histo-legend></div>
+      <div data-histo-chart-table></div>
+
+      <div class="w-histo-sliders" data-slider-row style="--bucket-count:${nBuckets}">
+        ${sliderValues.map((v, i) => `
+          <div class="w-histo-slider-cell">
+            <input type="range" min="1" max="${sliderMax}" value="${v}"
+                   orient="vertical" data-slider-idx="${i}"
+                   aria-label="Cap for ${esc(labels[i])}" />
+            <span class="w-histo-slider-val" data-val-idx="${i}">${v}</span>
+            <span class="w-histo-slider-label">${labels[i]}</span>
+          </div>
+        `).join("")}
+      </div>
+
+      <div class="w-histo-actions">
+        <button class="btn btn-primary" data-save-histo>Save Caps</button>
+        <button class="btn btn-ghost" data-reset-histo>Reset to My Averages</button>
+        <span data-histo-status></span>
+      </div>
+      </div>
+
+      <details class="form-section w-histo-legacy">
+        <summary class="form-section-summary">Manual Caps</summary>
+        <p class="field-hint">A flat limit for one scope and window, independent of the sliders above.</p>
+        <div class="w-list">${flatCapsHTML}</div>
+
+        <div class="section-label">Add Manual Cap</div>
+        <form data-add-form class="form">
+          <div class="field">
+            <label>Label
+              <input type="text" name="label" required maxlength="40" placeholder="e.g. Daily Limit" />
+            </label>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>Window
+                <select name="window">${caps.windows.map(w => `<option value="${w}">${w}</option>`).join("")}</select>
+              </label>
+            </div>
+            <div class="field">
+              <label>Message Limit
+                <input type="number" name="limit" min="1" value="50" required />
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <label><input type="checkbox" name="exclude_exempt" checked /> Don’t Count Exempt Channels</label>
+            <div class="field-hint">Messages in channels your server marked exempt won’t count toward this cap.</div>
+          </div>
+          <div class="field-hint">Manual caps count messages across all channels.
+          Per-channel and per-category caps arrive with a channel picker.</div>
+          <div><button type="submit" class="btn btn-primary">Add Cap</button><span data-add-status></span></div>
+        </form>
+      </details>
+    `;
+
+    // ── Build chart ──────────────────────────────────────────────
+    if (chart) { chart.destroy(); chart = null; }
+    const canvas = container.querySelector("[data-histo-canvas]");
+    chart = new Chart(canvas, {
+      type: "bar",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "Avg messages",
+            data: [...bucketAvgs],
+            backgroundColor: CHART_BAR,
+            barPercentage: 0.85,
+            categoryPercentage: 0.9,
+            order: 2,
+          },
+          {
+            label: "Cap Limit",
+            data: [...sliderValues],
+            type: "line",
+            borderColor: CHART_ACCENT,
+            backgroundColor: CHART_ACCENT + "33",
+            borderWidth: 2,
+            pointRadius: 5,
+            pointHoverRadius: 8,
+            stepped: "middle",
+            fill: false,
+            order: 1,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          // Drawn in HTML instead: the caption sibling above names the chart,
+          // and renderChartLegend below covers the two datasets (bars +
+          // line). Both share this one y-axis — there is no second "y1" scale.
+          title: { display: false },
+          legend: { display: false },
+          tooltip: { backgroundColor: "#18191c", borderColor: CHART_GRID, borderWidth: 1 },
+        },
+        scales: {
+          x: { grid: { color: CHART_GRID }, ticks: { color: CHART_TEXT, maxRotation: 45, minRotation: 0 } },
+          y: { grid: { color: CHART_GRID }, ticks: { color: CHART_TEXT, precision: 0 }, beginAtZero: true },
+        },
+      },
+    });
+
+    // ── Caption / legend / table ─────────────────────────────────
+    // Two real series (observed averages + the cap being set), so per the
+    // "none for one" rule this earns a legend, not just a caption.
+    const captionEl = container.querySelector("[data-histo-caption]");
+    const legendEl = container.querySelector("[data-histo-legend]");
+    const tableEl = container.querySelector("[data-histo-chart-table]");
+    captionEl.textContent = currentMode === "daily"
+      ? `Average messages by hour of day — last ${histo.days_covered} days`
+      : `Average messages by day of week — last ${histo.days_covered} days`;
+    const legendHandle = renderChartLegend(legendEl, chart);
+    // Sliders and drag both mutate sliderValues/chart data directly (not
+    // through load()), so the legend totals and table need their own refresh
+    // hook rather than relying on the next full reload.
+    function refreshChartExtras() {
+      legendHandle.refresh();
+      renderChartTable(tableEl, {
+        labels,
+        datasets: [
+          { label: "Avg messages", data: bucketAvgs },
+          { label: "Cap Limit", data: sliderValues },
+        ],
+        indexLabel: currentMode === "daily" ? "Hour" : "Day",
+      });
+    }
+    refreshChartExtras();
+
+    // ── Drag cap-limit points on the chart ─────────────────────
+    let dragIdx = -1;
+    // A canvas drag fires neither `input` nor `change`, so without this the
+    // most direct way to set a cap left no trace for the unsaved-edits guard.
+    const markDirty = () =>
+      canvas.dispatchEvent(new CustomEvent("dk:change", { bubbles: true }));
+
+    function getPointIndex(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const ds = chart.getDatasetMeta(1); // Cap Limit dataset
+      const hitRadius = 12;
+      for (let i = 0; i < ds.data.length; i++) {
+        const pt = ds.data[i];
+        if (Math.abs(pt.x - x) < hitRadius && Math.abs(pt.y - y) < hitRadius) return i;
+      }
+      return -1;
+    }
+
+    function yToValue(yPixel) {
+      const yScale = chart.scales.y;
+      const val = yScale.getValueForPixel(yPixel);
+      return Math.max(1, Math.round(val));
+    }
+
+    canvas.addEventListener("mousedown", (e) => {
+      const idx = getPointIndex(e);
+      if (idx >= 0) { dragIdx = idx; canvas.style.cursor = "grabbing"; }
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+      if (dragIdx >= 0) {
+        const rect = canvas.getBoundingClientRect();
+        const yPixel = e.clientY - rect.top;
+        const val = yToValue(yPixel);
+        sliderValues[dragIdx] = val;
+        chart.data.datasets[1].data[dragIdx] = val;
+        chart.update("none");
+        // Sync slider + label
+        const slider = container.querySelector(`[data-slider-idx="${dragIdx}"]`);
+        if (slider) slider.value = val;
+        const valLabel = container.querySelector(`[data-val-idx="${dragIdx}"]`);
+        if (valLabel) valLabel.textContent = val;
+        refreshChartExtras();
+      } else {
+        canvas.style.cursor = getPointIndex(e) >= 0 ? "grab" : "default";
+      }
+    });
+
+    canvas.addEventListener("mouseup", () => {
+      if (dragIdx >= 0) { dragIdx = -1; canvas.style.cursor = "default"; markDirty(); }
+    });
+    canvas.addEventListener("mouseleave", () => {
+      if (dragIdx >= 0) { dragIdx = -1; canvas.style.cursor = "default"; markDirty(); }
+    });
+
+    // Touch support for mobile
+    canvas.addEventListener("touchstart", (e) => {
+      const touch = e.touches[0];
+      const idx = getPointIndex(touch);
+      if (idx >= 0) { dragIdx = idx; e.preventDefault(); }
+    }, { passive: false });
+    canvas.addEventListener("touchmove", (e) => {
+      if (dragIdx < 0) return;
+      e.preventDefault();
+      const touch = e.touches[0];
+      const rect = canvas.getBoundingClientRect();
+      const yPixel = touch.clientY - rect.top;
+      const val = yToValue(yPixel);
+      sliderValues[dragIdx] = val;
+      chart.data.datasets[1].data[dragIdx] = val;
+      chart.update("none");
+      const slider = container.querySelector(`[data-slider-idx="${dragIdx}"]`);
+      if (slider) slider.value = val;
+      const valLabel = container.querySelector(`[data-val-idx="${dragIdx}"]`);
+      if (valLabel) valLabel.textContent = val;
+      refreshChartExtras();
+    }, { passive: false });
+    canvas.addEventListener("touchend", () => {
+      if (dragIdx >= 0) markDirty();
+      dragIdx = -1;
+    });
+
+    // ── Align slider row with chart area ─────────────────────────
+    alignSliders = () => {
+      const area = chart?.chartArea;
+      if (!area) return;
+      const row = container.querySelector("[data-slider-row]");
+      if (!row) return;
+      row.style.paddingLeft = area.left + "px";
+      row.style.paddingRight = (canvas.parentElement.offsetWidth - area.right) + "px";
+    };
+    // Align after initial render and on resize. The observer is created once
+    // and re-pointed at the current canvas — creating one per load() leaked.
+    requestAnimationFrame(() => alignSliders());
+    if (!resizeObserver) resizeObserver = new ResizeObserver(() => alignSliders());
+    resizeObserver.disconnect();
+    resizeObserver.observe(canvas.parentElement);
+
+    // ── Slider interaction ───────────────────────────────────────
+    // The sliders' native `input` is tracked for free once this is guarded,
+    // and [data-histo-status] is inside the wrapper, so a save clears this form
+    // and only this form.
+    histoForm = guardForm(container.querySelector("[data-histo-form]"));
+
+    container.querySelectorAll("[data-slider-idx]").forEach(slider => {
+      slider.addEventListener("input", () => {
+        const idx = parseInt(slider.dataset.sliderIdx);
+        const val = parseInt(slider.value);
+        sliderValues[idx] = val;
+        container.querySelector(`[data-val-idx="${idx}"]`).textContent = val;
+        chart.data.datasets[1].data[idx] = val;
+        chart.update("none");
+        refreshChartExtras();
+      });
+    });
+
+    // ── Mode / lookback controls ─────────────────────────────────
+    container.querySelector('[data-control="mode"]').addEventListener("change", (e) => {
+      currentMode = e.target.value;
+      load();
+    });
+    container.querySelector('[data-control="days"]').addEventListener("change", (e) => {
+      currentDays = parseInt(e.target.value);
+      load();
+    });
+
+    // ── Save histogram caps ──────────────────────────────────────
+    const histoStatus = container.querySelector("[data-histo-status]");
+    container.querySelector("[data-save-histo]").addEventListener("click", async () => {
+      const window_ = currentMode === "daily" ? "daily" : "weekly";
+      try {
+        if (existingHistoCap) {
+          await wPut(`/api/wellness/caps/${existingHistoCap.id}`, { bucket_limits: sliderValues });
+        } else {
+          const label = currentMode === "daily" ? "Daily Activity Cap" : "Weekly Activity Cap";
+          await wPost("/api/wellness/caps", {
+            label,
+            scope: "global",
+            window: window_,
+            limit: Math.max(...sliderValues),
+            exclude_exempt: true,
+            bucket_limits: sliderValues,
+          });
+        }
+        showStatus(histoStatus, true, "Caps saved.");
+        // Reload to update existingHistoCap reference
+        load();
+      } catch (e) {
+        showStatus(histoStatus, false, `Couldn’t save — ${e.message}`);
+      }
+    });
+
+    // ── Reset to averages ────────────────────────────────────────
+    container.querySelector("[data-reset-histo]").addEventListener("click", () => {
+      sliderValues = bucketAvgs.map(v => Math.max(1, Math.ceil(v)));
+      container.querySelectorAll("[data-slider-idx]").forEach(slider => {
+        const idx = parseInt(slider.dataset.sliderIdx);
+        slider.value = sliderValues[idx];
+        container.querySelector(`[data-val-idx="${idx}"]`).textContent = sliderValues[idx];
+      });
+      chart.data.datasets[1].data = [...sliderValues];
+      chart.update("none");
+      refreshChartExtras();
+    });
+
+    // ── Legacy flat caps: save/delete/add ─────────────────────────
+    container.querySelectorAll("[data-save-cap]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.saveCap;
+        const row = container.querySelector(`[data-cap-id="${id}"]`);
+        const limit = parseInt(row.querySelector("[data-edit-limit]").value, 10);
+        const st = container.querySelector(`[data-cap-status="${id}"]`);
+        try { await wPut(`/api/wellness/caps/${id}`, { limit }); showStatus(st, true); }
+        catch (e) { showStatus(st, false, `Couldn’t save — ${e.message}`); }
+      });
+    });
+
+    container.querySelectorAll("[data-del-cap]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const ok = await confirmDialog(
+          "Remove this cap? Dungeon Keeper will stop nudging you when you pass it.",
+          { title: "Remove Cap", danger: true, confirmLabel: "Remove" },
+        );
+        if (!ok) return;
+        try { await wDelete(`/api/wellness/caps/${btn.dataset.delCap}`); load(); }
+        catch (e) { toast(`Couldn’t remove that cap — ${e.message}`, "error"); }
+      });
+    });
+
+    const form = guardForm(container.querySelector("[data-add-form]"));
+    const addSt = container.querySelector("[data-add-status]");
+    guardedSubmit(form, async () => {
+      const fd = new FormData(form);
+      try {
+        await wPost("/api/wellness/caps", {
+          label: fd.get("label"),
+          // Only global is creatable from the panel until the channel picker
+          // exists — the API rejects channel/category caps without a target.
+          scope: "global",
+          window: fd.get("window"),
+          limit: parseInt(fd.get("limit"), 10),
+          exclude_exempt: form.querySelector("[name=exclude_exempt]").checked,
+        });
+        toast("Cap added.");
+        load();
+      } catch (err) { showStatus(addSt, false, `Couldn’t add that cap — ${err.message}`); }
+    });
+  }
+
+  const loading = mountAsync(container, load, {
+    errorMsg: "Couldn’t load your activity caps.",
+  });
+
+  // Without this handle the last Chart.js instance and the ResizeObserver both
+  // survived navigation away from the panel.
+  return {
+    unmount() {
+      loading.unmount();
+      if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
+      if (chart) { chart.destroy(); chart = null; }
+    },
+  };
+}

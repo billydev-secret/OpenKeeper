@@ -1,0 +1,1364 @@
+"""Tests for the extracted Clapback pure-logic modules.
+
+Covers ``bot_modules/games/clapback/logic.py`` (create_matchups,
+calculate_matchup_score, find_best_answer_record,
+find_closest_matchup_record, sort_scores, shuffled_replay_config,
+clamp_config_values); the cards are in ``test_games_clapback_layouts.py``.
+
+Mirrors the hottakes / ttl extraction pattern: the cog file stays thin;
+this module proves the extracted pieces work without spinning up
+Discord.
+"""
+
+from __future__ import annotations
+
+import random
+from itertools import combinations
+
+import pytest
+
+from bot_modules.games.clapback.logic import (
+    AI_SYSTEM_PROMPT,
+    AI_USER_PROMPT,
+    MAX_PLAYERS,
+    MIN_PLAYERS,
+    accept_answer,
+    admit_pending_players,
+    admit_player_now,
+    all_eligible_voted,
+    board_scores,
+    calculate_bye_award,
+    submit_window_may_close,
+    withdraw_player,
+    calculate_matchup_score,
+    drain_pending_players,
+    clamp_config_values,
+    create_matchups,
+    find_best_answer_record,
+    find_closest_matchup_record,
+    pick_round_bye,
+    playable_players,
+    shuffled_replay_config,
+    sort_scores,
+    vote_button_label,
+)
+from bot_modules.core.branding import SECTION_SPACER
+
+
+def _unspaced(value: str | None) -> str:
+    """A field value without the trailing spacer ``apply_section_spacing`` adds.
+
+    Every field but the last carries ``SECTION_SPACER`` for breathing room
+    (docs/embed_style_guide.md § Section spacing). These tests assert content,
+    not spacing, so they compare against the value with it removed.
+    """
+    text = value or ""
+    return text[: -len(SECTION_SPACER)] if text.endswith(SECTION_SPACER) else text
+
+
+
+def _name_resolver(uid: int) -> str:
+    return f"User{uid}"
+
+
+# ── constants sanity ─────────────────────────────────────────────────
+
+
+def test_player_bounds_are_sensible():
+    assert MIN_PLAYERS == 3
+    assert MAX_PLAYERS == 16
+    assert MIN_PLAYERS < MAX_PLAYERS
+
+
+def test_ai_prompts_are_nonempty_strings():
+    assert isinstance(AI_SYSTEM_PROMPT, str) and AI_SYSTEM_PROMPT
+    assert isinstance(AI_USER_PROMPT, str) and AI_USER_PROMPT
+
+
+# ── clamp_config_values ──────────────────────────────────────────────
+
+
+def test_clamp_config_values_within_range_unchanged():
+    assert clamp_config_values(5, 120, 40) == (5, 120, 40)
+
+
+def test_clamp_config_values_below_min_pulled_up():
+    assert clamp_config_values(0, 5, 1) == (1, 15, 10)
+
+
+def test_clamp_config_values_above_max_pushed_down():
+    assert clamp_config_values(999, 9999, 9999) == (15, 180, 60)
+
+
+# ── sort_scores ──────────────────────────────────────────────────────
+
+
+def test_sort_scores_highest_first():
+    out = sort_scores({"a": 10, "b": 50, "c": 30})
+    assert out[0] == ("b", 50)
+    assert out[-1] == ("a", 10)
+
+
+def test_sort_scores_empty_dict_returns_empty():
+    assert sort_scores({}) == []
+
+
+# ── create_matchups: 3-player round-robin ────────────────────────────
+
+
+def test_create_matchups_three_players_returns_round_robin():
+    answers = {"1": "x", "2": "y", "3": "z"}
+    pairs, byes = create_matchups(answers, rng=random.Random(0))
+    assert byes == []
+    assert len(pairs) == 3
+    # Each player appears in exactly 2 of the 3 pairs (round-robin)
+    seen: dict[str, int] = {"1": 0, "2": 0, "3": 0}
+    for p in pairs:
+        for pid in p["pair"]:
+            seen[str(pid)] += 1
+    assert all(v == 2 for v in seen.values())
+    # Every pair starts with empty votes / no winner
+    for p in pairs:
+        assert p["votes"] == {}
+        assert p["winner"] is None
+
+
+# ── create_matchups: even player count, no bye ──────────────────────
+
+
+def test_create_matchups_even_count_no_bye():
+    answers = {str(i): f"answer{i}" for i in range(1, 5)}  # 4 players
+    pairs, byes = create_matchups(answers, rng=random.Random(0))
+    assert byes == []
+    assert len(pairs) == 2
+    # All four ids are present across the pairs
+    flat = [pid for p in pairs for pid in p["pair"]]
+    assert sorted(flat) == ["1", "2", "3", "4"]
+
+
+# ── create_matchups: odd player count, bye logic ────────────────────
+
+
+def test_create_matchups_odd_count_picks_bye():
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}  # 5 players
+    pairs, (bye,) = create_matchups(answers, rng=random.Random(0))
+    assert bye is not None
+    assert len(pairs) == 2  # 4 players paired, 1 bye
+    flat = [pid for p in pairs for pid in p["pair"]]
+    assert str(bye) not in flat
+
+
+def test_create_matchups_odd_count_skips_players_who_already_had_a_bye():
+    """Anyone already in bye_history is passed over while a player with
+    zero byes is still available. Note: answers keys are strings, so the
+    cog passes bye ids through as the same str the answer keys use."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    for seed in range(10):
+        _, (bye,) = create_matchups(
+            answers, bye_history=["3"], rng=random.Random(seed)
+        )
+        assert bye != "3"
+
+
+def test_create_matchups_odd_count_ignores_bye_history_for_absent_players():
+    """A bye id that isn't among this round's submitters constrains
+    nothing — everyone present is equally overdue."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    _, (bye,) = create_matchups(answers, bye_history=[999], rng=random.Random(0))
+    assert bye in ["1", "2", "3", "4", "5"]
+
+
+def test_create_matchups_everyone_byes_once_before_anyone_byes_twice():
+    """The whole point of the rotation: across five odd rounds with a
+    stable roster, five distinct players sit out — no repeats."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    history: list[str] = []
+    for round_num in range(5):
+        _, (bye,) = create_matchups(
+            answers, bye_history=history, rng=random.Random(round_num)
+        )
+        history.append(bye)
+    assert sorted(history) == ["1", "2", "3", "4", "5"]
+
+
+def test_create_matchups_second_lap_reuses_players_with_fewest_byes():
+    """Once everyone has one bye, round six starts a fresh lap rather
+    than deadlocking or favouring whoever sat out first."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    history = ["1", "2", "3", "4", "5", "1", "2"]
+    # 3, 4 and 5 are tied on one bye each; 1 and 2 have two.
+    for seed in range(10):
+        _, (bye,) = create_matchups(
+            answers, bye_history=history, rng=random.Random(seed)
+        )
+        assert bye in ["3", "4", "5"]
+
+
+def test_create_matchups_rotation_survives_a_changing_submitter_set():
+    """Counting byes (rather than remembering only the last one) is what
+    makes the rule hold when someone misses the submit window: player 5
+    skips round two, and still doesn't get a second bye in round three."""
+    full = {str(i): f"answer{i}" for i in range(1, 6)}
+    without_two = {k: v for k, v in full.items() if k != "2"}
+
+    history: list[str] = []
+    _, (bye1,) = create_matchups(full, bye_history=history, rng=random.Random(1))
+    history.append(bye1)
+    # Round two has an even count without player 2's answer, so no bye.
+    _, byes2 = create_matchups(without_two, bye_history=history, rng=random.Random(2))
+    assert byes2 == []
+    _, (bye3,) = create_matchups(full, bye_history=history, rng=random.Random(3))
+    assert bye3 != bye1
+
+
+def test_create_matchups_no_bye_history_treats_everyone_equally():
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    seen = {create_matchups(answers, rng=random.Random(s))[1][0] for s in range(25)}
+    # With nobody constrained, the bye shouldn't be pinned to one player.
+    assert len(seen) > 1
+
+
+# ── create_matchups: duplicate-answer avoidance ─────────────────────
+
+
+def test_create_matchups_avoids_pairing_identical_answers():
+    """When non-duplicate pairings exist, duplicates shouldn't be paired."""
+    # 4 players: 1 and 2 share an answer; 3 and 4 are different.
+    answers = {"1": "same", "2": "same", "3": "alt", "4": "other"}
+    found_dup_avoidance = False
+    for seed in range(20):
+        pairs, _ = create_matchups(answers, rng=random.Random(seed))
+        for p in pairs:
+            a, b = str(p["pair"][0]), str(p["pair"][1])
+            if answers[a].strip().lower() == answers[b].strip().lower():
+                break
+        else:
+            found_dup_avoidance = True
+            break
+    assert found_dup_avoidance, "Should find a no-duplicate pairing in 20 tries"
+
+
+def test_create_matchups_all_identical_answers_force_pairs_anyway():
+    """When every player gave the same answer, we still pair them up."""
+    answers = {"1": "same", "2": "same", "3": "same", "4": "same"}
+    pairs, _ = create_matchups(answers, rng=random.Random(0))
+    assert len(pairs) == 2
+    # Every pair will have identical answers — that's expected
+    for p in pairs:
+        assert len(p["pair"]) == 2
+
+
+def test_create_matchups_strips_and_lowercases_for_dup_check():
+    """Duplicate detection ignores surrounding whitespace and case."""
+    answers = {"1": "  HELLO ", "2": "hello", "3": "different", "4": "other"}
+    # Run a bunch of seeds — 1 and 2 should rarely (ideally never) end up paired
+    paired_dups = 0
+    for seed in range(20):
+        pairs, _ = create_matchups(answers, rng=random.Random(seed))
+        for p in pairs:
+            a, b = str(p["pair"][0]), str(p["pair"][1])
+            if {a, b} == {"1", "2"}:
+                paired_dups += 1
+    # At least some seeds should find the non-dup pairing
+    assert paired_dups < 20
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_create_matchups_never_drops_a_player_when_dupes_are_unavoidable(seed):
+    """Regression: four identical answers among six players means every
+    shuffle collides. The retry loop used to keep the *partial* pair list
+    built before it broke out, so four of six players silently vanished
+    from the round. Every submitter must be pairable or the bye."""
+    answers = {
+        "1": "same", "2": "same", "3": "same",
+        "4": "same", "5": "x", "6": "y",
+    }
+    pairs, byes = create_matchups(answers, rng=random.Random(seed))
+    assert byes == []  # even count
+    flat = sorted(str(pid) for p in pairs for pid in p["pair"])
+    assert flat == ["1", "2", "3", "4", "5", "6"]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_create_matchups_odd_count_pairs_everyone_but_the_bye(seed):
+    """Same guarantee with a bye in play: 7 submitters → 3 matchups
+    covering the 6 non-bye players, even with unavoidable duplicates."""
+    answers = {str(i): "same" for i in range(1, 6)} | {"6": "x", "7": "y"}
+    pairs, (bye,) = create_matchups(answers, rng=random.Random(seed))
+    flat = sorted(str(pid) for p in pairs for pid in p["pair"])
+    assert len(flat) == 6
+    assert str(bye) not in flat
+    assert sorted(flat + [str(bye)]) == [str(i) for i in range(1, 8)]
+
+
+def test_create_matchups_minimises_duplicate_pairs_it_cannot_avoid():
+    """When some duplication is forced, the chosen pairing should carry
+    the fewest same-answer matchups, not merely the first one tried."""
+    answers = {
+        "1": "same", "2": "same", "3": "same",
+        "4": "same", "5": "x", "6": "y",
+    }
+    for seed in range(20):
+        pairs, _ = create_matchups(answers, rng=random.Random(seed))
+        dupes = sum(
+            1 for p in pairs
+            if answers[str(p["pair"][0])] == answers[str(p["pair"][1])]
+        )
+        # Best possible here is 1: pair two "same" players together and
+        # spend the other two against x and y.
+        assert dupes == 1
+
+
+# ── calculate_bye_award ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "round_points,expected",
+    [
+        pytest.param([60, 40, 75, 25], 50, id="balanced-field-averages-50"),
+        pytest.param([100, 0], 50, id="two-player-blowout"),
+        pytest.param([125, 0, 80, 20], 56, id="clapback-bonus-lifts-the-mean"),
+        pytest.param([33, 67, 50], 50, id="rounds-to-nearest-int"),
+        pytest.param([70, 30, 70, 30, 60], 52, id="odd-count-rounds-down"),
+        pytest.param([], 50, id="no-matchups-falls-back-to-default"),
+        pytest.param(None, 50, id="none-falls-back-to-default"),
+    ],
+)
+def test_calculate_bye_award(round_points, expected):
+    assert calculate_bye_award(round_points) == expected
+
+
+def test_calculate_bye_award_honours_a_custom_default():
+    assert calculate_bye_award([], default=0) == 0
+
+
+def test_calculate_bye_award_tracks_a_high_scoring_round():
+    """A round where everyone did well pays the bye player more than a
+    round where everyone bombed — that's the 'neither punish nor
+    reward' property the flat 50 didn't have."""
+    assert calculate_bye_award([90, 85, 100, 80]) > calculate_bye_award([20, 15, 30, 10])
+
+
+# ── calculate_matchup_score ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "votes,expected",
+    [
+        # The 50/50 zero-votes fallback is the cog's intentional
+        # "show up and play" behavior.
+        pytest.param(
+            {},
+            {"winner": None, "scores": {10: 50, 20: 50},
+             "clapback": False, "vote_counts": {10: 0, 20: 0}},
+            id="no-votes-5050-tie",
+        ),
+        # Clapback rule requires >= 2 votes even when unanimous.
+        pytest.param(
+            {"v1": 10},
+            {"winner": 10, "scores": {10: 100, 20: 0},
+             "clapback": False, "vote_counts": {10: 1, 20: 0}},
+            id="single-vote-no-clapback",
+        ),
+        # +25 clapback bonus on top of 100% pct
+        pytest.param(
+            {"v1": 10, "v2": 10},
+            {"winner": 10, "scores": {10: 125, 20: 0},
+             "clapback": True, "vote_counts": {10: 2, 20: 0}},
+            id="two-unanimous-is-clapback",
+        ),
+        # Non-unanimous → no clapback even if a clear winner.
+        pytest.param(
+            {"v1": 10, "v2": 10, "v3": 20},
+            {"winner": 10, "scores": {10: 67, 20: 33},
+             "clapback": False, "vote_counts": {10: 2, 20: 1}},
+            id="split-no-clapback",
+        ),
+        pytest.param(
+            {"v1": 10, "v2": 20},
+            {"winner": None, "scores": {10: 50, 20: 50},
+             "clapback": False, "vote_counts": {10: 1, 20: 1}},
+            id="even-split-is-tie",
+        ),
+        pytest.param(
+            {"v1": 20, "v2": 20, "v3": 10},
+            {"winner": 20, "scores": {10: 33, 20: 67},
+             "clapback": False, "vote_counts": {10: 1, 20: 2}},
+            id="player-b-wins",
+        ),
+        pytest.param(
+            {"v1": 20, "v2": 20},
+            {"winner": 20, "scores": {10: 0, 20: 125},
+             "clapback": True, "vote_counts": {10: 0, 20: 2}},
+            id="unanimous-b-yields-clapback",
+        ),
+    ],
+)
+def test_calculate_matchup_score(votes, expected):
+    assert calculate_matchup_score(votes, 10, 20) == expected
+
+
+def test_calculate_matchup_score_handles_string_or_int_vote_values():
+    """Votes can come in either str or int form — the score should match."""
+    int_votes = {"v1": 10, "v2": 10}
+    str_votes = {"v1": "10", "v2": "10"}
+    assert (
+        calculate_matchup_score(int_votes, 10, 20)["winner"]
+        == calculate_matchup_score(str_votes, 10, 20)["winner"]
+    )
+
+
+# ── find_best_answer_record ─────────────────────────────────────────
+
+
+def test_find_best_answer_record_returns_none_for_no_history():
+    assert find_best_answer_record([]) is None
+
+
+def test_find_best_answer_record_skips_matchups_with_under_3_votes():
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                {"player_a": 1, "answer_a": "a1", "votes_a": 2,
+                 "player_b": 2, "answer_b": "a2", "votes_b": 0,
+                 "clapback": False},
+            ],
+        }
+    ]
+    assert find_best_answer_record(history) is None
+
+
+def test_find_best_answer_record_picks_highest_pct():
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                # 3-0: 100% for player 1
+                {"player_a": 1, "answer_a": "best", "votes_a": 3,
+                 "player_b": 2, "answer_b": "loser", "votes_b": 0,
+                 "clapback": True},
+                # 3-2: 60/40 split
+                {"player_a": 3, "answer_a": "ok", "votes_a": 3,
+                 "player_b": 4, "answer_b": "less", "votes_b": 2,
+                 "clapback": False},
+            ],
+        }
+    ]
+    rec = find_best_answer_record(history)
+    assert rec is not None
+    assert rec["text"] == "best"
+    assert rec["author"] == 1
+    assert rec["pct"] == 1.0
+    assert rec["round"] == 1
+
+
+def test_find_best_answer_record_tiebreaks_by_more_votes():
+    """When two answers have equal pct, the one with more raw votes wins."""
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                # 3-0 → 100%
+                {"player_a": 1, "answer_a": "small_win", "votes_a": 3,
+                 "player_b": 2, "answer_b": "lost", "votes_b": 0,
+                 "clapback": True},
+            ],
+        },
+        {
+            "round": 2,
+            "matchups": [
+                # 5-0 → 100% — same pct, more votes
+                {"player_a": 3, "answer_a": "big_win", "votes_a": 5,
+                 "player_b": 4, "answer_b": "lost", "votes_b": 0,
+                 "clapback": True},
+            ],
+        },
+    ]
+    rec = find_best_answer_record(history)
+    assert rec is not None
+    assert rec["text"] == "big_win"
+    assert rec["round"] == 2
+
+
+def test_find_best_answer_record_finds_b_side_if_better():
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                {"player_a": 1, "answer_a": "loser", "votes_a": 0,
+                 "player_b": 2, "answer_b": "winner_b", "votes_b": 3,
+                 "clapback": True},
+            ],
+        }
+    ]
+    rec = find_best_answer_record(history)
+    assert rec is not None
+    assert rec["text"] == "winner_b"
+    assert rec["author"] == 2
+
+
+# ── find_closest_matchup_record ─────────────────────────────────────
+
+
+def test_find_closest_matchup_record_returns_none_for_no_history():
+    assert find_closest_matchup_record([]) is None
+
+
+def test_find_closest_matchup_record_skips_zero_vote_matchups():
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                {"player_a": 1, "answer_a": "x", "votes_a": 0,
+                 "player_b": 2, "answer_b": "y", "votes_b": 0,
+                 "clapback": False},
+            ],
+        }
+    ]
+    assert find_closest_matchup_record(history) is None
+
+
+def test_find_closest_matchup_record_picks_smallest_margin():
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                # Margin 3
+                {"player_a": 1, "answer_a": "a1", "votes_a": 5,
+                 "player_b": 2, "answer_b": "a2", "votes_b": 2,
+                 "clapback": False},
+                # Margin 1 — tighter
+                {"player_a": 3, "answer_a": "a3", "votes_a": 3,
+                 "player_b": 4, "answer_b": "a4", "votes_b": 2,
+                 "clapback": False},
+            ],
+        }
+    ]
+    rec = find_closest_matchup_record(history)
+    assert rec is not None
+    assert rec["matchup"]["answer_a"] == "a3"
+    assert rec["round"] == 1
+
+
+def test_find_closest_matchup_record_tiebreaks_by_higher_total():
+    """Same margin? prefer the one with more total votes."""
+    history = [
+        {
+            "round": 1,
+            "matchups": [
+                # Margin 1, total 3
+                {"player_a": 1, "answer_a": "small", "votes_a": 2,
+                 "player_b": 2, "answer_b": "small_l", "votes_b": 1,
+                 "clapback": False},
+            ],
+        },
+        {
+            "round": 2,
+            "matchups": [
+                # Margin 1, total 9 — wins the tiebreak
+                {"player_a": 3, "answer_a": "big", "votes_a": 5,
+                 "player_b": 4, "answer_b": "big_l", "votes_b": 4,
+                 "clapback": False},
+            ],
+        },
+    ]
+    rec = find_closest_matchup_record(history)
+    assert rec is not None
+    assert rec["matchup"]["answer_a"] == "big"
+    assert rec["round"] == 2
+
+
+# ── shuffled_replay_config ──────────────────────────────────────────
+
+
+def test_shuffled_replay_config_changes_three_fields():
+    base = {"rounds": 5, "timer": 120, "vote_timer": 40, "source": "both", "anonymous": False}
+    new_cfg = shuffled_replay_config(base, rng=random.Random(42))
+    assert new_cfg["rounds"] in range(3, 9)
+    assert new_cfg["timer"] in {60, 90, 120, 150, 180}
+    assert new_cfg["vote_timer"] in {30, 40, 50, 60}
+    # Other fields preserved
+    assert new_cfg["source"] == "both"
+    assert new_cfg["anonymous"] is False
+
+
+def test_shuffled_replay_config_does_not_mutate_base():
+    base = {"rounds": 5, "timer": 120, "vote_timer": 40}
+    new_cfg = shuffled_replay_config(base, rng=random.Random(0))
+    assert base == {"rounds": 5, "timer": 120, "vote_timer": 40}
+    assert new_cfg is not base
+
+
+def test_shuffled_replay_config_deterministic_with_pinned_rng():
+    base = {"rounds": 5, "timer": 120, "vote_timer": 40}
+    a = shuffled_replay_config(base, rng=random.Random(42))
+    b = shuffled_replay_config(base, rng=random.Random(42))
+    assert a == b
+
+
+@pytest.mark.parametrize("rounds,timer,vote_timer", [
+    (5, 120, 40),
+    (1, 15, 10),
+    (15, 180, 60),
+])
+def test_clamp_config_values_boundary_inputs_unchanged(rounds, timer, vote_timer):
+    """Boundary-valid inputs aren't altered."""
+    assert clamp_config_values(rounds, timer, vote_timer) == (rounds, timer, vote_timer)
+
+
+# ── economy roster enrichment (Stage 2 faucet) ──────────────────────
+
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+import bot_modules.games.clapback.cog as clapback_cog  # noqa: E402
+from tests.fakes import FakeChannel  # noqa: E402
+
+
+class _SpyBot:
+    def __init__(self) -> None:
+        self.games_db = None
+        self.active_views: dict = {}
+        self.ctx = SimpleNamespace(db_path=":memory:")
+
+    def get_cog(self, name):
+        return None
+
+
+async def test_post_recap_passes_players_to_end_game(monkeypatch):
+    """The genuine recap site pays the joined roster, not just the host."""
+    spy = AsyncMock()
+    monkeypatch.setattr(clapback_cog, "end_game", spy)
+    cog = clapback_cog.ClapbackCog(_SpyBot())  # type: ignore[arg-type]
+    channel = FakeChannel(id=100)
+    payload = {"players": [1, 2, 3], "scores": {}, "clapbacks": {},
+               "round_history": [], "host_id": 1}
+    await cog._post_recap("g1", channel, payload, {"anonymous": False})
+    call = spy.await_args
+    assert call is not None and spy.await_count == 1
+    assert call.kwargs["player_ids"] == [1, 2, 3]
+    assert call.kwargs["bot"] is cog.bot
+
+
+# ── /games join: the bumped bye player is still notified ──────────────────
+#
+# ``mid_game_join`` is registered as ``bot.game_joiners["clapback"]`` and its
+# message is posted by GamesConfigCog, in another file, off a runtime dict
+# lookup. The bot pings nobody unless the send says so, and that send cannot
+# read this text to find out who it names — so the ids travel with it.
+
+
+async def _mid_game_join(monkeypatch, payload: dict, uid: int):
+    cog = clapback_cog.ClapbackCog(_SpyBot())  # type: ignore[arg-type]
+
+    async def _get_payload(db, game_id):
+        return payload
+
+    async def _modify(db, game_id, fn):
+        fn(payload)
+
+    monkeypatch.setattr(clapback_cog, "get_game_payload", _get_payload)
+    monkeypatch.setattr(clapback_cog, "modify_payload", _modify)
+    monkeypatch.setattr(cog, "_forbidden_pairs", AsyncMock(return_value=set()))
+    member = SimpleNamespace(id=uid, display_name=f"U{uid}")
+    return await cog.mid_game_join(FakeChannel(id=100), "g1", member)
+
+
+async def test_mid_game_join_hands_the_unbenched_player_over_to_be_pinged(monkeypatch):
+    """Five playing with 5 benched: joining as 6 un-benches 5 and tells them
+    to hit Submit. That line is the only warning they get that their button
+    just opened, so the ids ride along with the message."""
+    payload = {
+        "phase": "submitting", "players": [1, 2, 3, 4, 5], "round_bye": "5",
+        "scores": {str(p): 0 for p in range(1, 6)},
+    }
+
+    result = await _mid_game_join(monkeypatch, payload, 6)
+
+    ok, text, ping_ids = result
+    assert ok is True
+    assert "<@5>" in text and "Submit" in text
+    # Only the bye player — the joiner is the one reading the reply.
+    assert ping_ids == ["5"]
+
+
+async def test_mid_game_join_says_nothing_to_allow_list_on_an_ordinary_join(monkeypatch):
+    """An ordinary join names people by display name, so there is nothing to
+    allow-list and the message stays a two-element return."""
+    payload = {"phase": "submitting", "players": [1, 2], "scores": {}}
+
+    result = await _mid_game_join(monkeypatch, payload, 3)
+
+    assert len(result) == 2
+    ok, text = result
+    assert ok is True and "<@" not in text
+
+
+# ── pick_round_bye: benched before the prompt, not after ─────────────────────
+
+
+def test_pick_round_bye_none_for_even_field():
+    assert pick_round_bye(["1", "2", "3", "4"]) is None
+
+
+def test_pick_round_bye_none_for_three_players():
+    """Three players run a full round-robin, so nobody sits out — the rule
+    has to match create_matchups or the round would lose a player."""
+    assert pick_round_bye(["1", "2", "3"]) is None
+
+
+def test_pick_round_bye_picks_one_for_odd_field():
+    bye = pick_round_bye(["1", "2", "3", "4", "5"], rng=random.Random(0))
+    assert bye in {"1", "2", "3", "4", "5"}
+
+
+def test_pick_round_bye_skips_players_who_already_sat_out():
+    for seed in range(10):
+        bye = pick_round_bye(
+            ["1", "2", "3", "4", "5"], bye_history=["3"], rng=random.Random(seed)
+        )
+        assert bye != "3"
+
+
+def test_pick_round_bye_rotates_everyone_before_repeating():
+    history: list[str] = []
+    for round_num in range(5):
+        bye = pick_round_bye(
+            ["1", "2", "3", "4", "5"], bye_history=history, rng=random.Random(round_num)
+        )
+        history.append(bye)
+    assert sorted(history) == ["1", "2", "3", "4", "5"]
+
+
+def test_pick_round_bye_leaves_an_even_field_for_create_matchups():
+    """The point of picking up front: the remaining submitters pair cleanly,
+    so create_matchups hands out no second bye."""
+    players = ["1", "2", "3", "4", "5"]
+    bye = pick_round_bye(players, rng=random.Random(1))
+    answers = {p: f"answer{p}" for p in players if p != bye}
+    _, late_byes = create_matchups(answers, rng=random.Random(1))
+    assert late_byes == []
+
+
+def test_pick_round_bye_a_missing_submitter_still_forces_a_late_bye():
+    """A player who never answers leaves an odd submitter count, so a second
+    bye is real and both have to be paid."""
+    players = [str(i) for i in range(1, 8)]  # 7: pre-bye leaves 6 submitters
+    bye = pick_round_bye(players, rng=random.Random(1))
+    answers = {p: f"answer{p}" for p in players if p != bye}
+    answers.pop(next(iter(answers)))  # someone misses the window → 5 left
+    _, (late_bye,) = create_matchups(answers, rng=random.Random(1))
+    assert late_bye is not None and late_bye != bye
+
+
+# ── the no-contact gate: a forbidden pair is never a matchup ────────────────
+
+
+def _flat(pairs) -> list[str]:
+    return sorted(str(pid) for p in pairs for pid in p["pair"])
+
+
+def _meets(pairs, a: str, b: str) -> bool:
+    return any({str(p["pair"][0]), str(p["pair"][1])} == {a, b} for p in pairs)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_create_matchups_three_players_never_seat_the_pair(seed):
+    """Three players would normally round-robin, which *guarantees* the pair
+    meets. With a pair on the list one of the two sits out (paid the bye like
+    any bye) and the other two play one matchup."""
+    answers = {"1": "x", "2": "y", "3": "z"}
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(seed), forbidden_pairs={(1, 2)},
+    )
+    assert not _meets(pairs, "1", "2")
+    assert len(pairs) == 1
+    assert len(byes) == 1 and byes[0] in {"1", "2"}
+    assert sorted(_flat(pairs) + byes) == ["1", "2", "3"]
+
+
+def test_create_matchups_three_players_pair_rotates_the_bye_between_them():
+    """Across a whole game the bye alternates between the two on the list —
+    fewest-byes-first still drives it — and the third player never sits."""
+    answers = {"1": "x", "2": "y", "3": "z"}
+    history: list[str] = []
+    for round_num in range(6):
+        pairs, byes = create_matchups(
+            answers, bye_history=history, rng=random.Random(round_num),
+            forbidden_pairs={(1, 2)},
+        )
+        assert not _meets(pairs, "1", "2")
+        history.extend(byes)
+    assert sorted(history) == ["1", "1", "1", "2", "2", "2"]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_create_matchups_four_players_pair_around_the_forbidden_pair(seed):
+    answers = {str(i): f"answer{i}" for i in range(1, 5)}
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(seed), forbidden_pairs={(1, 2)},
+    )
+    assert byes == []
+    assert len(pairs) == 2
+    assert not _meets(pairs, "1", "2")
+    assert _flat(pairs) == ["1", "2", "3", "4"]
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        pytest.param({(2, 1)}, id="ints-reversed"),
+        pytest.param({("1", "2")}, id="strings"),
+        pytest.param([("2", "1")], id="list-of-strings-reversed"),
+    ],
+)
+def test_create_matchups_forbidden_pairs_normalised_either_way_round(forbidden):
+    answers = {str(i): f"answer{i}" for i in range(1, 5)}
+    for seed in range(10):
+        pairs, _ = create_matchups(
+            answers, rng=random.Random(seed), forbidden_pairs=forbidden,
+        )
+        assert not _meets(pairs, "1", "2")
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_create_matchups_a_submitter_blocked_from_everyone_sits_out(seed):
+    """Nobody can be seated opposite them, so they are the bye — and the
+    rest pair cleanly rather than losing a second player to the rotation."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(seed),
+        forbidden_pairs={(1, 2), (1, 3), (1, 4), (1, 5)},
+    )
+    assert byes == ["1"]
+    assert _flat(pairs) == ["2", "3", "4", "5"]
+
+
+def test_create_matchups_rotation_bye_never_leaves_a_forbidden_remainder():
+    """Players 4 and 5 are the most overdue for a bye, but benching either
+    leaves 1, 2 and 3 — mutually blocked — needing partners. The bye goes to
+    one of the three instead, and the rest pair safely."""
+    answers = {str(i): f"answer{i}" for i in range(1, 6)}
+    forbidden = {(1, 2), (1, 3), (2, 3)}
+    for seed in range(20):
+        pairs, byes = create_matchups(
+            answers, bye_history=["1", "2", "3"], rng=random.Random(seed),
+            forbidden_pairs=forbidden,
+        )
+        assert len(byes) == 1 and byes[0] in {"1", "2", "3"}
+        assert len(pairs) == 2
+        for a, b in forbidden:
+            assert not _meets(pairs, str(a), str(b))
+        assert sorted(_flat(pairs) + byes) == ["1", "2", "3", "4", "5"]
+
+
+@pytest.mark.parametrize(
+    "answers, forbidden",
+    [
+        pytest.param({"1": "x", "2": "y"}, {(1, 2)}, id="two-who-are-a-pair"),
+        pytest.param(
+            {"1": "x", "2": "y", "3": "z"}, {(1, 2), (1, 3), (2, 3)},
+            id="three-all-blocked",
+        ),
+    ],
+)
+def test_create_matchups_returns_nothing_when_no_matchup_is_safe(answers, forbidden):
+    """No safe matchup at all reads as an empty round — the cog skips it with
+    the ordinary "Not enough answers" line, and nobody is paid a bye for a
+    round that never ran."""
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(0), forbidden_pairs=forbidden,
+    )
+    assert pairs == [] and byes == []
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_create_matchups_falls_back_to_extra_byes_when_no_full_pairing_exists(seed):
+    """Player 1 can face anyone; 2, 3 and 4 can only face player 1. One
+    matchup is all that is safe, so the two left over are byes — never a
+    forbidden matchup, never a dropped player."""
+    answers = {str(i): f"answer{i}" for i in range(1, 5)}
+    forbidden = {(2, 3), (2, 4), (3, 4)}
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(seed), forbidden_pairs=forbidden,
+    )
+    assert len(pairs) == 1 and "1" in _flat(pairs)
+    assert len(byes) == 2
+    assert sorted(_flat(pairs) + byes) == ["1", "2", "3", "4"]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_create_matchups_gate_holds_alongside_duplicate_avoidance(seed):
+    """Duplicate answers still steer the shuffle, but never into the pair."""
+    answers = {"1": "same", "2": "same", "3": "same", "4": "same", "5": "x", "6": "y"}
+    pairs, byes = create_matchups(
+        answers, rng=random.Random(seed), forbidden_pairs={(1, 5), (2, 6)},
+    )
+    assert byes == []
+    assert _flat(pairs) == ["1", "2", "3", "4", "5", "6"]
+    assert not _meets(pairs, "1", "5") and not _meets(pairs, "2", "6")
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_create_matchups_gate_invariants_under_random_rosters(seed):
+    """Property check: any roster and any forbidden set → no forbidden
+    matchup, and every submitter is seated once or is a bye (the round-robin
+    seats each of three twice)."""
+    rng = random.Random(seed)
+    n = rng.randint(2, 9)
+    ids = [str(i) for i in range(1, n + 1)]
+    answers = {p: rng.choice(["a", "b", "c", f"u{p}"]) for p in ids}
+    forbidden = {
+        (int(a), int(b)) for a, b in combinations(ids, 2) if rng.random() < 0.3
+    }
+    pairs, byes = create_matchups(answers, rng=rng, forbidden_pairs=forbidden)
+    for a, b in forbidden:
+        assert not _meets(pairs, str(a), str(b))
+    seated = _flat(pairs)
+    if pairs == []:
+        assert byes == []
+        return
+    assert len(set(byes)) == len(byes)
+    if len(pairs) == 3 and len(seated) == 6 and len(set(seated)) == 3:
+        # Round-robin: the three seat twice each; anyone the list kept
+        # apart from all of them was benched first and is still a bye.
+        assert sorted(set(seated) | set(byes)) == ids
+        return
+    assert len(set(seated)) == len(seated)
+    assert sorted(seated + byes) == ids
+
+
+def test_create_matchups_without_forbidden_pairs_is_unchanged():
+    """The gate is inert when nothing is forbidden: same shuffle, same bye."""
+    answers = {str(i): f"answer{i}" for i in range(1, 8)}
+    plain = create_matchups(answers, bye_history=["2"], rng=random.Random(4))
+    gated = create_matchups(
+        answers, bye_history=["2"], rng=random.Random(4), forbidden_pairs=set(),
+    )
+    assert plain == gated
+
+
+# ── pick_round_bye honours the same gate ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_pick_round_bye_three_players_with_a_pair_benches_one_of_them(seed):
+    bye = pick_round_bye(["1", "2", "3"], rng=random.Random(seed), forbidden_pairs={(1, 2)})
+    assert bye in {"1", "2"}
+
+
+def test_pick_round_bye_three_players_without_a_pair_still_round_robin():
+    assert pick_round_bye(["1", "2", "3"], forbidden_pairs={(4, 5)}) is None
+
+
+def test_pick_round_bye_benches_a_player_blocked_from_everyone():
+    for seed in range(10):
+        bye = pick_round_bye(
+            ["1", "2", "3", "4"], rng=random.Random(seed),
+            forbidden_pairs={(1, 2), (1, 3), (1, 4)},
+        )
+        assert bye == "1"
+
+
+def test_pick_round_bye_even_field_that_pairs_safely_has_no_bye():
+    assert pick_round_bye(["1", "2", "3", "4"], forbidden_pairs={(1, 2)}) is None
+
+
+def test_pick_round_bye_odd_field_leaves_a_safe_remainder():
+    forbidden = {(1, 2), (1, 3), (2, 3)}
+    for seed in range(20):
+        bye = pick_round_bye(
+            ["1", "2", "3", "4", "5"], bye_history=["1", "2", "3"],
+            rng=random.Random(seed), forbidden_pairs=forbidden,
+        )
+        assert bye in {"1", "2", "3"}
+
+
+# ── playable_players: what the Start button counts ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    "players, forbidden, expected",
+    [
+        pytest.param([1, 2, 3], set(), [1, 2, 3], id="nothing-forbidden"),
+        pytest.param([1, 2, 3], {(1, 2)}, [1, 2, 3], id="one-pair-everyone-playable"),
+        pytest.param([1, 2, 3], {(1, 2), (1, 3)}, [2, 3], id="one-blocked-from-both"),
+        pytest.param([1, 2], {(1, 2)}, [], id="two-who-are-a-pair"),
+        pytest.param([1, 2, 3, 4], {(1, 2), (3, 4)}, [1, 2, 3, 4], id="two-pairs"),
+    ],
+)
+def test_playable_players(players, forbidden, expected):
+    assert playable_players(players, forbidden) == expected
+
+
+# ── vote_button_label: the answer goes on the button ─────────────────────────
+
+
+def test_vote_button_label_carries_the_answer():
+    assert vote_button_label("🅰️", "pineapple on pizza") == "🅰️: pineapple on pizza"
+
+
+def test_vote_button_label_flattens_newlines():
+    assert "\n" not in vote_button_label("🅱️", "two\nlines")
+    assert vote_button_label("🅱️", "two\nlines") == "🅱️: two lines"
+
+
+def test_vote_button_label_truncates_to_fit_a_discord_button():
+    label = vote_button_label("🅰️", "x" * 200)
+    assert len(label) <= 80
+    assert label.endswith("…")
+
+
+def test_vote_button_label_falls_back_when_the_answer_is_blank():
+    assert vote_button_label("🅰️", "   ") == "Vote 🅰️"
+    assert vote_button_label("🅱️", "") == "Vote 🅱️"
+
+
+# ── admit_pending_players: joining at a round boundary ───────────────────────
+
+
+def test_admit_pending_players_adds_them_in_order():
+    roster, admitted, turned_away = admit_pending_players([1, 2], [3, 4], 10)
+    assert roster == [1, 2, 3, 4]
+    assert admitted == [3, 4]
+    assert turned_away == []
+
+
+def test_admit_pending_players_ignores_someone_already_playing():
+    roster, admitted, _ = admit_pending_players([1, 2], [2], 10)
+    assert roster == [1, 2]
+    assert admitted == []
+
+
+def test_admit_pending_players_ignores_a_double_press():
+    roster, admitted, _ = admit_pending_players([1], [2, 2], 10)
+    assert roster == [1, 2]
+    assert admitted == [2]
+
+
+def test_admit_pending_players_turns_away_over_the_cap():
+    """Over-cap joiners are reported, not silently dropped — the caller says
+    so in channel rather than leaving someone waiting for a round that never
+    includes them."""
+    roster, admitted, turned_away = admit_pending_players([1, 2, 3], [4, 5], 4)
+    assert roster == [1, 2, 3, 4]
+    assert admitted == [4]
+    assert turned_away == [5]
+
+
+def test_admit_pending_players_handles_no_queue():
+    roster, admitted, turned_away = admit_pending_players([1, 2], None, 10)
+    assert (roster, admitted, turned_away) == ([1, 2], [], [])
+
+
+def test_drain_pending_players_returns_and_clears_the_queue():
+    """Admission only happens at a round boundary, so anyone who pressed Join
+    during the final round is queued for a round that never comes. The game end
+    has to clear them and say so."""
+    payload = {"pending_players": [7, 8]}
+    assert drain_pending_players(payload) == [7, 8]
+    assert payload["pending_players"] == []
+
+
+def test_drain_pending_players_is_a_no_op_on_an_empty_queue():
+    payload = {"players": [1, 2]}
+    assert drain_pending_players(payload) == []
+    assert payload["pending_players"] == []
+
+
+# ── admit_player_now: joining the round that is already open ─────────────
+#
+# Queueing a latecomer for the *next* round meant sitting out the one they
+# were watching. Matchups are built from the answers dict after the submit
+# window closes, so anyone who gets an answer in before then can simply be
+# paired — there is nothing to keep them out of.
+
+
+def test_admit_player_now_seats_them_in_the_open_round():
+    payload = {"phase": "submitting", "players": [1, 2], "scores": {"1": 4}}
+
+    assert admit_player_now(payload, 3, 10) == "joined"
+
+    assert payload["players"] == [1, 2, 3]
+    # Seeded on every board a scored round touches, checkpoint included —
+    # otherwise a crash-resume rolls them off the scoreboard.
+    assert payload["scores"]["3"] == 0
+    assert payload["scores_checkpoint"]["3"] == 0
+    assert payload["clapbacks"]["3"] == 0
+    # An existing score is never reset by a stray press.
+    assert payload["scores"]["1"] == 4
+
+
+def test_admit_player_now_leaves_someone_already_playing_alone():
+    payload = {"phase": "submitting", "players": [1, 2], "scores": {"2": 7}}
+
+    assert admit_player_now(payload, 2, 10) == "already-in"
+
+    assert payload["players"] == [1, 2]
+    assert payload["scores"]["2"] == 7
+
+
+def test_admit_player_now_turns_them_away_at_the_cap():
+    payload = {"phase": "submitting", "players": [1, 2, 3]}
+
+    assert admit_player_now(payload, 4, 3) == "full"
+
+    assert payload["players"] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("phase", ["voting", "revealing"])
+def test_admit_player_now_falls_back_to_the_queue_once_answers_close(phase):
+    """Mid-vote there is nothing to write: the matchups are already set."""
+    payload = {"phase": phase, "players": [1, 2]}
+
+    assert admit_player_now(payload, 3, 10) == "queued"
+
+    assert payload["players"] == [1, 2]
+    assert payload["pending_players"] == [3]
+
+
+def test_admit_player_now_recognises_a_second_press_while_queued():
+    payload = {"phase": "voting", "players": [1, 2], "pending_players": [3]}
+
+    assert admit_player_now(payload, 3, 10) == "already-queued"
+
+    assert payload["pending_players"] == [3]
+
+
+def test_admit_player_now_recognises_a_second_press_after_a_parity_queue():
+    """Four players and no bye: a fifth would need one, so the first press
+    queues them for parity. A second press must say they are already queued,
+    not report a fresh "in from the next round" success."""
+    payload = {"phase": "submitting", "players": [1, 2, 3, 4]}
+    assert admit_player_now(payload, 5, 10) == "queued-parity"
+
+    assert admit_player_now(payload, 5, 10) == "already-queued"
+
+    assert payload["pending_players"] == [5]
+    assert payload["players"] == [1, 2, 3, 4]
+
+
+def test_admit_player_now_clears_a_rejoiner_from_the_withdrawn_list():
+    """Leave, then Join again while answers are open: they are back on the
+    roster and their score must rank again, not sit struck through below the
+    board as "left mid-game" while they play."""
+    payload = {
+        "phase": "submitting", "players": [1, 2, 3, 4],
+        "scores": {"1": 90, "2": 40, "3": 10, "4": 5},
+    }
+    assert withdraw_player(payload, 1) is True
+
+    assert admit_player_now(payload, 1, 10) == "joined"
+
+    assert payload["left"] == []
+    standing, withdrawn = board_scores(payload)
+    assert standing[0] == ("1", 90)
+    assert withdrawn == []
+
+
+def test_admit_pending_players_clears_a_rejoiner_from_the_withdrawn_list():
+    """Same as above at the round boundary: a leaver who queued back in comes
+    off ``left`` when they are seated."""
+    left = ["1", "9"]
+
+    roster, admitted, _ = admit_pending_players([2, 3], [1], 10, left=left)
+
+    assert roster == [2, 3, 1]
+    assert admitted == [1]
+    assert left == ["9"]
+
+
+# ── clapback-1 / D1: a matchup closes once every eligible player has voted ──
+#
+# Reverses the June decision (ab27201b) that ran every vote to the timer once
+# spectators could vote: they do so in 2–12% of matchups, so the electorate is
+# the roster unless a spectator vote actually arrives.
+
+
+def _roster(n):
+    return [str(i) for i in range(1, n + 1)]
+
+
+@pytest.mark.parametrize(
+    "players, pair, byes, voters, expected",
+    [
+        # 3 players, round-robin: the one player not in the pair decides it.
+        pytest.param(_roster(3), ("1", "2"), [], ["3"], True, id="3-third-voted"),
+        pytest.param(_roster(3), ("1", "2"), [], [], False, id="3-nobody-yet"),
+        # Nobody left to wait for (the third player withdrew, or a no-contact
+        # bye benched them): nothing to close on, so the full timer runs.
+        pytest.param(_roster(2), ("1", "2"), [], [], False, id="nobody-eligible"),
+        pytest.param(_roster(3), ("1", "2"), ["3"], [], False, id="nobody-eligible-bye"),
+        # 5 players with a pre-picked bye: two are waited for, the bye is not.
+        pytest.param(_roster(5), ("1", "2"), ["5"], ["3", "4"], True, id="5-bye-silent"),
+        pytest.param(_roster(5), ("1", "2"), ["5"], ["3", "4", "5"], True, id="5-bye-voted"),
+        pytest.param(_roster(5), ("1", "2"), ["5"], ["3"], False, id="5-one-short"),
+        # 9 players, one bye: six eligible.
+        pytest.param(_roster(9), ("1", "2"), ["9"], _roster(8)[2:], True, id="9-all-six"),
+        pytest.param(_roster(9), ("1", "2"), ["9"], _roster(7)[2:], False, id="9-five-of-six"),
+        # A spectator's vote reopens the electorate: full timer.
+        pytest.param(_roster(5), ("1", "2"), ["5"], ["3", "4", "77"], False, id="spectator-voted"),
+        # A contestant's own vote can't happen, but it would not count as eligible.
+        pytest.param(_roster(3), ("1", "2"), [], ["1"], False, id="contestant-only"),
+        # Ids compare as strings whatever type the caller holds.
+        pytest.param([1, 2, 3], (1, 2), [], {"3": 1}, True, id="int-ids"),
+    ],
+)
+def test_all_eligible_voted(players, pair, byes, voters, expected):
+    votes = voters if isinstance(voters, dict) else {v: "1" for v in voters}
+    assert all_eligible_voted(votes, players, pair, byes) is expected
+
+
+# ── clapback-2: the submit window closes on a full house or one short ────────
+
+
+@pytest.mark.parametrize(
+    "count, expected, idle, may_close",
+    [
+        pytest.param(4, 4, 0, True, id="full-house"),
+        pytest.param(3, 4, 19, False, id="one-short-still-fresh"),
+        pytest.param(3, 4, 20, True, id="one-short-idle"),
+        pytest.param(2, 4, 60, False, id="two-short-never"),
+        pytest.param(1, 2, 60, False, id="below-min-answers"),
+        pytest.param(2, 3, 20, True, id="two-of-three-idle"),
+        pytest.param(5, 4, 0, True, id="over-a-full-house"),
+    ],
+)
+def test_submit_window_may_close(count, expected, idle, may_close):
+    assert submit_window_may_close(count, expected, idle) is may_close
+
+
+# ── clapback-4: a modal sent after its window belongs to no round ────────────
+
+
+@pytest.mark.parametrize(
+    "payload, round_num, accepted",
+    [
+        pytest.param({"phase": "submitting", "current_round": 2}, 2, True, id="open"),
+        pytest.param({"phase": "voting", "current_round": 2}, 2, False, id="closed"),
+        pytest.param({"phase": "submitting", "current_round": 3}, 2, False, id="next-round"),
+        pytest.param({"phase": "submitting", "current_round": "2"}, 2, True, id="string-round"),
+        pytest.param({}, 1, False, id="no-phase"),
+    ],
+)
+def test_accept_answer(payload, round_num, accepted):
+    assert accept_answer(payload, round_num) is accepted
+
+
+# ── clapback-5: Join now keeps the writer count even ─────────────────────────
+
+
+def test_admit_player_now_queues_a_joiner_who_would_leave_an_odd_field():
+    """Four writers and no bye: a fifth would bench someone after they wrote."""
+    payload = {"phase": "submitting", "players": [1, 2, 3, 4], "round_bye": None}
+
+    assert admit_player_now(payload, 5, 10) == "queued-parity"
+
+    assert payload["players"] == [1, 2, 3, 4]
+    assert payload["pending_players"] == [5]
+    assert "5" not in payload.get("scores", {})
+
+
+def test_admit_player_now_unbenches_the_bye_to_keep_the_field_even():
+    """Five on the roster with 5 pre-benched: the joiner and the bye both play."""
+    payload = {
+        "phase": "submitting", "players": [1, 2, 3, 4, 5], "round_bye": "5",
+        "scores": {str(p): 0 for p in range(1, 6)},
+    }
+
+    assert admit_player_now(payload, 6, 10) == "joined-unbenched"
+
+    assert payload["round_bye"] is None
+    assert payload["players"] == [1, 2, 3, 4, 5, 6]
+    assert payload["scores"]["6"] == 0
+    assert payload["clapbacks_checkpoint"]["6"] == 0
+    assert "pending_players" not in payload
+
+
+def test_admit_player_now_three_to_four_is_a_plain_join():
+    payload = {"phase": "submitting", "players": [1, 2, 3], "round_bye": None}
+
+    assert admit_player_now(payload, 4, 10) == "joined"
+
+    assert payload["players"] == [1, 2, 3, 4]
+
+
+def test_admit_player_now_keeps_an_isolated_bye_benched():
+    """The bye is on the no-contact list with everyone: un-benching them would
+    only see the gate bench them again after they wrote, so the joiner waits."""
+    forbidden = {(5, p) for p in (1, 2, 3, 4, 6)}
+    payload = {"phase": "submitting", "players": [1, 2, 3, 4, 5], "round_bye": "5"}
+
+    assert admit_player_now(payload, 6, 10, forbidden_pairs=forbidden) == "queued-parity"
+
+    assert payload["round_bye"] == "5"
+    assert payload["players"] == [1, 2, 3, 4, 5]
+    assert payload["pending_players"] == [6]
+
+
+def test_admit_player_now_seats_a_joiner_who_evens_out_an_isolated_bye():
+    """Six on the roster, 6 benched by the gate, five writers: a sixth writer
+    makes the field even and the bye stays where the gate put them."""
+    forbidden = {(6, p) for p in (1, 2, 3, 4, 5, 7)}
+    payload = {"phase": "submitting", "players": [1, 2, 3, 4, 5, 6], "round_bye": "6"}
+
+    assert admit_player_now(payload, 7, 10, forbidden_pairs=forbidden) == "joined"
+
+    assert payload["round_bye"] == "6"
+    assert payload["players"] == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_admit_player_now_unbenched_bye_must_still_be_pairable():
+    """5 is benched and blocked from 1 and 2 only: the roster of six still
+    pairs safely (5 can face 3, 4 or the joiner), so the un-bench goes ahead."""
+    forbidden = {(5, 1), (5, 2)}
+    payload = {"phase": "submitting", "players": [1, 2, 3, 4, 5], "round_bye": "5"}
+
+    assert admit_player_now(payload, 6, 10, forbidden_pairs=forbidden) == "joined-unbenched"
+
+    assert payload["round_bye"] is None
+
+
+# ── clapback-17: a leaver's score is withdrawn from the board ────────────────
+
+
+def test_withdraw_player_marks_the_score_and_drops_the_roster():
+    payload = {"players": [1, 2, 3], "scores": {"1": 90, "2": 40, "3": 10}}
+
+    assert withdraw_player(payload, 1) is True
+
+    assert payload["players"] == [2, 3]
+    assert payload["left"] == ["1"]
+    assert payload["scores"]["1"] == 90  # kept, marked — not erased
+
+
+def test_withdraw_player_ignores_someone_not_playing():
+    payload = {"players": [2, 3], "scores": {"2": 40}}
+
+    assert withdraw_player(payload, 9) is False
+
+    assert payload["players"] == [2, 3]
+    assert "left" not in payload
+
+
+def test_withdraw_player_pulls_a_queued_latecomer_out_of_the_queue():
+    """A latecomer still waiting for the round boundary who leaves is taken
+    out of the queue rather than told they aren't in the game and seated next
+    round anyway. They have no score, so nothing goes on ``left``."""
+    payload = {"players": [2, 3], "pending_players": [9], "scores": {"2": 40}}
+
+    assert withdraw_player(payload, 9) is True
+
+    assert payload["players"] == [2, 3]
+    assert payload["pending_players"] == []
+    assert "left" not in payload
+
+
+def test_board_scores_splits_standing_from_withdrawn():
+    payload = {"scores": {"1": 90, "2": 40, "3": 60}, "left": ["1"]}
+
+    standing, withdrawn = board_scores(payload)
+
+    assert standing == [("3", 60), ("2", 40)]
+    assert withdrawn == [("1", 90)]

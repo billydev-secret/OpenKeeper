@@ -1,0 +1,2921 @@
+# Economy & Perk Shop — Spec V3.1 (repo-grounded)
+
+**Brandable per-guild currency · Logins & streaks · XP conversion · Quests · Rentable perks**
+*Status: largely shipped. Stages 0–4 built (wallets/ledger/config, faucets,
+quests, transfers, the rental engine + role perks + gifts, and the metrics
+dashboard), plus sinks rounds 1–3 (§6: gifting, streak shield, voice-style lease,
+emoji sponsorship, raffle, wagers, hoard tax; the last few shipped dark).
+Soak/tuning (Stage 5) is ongoing; private rooms (Stage 6) plus the v2 member
+dashboard and spotlight slots remain design-only. Implementation plan in
+`docs/plans/economy-and-perk-shop.md` (gitignored; recover it with
+`git show 678a16fa:docs/plans/economy-and-perk-shop.md`). Supersedes the uploaded V3
+draft. All numbers are per-guild-tunable defaults (§9).*
+
+This revision replaces V3's assumptions with the systems Dungeon Keeper actually has.
+The load-bearing change: **currency does not get its own activity tracker**. It converts
+from the existing XP ledger (`xp_events`), so one system counts activity and the economy
+inherits its anti-grind damping and voice rules.
+
+---
+
+## 1. Overview
+
+A per-guild economy module. Each guild brands its currency and runs an
+interaction-driven economy with four income streams (daily logins with streaks,
+daily XP→currency conversion, quests, and game/QOTD rewards), spent on
+weekly-renewing perks (role customization, private rooms) and social sinks
+(gifting, spotlights, transfers).
+
+**Design pillars** (unchanged from V3, with one amendment)
+1. Interaction is the currency; voice presence counts.
+2. Per-guild identity and tuning, informed by live metrics (§9).
+3. Rentals, not purchases: weekly auto-renew keeps demand recurring.
+4. Wide income spread: baseline regular ≈ 100–120/wk; hyper-active ceiling ≈ 1,000–1,200/wk
+   (anchors are now *targets to tune toward* with real `xp_events` data, not derived from
+   fixed rates; see §3.2).
+5. Boosters are patrons: 1.5× on all faucet credits; same shop as everyone.
+6. ~~No earn throttling~~ → **Inherited damping.** The XP ledger already applies
+   cooldown/duplicate/pair-streak multipliers to text XP. The economy inherits them by
+   design; no *additional* economy-specific throttles are added.
+
+## 2. Branding Configuration (per guild)
+
+Dashboard → Economy → Settings: `currency_name`/plural, `currency_emoji`,
+`currency_icon_url`, `wallet_name`, `bank_channel_id`, `approvals_channel_id`,
+`manager_role_id`, `game_role_id`, `transfers_enabled`, `enabled`.
+Dashboard → Economy → QOTD: `qotd_ping_role_id`, `qotd_spicy_role_id` (§3.4).
+
+- Stored as `econ_*` keys in the shared per-guild `config` table, loaded into a frozen
+  `EconSettings` dataclass (same pattern as `XpSettings` / `load_xp_settings`,
+  `src/bot_modules/core/xp_system.py`). Per-guild with **no** `guild_id=0` legacy fallback
+  (`allow_legacy_fallback=False`) so non-primary guilds get true defaults.
+  (`spotlight_channel_id`, the v2 spotlight slot's channel, is not built, so it has no
+  setting yet.)
+- Neutral defaults ("Coins", 🪙) pre-branding. All member-facing strings template these.
+- The economy's cards (perk shop, wallet, register, leaderboard, guide, pay,
+  grant/mute receipts) are Components V2 cards (bare `LayoutView`, no accent
+  color; the currency emoji is decorative either way, never semantic color).
+  The embeds left are the daily login digest DM, which takes its accent from
+  `resolve_dm_accent` in `shared/dm_branding.py` (`brand_dm_embed`), and the
+  color-palette swatch previews (`color_palette.py`).
+- **Card strips:** the economy's public posts (a bounty's
+  card, the auction card, a coin drop and the claimed/vanished receipt it
+  edits into, the pinned Pin of the Day, the `/bank grant` receipt and a
+  *public* `/bank pay` receipt) open on the guild's **Card Header** and close on its **Card
+  Footer** from Config → Branding → Panel Art, thin untitled strips with the
+  card's own heading kept underneath and any buttons inside the frame. So
+  do the paid-request review cards in the staff approvals channel; the todo
+  board's ephemeral copy, the private pay receipt and every other ephemeral
+  card stay plain, and so does the register (§10.1) on purpose: a strip on
+  every ledger line would bury the channel. Nothing shows until a card
+  header is uploaded (the footer alone never does); a card already posted
+  picks the strips up on its next edit. `core.layout.card_strips`, read
+  through `core.card_art.read_card_art` or `resolve_panel_art_conn`, pinned
+  by `CARD_ART_BUILDERS` in `tests/contracts/test_layout_hub_banner.py`.
+- **Feature gate:** economy is off until `enabled` is set AND `bank_channel_id` is
+  configured (Pen Pals pattern). Prod DK is multi-guild; each guild opts in separately.
+
+## 3. Faucets (Earning)
+
+All credits flow through a single `apply_credit()` in the economy service: it applies
+the **booster ×1.5** (checked via `member.premium_since`),
+rounds up, writes the wallet balance and an append-only ledger row atomically.
+
+### 3.1 Daily Login
+- **Trigger:** first qualifying activity of the guild-local day:
+  a counted message (hooks the existing `EventsCog.on_message` pipeline) **or** a
+  qualifying voice session reaching 5 minutes (piggybacks the 30s voice-XP poll tick and
+  the existing `voice_sessions.qualified_since`; same qualification as voice XP:
+  ≥2 humans, non-AFK; deafened still counts; decided).
+- **Day boundary: guild-local midnight** via existing `tz_offset_hours`
+  (`get_tz_offset_hours`), not UTC. V3's §12 "midnight flip" edge case is thereby removed.
+  The main guild needs an explicit tz row set at rollout (it currently inherits global −7).
+- **Reward:** text login 5 base; **voice login 15 base** (voice deliberately richer;
+  decided). +1 per consecutive day, streak bonus capped at +10.
+- **Voice top-up.** The login pays whichever source fires *first*,
+  and text nearly always wins: a member types before they join a call. Live
+  data showed **688 text logins against 30 voice ones**, so without a top-up
+  the richer voice base would be paid on 4% of days while the guide advertises
+  it as the voice rate.
+  A qualifying voice session on a day already claimed by text now tops the
+  member up by the base difference (`top_up_voice_login`, ledger kind `login`
+  with `meta.upgrade`). The streak bonus is **not** recomputed; it was already
+  paid on the text base, so the delta is the flat base gap only. Exactly-once
+  via the `source = 'text'` UPDATE guard: the row flips to `'voice'`, so a
+  replay or a second voice tick the same day matches nothing. Never downgrades
+  voice→text, and a guild that prices voice at or below text pays nothing.
+- **Grace:** one free missed day per rolling 7, automatic and silent; second miss resets.
+- **Streak shield (sinks round 3, stage 2):** a prepaid one-shot bought in `/bank shop`
+  (`price_streak_shield`, default 30; the row is shown while
+  `shop_streak_shield_enabled` is on; see §6.1), held at most ONE, auto-burned
+  when a reset would land; it covers what grace can't. Covers consume grace-first:
+  a 2-day gap survives on grace *or* shield, a 3-day gap only with both, 4+ always
+  resets, and a hopeless gap leaves the shield held. Purchase is a guarded
+  claim-before-debit upsert (`shields = 1 WHERE shields = 0`, then the debit; ledger
+  kind `streak_shield`), so a race can't double-charge; state is
+  `econ_streaks.shields` (migration 091). Purchasable at streak 0.
+- **Milestones:** day 7 → +25 · day 30 → +100 · day 100 → +365 · +100 each 100 after.
+- Idempotency: `INSERT OR IGNORE` on `(guild_id, user_id, local_day)`: one login/day
+  no matter how many events race (birthday-announcement pattern).
+- **Daily digest DM:** members with the opt-in `game_role_id` role get one DM per
+  qualifying login: a streak/payout line, any milestone/grace/shield/reset callout
+  (grace and shield burning together collapse into one "streak saved" field), an
+  optional **"biggest movers yesterday"** field (the community goals that advanced the
+  most on the previous guild-local day), and the member's **full** open-quest checklist.
+  Quests group by cadence (Daily / Weekly / Monthly / 🌍 Community; event/"Anytime"
+  quests get no section, staying a surprise payout rather than a listed menu); each
+  renders as a block: title, a monospace meter (bar in a code span so bars/counts line
+  up), and a blurb from the quest's `description` (with a per-cadence fallback), plus a
+  `<#channel>` link when the quest is scoped to a channel (`trigger_channel_id`,
+  via `quests.channel_scope_suffix`; see §4.5). The
+  layout is built by `economy/quest_digest.py` (pure; unit-tested) and packed into
+  ≤1024-char embed fields (`… (cont.)` on overflow). Members without the role earn the
+  same rewards with no DM. The embed itself is assembled by
+  `build_login_embed` in `onboarding/welcome/login_card_service.py`, shared with the hourly refresh
+  below so the send path and the refresh cannot drift into two renderings.
+  - **Live updates.** The DM is not a snapshot: the hourly
+    economy tick re-renders it **in place** as progress lands
+    (`login_card_service.refresh_guild_cards`, last pass in `run_tick`). Per-guild
+    dial `login_card_live_updates` (Economy → Settings), default **on**; off leaves
+    the DM exactly as written that morning.
+    - **Silent by design.** Discord raises no notification for an edit, and the
+      feature never posts a second message. Chosen deliberately over a nudge: the
+      card is there to check, not to interrupt. A member who deletes the DM is
+      **not** re-sent one; the row is dropped instead, since a repost would notify
+      precisely the person who threw it away.
+    - **Finished quests stay on the card**, ticked (`digest_sections(include_done=True)`,
+      ✅ bullet + full bar + a "Done" blurb, no channel link). Without this the card
+      *empties* as a member succeeds (`digest_sections` drops `state == "done"`), so
+      whoever did the most would end the day looking at a bare streak line. The
+      claimable status line moved ✅ → 🎁 so one glyph doesn't mean both "you did it"
+      and "you still have to press a button". Board order is preserved, so a quest
+      ticks in place rather than reshuffling the list under the reader.
+    - **Stop conditions:** every *personal* (daily/weekly) quest done → one last
+      render, row marked `final`; community/monthly goals are guild-wide counters
+      that never reach done for one member, so they can't hold a card open (they
+      freeze at the last render). A row whose `local_day` isn't today is dropped,
+      never edited. A 404 forgets the card; a 5xx leaves the row for the next hour.
+    - **Cost control:** the rendered card is hashed (`card_signature`) and an
+      unchanged card costs **zero** API calls, the same trick as `core/sticky.py`.
+      Edits go through `get_partial_messageable(...).get_partial_message(...)`, so a
+      refresh is one PATCH with no fetch and no cached DM channel. At ~130 logins/day
+      across the three live guilds the absolute worst case is ~2k edits/day; in
+      practice the signature skip and the finish rule cut that to a few hundred.
+    - **The refresh re-brands.** `deliver_econ_dm` stamps the attribution
+      footer and the DM accent (`resolve_dm_accent`, default `DM_PRIMARY`) on
+      the way out, so the refresh applies the same `brand_dm_embed`: a
+      re-render from scratch would otherwise drop the "on behalf of &lt;server&gt;"
+      footer at the first edit, and in a guild with no accent configured change
+      the card's color as well.
+    - **The member's gates are re-checked every pass**, not just at send: the
+      `econ_notify_prefs` mute and the `game_role_id` opt-in. Muting economy
+      DMs or losing the role at noon forgets the card, because the sweep is a
+      second path writing to the same message and "the edit is silent anyway"
+      isn't the member's call to have made for them.
+    - **Day-scoped writes.** The sweep takes its `local_day` once and then does
+      Discord I/O per member, so `mark_card` / `forget_card` are scoped by it:
+      if the day rolls mid-pass and that member logs in again, `record_card`
+      has already replaced their row, and an unscoped write would stamp
+      yesterday's signature (possibly `final`) onto a card sent minutes ago and
+      freeze it for the day.
+    - **Only a real DM is recorded.** `deliver_econ_dm` (the delivery core behind
+      `notify_member`) reports its *surface* rather than a bool, and `card_handle`
+      stores a handle only for `surface == "dm"`. A muted member, a member on a
+      Take a Break (no bank-channel fallback either), a member without
+      the opt-in role, and one with closed DMs all report `dropped` with no message;
+      the old bool said `True` for all three. The `bank` surface is refused outright:
+      that fallback is a deliberately different, wellness-free embed, and editing it
+      with the private render would publish a member's wellness section publicly.
+    - **Re-derived vs frozen.** Only the seven `LoginOutcome` scalars ride on the
+      card row (`econ_logins` keeps just `paid`; milestone/grace/reset/shield are
+      one-shot). The quest board, the movers and the wellness blurb are all re-read
+      each pass, so pausing wellness at noon really does take the section off the
+      card at 1pm. No rendered prose is stored, and the wellness text never lands in
+      the table. State: `econ_login_digest_cards` (migration 190, one row per member
+      per guild, registered in `docs/data_register.md`).
+  - **Movers data:** community progress is stored only as a cumulative `current`, so the
+    day roll (`economy.loop.run_guild_day_roll`) snapshots each community quest's total
+    into `econ_community_progress_snapshots` (keyed `(quest_id, day)`, taken before any
+    weekly settlement zeroes it). `community_gains_for_day` diffs consecutive days;
+    positive movers only, so a settlement reset shows nothing. A member logging in before
+    the hourly roll simply sees no movers field yet.
+
+### 3.2 XP → Daily Conversion — dormant (off by default)
+**This faucet ships OFF.** `econ_xp_per_coin` defaults to **0**, and the day-roll
+driver skips the conversion entirely while the rate is 0, so earning XP mints
+no currency. The mechanism (`convert_xp` / `process_conversion` /
+`econ_conversions`) is retained intact so a guild can re-enable it by setting a
+positive rate on the Income Sources panel; it is not a code change. XP itself is
+unaffected (it still drives levels/leaderboards); it simply has no currency faucet.
+
+When re-enabled, the behavior below applies. Members earn XP as today
+(`xp_events` ledger: text per-word, replies, image-reacts, voice 1.67/min with ≥2
+humans); at guild-local midnight, each member's XP earned that local day converts
+to currency.
+
+- **Conversion: `econ_xp_per_coin` XP → 1 currency** (0 = off), rounded down; fractional remainder carries to the next day (stored on
+  the conversion row).
+- **Ceiling: `econ_conversion_daily_cap`** (0 = none, the default) caps what one
+  member's XP can mint in a single local day. This is the only faucet without a
+  natural bound (a login fires once, drops have `drops_per_day`, a quest board
+  is finite), so without it the rate is the only brake, and the rate hits a
+  quiet member as hard as the top chatter. Overflow is **discarded, carry
+  included**: a cap that banks the excess is a delay, not a limit, and the
+  backlog would land in one lump the day it lifts. The clip is stored on the
+  conversion row (`coins` holds the paid figure, `remainder` 0) and flagged in
+  the ledger meta as `capped: <cap>`. Like every faucet rate it is a
+  **pre-booster** base; a booster's 1.5× applies on top of the ceiling.
+  The cap exists because conversion alone once produced 60% of a day's mint
+  (the 2026-07-25 sources/sinks review, `git show 242bddeb:docs/reviews/2026-07-25-economy-casino-sources-sinks.md`).
+- Because the driver skips conversion while the rate is 0, turning the faucet off
+  does **not** accumulate a remainder backlog; re-enabling resumes from that day,
+  consistent with the no-retroactive-backlog rule (§ outage behavior), rather than
+  paying out every skipped day at once.
+- V3's flat XP table (3/post etc.) is **dropped**; the real rates rule. Reference at
+  a rate of 15: a 2-hour qualifying voice hangout ≈ 200 XP ≈ 13 coins. The conversion
+  rate and all XP coefficients are the scaling parameters in the config menu (§9);
+  income anchors are tuned there against the metrics card, not hardcoded.
+- **XP source `reaction_given`** (live, Stage 1): reacting to someone else's message
+  pays the *reactor* XP, default 0.34 (double the existing image-react rate), tunable via
+  `xp_coeff_reaction_given_xp` on the dashboard XP panel. Feeds regular XP/leaderboards
+  (and currency too, but only when the conversion faucet is on). Guards: no self-reactions,
+  no bots, one award per (message, reactor) ever (dedup table), so react/unreact can't farm.
+  See [[xp-spec]].
+- When on, conversion is silent (ledger entry: "Daily activity"). Runs from the economy
+  hourly loop when a guild's local day rolls; idempotent via a per-(guild, user,
+  local_day) conversion row.
+
+### 3.3 Quests — per §4. Daily 10–20 · weekly 25–75 · community flat payout.
+
+### 3.4 Interaction Rewards
+- **QOTD (built, manual):** the reward is paid for **replying** to a registered
+  question: a direct Discord reply (`message.reference`) to the QOTD message earns
+  **10**, once per QOTD (dedup row per member). One way to register one:
+  **tag the role.** Any message from an economy manager
+  (admin or `manager_role_id`) that mentions `qotd_ping_role_id` becomes that
+  day's question. There is no command and no card; the mod asks in their own words.
+  `logic.qotd_marker_question` strips the mentions for the stored audit text
+  (capped at 300 chars; empty is valid, since an image can be the question) and
+  `events.cog._econ_work` writes the `econ_qotd` row in the same transaction as
+  the login faucet. The manager gate is the security boundary: Discord lets
+  anyone *type* `<@&id>` regardless of ping permission, so without it any member
+  could mint a faucet and farm replies to it. Re-entrant: a row already
+  registered for that message id is never duplicated.
+  **There is no `/qotd post` command** (it ran 7 times against ~60 registered
+  questions; tagging the role is the path mods use). A question
+  is opened by tagging the role, so the role has to exist first, and a guild
+  without one makes it from the Bot-Managed Roles page
+  (`docs/specs/role_provisioning_spec.md`).
+  Replies pay only while the question's `local_day` is still the current
+  guild-local day. The row lives forever, so without that check a member could
+  reply down a month of old questions for 10 each. No scheduler; mods ask when
+  they want. A missed day can page staff: with a QOTD deadline hour set, the
+  opt-in `@Staff · QOTD` ping fires once that guild-local day if no `econ_qotd`
+  row of kind `'qotd'` exists by then ([staff_pings_spec.md](staff_pings_spec.md)). A guild that has **never** set the notifications dial
+  gets an `@Economy Notifications` role the first time a member presses 🔔.
+  A stored `0` is honored like every other ping dial: with `game_role_id`
+  stored as 0 the 🔔 button replies that notifications aren't set up in this
+  server and makes nothing (the panel's "(none)" means off). The ambiguity of
+  the Economy Settings panel writing 0 for an untouched picker on any save is
+  answered on the panel by the state line under the picker
+  (`docs/specs/role_provisioning_spec.md` §3). Both keys are guild-scoped `econ_`-prefixed
+  config with no legacy fallback. `qotd_ping_role_id` set to 0 (an admin
+  choosing "(none)") means no tag-to-ask, so no QOTD at all. The mention only notifies if the role is mentionable or the bot holds
+  "Mention @everyone, @here, and All Roles"; Discord renders it as inert text
+  otherwise. That permission governs *notification*, not registration.
+- **Spicy QOTD (migration 249, ships dark):** a second
+  question of the day under its own ping role, `qotd_spicy_role_id`. The server's own role, not a
+  `feature_roles` entry: the bot never makes it and never offers it in
+  onboarding or Roles & Pings. Tag-to-ask, like the regular one. `logic.qotd_marker` registers a manager's tag
+  of it as an `econ_qotd` row of `kind = 'spicy'` **only in a channel Discord
+  age-gates** (`is_age_gated_channel`, the channel or its category); tagged
+  anywhere else it registers nothing. A message tagging both roles is the
+  spicy question in an age-gated channel and the regular one elsewhere.
+  Replies pay `reward_qotd` and fire `qotd_reply` exactly like the regular
+  question (the same reward), so a member answering both earns
+  twice a day. Each kind signs off only its own recurring chore
+  (`logic.QOTD_CHORE_TRIGGER`: `qotd` / `spicy_qotd`, [todo_spec.md](todo_spec.md)),
+  and has its own staff reminder, `@Staff · Spicy QOTD`, on the shared
+  deadline hour ([staff_pings_spec.md](staff_pings_spec.md)). With the dial
+  unset nothing registers as spicy and the reminder isn't offered. The
+  economy config PUT refuses (422) one role in both QOTD dials, checked
+  against the stored value too: that role tagged in an age-gated channel would
+  always register as spicy, starving the regular reminder and chore. Not being
+  a managed role, it has no Bot-Managed Roles state line; the QOTD panel marks
+  it **Deleted** itself when the saved id is missing from the guild's roles.
+- **There is no sponsored QOTD** (migrations 090 → 250 added and then dropped
+  it): the paid queue's only exit was the removed `/qotd post` command, and
+  it never made a sale (`econ_qotd_submissions` held zero rows in prod).
+  Migration 250 dropped the table, `econ_qotd.sponsor_user_id` and the two
+  dials (`price_qotd_sponsor`, `qotd_sponsor_expire_days`). Its pattern
+  (escrow at submit, an exactly-once `refunded_at` refund, one open submission
+  per member by partial index) lives on in Pin of the Day, Flash Themes and
+  the emoji sponsorship below.
+- **Pin of the Day (built, sink; migration 108):** the sponsored-submission
+  pattern applied to a *public*
+  artifact. The shop's **🏠 Server Features** section opens a modal; the
+  text is charged `price_pin_of_day`
+  at submit (ledger `pin_sponsor` out / `pin_sponsor_refund` back) and queued
+  `pending`; a mod Approves/Declines from the card in the approvals channel or
+  the todo board's **🧾 Approvals** button (`PinApproveButton`/`PinDenyButton`,
+  persistent). Pin of the Day has **no dashboard queue**, so those two are its
+  only review surfaces, and with `approvals_channel_id` unset, the board is
+  the only one.
+  Approve posts + pins a
+  "Pinned by @X" card in `pin_channel_id` and flips the row to `live` with a
+  24h `expires_at`. The Discord post happens *before* the DB move, so a failed
+  post refunds (the member is never charged for a pin nobody saw). One live pin
+  per guild (partial unique index); a new approval **supersedes** the prior one
+  (unpinned early; mod-paced). The hourly loop's `run_pin_expiry` unpins live
+  pins past 24h (**no refund**, since the day ran) and refunds `pending` ones no mod
+  reached within `pin_expire_days` (default 3). Enabled only when
+  `price_pin_of_day > 0` **and** `pin_channel_id` is set. A public sink, dark
+  by default. One submission in flight per member. The stake is charged at
+  submit, not at approval, because a free queue invites spam; a pin that
+  actually went live is never refunded. The 24 hours run from go-live rather
+  than the calendar day, so a late-evening approval still gets a full day. The
+  in-flight limit (a partial unique index on pending or live rows) stops one
+  member buying several slots to flood the queue. Buying a public pin is
+  opting into being named on its card, the same carve-out as the raffle and
+  Flash Themes. The resolution DM
+  (`pin_resolution_dm_text`) **links the pin** on the approved branch: the row
+  holds `pin_channel_id`/`pin_message_id` by the time it is sent, and "enjoy
+  the spotlight" is a poor invitation if the member has to hunt for their own
+  post. The declined branch carries no link: it never became a message. Nor
+  does the *expiry* refund, since `unpin_and_delete` has already removed it.
+  The live card carries the **shop pointer**; see *The shop pointer on
+  those two cards* under the paid-request review surfaces below.
+
+  The review card is Components V2 (`economy/pin_layouts.py`,
+  `build_pin_review_layout`, **paradigm 5** via
+  `approval_layouts.build_review_card_layout`), not an `Embed`: the
+  persistent Approve/Decline pair is baked straight into the returned
+  `LayoutView` rather than attached as a separate view, matching the retired sponsored-question card.
+  Pin's five submission states collapse onto the shared builder's three card
+  states: `pending` and `approved` map straight across; `denied` is a true
+  decline (heading "❌ Pin Declined"); `expired` splits on `refunded_at`. A
+  refunded expiry (no mod reached it in time) is also a decline, but a pin
+  that went `live` and then lapsed, or was `superseded` by a newer approval,
+  is not a decline at all (heading "📌 Pin Ended", no refund line) since the
+  day ran. The live card (`build_pin_live_layout`) is the same paradigm-7
+  receipt shape as before, now two `TextDisplay` items instead of an embed.
+- **Flash Themes (built, sink; migration 188):** the (retired) sponsor pattern applied
+  to a *day* rather than a message, and the fourth consumer of
+  `submission_store`. The shop's **🏠 Server Features** section opens
+  a modal (theme name + blurb); both are charged `price_flash_theme` at
+  submit (ledger `flash_theme` out / `flash_theme_refund` back) and queued
+  `pending`; a mod
+  Approves/Declines from the card in the approvals channel, the todo board's
+  **🧾 Approvals** button (`ThemeApproveButton` / `ThemeDenyButton`,
+  persistent), or the dashboard's **Approvals** page.
+  Two things distinguish it from Pin of the Day, which it otherwise mirrors:
+  - **Approve posts nothing.** It moves the row to `approved` and that is all.
+    The hourly loop's `run_theme_expiry` promotes the oldest approved row
+    (`next_approved`, FIFO) *only when nothing is live*, and the caller
+    (`announce_theme`) posts one card in `theme_channel_id` and pins it, so
+    the announcement and the pin are the same message. There is **no
+    supersede**: a paid theme is never cut short by a newer one, so the
+    one-live-per-guild partial index is the invariant rather than a backstop.
+    Approval does not start the clock either, or a theme approved during a
+    busy queue would expire before it ran. An empty queue posts **nothing**;
+    a day without a theme is a normal day.
+  - **`price_flash_theme = 0` does not disable it.** `flash_theme_enabled` is
+    a real toggle (the per-perk-switch convention of migration 182), so a free
+    themed day is expressible; `theme_channel_id` must also be set. This is
+    the first paid submission where a zero price means *free* rather than
+    *off*, and `charge_and_insert` skips the ledger below 1 accordingly, the
+    mirror of `refund_once`'s existing no-op.
+
+  The same sweep retires themes past `theme_hours` (clamped 1–168; **no
+  refund**, since the day ran) and refunds `pending` ones no mod reached within
+  `theme_expire_days` (default 3); approved-and-waiting rows never expire.
+  The live card carries the **shop pointer**; see *The shop pointer on
+  those two cards* under the paid-request review surfaces below.
+
+  Both cards (the mod's review card and the public live announcement) are
+  Components V2 (`economy/theme_layouts.py`, `build_theme_review_layout` /
+  `build_theme_live_layout`), not `Embed`s: no accent color, and the review
+  card's persistent Approve/Decline pair is baked straight into the returned
+  `LayoutView` rather than attached as a separate view. `refunded` (read off
+  the row's `refunded_at`, never inferred from `state`) still decides the
+  refund line and the "Ended" vs "Declined" heading: `expired` alone is
+  three different endings (unreviewed-and-refunded, ran-its-course,
+  ended-early), and getting that wrong tells a mod money moved when it
+  didn't.
+
+  **The live announcement wears the hub banner.**
+  `announce_theme` reads the guild's configured panel art the same way a hub
+  panel does (`core.branding_service.resolve_panel_art_conn`), and when a banner
+  is set, titles it "Today's Theme" (`panels.title_service.titled_banner_url`)
+  before opening the card with it (`core.layout.hub_banner`). The
+  member-written theme title stays text-only, in the card's own
+  `## 🎨 {title}` heading, never drawn into the image itself, so it never
+  needs escaping through Pillow. The card closes on the guild's hub footer
+  when one is configured (`core.layout.hub_footer`). A guild with no panel
+  art configured sees a plain `## 🎨 {title}` card with no galleries at all.
+  This is the one documented exception to "hub
+  banner art is for channel-resident hub panels only"
+  (`tests/contracts/test_layout_hub_banner.py`'s `HUB_BANNER_EXCEPTIONS`,
+  `docs/components_v2_style_guide.md` § Media): the announcement pins itself
+  into the theme channel for its whole window, reading as a hub of one even
+  though it isn't `EconomyCog`'s persistent panel. The review card, the DM
+  receipts and every ephemeral reply stay plain; the banner is for the
+  public post only.
+
+  Retiring runs *before* promotion in one transaction, so a handover happens
+  inside a single tick rather than leaving the channel bare for an hour.
+  Withdrawing a queued theme refunds; **taking down a running one does not**.
+  One submission in flight per member. Ships dark, price provisionally 300.
+
+  *Erasure:* a `live` row is **detached** (`user_id` → 0), not deleted. It
+  holds a pinned announcement only the sweep can take down, and the sweep
+  finds its work by reading live rows, so deleting it would strand the pin
+  permanently. See `docs/data_register.md`.
+
+  **Where paid requests are reviewed: two surfaces, one ledger.** The pin and
+  the themed day are one job to a moderator. They are reviewed in two
+  places, and both are always live:
+
+  1. **A card in `approvals_channel_id`** (`approval_views.post_approval_card`):
+     the primary surface, where mods actually work.
+  2. **The mods' todo board**: a 🧾 Paid requests section and one 🧾 Approvals
+     button opening an ephemeral pick-one select. The backstop, and the only
+     surface when the channel dial is unset.
+
+  **A third surface, and it is only a finder.** All economy approvals should
+  be visible in one place, so `shop-approvals` has an **Everything Waiting** list, served by
+  `GET /api/economy/approvals` (`require_economy_manager`) over
+  `approvals_service.pending_for_dashboard`. It unions **five** queues, not the board's two: the
+  three paid-submission products (themed day, pin, sponsored emoji) via the
+  shared `_pending_select`,
+  plus quest sign-offs and custom-item orders merged in Python, because neither
+  is a paid submission (a claim has no price and pays the quest's own reward,
+  and an order takes its summary from a join to the item it bought).
+
+  Two things it deliberately is not. It is **not** the board's `QUEUES`: those
+  keys ride in the Discord select values and the board signature, so
+  `DASHBOARD_QUEUES` is a separate tuple and the board still shows two. And
+  it **resolves nothing**: every row links to where that product is already
+  handled, so no approve path, permission or member-facing copy moved. Pin of
+  the Day still has no web queue and its row says "In Discord"; listing it is
+  the point, so a waiting pin is visible on the dashboard.
+
+  Motivating fact, and the reason a flat list beat tabs: production runs these
+  queues at zero to two pending rows each, so the win is "one glance says
+  nobody is waiting", which tabs would have preserved as three clicks.
+
+  Custom-item orders are gated by `require_economy_manager` (not
+  `require_perms({"admin"})`), refund included. They sit on a page that is
+  deliberately not `adminOnly`, so an admin gate would render a permissions
+  error box exactly where the orders should be.
+
+  `approvals_channel_id` is a **dedicated dial** and is deliberately not
+  `bank_channel_id`: that is the economy's member-facing explainer in the main
+  guild (`🏦│how-it-works`), and a review card names the member, shows what
+  they paid and quotes their unreviewed submission, so posting one there
+  would publish an unreviewed adult-register request to the whole server. The dial **ships dark**; with it unset
+  nothing posts, nothing errors, and the board is the whole story. The
+  dashboard warns (never refuses) when the chosen channel is readable by
+  `@everyone`; nothing in the code can tell a staff channel from a public one,
+  so the decision stays the admin's.
+
+  **One ledger.** `card_channel_id`/`card_message_id` on each submissions
+  table (written by `approvals_service.set_approval_card`, read by
+  `card_location`) are what make the two surfaces one. A resolution from any
+  of the three entry points closes both: the board self-corrects because its
+  section reads the queue live, and the channel card is repainted. Both
+  products are Components V2 now, and `view_helpers.py` keeps only the
+  layout-flavored repaint trio (`edit_review_card_layout` /
+  `edit_stored_card_layout` / `refresh_review_card_layout`); there is no embed trio. Pin and the themed day both bind the shared
+  `edit_stored_card_layout` straight. Both skip the message the
+  resolver was already looking at, so a resolution *from* the card doesn't
+  edit it twice.
+  The dashboard's own resolution path has repainted the stored card since
+  before the move. The hourly expiry sweep now closes cards too
+  (`approval_views.close_expired_card`): before this, an expired-and-refunded
+  request left a card showing Approve/Decline for good. That was safe, because
+  `move_state`'s `state = from_state` guard rejects the press, but it read as
+  broken.
+
+  The queue is `approvals_service.pending_approvals`, a `UNION ALL`
+  over the products in `QUEUES`; both surfaces render **that product's own
+  card and buttons** from one registry (`approval_views._renderers`), so a mod
+  reads an identical card either way. Pin and the themed day
+  (`economy/pin_layouts.py`, `economy/theme_layouts.py`, **paradigm 5** via
+  `approval_layouts.build_review_card_layout`) all build bare
+  `LayoutView`s, with the Approve/Decline pair baked in rather than
+  attached as a separate view, so `_Renderer` (the registry's value type) is a plain
+  `Callable[[EconSettings, Any], discord.ui.LayoutView]`: there is no
+  companion view to hold. Cards ping `manager_role_id` (the
+  same role `can_manage_economy` gates on, so the ping reaches exactly the
+  people who can act), allow-listed by id via `core.utils.role_ping_kwargs`,
+  never a blanket `roles=True`. Gate is `can_manage_economy`, not the board's
+  mod check: every decision moves currency. Emoji sponsorship is deliberately
+  excluded (its approval is an upload, not a yes/no, and it has a dashboard
+  queue), and `notify_member`'s public bank-channel fallback for a member with
+  DMs closed is a different mechanism and unchanged. Full shape in
+  `docs/specs/todo_spec.md` § "Paid requests on the board".
+
+  **Names in the cards.** Every paid-request card resolves the requester and
+  the resolving mod through `shared/name_resolver` (`card_name_fn` →
+  `named_or_anonymous`) rather than emitting `<@id>`. An embed mention is
+  resolved by the *reading* client from its own cache, so in a channel it
+  degrades to a bare number for any mod who has never seen that member, and a
+  paid request is often the first time they meet them; the Components V2
+  cards (pin, the themed day) name-resolve the same way for the
+  identical reason, even though a `LayoutView`'s `TextDisplay` text has no
+  separate mention slot to degrade. The two public announcement surfaces
+  (`pin_layouts.build_pin_live_layout`, `theme_layouts.build_theme_live_layout`)
+  resolve the same way. A `user_id` of 0 is an erasure detaching a live
+  purchase from its buyer and renders "a member", never `<@0>`.
+
+  **The shop pointer on those two cards (`shop.shop_pointer_line`).** Both live cards end with
+  a `-#` subtext line routing the reader to `/bank shop` → 🏠 Server
+  Features (the cards are Components V2 `LayoutView`s with no embed field to
+  attach a pointer to). They are read by
+  a whole channel and bought by one person, which makes them the only place
+  most members learn the thing was for sale at all. One helper for both, so
+  the copy and the route cannot drift apart. The route is the fragile half
+  and is **tested** (`tests/contracts/test_shop_pointer_contract.py`): `/bank theme`,
+  `/bank pin` and `/bank sponsor` do not exist (the shop is organized into
+  sections), so a card naming one would advertise a command
+  Discord answers with "unknown integration", and the section caption is
+  read from `shop.SECTION_CAPTIONS` rather than retyped, so a rename moves
+  the signpost with the aisle. It is plain text, not a slash-command
+  mention: a clickable chip needs the live command id, which a `TextDisplay`
+  has no way to hold. No other paid perk gets one; the sponsored emoji has
+  no public "this was bought" card to hang it on.
+
+- **Community Bounty (built, sink; migration 109):** the economy's first
+  *many-payer* mechanic. A bounty is a freeform text task whose winner a person
+  picks (a `UserSelect`), deliberately not coupled to the quest system, so the
+  winner is never ambiguous.
+  Components V2 (`bot_modules/economy/bounty_layouts.py`): both the board card and the
+  hub are bare `LayoutView`s, no accent color. A sticky **hub panel**
+  (`EconomyCog.bounty_panel`, `build_bounty_hub_panel`) sits at the bottom of
+  `bounty_channel_id`: a how-it-works blurb plus the open bounties, each its own
+  two-line row (title, then a small line with the pot and a jump link,
+  `board_entries`) beside its own 💰 **Chip In** button (paradigm 6). It is
+  the board's only entry point: 🎯 **Post Bounty** opens the modal (title,
+  details, opening stake); a row's own Chip In opens the amount modal
+  directly, no bounty-picker select in between. There is no
+  `/bounty` command. Anyone can also chip in from a bounty's own
+  board card (paradigm 5 while open: the facts, then Chip In / Award /
+  Cancel in one row; paradigm 7 once resolved: the same facts, no controls),
+  and **the poster or a mod** Awards it (a `UserSelect` picks the winner) or
+  Cancels it, through persistent
+  `BountyChipInButton`/`BountyAwardButton`/`BountyCancelButton` on the card and
+  `BountyHubPostButton`/`BountyHubChipButton` on the hub (the latter has its own custom_id format,
+  `econ_bounty:hub_chip:<id>`; the hub click's `interaction.message` is the
+  hub panel, not the bounty's card, so its chip-in refresh finds the card by
+  its stored ids instead). The hub itself wears the guild's small
+  **lobby strip** (`core.layout.lobby_art`, `header`/`footer`/
+  `title_in_header` on `core.branding_service.PanelArt`) rather than the tall hub
+  banner: every such channel hub wears the strip, title
+  drawn into the header in place of the `## ` heading; hubs on the
+  tall banner (Perk Shop, Server Features, casino) keep it. Ships dark: a
+  guild with no lobby header art configured sees the plain heading.
+  All three member DMs
+  (awarded, canceled-and-refunded, and the loop's expired-unawarded notice)
+  **link the bounty's card**. Unlike the auction's, a bounty card is an
+  ordinary message, so its permalink keeps working; the award and cancel
+  handlers can therefore link `interaction.message` directly, which is only
+  sound because Award/Cancel live solely on `BountyBoardView` (the card's own
+  view) and never on the sticky hub; a test in
+  `tests/economy/test_economy_bounty_views.py` pins that. The expiry DM builds its link
+  from `notice.card_channel_id`/`card_message_id` and simply omits it when
+  those are 0 (a bounty whose card never posted). **Who may resolve** is
+  `bounty_service.resolve_denial`, the service's only permission rule,
+  asked by the view's `_gate_resolve` for both buttons: a manager resolves
+  anything, the poster may cancel their own bounty and award it to *someone
+  else*, and nobody else may do either. A poster awarding **themselves** is
+  refused in its own words (the pot is other members' coins; "no permission"
+  would read as the feature being broken), though a manager who happens to be
+  the poster keeps a manager's rights. The rule (bug #221) has no dial;
+  it is unconditional. Three no-contact calls ride with it, none of which
+  touches the money: the winner's award DM is dropped for a poster/winner pair
+  (`should_notify_winner`), a refunded contributor under a rule with the poster
+  is left out of the cancellation DMs (`notifiable_contributors`; the
+  refund notes themselves are batched as `econ_notice` lines, so bounties
+  canceled inside one ten-minute window reach a contributor as one DM, and the
+  poster rides as the unnamed actor so the rule is re-checked at send), and an
+  awarded card whose poster and winner are a pair prints **both as a bare
+  `User <id>`** (`award_pair_no_contact`, applied in `_card_name_fn` so every
+  repaint path inherits it). That last one is a **deliberate anomaly**: a card
+  full of numbers is correct, not a naming bug, for the reason
+  `games/guess/layouts.reveal_names` gives; `tests/economy/test_economy_bounty_views.py`
+  fails if someone "fixes" it. `post_bounty_panel`
+  **takes no channel from the caller**; it reads `bounty_channel_id` itself
+  (`_OWN_CHANNEL_METHODS`, alongside Voice Control and the Guess Who prompt),
+  so the dashboard draws no picker for it (a picker beside the Bounty Board
+  Channel setting could only ever have that setting as its valid answer). Where the hub landed is stored in its own
+  pair (`bounty_panel_channel_id`/`_message_id`): an admin repointing
+  `bounty_channel_id` doesn't touch them, so on a mismatch `_bounty_panel_ids`
+  reads the hub as unposted. The restick stops chasing a message off the
+  board, which would otherwise edit-404 into a *second* live hub, and the
+  next post deletes the orphan. The list is bounded by the card's component
+  budget (`HUB_LIST_LIMIT`, 8 rows, each a three-component Section, stays
+  under the 40-component ceiling); titles are clipped (`HUB_TITLE_CLIP`, 24
+  characters) and whatever doesn't fit is named in an "…and N more" tail. `sticky_panel_channels` counts the board channel, so
+  `/bank auction start` **refuses** it outright (see the auction section).
+  `restick_on_bot` is **on**: the hub's own channel is where
+  bounty cards post, and without the flag a burst of new cards would strand the
+  hub (the board's only entry point) up-channel until a human happened to
+  speak. It does not reintroduce the casino's repost flood, for two reasons
+  worth keeping written down, because leaving the flag off was once thought
+  necessary to avoid that:
+  - **The re-render paths can't arm a restick at all.** Chip-in and award edit
+    the card in place (`_refresh_card`) and so does the expiry sweep
+    (`refresh_card_by_id`); a message edit fires no `MESSAGE_CREATE`. A
+    genuinely new card is the only trigger, exactly the event the hub should
+    jump over, so a burst of N cards costs **one** repost once the channel
+    goes quiet for the 6 s debounce.
+  - **The self-chase is guarded three deep and proven in prod.** The casino hub
+    runs `restick_on_bot=True`. A repost flood is never the flag's doing: it
+    needs `schedule_restick` to cancel-and-rearm the very task parked inside
+    `place()`, so the repost lands but its id is never recorded and the
+    at-the-bottom guard keeps comparing against a dead message. The placement
+    is shielded against that. The layers are the cached-id skip in
+    `should_restick`, the `last_message_id` pre-check in `_delayed_restick`, and
+    `only_if_buried` re-deciding under the placement lock. Any one of them
+    alone is enough (verified by removing each in turn against
+    `test_core_sticky.py`).
+  Every stake is
+  an `apply_debit` (`bounty_stake`) recorded as its own `econ_bounty_contributions`
+  row; the pot is `SUM(non-refunded contributions)` (never stored). Award credits
+  one `bounty_payout` of `pot − floor(pot × bounty_rake_pct / 100)` to the winner;
+  the rake is escrow never credited back, the **burn** (a real sink, next to
+  `wager_rake_pct`/`demurrage`). Cancel/expire refund every contribution
+  (`bounty_refund`, exactly-once, **never raked**). `run_bounty_expiry` on the
+  hourly loop expires + refunds open bounties past `bounty_expire_days`
+  (default 14) and re-renders the card. Guards: `bounty_min_stake` floor,
+  `bounty_max_open` per member. Enabled only when `bounty_channel_id` is set,
+  so dark by default.
+- **Live Auction (built, sink; migration 123):** a mod runs `/bank auction start` (title,
+  freeform prize, hours); the bot posts a sticky card with a 🔨 **Bid** button
+  (persistent `AuctionBidButton`, custom_id carries the auction id). Bidding is
+  **ascending and open**: each bid must beat the standing high by
+  `auction_min_increment` (opening floor `auction_min_bid`), and the outbid
+  member is refunded *instantly* (`auction_refund`). Escrow-at-bid (`auction_bid`
+  via `apply_debit`) means the winner is already charged at close; the winning
+  escrow is simply never refunded → **burned** (the sink; the mod hands over the
+  freeform prize out of band). A bid inside `auction_soft_close_seconds` of the
+  end pushes the end out (anti-snipe). The bid mechanics (instant refund
+  on outbid, anti-snipe) are explained once, on the Bid modal itself, not
+  on the card; the card stays a bare status line so it doesn't repeat the
+  same paragraph to everyone on every repaint. The two-bids race is handled by
+  compare-and-swap on the high-bid slot; bids run under `place_bid_now` /
+  `open_db_immediate` (**BEGIN IMMEDIATE**, retry + friendly error) so concurrent
+  bidders serialize instead of hitting `SQLITE_BUSY_SNAPSHOT`. Close is timed:
+  `EconomyCog._auction_settle_loop` (30s) calls `settle_due_auctions` (exactly-once
+  via the `state='open'` claim) and announces the result, pinging winner + host
+  and DMing both. `/bank auction cancel` refunds the standing bid; `/bank auction end`
+  closes now. One live auction per guild (v1). **Dark by default**: no auction
+  exists until a mod opens one. The four `auction_*` guard-rails are set under
+  **Live Auctions** on the **Pricing** page (they are enforced on
+  every bid); the route bounds each where the service floors it, so a value that
+  would be silently clamped is refused rather than saved. The card is a bare
+  Components V2 layout (paradigm 8, live board;
+  `docs/components_v2_style_guide.md`), built by
+  `economy/auction_layouts.build_auction_card_layout` and wrapped by
+  `economy/auction_views.py` (Discord glue: the Bid button, the sticky
+  lifecycle, the settle/announce path); money lives in
+  `auction_service.py`.
+  - **The card is genuinely sticky:** it rides
+    `core.sticky.StickyPanel` like the guide/leaderboard/shop panels, so member
+    chat can't bury a live auction. It is the **only** sticky site in the bot
+    that *ends*, and the whole lifecycle lives in the two id callbacks, so
+    `core/sticky.py` needs no auction-specific code, which matters because that
+    module is shared by nine panels and its failure mode is a visible repost
+    flood (the casino hub storm).
+    - `card_ids(conn, guild)` returns the live ids only while the newest
+      auction is `open`, else `(0, 0)`. `_delayed_restick` bails on a falsy
+      message id ("only ever maintains an existing panel, never creates one"),
+      so **settlement makes the panel dormant by itself**.
+    - `build_auction_panel` refuses anything but an open auction. This is the
+      resurrection guard: a restick armed just *before* settlement can still be
+      in flight, and `_place_locked` reads a `(0, 0)` stored id as "not at the
+      bottom", so it would post a fresh card for a finished auction. `build`
+      runs before `send`, so refusing aborts the placement having posted
+      nothing.
+    - `attach_card_to_latest` writes to the guild's newest auction row
+      **regardless of state**. `save_ids` only receives a guild id, so
+      resolving "the open auction" would silently drop the write when a
+      placement returns after the settle loop closed the auction: old card
+      deleted, new card recorded nowhere, stored id frozen on a dead message.
+      That is precisely the storm's shape.
+    - `restick_on_bot` stays **off**, simply because there is nothing to chase:
+      while an auction is open the bot posts nothing into the channel (bid
+      confirmations are ephemeral, outbid notices are DMs). Turning it on would
+      buy no behavior and would only court a flood; see the bounty hub's entry for why
+      the flag was never the storm's cause.
+    - **DMs link the card only after the freeze.** The won-it and
+      bid-refunded DMs carry a jump link, built by `_frozen_card_link`, which
+      re-reads the row rather than trusting the caller's snapshot, since the freeze
+      has just deleted the id the caller was holding. The **outbid** DM
+      deliberately carries no link at all: the auction is still open, so the
+      card is a live sticky that will be deleted and reposted as chat moves,
+      and a permalink captured at bid time would be dead before it was read.
+      (Style guide: Pointing at things.)
+    - `_release_panel` drops the panel's TTL id cache at **both** ends of the
+      lifecycle, and the start end is not optional. `on_message` reads ids
+      through a 300s cache populated by *any* member message in the guild, and
+      it caches "no panel" as readily as a real id, and only `place` refreshes it,
+      via `_remember`. Since this feature posts its own card at
+      `/bank auction start` rather than through `place`, a guild with recent
+      chat would otherwise cache `(0, 0)` and the new card **would not stick at
+      all** for up to five minutes. At the close end it merely avoids a
+      pointless wake-up (and the ERROR the build refusal logs).
+  - **Freeze on close.** `_freeze_card` reposts the finished card once, on all
+    three end paths (timed settle, `/bank auction end`, `/bank auction cancel`),
+    *after* the "Sold!" ping (which would otherwise bury the result it
+    announces), then the card never moves again. Post-before-delete by hand, so
+    a failed send leaves the working card alone; the in-place repaint runs first
+    so the card reads closed either way. Exactly-once by riding the
+    settle/end/cancel state claim. Two ordering hazards it has to respect:
+    - It **re-reads the card id** from the row rather than trusting the caller's
+      snapshot, which was taken when the state claim won. A restick that placed
+      in between has already deleted that message and recorded a new one;
+      deleting the snapshot would strand the re-sticked card (rendered while
+      the auction was still open, Bid button and all) above the frozen result
+      permanently.
+    - It writes with `attach_card` (concrete auction id), **not**
+      `attach_card_to_latest`. The state-blind variant is only correct on the
+      `save_ids` path where a guild id is all there is; here, a mod starting the
+      next auction while the freeze's send is in flight would otherwise have
+      their fresh card's ids overwritten by the dead one, and the next restick
+      would then delete the frozen result and orphan the new card.
+  - **Where the card can't stay at the bottom.** `_sticky_check` covers the
+    three cases and `/bank auction start` tells the mod, who is standing right
+    there choosing a channel. Two of them warn and the auction runs; the third
+    **refuses**. The split is `StickyResident.restick_on_bot`, whether the
+    resident panel follows the bot's own posts:
+    - **A channel whose resident panel re-sticks on bot messages**: the casino
+      hub and the bounty board hub. These re-take the bottom
+      after *every* card render, so the card loses the slot every time and
+      nothing the mod does in the channel brings it back. Warning about a card
+      guaranteed to vanish just documents a broken auction, so this **blocks**,
+      and the check runs *before* `open_auction`, so a refusal costs no escrow, no
+      rollback, and doesn't consume the single-live-auction slot. Prod
+      precedent: auction #1 ran in the casino hub's channel. The reverse
+      direction (an admin repointing `bounty_channel_id` at a channel with a
+      live auction) is deliberately **not** gated: the auction is transient and
+      closes on its own, while the board channel is permanent config, so letting
+      a live auction veto an admin's setup gets the priority backwards.
+    - **A channel with a resident panel that only moves on human messages**:
+      guide, leaderboard, shop. One bottom slot, two claimants, so the two trade
+      places as people chat: intermittent and visible, so the mod can judge it.
+      This stays a warning. `sticky_panel_channels` detects the five panels
+      reachable from a config read (guide, leaderboard, shop, bounty board,
+      casino hub) instead of coupling the cogs at runtime. The other four sticky
+      panels (pen pals, DM perms, Voice Master, todo board) keep their ids in
+      their own tables and are not covered; a missed warning costs nothing but
+      the warning.
+    - **A thread or forum post.** `StickyPanel._channel` resolves ids with
+      `guild.get_channel`, which never returns a thread, and `_freeze_card`
+      wants a `TextChannel` too, so the card posts and works but never moves.
+      Auctions in threads predate stickiness, so this warns rather than blocks;
+      the capability isn't ours to remove. Without the warning it is a silent
+      broken promise, since manual.html says the card stays at the bottom.
+- **Game participation 5:** paid at the party-games `end_game` choke point
+  (`games/utils/game_manager.py`) from the session's player set, and at the duel games' **single terminal-state
+  seam**: `BaseGame._db_set_state` is a concrete template method (cogs implement
+  `_db_write_state`) that fires `_on_terminal_state` on every game-ending
+  transition (`RESOLVED`/`RESOLVED_NO_NICK`/`ABANDONED`/`VOID`/`EXPIRED_*`).
+  `RESOLVED`/`RESOLVED_NO_NICK` pay participation + win from the re-read row
+  (roster for group games, challenger/target for duels; `winner_id=None`
+  wipeouts pay participation only); the other terminal states pay nothing but
+  still reach the hook, which is the guarantee the wager escrow settles and
+  refunds on. No duel cog calls `pay_game_rewards` directly.
+  Participation covers **20 of 23 games**: the six duel games,
+  ttl/traditional/legitlibs, and 11 party cogs that pass
+  their real player rosters into `end_game` (ama, clapback, compliment, hottakes, mfk,
+  mlt, nhie, price, rushmore, story, wyr). ffa and fantasies are excluded by design
+  (anonymous submissions); photo has no per-player completion hook either, but pays
+  through the **`photo_post` faucet** (§4.5; paid on the post itself) instead of
+  `end_game`.
+- **Game win +20:** paid for **both** game architectures in v1 (decided). Duel games
+  read their explicit `winner_id` (chicken, hot potato, musical chairs, pressure
+  cooker, quickdraw, …). Party games get a per-game-type winner resolver over the
+  `end_game` payload (`economy/game_rewards.py::_WINNER_RESOLVERS`).
+  **Every party game with a genuine winner resolves one**:
+  NHIE guiltiest, TTL Best Liar **and** Best Guesser (ties included; Open Book is a
+  booby prize and unpaid), Hot Takes hottest author, **Rushmore vote winner(s),
+  Clapback top score, MLT most crowns, Price "Most Reasonable (overall)"**. All-zero
+  scoreboards pay nobody (an everyone-ties-at-0 board must not pay the room). Game
+  types with no meaningful winner (story, AMA, MFK, compliment, traditional, WYR by
+  design) pay participation only.
+- **External score-based payout:** the flat participation/win amounts
+  above do **not** apply to the external games that carry a score: Gamebot CAH
+  and Anagrams, Wordle, and Co-ordle all call `pay_cah_game_by_score` instead of
+  `pay_game_rewards`, each passing its own `game_key` and sharing the one
+  `reward_cah_win_max` cap (they all pay by score *ratio*, so the wildly
+  different point scales (5 vs 900 vs 6) cancel out). Anagrams and Wordle name
+  some players by username rather than mention, resolved via
+  `resolve_named_scores`. Wordle's raw score is inverted (fewer guesses is
+  better) and flipped in the parser; its 👑 line often has **several winners**,
+  which is why `pay_cah_game_by_score` accepts a collection of winner ids.
+  The top scorer earns `EconSettings
+  .reward_cah_win_max` (default 50) coins; every other player earns that cap
+  scaled by their score's ratio to the winner's, rounded to the nearest coin;
+  a share that rounds to 0 pays nothing. 0 turns the CAH payout off entirely.
+  Ledger kind is still `game_win`/`game_participation` (so it groups with
+  everything else under "games" in `metrics.py`), and the same
+  `party_game`/`game_win` quest triggers fire for the full roster/winner as a
+  flat payout would. Only the coin math changed. Configurable on the Income
+  Sources dashboard page next to the flat game rewards. Scores come from
+  `parser.extract_cah_game`, which reads the *last* standings post in the
+  game's window (each is a cumulative snapshot, so later ones supersede
+  earlier ones) and folds in submission-only/winner-only players at 0.
+  Gamebot's current CAH format declares no winner either, so
+  it is derived as the top of those standings and can tie when Gamebot drops
+  a game part-way; every tied player then takes the cap, exactly as Wordle's
+  👑 line already did. See `docs/specs/games_system_spec.md` for both vocabularies.
+- **Payout visibility:** every paying party game's recap embed gets a
+  footer via `append_payout_footer`: `🪙 +20 to winners · +5 to everyone who
+  played`, using the guild's configured amounts and currency emoji; winner line only
+  for game types with a resolver; suppressed entirely when the economy is disabled.
+  WYR has no recap embed, so it stays footer-less.
+- **Host bounty (dark by default):** the member who *ran* a party
+  game earns `host_bounty_per_joiner` per attendee who joined, capped at
+  `host_bounty_cap` attendees (defaults 0 / 5; the 0 rate ships it dark).
+  Either box accepts 0 on Automatic Payments and either 0 turns the bounty off,
+  matching `host_bounty_amount`, which pays nothing on a non-positive rate *or*
+  cap (the route accepts 0 on the cap).
+  `pay_game_rewards` takes an optional `host_id` and pays only when at least
+  one member *other than the host* joined (attendees exclude the host), so a
+  host talking to themselves earns nothing and there is no farm in starting an
+  empty game (74 of 122 historical games ended with zero recorded players, so
+  this gate is load-bearing). **Party games only:** `host_id` is threaded from
+  `game_manager` (`games_active_games.host_id`); the duel games pass none (they
+  are peer challenges) and the external CAH path passes none (Gamebot is the
+  host, not a member). The point is recruiting hosts two-through-five, and the
+  research is explicit that recognition recruits volunteers better than a fee,
+  so the coin is deliberately small next to the visible role/quest. Amount
+  logic is `logic.host_bounty_amount`; the credit is `award_host_bounty`
+  (ledger kind `game_host`, `meta.joiners`). Gated by the `game_host`
+  income-source toggle.
+- **Host-a-game quest (`game_host` trigger):** the same host-with-a-joiner
+  event fires the `game_host` trigger kind, which is a first-class quest hook,
+  usable as a **personal daily** ("host a game today") and, because community
+  goals count any trigger kind guild-wide, as a **community counted weekly**.
+  Fires once per hosted game (keyed to the game id), for the host only, and
+  only when a joiner was present (same gate as the bounty). This is the
+  recruitment lever the games program needed: hosting is currently ~77%
+  one person (§ live review), and the quest makes it a rewarded, visible task.
+- **Event host 30 (mod grant):** `/bank grant @member amount reason` + the Bank
+  page's Grant Currency card; manager-role or admin gated; audit-tagged in the ledger. The
+  Bank page carries the inverse too, **Remove Currency** (§ manager
+  surface), ledger kind `admin_remove`.
+
+### 3.5 Coin Drops (built — migration 105)
+- The bot drops a pouch of coins into `drops_channel_id` at random moments;
+  the **first member to press the drop message's Claim button** collects
+  it. The channel picker is the toggle (0 = off); everything is on the
+  dashboard's Economy Settings page (`drops_min_coins` 5 /
+  `drops_max_coins` 25, uniform roll; `drops_per_day` 4 as an *average*
+  cadence; `drops_expire_minutes` 60).
+- **Scheduling** (`drops_loop`, 60 s tick, startup task factory):
+  each guild's next drop lands a jittered 0.5–1.5× of the average period
+  after the last, so members can't clock it. A due drop additionally waits
+  until (a) the channel isn't mid-game (`channel_is_busy`, the chat-revive
+  helper over `games_active_games` + `bot.game_busy_checks`), (b) the
+  guild holds no other open pouch, and (c) someone has spoken since the
+  bot's own newest message. A drop should land in conversation, not echo
+  into the void, so dead hours simply drop nothing (the due time stands).
+- **Claim** (`econ_drops`, `drops_service`): `DropClaimButton` is a
+  stateless `DynamicItem` whose `custom_id` carries the drop id
+  (`econ_drop:claim:<id>`), so pouches survive restarts with no cache or
+  re-seed. The `econ_drops` row is created *before* the send (the button
+  needs the id; `message_id` starts 0 and is backfilled, or the open row
+  deleted if the send fails). A drop channel the bot can't read or post in
+  is paused after five failures in a row (`core/background.FailureStreak`),
+  then tried once an hour until a send works; picking another channel
+  starts clean (standards row 4.17: retrying every tick would cost a row and a
+  traceback a minute, for good). The race is settled by a conditional UPDATE
+  (`status = 'open' AND expires_at > now`, rowcount 0 = lost; the
+  Guess-Who pattern, never check-then-write), then `apply_credit` kind
+  **`drop`** with the booster multiplier. Winner: the click edits the
+  card to the "claimed by X" receipt and removes the button; losers get an
+  ephemeral "too slow". Claims only check `settings.enabled`, so a drop
+  already posted stays claimable even if the channel is re-pointed
+  meanwhile.
+- **Expiry**: the tick sweeps overdue open drops (`status → 'expired'`,
+  select-then-conditional-update per row so a racing claim wins), edits the
+  message to the "vanished" receipt (button removed), and pays nobody.
+- **Cards** (`drops_layouts.py`, Components V2;
+  `docs/plans/components_v2_migration.md` wave 3a, recoverable with
+  `git show 678a16fa:docs/plans/components_v2_migration.md`): three bare cards, no
+  embed. The pouch itself is a **paradigm 5** decision card: the facts,
+  then the one Claim button in the bottom row, the count already at its
+  minimum since Claim is the pouch's only choice. A winning click edits
+  that same card into a **paradigm 7** receipt with the button gone; the
+  expiry sweep edits it into the other receipt instead. The winner's name
+  renders through `name_fn`, never a raw mention; the claimed card is read
+  by the whole channel, most of whom have not necessarily seen that member
+  recently.
+
+## 4. Quest System
+
+### 4.1 Authoring (Quests page, gated on `economy_manager_role` or admin —
+mirrors the `games_editor_role` / `require_game_host` dashboard pattern)
+Fields: title, description, type (daily/weekly/community/event), reward, sign-off
+tickbox, criteria (freeform v1), date range, repeat/auto-rotate tag, and a
+**completion mode** (member claims it / trigger phrase (§4.4) / game trigger
+(§4.5)), phrase and game trigger being mutually exclusive. Rewards free-entry with
+an amber out-of-band warning; out-of-band saves fine, audit-tagged. Counted
+trigger quests take a **target count** ("how many times", §4.5). Library model:
+each of daily/weekly is a **pool** of active quests (capped at `POOL_CAP = 25`
+each) that the **per-user board** (§4.6) draws from, **plus** guild-wide goals
+(weekly `community` + the single monthly lane, §4.5) and **1 active event quest
+per trigger kind** per guild. (The former "1 active daily +
+rotate-tag pool" rule is retired. `rotate_tag`/`rotate_pool` still exist but
+`rotate_pool` is a true **no-op whenever more than one pool member is active**
+(the normal all-active state), so a day roll never quietly
+deactivates a live quest; it only advances a pool that keeps a single quest
+active at a time. The per-user board supplies the variety rotation this used
+to.) Authoring
+lives on the **Quests** page (a **Quest Library** tab with the pool summary + inline
+edit, a **Board Size** tab with the dials (§4.6, admin-only: the section is read-only
+prose for manager-role holders, since `GET/PUT /economy/config` is admin-gated), and a
+**New Quest** editor tab) with in-place editing (PUT); community-goal progress and
+manual Settle also live on the Quests page. The sign-off inbox is the
+**Claims** page (pending queue with Approve/Deny plus a state filter over the
+paid/denied/expired history); the remaining operational cards (grant, remove,
+rentals and the ledger audit, with member pickers for
+grant/remove/ledger and a ledger kind datalist) live on the **Bank** page's tabs.
+
+### 4.2 Member Flow
+- `/bank quests` + wallet page: active quests, progress, claim state. The
+  card (Components V2 `LayoutView`, `economy/quest_layouts.py`
+  `build_quest_board_layout`) is one line per quest: title cell | status glyph (✅ done, ⏳
+  sign-off, 🔶 claim below, ☐ to do) or an inline `▰▱` progress bar
+  (`_QUEST_BAR_WIDTH`, the same meter the details popup and login digest draw)
+  | payment. The board's title+status cell is one code span the row builds
+  itself, so the status meter is drawn **raw** here (`bar_fill`, or
+  `progress_bar(..., code=False)`); backticks don't nest. The details popup
+  and login digest, which render a bare bar, take the code-spanned default;
+  see `core/meters.py` for why every displayed meter needs one. A counted daily/weekly shows `{bar} n/target`: the small personal
+  counts are the point; the guild-wide community/monthly goals show the **bar
+  fill alone** (`bar_fill`, no counts), since their shared totals run to five
+  or six figures and only the details popup / login digest spell them out. Lines are split into two
+  top-level sections: **🧍 Your quests** (the member's board: daily/weekly
+  draws) and **🌐 Community goals** (the guild-wide shared counters: the
+  monthly goal + the weekly community goals, no self-claim). Event
+  ("Anytime") quests aren't board-drawn and don't get a section at all (a
+  surprise payout rather than a listed menu); they're still claimable via the
+  details select if one lands in a claimable state. Within a section a bold
+  cadence sub-label (Daily/Weekly, or Monthly/Weekly) separates the groups
+  when more than one is present; a single-cadence section is unlabeled
+  (`_QUEST_SECTIONS` / `_quest_section_lines`, in `economy/quest_layouts.py`
+  beside `build_quest_board_layout`). Title and status share one
+  monospace code cell padded to the section's widest status (`_status_disp_width`
+  counts emoji as 2 columns), so the reward (which stays outside the backticks)
+  lines up on every row. Descriptions and
+  the how-it-completes explainers (`quest_layouts.QUEST_STATE_LABEL`) moved
+  behind an ℹ️ details select (`QuestDetailSelect`, always attached when
+  quests exist) that answers with a one-quest ephemeral card
+  (`build_quest_detail_layout`).
+- **Claims are period-keyed.** A daily's period is the guild-local day (`YYYY-MM-DD`),
+  a weekly's is the ISO week (`YYYY-Www`), community is `once`. Partial-unique indexes on
+  `(quest_id, user_id, period)` permit at most one `pending` and one `paid` row per
+  period, so re-claimability falls out of the key: a member is claimable again the next
+  local day / ISO week with no reset sweep. Instant quests insert `paid` and credit in
+  one transaction; sign-off quests insert `pending`.
+- **Instant quests:** claim → immediate payout (ledger kind `quest`).
+- **Sign-off quests (on the todo board):** claim → a pending
+  row in the **✍️ Quest sign-offs** section at the top of the mods' sticky todo
+  board (`todo/board_logic.py`; rows read live from `econ_quest_claims` via
+  `pending_signoff_rows`, never mirrored into `todos`, so nothing can drift and
+  the board's Complete button can't offer one). The board's **Sign-Offs**
+  button (`todo_board_signoffs`) opens an ephemeral pick-one select →
+  the claim's detail (the same `quest_layouts.build_signoff_card_layout`,
+  a Components V2 card shared with the resolved-receipt redraw, with
+  `approval_layouts.build_review_card_layout` underneath) → Approve/Deny as
+  persistent `DynamicItem` buttons (`custom_id` `econ_claim:approve|deny:<claim_id>`,
+  re-registered in `cog_load` so they survive a restart, with no per-message view store).
+  Gated on `can_manage_economy`, not the board's own mod check: approving pays.
+  Deny opens a reason modal and leaves the period re-claimable. One pending
+  claim per quest per member; a claim left pending **>7 days** expires via the
+  hourly loop (`expire_stale_claims`) and frees a re-claim.
+  **Approve/Deny works from both surfaces**: the board and the Claims page's
+  pending queue resolve the same claim, and either way the todo board is
+  repainted (`refresh_signoff_board`) so the row drops off it.
+
+  *Why the board and not a card:* a card per claim landed in
+  `🏦│how-it-works`, a member-facing explainer channel, and a mod had to
+  scroll for it. The board is one sticky message a mod already reads. Discord
+  caps components per message, so Approve/Deny cannot hang off it N times;
+  hence the button-opens-a-select shape the board's Complete button already
+  uses.
+- **Sign-off outcomes are announced in the register channel, never DMed:**
+  an approval needs no work: it credits ledger kind `quest`
+  and the register drain (§10.1) posts it. A **denial** (with its reason) and
+  an **expiry** move no currency and so write no ledger row; they are posted
+  directly by `economy/signoff_notice.announce_signoff_outcome`, built by
+  `register.build_signoff_notice_layout`, a Components V2 card with the same
+  silhouette as a register entry (§10.1), carrying no amount and no balance.
+  Two cases post **nothing at all, deliberately**:
+  a quest on a privacy-suppressed trigger kind (`suppress_signoff_notice`,
+  the same `ANON_KINDS` rule the payout drain applies: "X's claim for *Send a
+  Whisper* was denied" names the whisperer exactly as the payout would), and a
+  guild with no register channel configured. In both, the member sees the claim
+  reopen on their own `/bank quests` board and nowhere else. Every announcement is
+  best-effort: the resolution and any payout are committed before it runs.
+
+### 4.3 Community Quests
+Guild-wide objective with a progress bar; never member-claimable. Two flavors
+since stage 3 of the quest-variety plan
+(`docs/plans/quest-variety-and-community-weeklies.md`, recoverable with
+`git show 678a16fa:docs/plans/quest-variety-and-community-weeklies.md`):
+
+**Manual (no trigger kind: the original).** A manager drives `current`
+toward the target from the Quests page and `completed_at` stamps once on
+the crossing. **Payout: flat, to every member active in the last 30 days**
+(`member_activity` via `active_member_ids`). Settlement is exactly-once: a
+per-(quest, user) row in `econ_community_payouts` is reserved before
+crediting (wellness-scheduler pattern), so a replay pays only the members it
+missed and `settled_at` stamps last. **Sign-off gates the sweep:** a
+sign-off community quest settles ONLY via the dashboard's manual Settle
+(`settle_community_quest`); a plain one auto-settles on the weekly ISO-week
+roll (`list_settleable_community_quests` filters out sign-off AND
+kind-carrying quests).
+
+**Auto-tracking community weeklies (`trigger_kind` set).** The kind's module
+events advance the counter guild-wide: `fire_trigger_quests` bumps every
+active same-kind community quest (`_bump_community_kind`), deliberately NOT
+filtered by personal boards, with per-member rows in `econ_community_contrib`
+(migration 082). Lifecycle is scheduler-owned, running **two concurrent
+lanes** (`econ_quests.community_slot`, migration 111) so
+the board always shows up to 2 goals rather than 1:
+
+- **Lane 1** keeps the original **one week on / one week off**
+  (`_roll_community_weekly` at the ISO-week roll, alternation state in
+  `econ_day_marks.last_community_week`): a run settles at the roll that
+  closes its week, then the lane sits empty for a full gap week ("let the
+  win breathe") before the next library pick activates.
+- **Lane 2** (`_roll_community_weekly_slot2`) runs the same weekly cadence
+  and tier rules but with **no gap week**: it refills in the same roll it
+  settles. Two lines with matched 1-week run/gap durations can only ever be
+  perfectly in phase (both active, both dark together) or perfectly out of
+  phase (always exactly one active); there's no offset that sustains double
+  coverage, so lane 2 trades away its own breather instead, keeping the
+  board from ever going fully dark even during lane 1's gap week.
+- **Self-repair** (`_repair_orphaned_community_quests`, runs every hourly
+  tick): a quest only carries a real `community_target` once it passes
+  through `activate_community_weekly`; a direct `active=1` write (as a seed script
+  once did, shipping 11 library rows live at once with
+  no target) leaves it outside both lanes. The repair deactivates any such
+  orphan and immediately fills whichever lane(s) it just freed, so a bad
+  seed self-heals within the hour instead of waiting on the next week roll,
+  but only in the tick it actually finds orphans, so it never overrides a
+  legitimate gap week.
+- **Activation** (a lane's first roll after its gap, or ever): the library's
+  least-recently-run inactive kind community quest (`next_community_weekly`,
+  `last_run_week` ordering, tagged with the activating lane's `slot`)
+  activates with a **fully automatic target**:
+  trailing 28 days of that kind's `econ_kind_activity` ÷ 4 ÷ 0.75
+  (`community_auto_target`, floor 10), so a typical week lands ~75% and a
+  push clears it. No manual override, by design. A
+  **channel-scoped** community quest on a message-shaped kind
+  (`quests.CHANNEL_SHARE_KINDS`) scales the guild total by the channel's
+  message share first (`channel_message_share` over `processed_messages`);
+  without it a 43%-of-traffic channel would be sized against 100% of the
+  activity and its top tiers would be mathematically unreachable.
+- **Tiers at 40/70/100%** (`quests.COMMUNITY_TIERS`): settlement at the
+  closing week roll pays the quest's flat `reward` once per crossed tier to
+  every 30d-active member, exactly-once per run via
+  `econ_community_tier_payouts` (tier 0 reserves the **top-contributor
+  bonus**: `reward // 2` to the top 3 by contribution). Contribution and
+  tier-payout rows reset at the next activation, so a re-run pays afresh;
+  idempotency only has to hold within a run. **Privacy-suppressed kinds**
+  (`quests.ANON_KINDS`: confession, confession_reply, whisper, ama_ask,
+  guess_post, pen_pal, pen_pal_complete)
+  pay flat tiers only: no bonus, an empty top list in the settle summary,
+  and a name-free resolution beat sheet, because naming the most active
+  confessors/whisperers/askers would deanonymize the feed, and a top
+  `guess_post` list would spoil several live rounds at once. The same set
+  now gates three surfaces: the register feed drops these payouts (§10.1),
+  sign-off is refused at config time (a pending claim names the claimant on
+  the todo board), and a denial or expiry on such a quest is never posted to
+  the register (`suppress_signoff_notice`).
+- **Beat sheets, not bot posts:** kickoff / final-24h / resolution are **DMed
+  to the community host** (`EconSettings.community_host_user_id`, 0 → guild
+  owner) as numbers + suggested copy; the host narrates publicly in their own
+  voice.
+- **Tier crossings are the exception:** they are posted by the
+  bot, to main chat, as an Event Echo (`community_tier` source; see
+  [event_echo_spec.md](event_echo_spec.md)) rather than DMed as a beat. A
+  milestone is news the moment it happens, and routing it through a human who
+  has to notice a DM and write it up is how it goes stale. The copy is the
+  "Suggested post" line of the host's beat sheet (`quests.tier_echo_line`), so
+  the voice is the host's and there is no middleman. The echo links the
+  economy panel and is skipped when none is posted.
+- Tier crossings and the final-24h nudge are both detected hourly
+  (`community_hourly_pulse` → `HourlyPulse.crossings` / `.beats`;
+  `notified_tier` / `final_notice_sent` advance in the same transaction, so
+  each fires once). Because `notified_tier` advances there rather than inside
+  Event Echo, the tier echo is **exempt from the echo cooldowns**; nothing
+  would re-offer a crossing the global floor refused.
+- Kind community quests reject `signoff=1`, and the dashboard's manual
+  progress/settle endpoints 422 on them (the Quests page card renders them
+  read-only with an "auto-tracking" note); the manual Settle path and the
+  legacy completed-quest sweep are for manual quests only.
+
+### 4.4 Trigger-Word Quests
+A daily/weekly quest may carry **trigger words** (comma/newline-separated phrases,
+`econ_quests.trigger_words`) and an optional **trigger channel**
+(`trigger_channel_id`, NULL = anywhere; threads count toward their parent channel).
+The message is the verification: when a member's message contains a phrase
+(whole-phrase, case-insensitive, word-boundary-anchored; "gm" never matches
+"dogma"; matching lives in `quests.parse_trigger_words` /
+`compile_trigger_pattern`), the `EconomyCog` `on_message` listener claims the quest
+on their behalf through the ordinary `claim_quest` state machine:
+
+- **Instant quest:** pays on the spot, with a ✅ reaction only and no reply or DM.
+  Wallet/quest log carries the news, same as every other trigger kind.
+- **Sign-off quest:** files the `pending` claim, repaints the mods' todo board
+  (where it becomes a sign-off row), and reacts 📝; a manager still approves
+  the payout.
+
+`game_role_id` does not affect trigger/photo/media quest completions; it gates the other recurring
+engagement DMs: the daily digest (§3.1) and the weekly raffle-winner notice.
+
+Members toggle the role themselves with the **🔔 Notifications** button on the
+economy panel (§ the economy panel), a persistent static-`custom_id` view
+(`econ_guide_notify`) re-registered via `bot.add_view` at cog load. The
+button answers ephemerally with whichever way it flipped; the toggle decision
+is the pure `economy/logic.py::resolve_notify_toggle`.
+
+The same opt-in gate covers the **daily digest DM** (§3.1: streak + payout +
+milestone/grace/reset callouts + quest checklist): it only reaches members who
+took the role (`notify_member(..., require_game_role=True)`); everyone else
+keeps earning with no DMs about it. With no role configured, nobody has opted
+in yet, so the gate defaults to dropping the notice for everyone rather than
+notifying the whole guild. Transactional notices (rental billing) are *not*
+gated; they target a member by their prior spend, not by opt-in.
+
+Trigger quests are **excluded from the `/bank quests` claim select** (state
+`trigger` on the wallet page), because self-claiming without saying the phrase would
+bypass the verification. Repeats inside a period fall out silently via the
+per-period claim collision, so a busy "good morning" channel never gets error
+spam. Per-guild trigger quests are cached in the cog for **60 s**
+(`_TRIGGER_CACHE_TTL`), so a dashboard edit takes effect within a minute without
+a restart; the cache also stores empty lists, keeping the per-message cost of
+guilds without trigger quests to a dict lookup. Community quests never trigger
+(not member-claimable).
+
+### 4.5 Game-Trigger Quests (`trigger_kind`)
+### Faucet scale (`econ_faucet_scale_pct`)
+
+One rate over **every earned faucet**, as a percentage (100 = ship rate),
+applied in `apply_credit` after any booster multiplier. It exists because a
+retune otherwise means editing ~14 dials, which goes stale: per-earner minting
+can fall 41% while headcount rises 59%, so the float keeps climbing and nobody
+has one number to turn.
+
+What it must never touch is `economy.kinds.UNSCALED_CREDIT_KINDS`: everything
+in `NON_FAUCET_KINDS` (money moving sideways: transfers, casino/wager payouts
+and refunds, escrow returns), plus `grant` and the refunds. Shaving a casino
+payout or an incoming transfer would take the member's own coins; an admin
+typing 500 means 500. The list is **derived** from `ESCROW_PAIRS`, so a new
+escrow pair is covered the day it is added.
+
+It is a *rate*, not an off-switch: a faucet that would round to nothing still
+pays 1, and each faucet keeps its own zero/enable dial. Dashboard control is
+the first row of **Income Sources**; the route caps it at 500.
+
+A quest may carry a **trigger kind**, a custom-coded module hook that completes
+it automatically (`quests.TRIGGER_KINDS`; mutually exclusive with trigger words).
+The kind decides *what* completes the quest; the qtype decides *how often it can
+pay*:
+
+- **daily + kind:** "do it once today"; the trigger auto-claims on the first
+  occurrence in the calendar day. Daily is the **only** one-shot triggered
+  cadence.
+- **weekly + kind:** must **count progress**, never fire-and-done: a triggered
+  weekly quest requires `target_count > 1` or a target band (`_check_target_count`
+  rejects a one-shot; see §4.5 Counted quests). A per-user push across the ISO
+  week; auto-claims silently, never in the manual claim select (wallet state =
+  the kind's how-to line / progress meter).
+- **monthly + kind:** a **guild-wide** goal (see the Monthly cadence note
+  below), NOT a per-user claim: the kind bumps one shared counter and the
+  month-end tier settlement pays it. Monthly is auto-tracked only (kind
+  required, no sign-off, no words, no per-user target).
+- **event + kind** (`qtype='event'`, kind required): pays **every occurrence**,
+  period `"<kind>:<occurrence>"`: once per member per game/card/round, forever,
+  no time gate. `quest_period('event', …)` deliberately raises; only listeners
+  build occurrence keys. Slot rule: **1 active event quest per trigger kind**
+  (`can_activate_event`); different kinds coexist, and event quests occupy no
+  daily/weekly/community slot.
+
+All firing funnels through `fire_trigger_quests` (service): one member, one
+kind, every matching active quest, riding the normal `claim_quest` machine, so
+sign-off, booster multiplier, ledger kind `quest`, and per-period dedup come for
+free. Repeats fall out silently on the claim collision.
+
+A kind quest may also carry a **trigger channel** (`trigger_channel_id`, NULL =
+anywhere), same column the trigger-word quests use. The dashboard offers the
+channel picker only for `quests.CHANNEL_SCOPED_KINDS` (`message_sent`,
+`reply_sent`, `reaction_given`, `media_post`, `voice_message`), mirrored in
+`economy-sources-shared.js` and held there by a parity test. Membership is a
+claim about the **firing site**: it has to pass `channel_ids` (the message's
+channel plus its thread parent, so a thread counts toward its parent) into
+`fire_trigger_quests`, or a scoped quest on that kind silently never fires.
+The gate refuses a scoped quest from a caller with no channel context at all.
+Adding a kind to the set without plumbing its listener is the bug.
+
+**Telling the member where.** A scope nobody is told about is a
+quest that quietly pays nothing wherever they happen to be posting. Both
+renderings (and the rule deciding whether to render at all) live in
+`economy/quests.py` so a change cannot land on one card and miss the other:
+
+- `channel_scope_suffix` → `" → <#123>"`, trailing a blurb that already has a
+  line of its own. Used by the login digest's three-line block.
+- `channel_scope_line` → `"📍 Only counts in <#123>"`, standing alone. Used by
+  the `/bank quests` **details card** (`QuestDetailSelect`) and the
+  **community-goal block** on the leaderboard / login card
+  (`leaderboard._community_block`, off `CommunityGoal.channel_id`).
+
+Three deliberate silences. An **unscoped** quest renders nothing at all: "any
+channel" is the default a member already assumes, and printing it on every row
+would bury the few quests where the scope matters; production is mostly NULLs,
+since the VN quest channel-scope work (`5ebec438`) shipped with the picker
+unset. A **finished** quest or goal drops its channel: sending someone to a
+channel to earn what they have already earned reads as a bug, and the digest
+already blanks a done quest's blurb for the same reason. "Finished" is asked
+differently on each surface because they hold different facts. A personal
+quest is `state == "done"`, but a guild-wide goal never reaches `done` at all;
+its state stays `"community"` for its whole life, so a `state != "done"` guard
+alone silently never fires for one, and its counter has to answer instead.
+`quests.scope_worth_showing(state, current, target)` holds that judgment for
+the details card so it is not a fourth hand-written guard. The leaderboard
+block keeps its own, waiting for `completed_at` / `settled_at`: it is a
+settlement record, and it is deliberately a hair behind the card, since
+reaching the target is the moment the channel stops being worth going to. And
+the terse `/bank quests` **list** gets nothing: its rows are a padded monospace
+table, and a channel mention renders at whatever width the reader's client
+makes of the name, which would pull the reward column out of true on every row
+that carried one. The details card behind it is where the long form lives.
+
+`<#id>` is a *channel* mention and needs no name resolver: every client
+resolves it from the guild itself. The embed-name rule
+(`docs/embed_style_guide.md`) is about **member** mentions, which the reading
+client resolves from its own cache and so degrade to a bare number.
+
+Kinds:
+
+| kind | fires when | fired from | occurrence key |
+|---|---|---|---|
+| `photo_post` | a member posts an image in the configured Photo Challenge channel (the post itself pays; no reactions needed) | `EconomyCog._on_photo_post` (on_message listener; announces ✅/📝; in-channel, or DM under `game_role_id`) | `photo_post:<local_day>` (once/day by construction) |
+| `party_game` | party game completes with the member in the roster, **including external games** (Gamebot Cards Against Humanity / Anagrams / Connect 4, Wordle, Co-ordle, parsed from externally-tracked channels) | `pay_game_rewards` via `game_manager.end_game`, or `pay_cah_game_by_score` via `games.external.cog._pay_cah_game` / `._pay_anagrams_game` / `._pay_wordle_results` / `._pay_coordle_round` (score-proportional coins, same trigger) | `party_game:<game_type>:<game_id>` (`party_game:cah:<game-over-msg-id>`, `party_game:anagrams:…`, `party_game:connect4:…`, `party_game:wordle:<digest-msg-id>`, `party_game:coordle:<round-timestamp>`) |
+| `game_host` | a party game the member hosted completes with **at least one other member** in the roster (empty games pay nothing: the anti-farm gate). Native party games *and* external Gamebot games, whose host comes from the lobby embed's title (`parser.host_from_lobby`, resolved by username) | `pay_game_rewards` via `game_manager.end_game` or `pay_cah_game_by_score` for external games, both through the shared `pay_host_bounty` → `award_host_bounty` | `game_host:<game_type>:<game_id>` |
+| `duel` | duel/PvP game resolves (chicken, hot potato ×2, musical chairs, pressure, quickdraw) | `pay_game_rewards` at each duel cog's resolution | `duel:<game_type>:<id>` |
+| `risky_roll` | member presses Roll in a Risky Rolls round | `RiskyRollView.roll_button` → `fire_member_trigger` | `risky_roll:<game_id>` |
+| `guess` | member submits a scored guess in a Guess Who round | `GuessSelectView._on_select` → `fire_member_trigger` | `guess:<round_id>` |
+| `voice_session` | member earns voice-activity XP (anti-idle rules apply) | `xp.voice_xp_service.process_voice_xp_tick` (inline conn) | `voice_session:<local_day>` (once/day by construction) |
+| `qotd_reply` | member newly earns the QOTD flat award | `events.cog._econ_work` after `try_award_qotd` returns True | `qotd_reply:<qotd_id>` |
+| `starboard` | a member's message first crosses the star threshold | `starboard.cog` first-crossing insert (bot authors excluded) | `starboard:<message_id>` |
+| `invite` | a member the inviter recruited joins | `events.cog.on_member_join` beside `record_invite` | `invite:<invitee_id>` (rejoin never re-pays) |
+| `boost` | member starts a server boost (`premium_since` None→set) | `EconomyCog._on_boost_started` (live listener), plus a startup reconcile `economy.boost_reconcile.reconcile_boosters` that replays the trigger for members already boosting when the quest/listener shipped; the live transition never fires for them, and boosting is one-shot, so without the reconcile they'd never be paid; keyed on the same `premium_since` timestamp, so the claim collision makes it idempotent and never double-pays | `boost:<boost_start_ts>` |
+| `bio_set` | member saves/updates their bio via the wizard | `bios/wizard._persist_sync` | `bio_set:set` (event = once ever) |
+| `media_post` | member posts a message with an image; per-quest `trigger_channel_id` scopes it (threads count via parent) | `EconomyCog._on_media_post` (announces like photo; DM under `game_role_id`) | `media_post:<message_id>`: use daily/weekly cadence |
+| `pen_pal` | two members are paired into a Pen Pals session (both fire) | `pen_pals.cog._do_pair` save | `pen_pal:<session_id>` |
+| `message_sent` | any member message (channel-scopable) | `events.cog._econ_work` (same txn as login/QOTD) | `message_sent:<message_id>` |
+| `reply_sent` | a Discord reply to someone ELSE's message (self-replies skipped; unresolvable references count) | `events.cog._econ_work` | `reply_sent:<message_id>` |
+| `reaction_given` | reaction-given XP newly awarded (inherits the farm guard: one per message+reactor ever, no self-reacts) | `events.cog.on_raw_reaction_add` | `reaction_given:<message_id>` |
+| `game_win` | winning a party game (NHIE, TTL liar+guesser, Hot Takes, Rushmore, Clapback, MLT, Price resolve winners), **including external CAH** (the top scorer) | `pay_game_rewards` winners pass, or `pay_cah_game_by_score` for CAH | `game_win:<game_type>:<game_id>` |
+| `duel_win` | winning a duel/PvP match | `pay_game_rewards` winners pass | `duel_win:<game_type>:<id>` |
+| `duel_lose` | resolving a duel/PvP match without winning it (every participant minus the winner set) | `pay_game_rewards` losers pass | `duel_lose:<game_type>:<id>` |
+| `cat_catch` | catching a cat with the external **Cat Bot** in a channel tracked with the Cat Bot parser, parsed from the catch message (catcher resolved by username→member, rarity from the emoji). Pays **rarity-tiered coins** (six per-guild dials `catcatch_coins_common..divine`, defaults 1 → 300, tunable from the Income Sources panel; blessed catches ×2), clipped by the per-member, per-guild-local-day `cat_catch_daily_cap` (0 = uncapped; a clipped catch pays nothing but **still fires this trigger**, so the cap bounds the faucet, not participation) *and* this trigger | `games.external.cog._pay_cat_catch` → `pay_cat_catch` (`apply_credit` kind `cat_catch` + trigger); once per catch via the `games_external_payouts` ledger | `catbot:<catch-msg-id>` |
+| `confession` | member submits an anonymous confession (posts to the feed) | `confessions.cog.ConfessModal.on_submit` → `_fire_confession_trigger` (both forum + text paths) | `confession:<message_id>`: silent claim keeps the feed anonymous; only trace is the ledger |
+| `ama_ask` | member's AMA question becomes visible: on submit (unfiltered) or on host approval (screened; rejected never pays) | `games.ama.cog` `AskQuestionModal.on_submit` + `ScreenedQuestionView.approve` → `_fire_ama_ask_trigger` | `ama_ask:<game_id>:<q_idx>` |
+| `whisper` | member sends an anonymous whisper that is delivered | `whisper.cog.WhisperCog._send_impl` after the DM+feed post succeed | `whisper:<whisper_id>` |
+| `quote` | member turns a message into a quote card via the make-it-a-quote role (the invoker is credited, not the quoted author; self-quotes never fire) | `quotes.cog._on_quote_trigger` after the card posts | `quote:<quoted_message_id>`: mildly farmable, pair with daily/weekly + target count |
+| `quoted` | someone ELSE quote-cards the member's message (the quoted author's passive twin of `quote`; self-quotes never fire) | `quotes.cog._on_quote_trigger` beside the `quote` fire | `quoted:<quoted_message_id>` |
+| `chat_revive` | member talks in the 30-min follow window after a Chat Revive prompt (every distinct human author fires; individual credit doesn't hinge on the collective success bool) | `chat_revive.service.measure_due_events` via `fire_trigger_inline` (measured-at NULL check keeps replays out) | `chat_revive:<event_id>` |
+| `bump` | member bumps the server: `/bump log` (mod-gated) credits its invoker; an auto-detected listing-bot response credits `message.interaction_metadata.user` (migration 081 also stores the bumper on `bump_tracker_log`) | `bump_tracker.cog` both paths | `bump:<interaction_or_message_id>`: site cooldowns are the natural rate limit |
+| `voice_room_host` | member's Voice Control room reaches 2+ non-bot guests with the owner present (once per room lifetime, in-memory set; restarts forgive but the occurrence key still blocks a same-room re-pay) | `voice.master.cog._handle_joined_tracked` | `voice_room_host:<channel_id>` |
+| `pen_pal_complete` | a Pen Pals session reaches its natural 24 h expiry (both members fire; `early`/`channel_missing` closes never fire) | `pen_pals.cog` expiry sweep | `pen_pal_complete:<session_id>` |
+| `whisper_guess` | member correctly guesses a whisper's sender (fires after the race-consumed check, so a two-tab solve pays once) | `whisper.cog._handle_guess_outcome` | `whisper_guess:<whisper_id>` |
+| `guess_win` | member wins a Guess Who round (stretch twin of `guess`; fires only for the solve-race winner) | `games.guess.cog` solved path | `guess_win:<round_id>` |
+| `guess_post` | member submits a Guess Who round for others to solve (confession rounds included; producer half of the guess-who pair, see §4.6 pairing) | `games.guess.cog` both `_do_insert_round` call sites | `guess_post:<round_id>` |
+| `session_join` | member appears in a games session's roster (end_game now merges the real roster into `games_session_tracker`, which start-time calls only seeded with the host) | `game_manager._fire_session_join` | `session_join:<session_id>`: later games in the same session collide silently |
+| `voice_message` | member posts a voice message (fires before the transcription config gate; the quest is the post, not the transcript); per-quest `trigger_channel_id` scopes it (threads count via parent) | `voice.transcription.cog._on_message` | `voice_message:<message_id>`: use daily/weekly with a target count |
+| `music_request` | member's `/play` adds ≥1 track | `music.cog.play` via `daily_occurrence=True` | `music_request:<local_day>` (once/day by construction: a 30-track playlist and 30 requests look the same) |
+| `birthday_set` | member saves their birthday | `birthday.cog` modal submit | `birthday_set:set` (event = once ever, the `bio_set` pattern) |
+| `level_up` | member's level-up is announced (announce-time, not award-time, so quest-XP payouts can't recurse into another claim; a silently-won level fires when its announcement lands) | `xp.service.handle_level_progress` via `fire_trigger_inline`, one fire per delivered level | `level_up:<level>` |
+| `ama_answer` | hot-seat answers a question in their own AMA | `games.ama.cog` reply-modal submit | `ama_answer:<game_id>:<q_idx>`: use daily/weekly with a target count |
+| `conversed` | member replies to another member (replies only, never bare mentions: mention spam is free, a reply is directed) | `events.cog._econ_work` beside `reply_sent` | `conversed:<partner_id>`: **occurrence = the partner**, so counted quests read "talk with N different people"; repeat partners collide in the marks table |
+| `replied_to` | someone else replies to the member's message (passive twin; needs the reference resolved to a real non-bot author) | same site, fired for the target author | `replied_to:<replier_id>`: counted = "have N different people reply to you" |
+| `reacted_to_member` | member's reaction lands on a new person's message (inherits the reaction XP farm guard) | `events.cog.on_raw_reaction_add` beside `reaction_given` | `reacted_to_member:<author_id>`: counted = "react to N different members" |
+| `channel_hop` | member posts in a channel (threads count toward their parent, so thread-hopping can't farm it) | `events.cog._econ_work` | `channel_hop:<channel_id>`: counted = "talk in N different channels" |
+| `active_day` | member's message on a guild-local day | `events.cog._econ_work` | `active_day:<local_day>`: counted weekly = "show up any N days this week"; the gentle streak (research: hard reset-to-zero streaks burn small communities) |
+| `voice_partner` | member earns voice XP with another undeafened human in the channel (anti-idle rules gate the member's side) | `xp.voice_xp_service` tick beside `voice_session` | `voice_partner:<partner_id>`: counted = "share voice with N different people" |
+| `thread_deep` | member posts in a thread at ≥ `THREAD_DEEP_MIN` (20) messages (`Thread.message_count` at ingest; no storage) | `events.cog._econ_work` | `thread_deep:<thread_id>`: once per thread; everyone posting after the crossing gets credit |
+| `welcome` | member replies to someone who joined within `WELCOME_WINDOW_SECONDS` (7 days) | `events.cog._econ_work` | `welcome:<newcomer_id>`: counted = "welcome N new faces"; the retention quest |
+| `intake_step` | a greeter ticks a step on a newcomer's intake card: the manual step buttons, the `greeted` auto-tick (which carries the greeting author's id), and a posted **step code** (pasting the step's canned message ticks it). Role-change auto-ticks (`verified`, `role_gained`) record `AUTO_ACTOR` (0) and pay nobody; skipped steps pay nobody | `intake_rewards.pay_intake_steps` via `onboarding.intake.views.handle_intake_message` (greet + step-code branches) / `_toggle_step` | `intake_step:<card_id>:<step_key>`: once per card step, anchored so re-ticking a toggled step or re-pasting a code never re-pays. Distinct from `welcome`, which fires on replying to any recent joiner |
+| `conversation_starter` | member's message draws replies from `CONVERSATION_STARTER_REPLIERS` (3) distinct humans; distinct-replier rows accrue in `econ_msg_replies` (migration 085, ingest-derived since content is never stored; pruned to 14 days on the day roll) and the fire happens exactly on the crossing | `events.cog._econ_work` reply path, fired for the target author | `conversation_starter:<message_id>` |
+| `greeting_answered` | member replies to / @mentions someone whose greeting is still pending in Greeting Watch, same channel (pending ≈ inside the window; the loop resolves rows right after it closes). Self-gates on the feature: no watched channels, no fires | `events.cog._econ_work` via `onboarding.greeting_watch.service.pending_greetings_for` | `greeting_answered:<greeting_message_id>`: one hello credits an answerer once |
+| `birthday_wish` | member wishes a happy birthday on a day a birthday was **announced** (`birthday_announcements` row; quiet/unset birthdays never become quest bait; pre-09:00 wishes miss, documented soft edge): a reply/mention of the birthday member, or a wish phrase (`birthday.service.is_birthday_wish`) anywhere when no target resolved. One fire per message; the wisher can't be the birthday member | `events.cog._econ_work` | `birthday_wish:<target_id>:<local_day>` (phrase fallback: `birthday_wish:day:<local_day>`) |
+| `drop_claim` | member wins a coin-drop Claim race; pays beside the drop's own credit (the `cat_catch` double-pay pattern); drop cadence is the natural rate limit | `economy.drops_service.try_claim_drop` after the credit | `drop_claim:<drop_id>` |
+| `role_pick` | member self-assigns a role via a role menu **grant** (removals never fire) or an announcement role button grant. Setup kind (see below) | `roles/menus/views._apply_outcome` + `announcements/buttons._apply` | `role_pick:set` (once ever) |
+| `confession_reply` | member posts an anonymous reply to someone ELSE's confession (OP self-replies never fire; both thread and channel reply paths). Same privacy contract as `confession`: silent claim, no channel noise | `confessions.cog.ReplyModal.on_submit` → `_fire_confession_trigger(kind="confession_reply")` | `confession_reply:<reply_message_id>`: use daily/weekly with a target count |
+| `shop_purchase` | member makes a voluntary shop purchase: perk rent (voucher-covered counts; the quest rewards shop engagement, not the spend), streak shield, emoji sponsorship, raffle tickets. Renewal billing (`bill_rental`) deliberately never fires. Setup kind (see below) | each purchase service beside its `apply_debit` | `shop_purchase:set` (once ever) |
+| `daily_complete` | any of the member's **daily** quests reaching 'paid' (instant claim or approved sign-off; setup-quest claims count, their tick stamped to the current guild-local day). The board meta-kind: dailies are check-offs, a weekly counted `daily_complete` quest is the progression bar over them ("complete N dailies this week"). Rejected on daily cadence (`_check_trigger_config`) and refused by the fire hook: a daily can't tick itself. The nested fire's outcomes aren't returned to the outer caller, so a weekly completing this way pays without a cog announcement (register feed + board/digest still show it) | `_fire_daily_completion` in `claim_quest` + `resolve_claim` | `daily_complete:<daily_quest_id>:<daily_period>` |
+
+**One-time setup kinds** (`SETUP_QUEST_KINDS`): `bio_set`, `birthday_set`,
+`role_pick`, `shop_purchase`. Board-cadence quests on these kinds claim once
+ever on a constant period (occurrence `set`), pay on completion even when not
+drawn on the member's board, and drop off the board once the underlying thing
+is done (`_setup_underlying_done`: bio row / birthday row / any
+`role_menu_grants` grant row / any `econ_ledger` row with a purchase kind
+(`PURCHASE_LEDGER_KINDS`) or an `econ_setup_marks` row, below). Known soft
+edge: announcement-button grants aren't recorded in `role_menu_grants`, so
+those pickers stay board-visible until the paid-claim backstop catches them.
+
+**Externally-detected completion** (`econ_setup_marks`, migration 134):
+some completing actions happen where the bot has no table of
+record: picking roles through Discord's native onboarding ("Channels &
+Roles → Customize") assigns roles with no bot event, so those members looked
+forever-pending and `role_pick` stayed pinned to their boards (live data:
+148 of 149 active members). The economy loop's hourly sweep
+(`_sync_setup_marks`) fetches `guild.onboarding()`, and any non-bot member
+holding one of the onboarding-offered roles gets a
+`(guild, user, 'role_pick')` mark via `sweep_setup_marks`. A mark clears the
+quest from the board exactly like the feature-table checks but **never
+pays**: detection is not the member acting on the quest, and the first
+sweep over a guild full of long-standing pickers would otherwise mass-mint.
+A marked member who later picks via a role menu or announcement button still
+earns the once-ever claim through the normal trigger.
+
+**Kind activity ledger.** Every `fire_trigger_quests` call (before the
+income-source switch and the personal-board filter) bumps
+`econ_kind_activity` (migration 080: one row per guild/member/kind/local-day,
+pruned to a trailing 70 days on the economy loop's day roll). It measures
+what members actually *do*, not what happened to pay, and is the data source
+for dynamic target sizing on both surfaces (personal trailing-period medians
+and community guild-wide sums; plan
+`docs/plans/quest-variety-and-community-weeklies.md`, recoverable with
+`git show 678a16fa:docs/plans/quest-variety-and-community-weeklies.md`). Historical warm-up for
+the xp_events-mirrored kinds is a stage-2 script job, not a migration
+(local-day bucketing needs per-guild tz offsets).
+
+Quests on a privacy-suppressed kind (`quests.ANON_KINDS`: `confession`,
+`confession_reply`, `whisper`, `ama_ask`, `guess_post`, `pen_pal`,
+`pen_pal_complete`) reject `signoff=1` at creation/update: a sign-off
+claim names the claimant on the mods' todo board, timing-correlatable against
+the anonymous feed. (Community and monthly quests take a kind but already
+forbid sign-off on their own account, since tier settlement is automatic, so the
+paths left for these kinds are all silent: the daily/weekly/event auto-claims
+and automatic tier settlement, whose ledger rows the register feed also
+drops; §10.1.) The set is `confession`, `whisper`, `confession_reply` (the same
+leak with no guard), `guess_post`, `pen_pal`, `pen_pal_complete` and `ama_ask`
+(see §10.1). `whisper_guess` stays outside the set; the whisper cog
+already names the solver in the feed.
+
+**Monthly cadence (guild-wide, migration 125):** `qtype='monthly'` is a
+**community-measured** goal, the monthly sibling of the weekly `community`
+cadence, not a per-user board quest. It reuses the community machinery
+end-to-end: a single guild-wide counter (`econ_community_progress`, keyed by
+`quest_id`), `_bump_community_kind` (which selects `qtype IN
+('community','monthly')`), the 40/70/100% tiers, the top-contributor bonus, and
+`settle_community_weekly`. **Auto-tracked only**: a monthly quest requires a
+trigger kind and forbids sign-off / trigger words / a per-user target
+(`_check_trigger_config`/`_check_target_count`); it is not in `_CLAIMABLE_TYPES`
+(no self-claim) and not a `BOARD_CADENCE` (no personal board draw).
+**Rotation:** a single lane, **one active monthly goal per calendar month, no
+gap month**: `_roll_community_monthly` (loop) settles the outgoing goal on the
+month roll and activates `next_community_monthly` for the new month, sized by
+`auto_size_community_target(..., cadence="monthly")` (28-day activity ÷ 0.75, a
+full month's worth). The month roll fires off `econ_day_marks.last_community_month`
+(added in 125), independent of the ISO-week roll; `community_hourly_beats`
+emits the tier/final-24h beats on the calendar-month clock. Existing per-user
+monthly quests are converted by migration 125 (seed the counter from this
+month's summed per-user progress, size the target, single-lane collapse,
+deactivate kindless monthlies; already-paid claims are never clawed back).
+
+**XP rewards:** `reward_xp` pays leveling XP alongside the coins on every
+quest payout; instant and approved sign-off both flow through
+`_credit_reward`, so an approved claim pays XP at approval, not filing. XP is
+flat (no booster multiplier, since that's a currency patron bonus; minting XP would
+distort the level curve), ledgered as `xp_events` source `quest`. Level
+progression lands in the DB; any level-up announces on the member's next
+ordinary XP award.
+
+**There is no onboarding path:** no "starter path" embed of
+`onboarding`-flagged quests is DMed on join. A join-time DM pushes the economy
+at members who never opted into the notification role, contradicting the
+"role set = opt-in to DMs" model (unlike a member who joins the server, a
+member who takes the role has opted in). Members discover the
+library through `/bank quests`. The `onboarding` column and `econ_onboarding_dms`
+table remain as inert dead schema (migration 071), never read or written,
+and the quest editor has no onboarding toggle. Don't introduce a join-time
+economy DM without a real opt-in signal.
+
+**One-time setup quests (the welcome guide):** the sanctioned,
+pull-not-push successor to the onboarding path. The setup trigger kinds
+(`quests.SETUP_QUEST_KINDS` = `bio_set`, `birthday_set`, `role_pick`,
+`shop_purchase`) can be run as ordinary
+**daily** quests, so they're drawn into a member's random daily board like any
+other: a subtle "fill out your bio / set your birthday" nudge that a newcomer
+happens on while browsing `/bank quests`, never a DM. Two service-layer
+special-cases make a once-in-a-lifetime action fit a daily cadence:
+
+- **Claim once ever, not per day.** `fire_trigger_quests` claims a
+  board-cadence setup quest on the constant occurrence period
+  `"<kind>:set"` (not the calendar day) and *independently of the board draw*.
+  So the completing member always gets paid the moment they do it (a lifetime
+  action can't wait for a lucky daily roll), and re-saving a bio tomorrow
+  collides on the same claim key and pays nothing (a plain daily would re-earn
+  each period; this is the whole reason `bio_set`/`birthday_set` were
+  event-only before). The setup claim's `:`-keyed period also skips
+  `maybe_pay_set_bonus` (it isn't part of any day's board set).
+- **Hide once done.** `assigned_board_ids` drops a setup quest from a member's
+  board once they've done the underlying thing (a `bios` / `member_birthdays`
+  row exists) or already claimed it: **drop, no refill**, so a completed setup
+  slot just leaves the board one shorter rather than reshuffling the window and
+  stranding a counted quest's in-progress work. Net: only members who *haven't*
+  done it ever see it, and it silently vanishes the moment they do. Rerolls
+  won't swap a member into a setup quest they've completed, and setup quests
+  are excluded from the clear-the-board set-bonus requirement (a member
+  shouldn't have to do their once-ever bio to earn today's daily set bonus).
+- **Pinned until done.** A *pending* setup
+  quest does not wait for a lucky draw: `_pin_pending_setup` pins
+  not-yet-done setup quests onto the board ahead of ordinary draws, evicting
+  ordinary content (highest quest id first) to hold the configured board
+  size. A lottery nudge fails: with a 20-quest daily pool and
+  a 3-slot board the shop-purchase quest reached **9 members in ten days**,
+  and onboarding shouldn't depend on the dice.
+
+  Pins are capped at **`quests.MAX_SETUP_PINS` (2) per board** (further
+  capped to the board size), and the pinned subset **rotates**: it is drawn
+  from the pending set with the same per-user window walk as the board
+  itself (`assigned_quest_ids` on the period index), so every pending setup
+  quest surfaces within ~ceil(pending / 2) periods. Pending setups outside
+  the day's pin window are held off the board entirely (a setup quest pays
+  on completion regardless of the draw, so board presence isn't needed to
+  earn it). The pins are capped and rotated rather than unbounded (live data: 121 of
+  149 active members had all four setups pending, so every 3-slot daily board
+  would be 100% pins) and rather than ranked (a ranked cap would show the
+  lowest-priority nudge to nobody). Rotation is a cap where every nudge still
+  reaches everyone.
+
+  Ordering matters: pins resolve **before** reroll overrides, so a member can
+  still pay to push a pinned quest off their board; honoring an explicit
+  reroll beats the nudge. (Applying pins after rerolls would let a paid reroll
+  land the quest straight back.)
+
+Enabling it is pure data: create a daily quest on each kind (normal daily
+reward). The fire hooks (`bios/wizard`, `birthday.cog`) already exist.
+
+**Counted quests:** a trigger-kind quest on a daily/weekly cadence may set
+`target_count` > 1 ("send 20 messages this week"). Each distinct occurrence
+inserts an `econ_quest_progress_marks` row (the dedup; replays never
+double-count) and bumps `econ_quest_progress`; the ordinary claim fires when
+the count reaches the target (see §4.6 for the per-member Gaussian target
+band), and `/bank quests` shows a progress meter. Targets are
+invalid on manual quests (nothing counts), event quests (every occurrence
+already pays), and monthly quests (guild-wide, no per-user count). Progress is
+per (quest, member, period); a new period starts a fresh count with no reset
+sweep.
+
+**One-shot rule:** a target > 1 (or a band) is **required**, not optional, on a
+triggered **weekly** quest; only *daily* triggered quests may be one-shot
+(`target_count == 1`, no band). The intent is that weekly quests always show a
+filling progress bar rather than completing on the first action;
+`_check_target_count` rejects a triggered weekly one-shot at create/update (the
+web route surfaces it as a 422). Manual and trigger-word weeklies have nothing
+to count, so they remain legitimate one-shots. (Monthly is guild-wide, not
+per-user counted; see the Monthly cadence note in §4.5.)
+
+### 4.6 Per-user quest board (`quests.assigned_quest_ids`)
+Daily/weekly quests are **personal**: each cadence's active quests form a
+**pool**, and every member is shown/paid their own subset drawn from it per
+period. (Monthly left the board model in migration 125; it's a guild-wide
+goal now, and there is no `quest_board_monthly` dial.) How many is
+**per-guild configurable**:
+`EconSettings.quest_board_daily` / `_weekly` (default **2** each, matching
+`PERSONAL_BOARD_SIZE`), edited on the dashboard Quests page under *Board Size*
+and capped at `POOL_CAP`. Lowering a dial is how a guild makes the board feel
+less busy without deactivating library quests; **0 turns that cadence off
+entirely**, so nothing shows and nothing pays.
+
+Because 0 is a real setting, "has a board" and "board size" are deliberately
+separate: `quests.has_board(qtype)` (true for daily/weekly, always) is
+what gates the board filter, never `board_size(...) > 0`. Gating on the size
+would make a cadence sized to 0 read as *unfiltered* (community/event's
+"no board concept, every active quest counts") and pay out the whole pool,
+the exact inverse of the intent.
+
+The draw is a pure function of `(pool_ids, user_id, period_index, board_size)`: a per-member
+`sha256` shuffle of the pool walked N-at-a-time by `period_index(qtype, day)`
+(day ordinal / ISO-week / month), so it needs **no assignment table**: it is
+stable within a period, differs between members, and spaces a member's repeats
+roughly **⌊poolsize/N⌋ periods** apart (a full cycle when N divides the pool,
+approximate otherwise, e.g. a 5-daily pool at N=2 recurs some dailies every 2
+days; small pools where `N ≥ poolsize` degrade to "everyone sees everything"). Community and event quests are **not** personalized (community is a
+guild-wide objective; event pays per occurrence).
+
+**Pool frozen per period** (migration 110, `econ_quest_pool_snapshots`): the
+draw's `pool_ids` and `board_size` are **snapshotted the first time any
+member's board of a cadence is computed in a period**, and every later read
+that period draws from the snapshot. Both `m = len(pool)` and `n = board_size`
+move the draw window (`start = index·n mod m`), so without this an admin
+activating/deactivating a library quest, or changing a *Board Size* dial,
+mid-period reshuffled **every member's current board**, not just the slot
+touched. Now such edits only surface at the **next daily/weekly/monthly roll**:
+the pool a member is looking at is stable for the period they're in. A quest
+deactivated mid-period keeps its slot in the frozen board set but both the
+`/bank quests` panel and the fire/payout paths filter on `active=1`, so it simply
+renders as an empty slot (never a visible dead quest, never pays) until the
+next period re-snapshots it out. It is the same "board runs one shorter" shape as a
+completed setup quest. `reroll_board_slot` draws its swap candidates from the
+same frozen pool, so a mid-period activation is never a reroll target. Snapshots are keyed
+`(guild_id, qtype, period_idx)` and pruned to the current period on each freeze
+(a board is only ever read for the current period).
+
+**Paired quests** (migration 106, `pair_tag`): two active quests of the same
+cadence sharing a non-empty `pair_tag` are drawn as a **bundle**: when the
+pure draw picks either, `quests.apply_pair_bundles` swaps its partner in for
+the last unpaired slot, so producer/consumer prompts (submit a Guess Who
+round + play one; send a whisper + unmask one) land on a member's board the
+same period. Pairs the draw already completed are never split; a tag carried
+by one active quest or by three-plus is inert (strict exactly-two rule,
+`quests.pair_map`); a board of one can't hold a pair and is left alone.
+Reroll overrides apply **after** pairing; a member can still opt out of half
+a pair, and that's their call. Note the frequency effect: a paired quest
+appears whenever *either* member of the pair is drawn, roughly doubling how
+often each shows up relative to an untagged pool-mate. Tag editing is on the
+dashboard Quests page (Pair tag field); like any pool change, it takes effect
+at the next period roll (the pool is frozen per period; see above), so a
+mid-period tag edit never reshuffles the current board.
+
+Both surfaces filter to the member's board: `fire_trigger_quests` and the
+trigger-word `on_message` path skip any daily/weekly/monthly quest not on the
+board this period (so a member only *earns* a kind when its quest is on their
+board), and `_load_quests_state` shows only the board on `/bank quests` + the wallet.
+Because assignment cadence equals the claim period, counted progress never
+fragments mid-period.
+
+**Board add-ons (stage 5 of the quest-variety plan, migration 084):**
+
+- **Board reroll:** one **free** per member per guild-local day
+  (`econ_rerolls`), then up to `EconSettings.quest_reroll_daily_cap`
+  (default 3) more at `price_quest_reroll` (default 10) each, ledger kind
+  `quest_reroll`, counted by `econ_rerolls.paid_count` (migration 089).
+  The cap is the point: unlimited paid rerolls turn a "this quest doesn't
+  fit how I use the server" escape hatch into a shopping trip for the
+  cheapest quests. Either setting at 0 disables the paid tier and leaves
+  the free reroll intact; the free one is never taken away. Offered via a
+  🎲 select on `/bank quests` that names the price. Swaps one *untouched*
+  board quest (no claim, no counted progress this period) for the first
+  pool quest in the member's own shuffle order that isn't on their board,
+  **preferring a different trigger kind**. Persisted as an
+  `econ_board_overrides` row keyed by the draw's `period_idx` and applied
+  on top of the pure draw in `assigned_board_ids` (a same-period re-reroll
+  would update `to_quest_id` in place, so application never chains; the
+  override dies with the period). The reroll spends *after* validation,
+  so a refused reroll costs neither the free allowance nor a coin, and a
+  failed debit leaves the board untouched.
+- **Clear-the-board set bonus:** completing every quest on the personal
+  daily (or weekly) board in one period pays
+  `EconSettings.quest_set_bonus_daily` / `_weekly` (**default 0 = off**;
+  a silent default-on bonus surprises 1-quest boards; the main guild opts
+  in at 10/25 via the seed script, editable on Settings) as ledger kind
+  `quest_bonus`, no booster multiplier. Checked after every paid claim (instant and sign-off
+  approval both) against the CLAIM's period, with an `econ_set_bonus`
+  reservation row as the exactly-once guard.
+- **⚡ Weekly spotlight:** one featured trigger kind per ISO week pays
+  **double** on quest claims (`spotlight_kind`: deterministic sha256 over
+  (guild, week) across the distinct kinds with an active non-community
+  quest; `None` under 2 kinds, since rotation needs something to rotate).
+  Candidates are narrowed to kinds **enough members can actually earn**
+  that week (`_reachable_spotlight_kinds`): event kinds reach
+  everyone; board kinds must land on ≥25% of 30-day-active members'
+  simulated boards (weekly + all seven dailies, pins and done-drops
+  included; computed against the live pools without freezing snapshots).
+  Skipped when it would leave <2 candidates or there are no active members
+  to measure. Without it a dead pick is possible: 2026-W31 would have
+  spotlit a kind on zero boards, every daily slot being setup-pinned.
+  Applied in `_credit_reward` (meta `spotlight: true` on the ledger row);
+  surfaced on `/bank quests` (⚡ tags + banner), the leaderboard card, the flip
+  announcement, and the live tracker. A sign-off approved after the week
+  flips pays at the approval week's rate (accepted drift).
+- **Flip announcement:** at the ISO-week roll the loop announces "this week's
+  quests are up" (+ the pool size and the ⚡ spotlight reveal) **to main chat
+  as an Event Echo** (`quest_flip` source; see
+  [event_echo_spec.md](event_echo_spec.md)); `_echo_quest_flip` loads the
+  numbers, `flip_echo_detail` renders them. It links the economy panel and
+  is skipped when none is posted.
+  It posts no message of its own to the leaderboard or bank channel and does
+  not ping the economy game role (`game_role_id`, the notifications opt-in):
+  one announcement beats two, and Event Echo is silent by design, so there is
+  no per-source ping exception. A guild with a bank channel but no economy
+  panel gets nothing.
+
+**Dynamic target band:** a counted quest may carry a target *band*
+(`0 < target_min < target_max`) instead of a fixed `target_count`. Each
+member's target for a period then resolves **from their own pace**
+(`resolve_member_target`, migration 083): the median of their trailing
+completed periods of that kind in `econ_kind_activity` (4 days / 4 ISO
+weeks / 2 months by cadence) × `DYNAMIC_STRETCH` (1.15), clamped to the
+author's band: a chatty member gets "send 45", a quiet one "send 10", for
+the same flat reward (effort-equity; scaling the payout would re-reward the
+already-active). The result is **stored on the progress row at first
+touch** (fire path or wallet view, whichever sees the period first), so it
+never moves mid-period and both surfaces agree. Members with fewer than 2
+active trailing periods of the kind fall back to the deterministic
+**Gaussian draw** over the band (`quests.effective_target`, stable on
+`(user, quest, period)`), the cold-start behavior, and the entire behavior
+before migration 080's ledger accrued history. Sandbagging by going quiet
+floors out at `target_min` and is self-defeating (less activity is less
+income anyway). **Channel-scoped band quests** on message-shaped kinds
+(`quests.CHANNEL_SHARE_KINDS`: message_sent, reply_sent, media_post) scale
+the member's median by *their own* share of traffic in the scoped channel
+(`channel_message_share` over `processed_messages`, trailing 28 days):
+kind activity has no channel dimension, so "send N in #the-meadow" sizes
+to their meadow pace, not their whole-server pace. The Gaussian fallback
+is never scaled (the author wrote the band for the channel already).
+Thread messages archive under the thread's id while scoped fires credit
+the parent, so shares read slightly low in thready channels, so targets err
+forgiving.
+income anyway).
+
+Kinds in `quests.PERSONAL_P25_KINDS` (currently `reaction_given`) resolve
+at the member's own trailing-period **p25 instead of the stretched median**
+(`quests.p25_target`, no `DYNAMIC_STRETCH`): reactions are passive
+one-click acts with a heavy-tailed distribution, so the target means "at
+least your own quiet-week level"; stretching past typical pace would turn
+the anti-freebie fix into a grind on a heavy reactor's off week. Zeros
+still count in the quantile, same as the median path.
+`0/0` (the default) means no band; the fixed `target_count` applies, so existing
+quests are unchanged. Both the counted-claim path and the `/bank quests` progress
+meter read the same `effective_target`.
+
+Game-fired claims are **silent in-channel** (matching the participation faucet:
+a game recap followed by a dozen quest embeds would be noise); the wallet ledger
+and `/bank quests` carry the news, and sign-off claims still reach the mods through
+the todo board (one repaint per batch, not one per claimant). The photo-post
+and media-post listeners announce (✅/📝 on the member's own message, since the
+payout lands on the post itself). Hooks that fire inside another module's open
+transaction use `fire_trigger_inline` (savepoint-wrapped, never raises, no
+board repaint; pending sign-off claims still appear on the claims panel, and
+on the board at its next repaint).
+
+**Income Sources page** (Economy section of the dashboard): a per-guild
+enable switch for every trigger kind, stored in `econ_income_sources`
+(absent = enabled; the gate is checked once inside `fire_trigger_quests`, so a
+disabled source stops firing everywhere immediately while its quests wait in
+the library). The page also shows which quests use each source, the built-in
+faucet rates (read-only for manager-role holders; admins edit them in place:
+saves go through the admin-gated partial `PUT /api/economy/config`, and the
+panel detects admin-ness by probing the admin-gated config GET). A Coin Drops
+card points at Economy → Settings, where the drop dials live. JS labels shared with the quest
+form via `economy-sources-shared.js`.
+
+**Photo plumbing:** payout fires on the post itself, not on replies to the card
+and not on reactions. `EconomyCog._on_photo_post` (an `on_message` listener) fires
+when a member posts an image in the configured photo channel, and pays **two
+independent, stacking amounts**, each capped once per guild-local day:
+
+1. a **flat participation award** (`EconSettings.reward_photo_post`, default 5,
+   ledger kind `photo_post`) on the post itself, no quest required. Dedup rides
+   an `INSERT OR IGNORE INTO econ_photo_rewards (guild_id, user_id, local_day)`
+   anchor in the credit's transaction (mirrors the login faucet). 0 turns the
+   flat award off; and
+2. the **`photo_post` quest** bonus on top, if one is active (occurrence
+   `photo_post:<local_day>`, dedup on `econ_quest_claims`).
+
+Guards are cheapest-first: a guild/bot check, an image check (content-type with a
+filename-extension fallback), a TTL-cached channel check, then a DB eligibility
+pre-check (economy on, `photo_post` source on, and something to pay: a positive
+participation award *or* ≥1 active `photo_post` quest). The `photo_post`
+income-source toggle gates **both** payouts. The channel is the standalone Photo
+Challenge feature's dedicated channel: `channel_id` in `games_game_config.options`
+(game type `photo`), owned by the **Photo Challenge → Setup** panel
+(`/api/photo-challenge/config`). When that config carries no channel but an
+**active photo schedule** does (a schedule created without the Setup panel ever
+being saved leaves the config row empty), the listener recovers the channel from
+`games_scheduled` so schedule-only setups still pay; the payout is dormant only
+when neither knows a channel. The flat
+rate is edited on the **Income Sources** page alongside the other faucets. *(The
+old reaction-gated model and its `react_threshold`/`auto_react` knobs are retired;
+migration 099 renames existing `photo_react` quests and income-source rows to
+`photo_post`; migration 101 adds `econ_photo_rewards`.)*
+
+**Intake plumbing:** greeters earn for working a newcomer's intake card (the
+welcome-procedure checklist; see `docs/specs/intake_spec.md`). Payment is
+**per step ticked**, not per completed card: `onboarding.intake.service.complete_card`
+records whoever posts the completion code as the welcomer of record and stamps
+every unticked step as *skipped*, so a per-card award would hand the whole
+payout to the code-poster even when someone else did the work, and would pay
+nothing for a shared or half-finished intake.
+
+`intake_rewards.pay_intake_steps` runs inside the tick's own transaction and
+pays two stacking amounts, like the photo faucet:
+
+1. a **flat award** (`EconSettings.reward_intake_step`, default 5, ledger kind
+   `intake_step`) to the greeter who ticked the step; and
+2. the **`intake_step` quest** bonus on top, if one is active (occurrence
+   `<card_id>:<step_key>`, dedup on `econ_quest_claims`).
+
+Guards, in order: non-empty step list → `actor_id > 0` → actor is not the
+newcomer → economy on → `intake_step` source on. The dedup anchor is
+`INSERT OR IGNORE INTO econ_intake_rewards (guild_id, card_id, step_key)`
+(migration 138). **The anchor cannot be the step's own `done_at`/`done_by`:**
+the manual step button in `onboarding.intake.views._toggle_step` is a *toggle*, so
+unticking clears both and re-ticking would mint the award again, unbounded. The
+anchor's primary key also excludes `user_id`, so a second greeter re-ticking a
+claimed step earns nothing either. Each step's payout is wrapped in its own
+`SAVEPOINT`, so an economy failure logs and rolls back only that award, never the
+intake tick itself.
+
+Four tick paths pay, all through the same anchor: the manual step button, the
+`greeted` auto-tick, a posted **step code** (`ACTION_STEP`: pasting the
+canned message for a stage ticks that step, so the greeter is paid for the
+paste that does the work), and a **grant step** press (`onboarding.intake.views._grant_step`):
+the greeter who presses Grant ‹role› is credited even when the gateway's
+`role_gained` auto-tick landed first, since `claim_grant_tick` overwrites a
+`done_by 0` tick). Stage 2 cards (after Level 5) pay exactly like join cards:
+the anchor is per card, so the same step key on both cards pays once each. `verified` and the `role_gained` steps auto-tick
+from a role change with `AUTO_ACTOR` (0) and pay nobody, which is why the
+faucet stays bounded by real newcomers. A 0 rate skips the anchor
+entirely so the quest can still fire and raising the rate later still pays. The
+rate is edited on the **Income Sources** page alongside the other faucets.
+
+## 5. Transfers
+
+`/bank pay @member amount`: min 1, whole numbers, no fee. **Confirmation step over
+100** (an ephemeral confirm button before the debit lands). Both sides ledgered
+(payer `transfer_out`, recipient `transfer_in`). Per-guild `transfers_enabled` toggle
+(default **on**) is the kill switch for alt-funneling; `/bank pay` refuses with a
+branded notice when it is off. **Transfers do not mint**: the recipient's
+`transfer_in` credit takes **no** booster multiplier (the ×1.5 is a faucet-only patron
+bonus); a transfer only moves existing currency between wallets. An optional
+**memo** rides `/bank pay`, collapsed to a single trimmed line and length-capped,
+stored verbatim under a `memo` key on both ledger rows and surfaced (escaped at
+render time) in the wallet ledger, the dashboard bank-manager ledger, and the
+public register feed's consolidated `A → B` transfer entry.
+
+**Public receipts.** A `public:` option (per payment, default off; this is member
+self-service, not a server dial) posts the receipt in the invoking channel instead
+of keeping it ephemeral. Three constraints shape it:
+
+* The public receipt **never carries the sender's balance**. The ephemeral receipt's
+  last line reads `Your balance: N`; the public variant drops that line and the
+  sender gets the balance in a short private ack instead. `build_payment_receipt_layout`
+  (`economy/transfers.py`, a Components V2 card; `docs/plans/components_v2_migration.md`
+  wave 3a, recoverable with `git show 678a16fa:docs/plans/components_v2_migration.md`) withholds it even when handed one; a
+  regression test (`tests/economy/test_economy_transfers.py`) pins that with the balance
+  argument set on purpose.
+* The public receipt is always a **followup**, on both paths. An ephemeral message
+  cannot be promoted to a public one, so the over-100 confirm, which resolves by
+  editing its own ephemeral message, has to send the receipt separately; the direct
+  path does the same so one payment looks identical either side of the threshold.
+  Discord attributes neither, so the public card names sender *and* recipient
+  (mentions rendered with `AllowedMentions.none()`; the recipient is already
+  notified once by `notify_member` and doesn't need a second ping). The confirm
+  card (`build_pay_confirm_layout`, `economy/layouts.py`) says the receipt will be
+  posted, so nobody confirms blind.
+* **Refusals are never public.** `_reply` (plain text) and `_reply_layout`
+  (Components V2 card) stay ephemeral-only and the option is threaded through the
+  success path alone, so "you don't have enough" (which reads the sender's
+  balance back) cannot reach a channel.
+
+The memo **does** publish (a deliberate call); the option's description says so.
+
+**The recipient's note is batched** (`docs/specs/dm_batching_spec.md` kind
+`econ_notice`). "X sent you N" and "X gifted you P" do not DM at once: each
+queues one line (`economy/notice_batch.queue_notice`), and every economy note a
+member collects inside one ten-minute window arrives as one message, one line per
+payment or gift, capped at twelve lines with "…and N more." The handler delivers
+through `notify_member`, so mute preferences and the bank-channel fallback apply
+exactly as before. Names are resolved at send time; a no-contact rule added inside
+the window drops that line (the money has already moved). A pay memo rides in the
+queued line, so it sits in `dm_batch_pending` until the batch is sent. It is
+already stored on both ledger rows, so nothing new is kept. A recipient who has
+left the server by then gets nothing.
+
+`public:` consults the no-contact list (`is_no_contact_conn`, read on the transfer's
+existing connection and only when the option is set). A blocked pair's payment still
+goes through and the sender gets the **ordinary ephemeral receipt** with no
+explanation, as does a channel the bot can't post in. Folding those two cases into
+one silent path is deliberate: any message explaining the downgrade would let a
+sender probe for a no-contact rule with a 1-coin payment. `/bank pay` itself remains
+ungated; the private path's DM predates this and is tracked separately.
+
+### 5.1 Reaction tips (migration 143)
+
+Tapping an emoji the bot placed on an image post pays the poster from the
+**reactor's own wallet**. A transfer with a rake, not a faucet: nothing is
+minted, and the rake is **burned** (credited to no one), so reactions are a
+net **sink**, pointing the same way as the economy's other retunes rather than
+against it. (A house-minted version was considered and rejected: at ~1,050
+reactions/day against a 74,083-coin supply it would have inflated the money
+supply ~1.4% per day.)
+
+**Rake** is `max(1, round_half_up(10%))` of what was actually paid. The floor
+matters: a flat 10% of a 5-coin tip rounds to zero, which would make the sink
+symbolic. Rounding is explicitly half-up rather than Python's banker's
+rounding, so a 25-coin tip rakes 3 and not 2. The smallest viable rung is
+**derived** from those constants (`min_rung_amount()`) rather than restated, so
+the API validator and the dashboard can't keep accepting prices the service has
+started declining at every tap.
+
+**The ladder is the emoji set.** Rungs are per-emoji per-channel
+(`reaction_tip_rungs`), so which emoji you tap is how much you give; 5 / 25 /
+100 is the suggested ladder. This is also the closest thing the design has to a
+confirmation dialog: reacting is a one-tap, low-deliberation action and Discord
+offers no confirm step, so the emoji itself has to carry the price. A rung
+below 2 is not viable: after the 1-coin floor it would deliver the poster
+nothing.
+
+**Only bot-placed emoji charge.** A tip requires a placement receipt
+([[auto-react-spec]]) for that exact message **listing that emoji**, so a rung
+pasted by hand onto a text post, an old message, an embed-only post, or a
+post where that particular emoji failed to attach is free and
+inert. Any other emoji anyone adds is always free.
+
+Ledger kinds are registered alongside the rest: `tip_in` is in the register
+feed's `SKIP_KINDS` so one tip is one feed entry (the payer's leg), and
+`tip_out` is in `BURN_EXCLUDED_KINDS` because ~90% of it lands in the poster's
+wallet. Only the rake burns, and that is not a ledger row at all; it is the
+amount never credited.
+
+**One charge per `(guild, message, reactor)`, forever**, the shape
+`xp_reaction_awards` already uses. Removing the reaction refunds nothing and
+re-adding costs nothing, so the toggle can't be farmed.
+
+Edge cases:
+
+| case | behavior |
+|---|---|
+| reactor can't afford the rung | tips what they hold (partial payment) |
+| reactor holds 1 coin | declined entirely, since the poster would net 0 after the floor |
+| reactor holds 0 | free no-op |
+| reactor is the poster | ignored: no debit, no credit, no row, so a self-tap can't pad the count |
+| reactor is a bot or webhook | ignored: the auto-react bot places these emoji and has no wallet |
+| the channel's rule was deleted, or its tipping toggle switched off | free no-op, including on posts the bot already reacted to; the rule and its toggle are re-read on every tap, and deleting the rule takes its prices with it |
+| balance changes mid-transaction | the guarded debit fails and nothing is written |
+
+Both sides are ledgered as `tip_out` / `tip_in` with the rake in `meta`, so
+§10.1's register feed narrates tips with no extra code, which is the **only**
+feedback a reactor gets that money moved, since nothing in this flow confirms.
+
+XP is untouched: the same tap still earns `xp_coeff_reaction_given_xp`. Coins
+therefore buy a trickle of XP, and the round trip back to coins stays bounded
+by the daily XP-mint ceiling.
+
+`economy.service.transfer_currency` is deliberately **not** used: it credits
+the recipient exactly what was debited by design and cannot express a rake.
+
+## 6. Sinks (The Perk Shop)
+
+**Shipped (Stage 3):** the role-customization perks (solid color, name, icon,
+gradient) are live: browsed, rented **and customized** in `/bank shop`'s
+ephemeral panel (§7), and **every one is giftable** (sinks round 2, stage 1:
+a gift is the base perk rented with `beneficiary_id` = the friend; the old
+`gift_color` kind and its separate `price_gift_color` retired in migration
+091, which rewrote live rows to `role_color`-with-beneficiary and widened the
+perk CHECK once for the round's later kinds, `voice_style` and `emoji`; the
+orphaned `econ_price_gift_color` config rows two guilds still carried were
+deleted in migration 191;
+see `docs/plans/economy-sinks-round-3.md`, recoverable with
+`git show 678a16fa:docs/plans/economy-sinks-round-3.md`). **Custom shop items**
+open the catalog to admins (see the row below and
+`docs/plans/economy-shop-items.md`, recoverable with
+`git show 678a16fa:docs/plans/economy-shop-items.md`): the
+Server Store section and 🎁 Store picker in `/bank shop`, the item editor on
+Shop & Perks, the order queue on the Approvals page, and the mod todo board as
+the fulfillment queue. The store is one click from the channel panel, not two
+levels deep, and its picker is not cut at Discord's 25-option ceiling.
+
+The ephemeral shop is now **a book of sections** (`shop_sections` /
+`shop_pages`), in this order: **🎁 Specials** (the guild's own items, ten to a
+page and the only section that runs to more than one), **🎨 Role Cosmetics**,
+**🏠 Server Features** (the voice-room lease, the paid pin and the themed day; personal channels when they ship; named wider
+than its products on purpose, since renaming a section under members is worse
+than one that reads roomy) and **🎲 Game Features**
+(streak shield, raffle).
+
+**An empty section gets no page at all**, so the shop's shape follows what the
+guild actually sells: TGM has no custom items and therefore no Specials
+section. `shop_pages` is never empty: a guild with every switch off still gets
+the cosmetics page as a floor, because a shop with no pages has nothing to show
+and the arrows nothing to step between.
+
+**Components V2 (`bot_modules/economy/shop_layouts.py`):** the paragraphs that
+follow describe the bare-`LayoutView` cards.
+
+Navigation is a **non-wrapping pager** (`_nav_row`): ◀️ / a caption chip / ▶️,
+the arrows disabled at each end rather than stepping round, since a grayed arrow
+reads as "you are at the end", where a wrap reads as broken. **The
+caption chip sits between the arrows:** a disabled secondary `Button` carrying
+`nav[page]`, the same caption `shop.page_captions` hands every other page
+reader, so a spread Specials page reads "🎁 Specials · 11–20" between the
+arrows and every other page its bare section caption. It has no callback
+(nothing to press) and is how this shop already says "you are here"
+elsewhere on the same card (🎙️ Leased, 🛡️ Held). A trailing
+`-# Page {n} of {total}` line (`_page_line`) still carries the count below
+it, numbered across the whole book exactly as `page_note` did. The chip
+says *which* page, the line says *how many*.
+
+`build_shop_section_layout(section, rows, ...)` renders one section's rows as
+one card; `build_store_layout` does the same for a Specials page. A Server
+Store item with no admin-typed blurb falls back to a
+`shop_layouts.STORE_FALLBACK_BLURBS` line derived from what it is (a role, or
+something a mod delivers), so a catalog row is never two lines. The
+**channel panel** (`build_shop_panel_layout`) still prices nothing and only
+names the guild's sections; it reads the same `shop_sections` the shop
+walks, unchanged from the embed-era design except that it is a bare card instead of an
+embed field list.
+
+`_ShopView`/`_StoreView` carry only their own page's controls, rendered as
+**one `Section` + one `Button` per row** rather than a single scoped
+`_ActionSelect` dropdown: Components V2 has no more no-op reason to spend a
+whole row on a picker Discord can't gray out per-option: a `Button` disables
+per row natively, so a gated perk, a held shield or an already-leased voice
+room shows its reason on its own line instead of failing to explain itself
+until tapped. **`shop_section_rows` is the single source both the card and the
+view read** (`shop_layouts.py`'s own docstring: "the card and the view that
+binds it can never disagree about what row N means"). The old two-place
+decision (`build_shop_embed`'s per-perk `_line()` price/status text, and the
+cog's separate `_ShopView.__init__` button logic) is now one pure function,
+which is also why the old "table row and its button agree" drift-guard test
+was deleted rather than converted (`tests/economy/test_shop_layouts.py` covers the
+branch matrix directly against `shop_section_rows` instead). **↩️ Cancel &
+Refund is still the one row that rides every section**: it ends any rental,
+so filing it under one section would hide it from a member whose only rental
+lives elsewhere.
+
+**The consumables live in the shop and have no commands:**
+`/bank sponsor`, `/bank pin` and `/bank theme` do not exist. The paid pin
+and the themed day sit in 🏠 Server Features, and their picker entries open
+submit modals. A product reachable only
+by knowing a command's name is one most members never find, and two surfaces
+for one purchase is two surfaces to drift.
+
+`/bank emoji` **stays a command** and is the one that cannot move: it takes an
+image attachment, and a Discord modal cannot collect a file.
+
+Because the section now mixes a weekly lease with one-off consumables, its
+header and footer say so per row rather than making a blanket billing claim.
+Every Server Features product defaults off, so 🏠 Server Features appears
+only once an admin stocks one.
+
+Navigation is the caption-chip stepper described above; the discarded
+alternatives are worth not re-proposing. **Bare ◀️/▶️**
+moved you without saying where to. **A select** spent a whole row to
+say what a heading says. **A tab row** showed every page at once but ran out
+at five pages.
+
+So there is **no** 🎁 Store button and **no** second panel button: an earlier
+cut of this work added both and they were taken back out, because a shop that
+*opens* on the store has no path left to shorten. A guild selling nothing of
+its own gets a one-page shop with no arrows, identical to what it always had.
+The channel panel (`build_shop_panel_layout`) is an invitation, not a
+catalog. It lists the guild's sections and nothing priced, so it can never
+drift from a viewer's own shop; the old 8-row `_items_block` price teaser is
+gone with the embed it rode on. Private rooms stay **Stage 6** and the
+spotlight slot stays **v2**; both are still design-only below.
+
+Weekly rentals bill on personal anniversary tick. Defaults below; every price per-guild
+tunable (§9). **Renewal bills the CURRENT guild price at each anniversary**. The
+rent-time price is snapshotted only for week one, and a price tuned on the Pricing page
+takes effect on the next cycle, never retroactively. A renewal whose
+re-read price differs from the previous cycle's **DMs the owner** the old and new price
+(with a pointer to cancel from `/bank shop`); unchanged-price renewals stay silent.
+
+| Perk | Per week | Repo grounding |
+|---|---|---|
+| Custom role color (solid) | 50 | `guild.create_role(color=…)` |
+| Custom role name | 35 | 32-char, filtered via the voice-master name-blocklist matcher (shared table). Setting it renames the member's personal role **and** sets their server nickname to match (`member.edit(nick=…)`, best-effort; a Forbidden/HTTP failure still keeps the role rename and tells them why via `_custom_name_confirmation`). When the perk lapses, `revoke_role_perks` reverts the nick too (`should_revert_nick`, only if the nick still equals the perk's name, so a game name-penalty stake set since is never clobbered) |
+| Role icon | 75 | Requires `ROLE_ICONS` in `guild.features` |
+| Gradient (member-picked two-color fade) | 240 | Sets `secondary_color`; requires Enhanced Role Styles guild feature; supersedes solid. Raised from 120 with the palette's arrival (todo #76) so the curated set is the value pick |
+| Palette color (curated two-color fade) | 80, or the color's own price | `role_preset` (migration 159), the ex-booster cosmetic colors, now rented from a curated catalog. Same projection and guild feature as the gradient; `econ_rentals.catalog_color_id` names the color, and a catalog `price` of 0 means "bill the flat `price_role_preset`". The shop row hides entirely in a guild with no palette. See [color_palette_spec.md](color_palette_spec.md) |
+| Holographic (Discord's fixed shimmer preset) | 300 | `role_holographic` perk (migration 107): the projector sets the fixed `(primary, secondary, tertiary)` triple Discord accepts for `tertiary_color`; requires the same Enhanced Role Styles feature; supersedes gradient; member picks nothing (no customize modal) |
+| Private text room | — | §8 (Stage 6), design-only. There is no `price_text_room` setting: nothing can be rented with it, so a stored price would only advertise a room nobody can buy in the pricing hints and the Statistics affordability card. Stage 6 prices itself when it is built |
+| Private voice room | — | §8 (Stage 6), design-only. `price_voice_room` was dropped alongside it, same date, same reason |
+| Custom shop item | admin-set, per item | **Custom shop items** (migration 179, `docs/plans/economy-shop-items.md`, recoverable with `git show 678a16fa:docs/plans/economy-shop-items.md`). Admin-defined on the Shop & Perks page (the order queue lives on **Approvals**) rather than compiled into `perks.py`; rendered as the shop's own section, absent entirely in a guild with none. Two axes per item: `kind` `role` (grant a role automatically; refused when the role carries elevated permissions, is managed, or sits above the bot, which leaves the sale standing and reads as a failed grant for staff) or `manual` (staff to-do), and `billing` `once` or `weekly` (a real `econ_rentals` row, perk `custom_item`, tagged `catalog_item_id`). Optional stock, per-member limit, availability window, staff-facing description and display order, all six editable on the item's row (the editor must render an input for the window, description and order, or a limited-time item cannot be set up from the dashboard). A manual purchase escrows the price (`shop_item` kind) and spawns a row on the **existing mod todo board** (`todos.purchase_id`); ticking it off delivers the order, riding `complete_todo`'s guarded UPDATE for exactly-once. Refusing refunds (`shop_item_refund`, `refunded_at` predicate) and closes the todo as **missed**, never as done. Unresolved orders refund after `shop_item_expire_days` (14, set under **Custom Shop Items** on the Pricing page like every sibling review window) |
+| Gift (any perk above) | base perk price | Payer funds a friend's perk: same kind, `beneficiary_id` = friend; billed to the payer at the perk's current price |
+| Streak shield | 30 once | One-shot consumable, not a rental (§3.1); shop "One-shot" row + panel button, wallet shows "held". Switchable off per guild (§6.1); a shield already held keeps working and stays refundable, since it is stock the member paid for |
+| Sponsored emoji | 60/wk (animated 90) | **Sinks round 3, stage 4.** `/bank emoji image: name:` escrows week one (`emoji_sponsor` kind); mod approves on the Approvals page queue → two-phase claim-then-upload opens a real `econ_rentals` row (perk `emoji`, meta carries `animated` so renewals bill the right rate); deny/cancel/expiry refund exactly-once (`emoji_sponsor_refund`, `refunded_at` predicate); lapse deletes the emoji and frees the slot + name. Caps: `emoji_sponsor_slots` (default 5) + never the guild's last free emoji slot of that kind. One in flight per member and one claim per name via partial unique indexes (migration 092). Names: 2–32 `[A-Za-z0-9_]` + the shared blocklist. `price_emoji` 0 disables new sponsorships (the one price-as-off dial migration 182 left standing; emoji sponsorship is not one of the eight switchable shop lines in §6.1); pending reviews auto-refund after `emoji_sponsor_expire_days` (default 14, the sweep pattern the retired QOTD sponsorship used) |
+| Voice room lease | **not sold by default**; price 0, suggested 30 | Leases Voice Control **rename + user limit** (sinks round 3, stage 3). Priced on the Pricing page as "Voice Room Lease, Per Week" (the `price_voice_style` field); this is the price the shop charges for a voice room. (There is no stage-6 `price_voice_room`, so this is the only voice price.) The paywall arms on `shop_voice_style_enabled` (§6.1), NOT on the price: checking the box on Shop & Perks is the launch switch (announce first), and unchecking it is the per-guild opt-out, which leaves rename/limit free for everyone. It defaults off, matching the price-0 dark default it replaced in migration 182. Selling it at a price of 0 means free: the paywall does not arm, so the controls stay open to everyone. Armed only while the economy is enabled. Entitlement is beneficiary-based (giftable); saved VM profiles stay stored but only re-apply while leased; lapse best-effort walks a live temp channel back to the template name + default limit (no role involved). Access dial / invite / kick / transfer / reset stay free. Verdict is pure (`voice/master/logic.style_lease_blocks`), enforced in `_apply_rename`/`_apply_limit` (one choke point for slash + panel) and the spawn profile loader |
+| PvP game wager | player-chosen, uncapped | **Sinks round 2, stage 4b.** Optional `wager:` on all six duel/group games: equal ante, winner takes the pot minus the optional house rake (`wager_rake_pct`), default **0 (dark)**, capped 50 (at 0 a wager is still the pure transfer that made the games matter; a priced rake evaporates its cut of every settled pot, read at settlement time like rental renewals, never snapshotted). Refunds are never raked, nor is a single-stake pot (a winner reclaiming their own ante isn't a contest); the payout announcement and register memo both name the cut (`meta.rake`) so the arithmetic visibly adds up. Escrow in `econ_game_wagers` (migration 094) keyed to (game_type, game_id, user_id); duels declare at challenge and debit both sides at accept (decline/timeout costs nothing), lobbies debit on join and refund on leave. Settlement/refund rides the stage-4a terminal seam, exactly-once via `settled_at`. Every non-settling terminal state (ABANDONED / VOID / EXPIRED_LOBBY / DECLINED) and a `winner_id` of None refunds; a guild-leaver's stake is refunded by the economy cog's member-remove listener. Ledger kinds `wager_stake` / `wager_payout` / `wager_refund`, payout and refund unboosted so a wager can never mint |
+| Raffle ticket | 10 each, ≤10/member/week | **Sinks round 3, stage 5.** Week-scoped tickets (`raffle_ticket` burn, no refunds); weighted draw at the ISO-week roll, exactly-once via the `econ_raffle_draws` PK (claim-before-side-effect). Prize is NEVER coins: a `free_week` voucher (28-day expiry) auto-covers the winner's next rental debit (renewal or first week of a new rent) as a 0-amount `rental` ledger row (`meta.voucher_id`). Winner DMed (opt-in-role gated) and **named** (resolved display name, `leaderboard._raffle_text`, with the week's ticket tally) on the economy panel's Weekly Raffle section (the deliberate anonymous-ticker carve-out: buying in is opting in). `raffle_enabled` default **off**; enabling is a comms decision, announce first. Shop: ticket row + quantity modal (ephemeral + persistent panel). Migration 093 |
+| Hoard tax (demurrage) | **0% (dark)**, suggested 2%/wk over a 500 floor | **Built (migration 100).** The only sink that needs no buyer: at the ISO-week roll, every wallet above `demurrage_threshold` loses `demurrage_rate_pct`% of the **excess** only; the floor is protected, so nobody is taxed below it and 100% is a hard wealth cap, not a wipe. Floor-division grace: a tax that rounds to 0 goes uncollected. Exactly-once via the `econ_demurrage_sweeps` (guild, week) PK (claim-before-debit, the raffle-draw pattern) with per-sweep totals recorded for metrics. Ledger kind `demurrage` (meta: closed week + pre-tax balance) narrated by the register feed (🐉 "Hoard tax"), so no separate announcement. Rate 0 default = off; both knobs on the Pricing page; enabling is a comms decision, announce first (`economy/demurrage_service.py`, swept from the week roll beside the raffle draw) |
+| Casino | fixed paytables, not priced | **Built**: house gambling (coinflip, slots, blackjack, roulette, the Meadow Derby, baccarat, dice, war, keno and mines) in one configured channel; net sink via tested house edges, bounded by a per-member daily wager cap. Kinds `casino_stake`/`casino_payout`/`casino_refund`, payouts never boosted. Own spec: [casino_spec.md](casino_spec.md) (dashboard: Economy → Wagering → Casino) |
+| Spotlight slot | 150 flat | **v2 (decided).** Featured embed in `spotlight_channel_id`, buyer text through the name blocklist, 7-day expiry, 3/ISO-week inventory |
+
+### 6.1 What the shop sells (per-perk switches, migration 182)
+
+Eight shop lines carry a per-guild on/off switch, set from the **What's On
+Sale** card on the Shop & Perks page: the six self-rented role perks, the voice
+room lease, and the streak shield. Each owns a `shop_<perk>_enabled` config key
+and an `EconSettings` field; the tuple is `SHOP_TOGGLE_PERKS` in
+`economy/service.py`, and `perks.perk_on_sale(settings, perk)` is the one
+question every surface asks. Anything outside that tuple answers True. Custom
+shop items carry their own per-item `enabled` column and emoji sponsorship is
+priced dark, so neither is reachable from this card.
+
+**These are the only off switch.** Before 182, a price of 0 was the de-facto
+one and meant three different things: `price_streak_shield` 0 hid the row,
+`price_emoji` 0 blocked new sponsorships, and `price_voice_style` 0 disarmed
+the paywall and made the controls **free for everyone**, the opposite of off.
+A price is now only a price; 0 means free. (The emoji dial is the one survivor,
+being outside the eight.)
+Free means free end to end: `service.charge_price` skips the wallet and ledger
+write for a price of 0 (rent, renewal, shield; `apply_debit` still refuses
+< 1), a free shield snapshots `shield_price = -1` so it refunds nothing, and
+`style_lease_blocks` does not arm at a voice price of 0, so rename/limit stay
+open to everyone.
+
+**Defaults:** every line on except `voice_style`, which ships off to match the
+price-0 dark default it replaced: a guild that has never configured its
+economy keeps its free rename/limit controls instead of waking up behind a
+paywall. Migration 182 backfills the switch from each guild's stored prices
+(`price_voice_style > 0` → on; `price_streak_shield` explicitly 0 → off), so
+nothing visibly changes on upgrade.
+
+**Enforcement** (a preference that isn't enforced is not shipped):
+
+- `rent_perk` raises `ValueError("not for sale")`, one chokepoint covering the
+  shop's Rent button, the icon and palette pickers' own entry points, and
+  `/bank gift`. `purchase_streak_shield` raises the same.
+- `shop_section_rows` (§6) skips an off perk's row entirely, the same
+  function both the card and the view read, so there is no separate
+  "and drop the matching button" step left to forget.
+- `/bank gift`'s perk parameter is **autocomplete**, not a static
+  `app_commands.choices` list, because choices are baked in at import and are
+  identical in every guild. The command body re-checks regardless: autocomplete
+  is a convenience and Discord will deliver a hand-typed value.
+- The staff comp narrows to what the guild sells (`comp_entitlements(...,
+  on_sale=)`); otherwise the one group who can see the checkbox would be the
+  one group it doesn't apply to.
+- `style_lease_blocks` arms on the switch rather than `price > 0`.
+
+**Live rentals run to expiry, then stop renewing.** Nothing is written when a
+perk goes off sale. `classify` takes `perk_disabled` (read fresh from settings
+each tick) and returns the new `BillingAction.DISCONTINUED` only once an
+active rental reaches its anniversary: the paid week is honored in full, the
+rental ends unbilled, and the perk is revoked. Because no flag is stored, an
+admin who re-checks the box before someone's anniversary renews them as if
+nothing had happened.
+
+Ordering rules inside `classify`: a member's own `cancel_at_period_end` wins
+(same ending, but a member-initiated cancel is silent and this one DMs, since saying
+the server withdrew a perk they canceled themselves would misreport who
+decided); `suspended` still wins over everything. A rental in **grace** is
+discontinued outright rather than retried: grace means the anniversary passed
+and the debit failed, so there is no paid week left to honor, and a retry that
+succeeded would bill a fresh week for a perk that is no longer sold.
+
+`DISCONTINUED` writes exactly what `CANCEL_PERIOD_END` writes and stays a
+separate value purely so the effects layer can DM: the owner is told the server
+stopped offering it and that they have not been charged again, and the
+beneficiary of a gift gets a courtesy note. A member can still refund a
+withdrawn rental early; withdrawing a perk must not trap anyone in it.
+
+**Curated role-icon catalog (currency sink).** Alongside bring-your-own icon
+uploads, an admin can stock a per-guild catalog of named role icons, each with its
+own weekly price, from the **Shop & Perks** dashboard page (the flat
+perk prices live on the **Pricing** page, moved off the Settings panel). When a catalog exists, `/bank shop`'s
+role-icon row shows a price span with the flat `price_role_icon` folded in (the
+floor is `min(catalog min, flat)`; `catalog_price_range` returns `(min, max,
+count)`) and a "N + custom" note, and its button becomes a picker of curated
+icons instead of a single flat-priced Rent button; choosing one rents or switches
+to it. The picker's **last slot is always 🎨 Custom — Upload Your Own** at the
+flat price (so a catalog never takes the classic bring-your-own rental off the
+shelf; catalog entries trim to 24 to keep the total within Discord's 25-option
+select cap). That trim runs in `sort_order, price, id` order (price, cheapest
+first, only among icons with equal Order, so an untouched catalog lists as
+a price list: bug-list row 266), so each row's **Order**
+box on Shop & Perks decides which icons survive it (without that input every
+icon sits at 0 and the cut falls to insertion order, which an admin cannot
+change). Picking Custom rents the flat perk when unowned, re-tags a live
+catalog rental to `catalog_icon_id = NULL` when owned (free mid-week like an
+icon-to-icon switch, with the flat price billing from the next renewal, and the projected
+image is **cleared**: the catalog art belongs to the catalog price, so the member
+starts blank and uploads their own), or just re-offers the customize button when
+the rental is already custom. The upload paths (`/bank role icon`, the emoji
+modal) are guarded **per-rental, not per-guild**: only a member whose live rental
+is catalog-tagged is locked to their icon (pointed at the picker's Custom entry
+to unlock); a custom renter uploads freely even in a catalog guild. The
+live-rental lookup matches on `beneficiary_id`, so a *gifted* icon resolves for
+the friend wearing it. It reuses the
+existing `role_icon` rental perk and the personal-role projector: **no new perk kind
+and no `econ_rentals.perk` CHECK change**: the rented catalog icon id is recorded on the
+rental (`catalog_icon_id`; NULL = a bring-your-own rental at the flat
+`price_role_icon`) and its image is projected as the role's `display_icon`. Billing
+snapshots the icon's price at rent time and re-reads the **current** catalog price at each
+renewal (like the flat perks), with a defensive fallback to the flat price if the row ever
+disappears. Disabling an icon (`enabled = 0`) hides it from new renters without touching
+current renters; a hard delete is blocked while any live rental points at the row, so a
+member always keeps the icon they paid for. Because the projector diffs the role icon by
+**presence only** (it can't read an uploaded asset's bytes back),
+`econ_personal_roles.projected_icon_path` records what was last projected, so a member
+*switching* from one icon to another forces the re-upload.
+
+**Personal roles:** one per member, auto-created **positioned above the legacy
+cosmetic swatch band** (the "#### Cosmetics" anchor) so a rented color wins the
+display-color contest, which is also what grandfathers the ex-booster colors: a
+member who rents overlays the role they were given, and a lapse uncovers it again. The position is set **on create only** (a reconcile never
+re-hoists a manually moved role). The projector is idempotent: it reconciles the role
+to the member's current entitlements (name / color / gradient / icon) and downgrades
+cleanly when a component lapses. Guards: role **names run through the Voice Control
+name blocklist** (the shared matcher/table). Colors are unguarded: any parseable
+`#RRGGBB` is accepted.
+**There is no ΔE ≥ 25 collision check against staff role colors.** An
+impersonation guard of that kind (refusing a color too close to a staff role's)
+is unnecessary here because every moderation-permissioned role in this server
+carries a **role icon**, which distinguishes staff independently of hue. The
+caveat worth remembering is that role icons need guild boost level 2
+(`ROLE_ICONS` in `guild.features`); a guild below that has neither the icons
+nor a color guard.
+Icon perks gate on `ROLE_ICONS` and gradient on Enhanced Role Styles
+(`ENHANCED_ROLE_COLORS`) in `guild.features`. The role is deleted when the member's last
+role-perk lapses; a role-count alert fires near the 250 ceiling.
+
+**Staff perk comp** (`econ_mod_perk_comp`, default **off**, Pricing page): while on,
+anyone `AppContext.is_mod`/`member_is_mod` counts as staff (a configured
+`mod_role_ids`/`admin_role_ids` holder, or Discord `manage_guild`/`administrator`) is
+entitled to **every** rentable perk without renting one. Running the server shouldn't
+cost the people running it.
+
+The comp is **derived, never stored**: `rentals.comp_entitlements` unions
+`COMPED_PERKS` (== `perks.GIFTABLE_PERKS`) onto the member's real rentals, and
+`economy.rentals_service.effective_entitlements` is the single chokepoint every
+"may this member use perk X" gate reads. Consequences, all deliberate:
+
+- **No `econ_rentals` row and no `econ_ledger` row.** A comp is not a purchase, so the
+  billing loop never sees it and the spend metrics never record money that didn't move.
+  (Contrast the raffle **free-week voucher**, which *does* write a 0-amount `rental`
+  row; that voucher covers a real rental with a real billing clock, and a comp is not a
+  rental at all.) `entitlements` stays the raw rental truth for billing and refunds.
+- **Gaining or losing staff takes effect immediately.** The entitlement flips with the
+  role, and `EconomyCog._on_staff_comp_changed` (an `on_member_update` role diff) runs
+  the same reconcile a rent/lapse does: apply on promotion, re-project on demotion,
+  which reverts a perk-set nickname and deletes the personal role unless a real rental
+  is still behind it. Stored customization (color, name, icon) survives as dormant
+  state, so re-modding or renting restores the setup.
+- **Union, not replacement.** A mod already paying for a rental keeps it and keeps
+  being billed; we never cancel or refund on their behalf. The shop labels the comped
+  rows `✅ _on the house_` (distinct from a rented `✅`) and still shows the price,
+  which is what everyone else pays.
+- **Feature gates still bite.** The comp grants entitlement, not capability: gradient /
+  holographic / icon remain gated on `ENHANCED_ROLE_COLORS` / `ROLE_ICONS`.
+- **Curated catalog icons are covered.** A catalog icon is the `role_icon` perk at a
+  per-icon price, so `pick_catalog_icon` sets the art with no rental and no debit for a
+  comped member (otherwise the catalog would be the one thing the comp missed), and
+  `_rent_perk_flow` no-ops the purchase for a comped clicker (the icon picker's
+  **Custom** entry reaches that flow directly, past the shop buttons the comp hides).
+- **Known gap:** a role change made while the bot is down is missed by the listener, so
+  an ex-mod keeps the projected role until the next reconcile touches them (any shop or
+  role-studio action). The entitlement itself is already correct; only the projected
+  Discord role lags.
+
+**Rental engine:** hourly billing loop → debit on `next_bill_at` → on failed debit,
+**36h grace with hourly retries and one DM at entry** → revoke on expiry (`lapsed`),
+re-purchasable. Anniversaries are **no-drift** (each renewal advances `next_bill_at` by
+exactly one week off the scheduled time, so downtime never shifts the billing day) and a
+multi-week catch-up after downtime charges **once**, not once per missed week.
+**Suspension** (a guild losing `ROLE_ICONS`/Enhanced Role Styles mid-rental) **pauses
+both the billing clock and the visual**: no charge accrues while suspended and the
+perk auto-resumes cleanly (re-projected, clock restarted) when the feature returns.
+**Take a Break** pauses the same way: rentals whose *beneficiary* is
+the member are paused at break start and resumed on return
+(`set_beneficiary_rentals_paused`), only for perks whose gate still passes. The
+suspension sweep skips a break-taker's rentals, and `apply_role_perks` keeps the
+role off while the break row exists (see `docs/specs/take_a_break_spec.md`).
+Restart-safe exactly-once via claim-before-side-effect on the rental row
+(`games.scheduled_service` pattern: state is advanced before the Discord side-effect),
+with feature-loss re-projection and transition-only DMs handled as post-commit effects.
+Dashboard cancel (admin, `POST /economy/rentals/{id}/cancel`): an **active** rental
+runs to the end of the paid week (no refund); a **grace** rental is canceled
+immediately and best-effort de-projects the role (§12). Leave/ban = immediate cancel +
+cleanup (member-remove listener), covering both rentals the member owns and gift
+rentals where they are the beneficiary.
+
+**Member self-service refund** (shop panel or `/bank shop` → 🧾 Your Rentals →
+**Cancel & Refund**): the payer (not
+just a gift's beneficiary) can end an **active** rental immediately and get back the
+pro-rated unused time, `floor(price × remaining / WEEK_SECONDS)`
+(`rentals.prorated_refund`), with no fee and no minimum holding period. A **grace** rental
+refunds 0 (the last debit already failed) but still cancels now rather than waiting
+for `force`-cancel. Either way the perk is stripped right away, through a shared
+`revoke_perk_effect` dispatcher (`economy/loop.py`, also used by the billing loop's
+own lapse/period-end handling) reverts the voice-style channel or re-projects/deletes
+the personal role; a failure there is logged and swallowed (`finalize_refund`), same
+as the billing loop's own guard, since the refund itself already committed and must
+not fail the interaction. Exactly-once via the terminal `state` transition itself, no
+separate "refunded" flag needed. Ledger kind: `rental_refund`. Two rentals are
+**excluded from self-refund** at the `list_refundable_rentals`/`refund_rental` level
+(`economy.rentals_service._refund_ineligible_reason`, shared with the single-row
+`get_refundable_rental` the confirm step uses): one an admin already
+**force-canceled** (`cancel_at_period_end` set with no refund intended; a
+self-refund would silently reverse that decision) and a **sponsored emoji** rental
+(its own lifecycle/refund bookkeeping lives in `economy.emoji_service`, never this
+generic path). A held, unconsumed **streak shield** refunds in full (the price
+actually paid, snapshotted in `econ_streaks.shield_price` at purchase, not the
+guild's current price) via `refund_streak_shield`, ledger kind
+`streak_shield_refund`; a shield already held when `shield_price` shipped (migration
+114) backfills as 0 and falls back to the guild's *current* price rather than hiding
+the refund option or crediting nothing (the true historical price is unrecoverable
+for those). **Raffle tickets are excluded**: they're entries in a shared weighted
+drawing, so refunding one would need to un-enter the member and reshuffle everyone
+else's odds; `buy_tickets` keeps its documented no-refund policy.
+
+## 7. Member Surface
+
+- **Discord is the entire v1 member surface** (decided; the member-facing dashboard
+  wallet page and role studio are v2). One top-level group **`/bank`** (`wallet`,
+  `pay`, `quests`, `shop`, `store`, `gift`, `emoji`, `role`, `mute`, `grant` [mod],
+  `auction` [mod]; the economy panel and the shop panel are posted from Economy → Settings → Post to Discord)
+  and rooms-stage `/room …` keeps the bot's top-level command budget flat. Command
+  names are global; all *strings* inside are currency-branded.
+  - **`/bank wallet`**: the member's own balance on an ephemeral, bare
+    Components V2 card (`wallet.build_wallet_layout`): a `##`
+    title of the wallet's name, the balance and a 🛡️ line when a streak
+    shield is held (the guild's currency icon, where set, as the heading's
+    thumbnail), then **Recent Activity** (last ten ledger rows), **Active
+    Rentals** and **🎰 At the Tables** under `###` captions, each behind a
+    large separator and the last two only when non-empty. Each section is
+    `fit_lines`-capped so the three together stay inside the message-wide
+    budget. The economy panel's **Wallet** button opens the same card.
+  - **`/bank pay @member amount`**: transfer (§5); **`/bank store`**: the
+    shop opened straight on 🎁 Specials (and refusing by name where the guild
+    stocks nothing); **`/bank shop`**: the section chooser, the channel
+    panel's buttons on an ephemeral, bare card
+    (`build_shop_chooser_layout`): a gray **Browse** per stocked section
+    and **🧾 Your Rentals → Manage**, a blurb where the panel lists stock.
+    Each button opens one section as its own ephemeral Components V2 card
+    (§6) that both browses and configures (split by section), so the ◀/▶ arrows walk only that
+    section's pages (`shop.section_book`; in practice only a Specials run past
+    ten items has a second page) and a section that has closed since the
+    panel was posted refuses by name ("That part of the shop is closed right
+    now") rather than serving another shelf. **🧾 Your Rentals**
+    (`SECTION_YOURS`, not a shelf: `shop_sections` never emits it) gathers
+    the member's owned rows from every shelf with their own buttons, a held
+    streak shield, and the **Cancel & Refund** row, which lives there only;
+    it is always on the panel because the panel is member-agnostic, and it
+    keeps a rental reachable after its shelf stops selling it. Each
+    self-perk is one `Section` with **always** a three-line Text Display
+    (`**Name**` bold and alone, a
+    one-line description underneath from `perks.PERK_BLURBS`, then
+    `-# 🪙 50/wk · ✅ owned` as subtext), each of the three lines separately
+    held to `shop_layouts.MAX_ROW_CHARS` (30, since it's a line's own width
+    that pushes a wide accessory button onto its own line on a phone, whether
+    or not the line wraps) beside its own Button,
+    whose label is held to the tighter `core.layout.MAX_ACCESSORY_LABEL`
+    (10, e.g. "🖌️ Browse" not "Browse Colors") for the same reason, in
+    `SELF_PERKS`
+    order (no price-tier grouping), with the viewer's balance in the card's
+    own `## ` heading and the renewal fine print in the `-#` page line.
+    Unrented rows carry an emoji-led **Rent** button, rented rows a green
+    **customize** button opening the matching modal (name / color hex /
+    gradient hexes / server-emoji icon), except holographic, a fixed preset
+    with nothing to pick, whose rented row shows an inert **Active** button
+    instead. A rented, customizable row's note reads "✅ owned" (holographic's
+    inert row reads "✅ active" instead); an icon or palette row with a
+    catalog configured swaps that note for the catalog's own size ("N + custom",
+    "N colors") whether rented or not, unless the perk is feature-gated, in
+    which case the row's note is the same "❌ not available" gate reason every
+    other gated row shows, same as a gated row's button staying disabled: a
+    disabled row always explains itself over reporting the catalog's size.
+    A fresh rental's post-rent receipt
+    carries the same customize button. Entitlements are beneficiary-based,
+    so a *gifted* perk surfaces exactly like a self-rented one (customize
+    button, "✅ owned" note). When the member has anything to cancel (a
+    live rental they PAID for, or a held streak shield), the section carries a
+    single **Cancel & Refund** row, its own accessory labeled **↩️ Refund**
+    (short to fit `MAX_ACCESSORY_LABEL`; the row's title is
+    the fuller "Cancel & Refund"): one entry point rather than a
+    second button per owned row. It opens a picker of everything cancellable
+    with its refund preview, each row two lines (the perk's name, then what
+    comes back as `-#` subtext), then a danger-styled **Yes, Cancel &
+    Refund**/Back gate (§6) before the perk ends and the pro-rated (or, for
+    a shield, full) amount is credited back. **`/bank gift
+    @member perk:<choice>`**:
+    pay to rent a friend any self-perk at its base price (eager role creation
+    on the recipient); feature-gated perks check the guild gate, and gifting
+    a perk the friend already has stops at an explicit "Gift anyway?" confirm
+    (the rental would stack silently).
+  - Each modal setter applies the matching rented component to the member's personal
+    role (§6), re-checking entitlements on submit, subject to the blocklist and
+    feature gates (there is no ΔE color gate). Emoji icons accept **this server's custom emojis only** (typed
+    `:name:` or pasted; the bot stores the emoji's image; animated refused).
+    The typed name matches the server's exact casing first, then
+    case-insensitively (an exact-case-only match would make every mixed-case
+    emoji, `:monkaS:` or `:peepoHappy:`, unreachable by the short name
+    members actually type; the pasted form matches by id).
+  - **`/bank role icon image:`** is the one surviving subcommand: modals can't take
+    file uploads, so image icons (256KB max) still arrive via slash command. The
+    former `name`/`color`/`gradient` subcommands are removed in favor of the shop's
+    modals.
+- **How-it-works guide (shipped):** four
+  **topics**: 🔔 Notifications (the panel's own 🔔 toggle for the opt-in DM
+  role), 💰 Earning (aligned what-pays-what
+  rows in the leaderboard's fixed-width-cell style, then the XP→coin line
+  when `xp_per_coin > 0`, naming `conversion_daily_cap` when set, or the
+  `/bank quests` line when it isn't), 🛍️ Spending (`/bank shop`, `/bank gift`,
+  and `/bank pay` only while `transfers_enabled`), and 🔥 Streaks & perks (the
+  streak line and weekly rentals always; the shield, the booster bonus and the
+  hoard tax each only while its dial is on). Each topic is a one-line gist
+  and a full body, built by `economy/guide.py::guide_topics(settings)` on
+  every render (never a module constant), so a guild with every optional
+  dial off still gets four topics that read sensibly, and none promises a
+  dial that is off.
+
+  A single all-at-once guide is too much, so the gists
+  are **on the economy panel** and the detail is one pick away. Two routes
+  reach the **ephemeral guide card** (a bare Components V2 card,
+  `build_guide_layout`, `GuideCardView`; no box, no banner; the guild's
+  `currency_icon_url`, when set, sits beside its title as the old embed's
+  thumbnail did, the wallet card's treatment):
+  - the panel's **📖 How it works** block, after the board: the four gists
+    and a **Learn more about…** dropdown (persistent custom_id
+    `econ_guide_topic`, `show_guide_topic`), whose pick opens the card at
+    that topic. A persistent select keeps showing the member's pick and
+    Discord sends nothing for re-picking it, so each pick schedules an
+    in-place panel redraw 8 s later (`PanelsMixin.schedule_panel_reset`,
+    coalesced per guild, `repost_if_missing=False`) that puts the
+    placeholder back; the casino's **Pick a table…** pays the same way.
+    A pick naming a topic that no longer exists answers with a ❌ line;
+  - the gray **Help** beside the title (`show_guide`, static custom_id
+    `econ_guide_howto`, the id the ❓ **How it Works** button carried before
+    the panel took the hub's shape, so older posted panels still route), which opens the card at its overview: the
+    gists and the dropdown, no topic open. It never shows the whole guide
+    at once.
+
+  The card carries its own dropdown and redraws **in place** on every pick
+  (`edit_message`, the same view instance, so its 10-minute expiry timer is
+  the live one), which also resets the dropdown so the same topic can be
+  re-picked. Every render (the first and each pick after it) reads
+  `EconSettings` fresh, so the card can never quote last week's payouts.
+  A pick whose settings read or redraw fails answers with a private ❌
+  line and leaves the card as it was, never Discord's bare "This
+  interaction failed".
+  It is not a posted channel panel of its own.
+
+  Its ids outlived the old panel: `econ_guide_channel_id` / `econ_guide_message_id` are
+  now **the economy panel's** ids (see the panel below), because the message
+  they name is the one the merge kept. Both remain bot-managed and not
+  dashboard-editable.
+
+  The 🔔 **Notifications** toggle (`toggle_notify`) moved with it, onto the panel's button row,
+  keeping its custom_id `econ_guide_notify` so clicks on messages posted before
+  the merge still route.
+- **Shop panel (shipped):** posted from **Economy → Settings → Post to Discord on the dashboard (there is no slash command)** [admin].
+  It is a bare `ShopPanelView` card (Components V2, §6), opening on the guild's
+  **panel banner** and closing on its **panel footer** when either is set
+  in **Config → Branding → Panel Art** (none by default;
+  `build_shop_panel_layout(banner_url=…, footer_url=…)`, read together with
+  `resolve_panel_art_conn` and repainted at once by the dashboard's
+  `panel_art_change` dispatch; the ephemeral shop pages it opens never
+  carry either, guide § Media; with Panel Art's **Title
+  in the Banner** switch on, "Perk Shop" is drawn into the banner and the
+  `##` heading line goes, `title_in_banner=True`; change the art on the
+  dashboard, not in `branding_config`, because only its save repaints). The card has the
+  **hub's shape** and is bare: no `Container`, because the panel art's frame
+  sits at the picture's edge (style guide § No container, § Media). The panel
+  has one row per section. Under the intro, each
+  stocked section gets a line, then a `###` caption over that section's `-#`
+  blurb (`SECTION_BLURBS`, the chooser's own line). The sections come from
+  `shop.shop_sections` read with no member, so every reader sees the same
+  rows as the chooser. The rows describe the
+  section (bug-list row 260) rather than listing names of what it sells; the stock is
+  one tap away on Browse. An empty shop says
+  "_Nothing is for sale right now._". Each section's row is a `Section`
+  with its own gray **Browse** beside it (`econ_shop_open:<section>`,
+  inline buttons with each section), opening just
+  that section privately; after a last line, **🧾 Your Rentals** with a
+  `-#` blurb and a gray **Manage** (`econ_shop_open:yours`) opens the
+  clicker's rentals, always present. Which sections show changes when an admin changes stock, so
+  every dashboard save that can change it (economy settings, the store
+  editor, the color catalog) dispatches `shop_stock_change` and the cog
+  repaints the panel through its sticky. A gray **Help**
+  sits beside the `## 🛍️ Perk Shop` title (static custom_id
+  `econ_shop_help`; beside the intro instead when the title is drawn into
+  the banner) and on the `/bank shop` chooser: it reads the guild's `shop`
+  doc at click time (`docs.help_card.load_doc_body` with
+  `shop_layouts.SHOP_HELP_DOC_KEY`) and answers privately with
+  `docs.help_card.build_doc_help_layout`, no allowed mentions, the doc's own
+  heading lifted into a `## 🛍️` title. A guild with no `shop` doc gets one
+  line saying there is no shop FAQ yet. The doc is found by its key, so
+  **renaming `shop` on the dashboard disconnects the button**. Nothing priced
+  (the panel is member-agnostic: a price can differ by reader, and the
+  section one tap away is both fuller and correct for whoever opens it).
+  `cog_load` re-registers `ShopPanelView()` with every shelf listed, so a
+  posted panel's subset is always routed (including one from the split by
+  section, whose Browse per shelf carried the same ids), and
+  `_LegacyShopOpenView()` for the single `econ_shop_open` button. A
+  shelf button serves the clicker's own copy of that one section
+  (`open_shop_section`, the same code path `/bank shop`'s chooser rows
+  use), so rent, customize and Cancel & Refund exist on both surfaces by
+  construction, and everything is re-read at click time (the panel can
+  outlive a re-pricing). **Pre-split panels** carried a single 🛍️ Open Shop
+  (`econ_shop_open`, as did the brief foot-row Browse; it opens the
+  chooser), and older ones one `ShopRentButton` per perk (`DynamicItem`,
+  `econ_shop_panel:<perk>`); both now open the section chooser, and a
+  repost replaces them. Panel ids persist as
+  `econ_shop_channel_id` / `econ_shop_message_id` (guide-panel pattern:
+  same-channel repost edits in place, card **and** view; another channel
+  deletes + reposts). **Bottom-sticky:** like the economy panel, a member
+  message in the panel's channel arms `shop_panel` (a `core.sticky.StickyPanel`)
+  through the shared `_restick_panels` listener, which debounces and
+  delete-reposts fresh at the bottom so the one panel members are meant to
+  tap never scrolls away. The repost re-derives sections through
+  `_build_shop_panel`, the same builder `post_shop_panel` uses, so a
+  re-stick can't serve a staler panel than a fresh post from
+  Economy → Settings would. Gifting stays command-only (`/bank gift` needs a
+  target member, which a button can't carry).
+- **The economy panel (shipped, live):** posted from Economy → Settings → Post
+  to Discord (one poster, `economy-panel`: the guide and leaderboard panels are one;
+  there is no `/bank post-leaderboard`). A single live Components V2 card
+  (`economy/bank_panel_layout.py`) titled *"{plural} — The Bank"*, the
+  economy's centerpiece and its only permanent surface.
+  **Paradigm 8 (live board) in the hub's frame** (style guide § Controls:
+  board, then a row), bare (no `Container`),
+  opening on the guild's **panel banner** and closing on its **panel footer**
+  when either is set in **Config → Branding → Panel Art**, the title drawn
+  into the banner when **Title in the Banner** is on (the `##` heading then
+  goes and **Help** moves beside the intro line; needs a banner). A gray
+  **Help** sits beside the title and opens the how-it-works guide above;
+  one intro line follows, because the panel's home is the how-it-works
+  channel and the reader arriving may be a newcomer. The embed's currency
+  thumbnail is gone: a Section holds one accessory, and the title's is Help.
+  The text is `leaderboard.panel_sections`; the layout only frames it.
+  Content, top to bottom: top 5 earners over a rolling 7 days (income = positive
+  ledger sums excluding `transfer_in`, matching the Statistics page) each
+  annotated **(+N today)**; community-goal progress bars, where each auto goal's
+  title carries an italic per-kind flavor line (`quests.TRIGGER_FLAVOR`,
+  warm copy like "*every word keeps the fire crackling*"; falls back to the
+  functional `TRIGGER_KINDS` label for a kind without one, since titles stay
+  descriptive and the flavor is the uplift); auto weeklies add
+  a tier-secured marker once the first tier is banked (no marker before
+  that, to keep the panel from reading as a numeric checklist), contributor
+  count, today's contribution delta (from `econ_kind_activity`; omitted for
+  channel-scoped goals the scope-blind activity ledger can't measure), and a
+  week-end deadline clock; a **quest-board summary** with one
+  line per board cadence ("**N** on your board, drawn from M" + reward
+  range; a cadence sized 0 or with an empty pool is omitted) rather than the
+  full pool, since members only ever face their personal draw; board-less
+  "Anytime" (event) quests get no section (a surprise payout rather than a
+  listed menu), and the ⚡ spotlight line keeps its "until" clock; then the
+  **reset line** (dailies-reset and new-weeklies clocks as Discord relative
+  timestamps, ticking client-side between edits), pointing at **Show My
+  Quests**; an **anonymous live
+  feed** of today's paid completions
+  aggregated per quest (title × count + latest relative timestamp, max 5
+  lines, plus a full-board-bonus count; titles and counts only, never member
+  names, per the ticker decision); and **Night at the Tables**
+  only on a week with casino play.
+  **There is no "Today's pulse" block:** the coins-paid / quests /
+  earners counts are not shown, and the two reset clocks sit under the quest
+  board they reset.
+  **Goals and the board share one heading** (`BOARD_HEADING`, "📋 Quest Board
+  & Community Goals"): two adjacent headings read as two competing
+  boards when both answer "what is there to do". Goals lead, the cadence
+  summary follows. A V2 message has one 4,000-character budget rather than a
+  per-field cap, so the board is held to `BOARD_CHAR_BUDGET` (1,800): trailing
+  blocks drop whole, with an "…and N more" count, instead of the old
+  "… (cont.)" fields.
+  The panel's one button row sits at the foot of the card, above the ⚡ Live
+  stamp. It is the whole member-facing economy surface, which is what let the
+  guide panel go. The **📖 How it works** block (the guide's four gists and
+  its **Learn more about…** dropdown, § How-it-works guide above) sits
+  between the board and the row. `EconomyPanelView` (in the cog) binds all
+  five ids through `core.layout.bind`; a registration instance is added at
+  cog load:
+  **Show My Quests**
+  (`econ:show_my_quests`, `quest_views.open_my_quests`) opening the same
+  ephemeral panel as `/bank quests`
+  (the members' door from the anonymous board into their own personal draw),
+  **Wallet** (`econ:show_my_wallet`, `open_wallet`) opening the same card as `/bank
+  wallet` via the shared `send_wallet_panel`, and **🔔 Notifications**
+  (`econ_guide_notify`); **Help** (`econ_guide_howto`) is beside the title.
+  The affordance
+  belongs on a button, not in the board's text.
+  Each section is a `###` heading over a small table with fixed-width inline-code cells
+  align the columns (earner name | amount, quest
+  cadence | description | payment, feed title | count | when) while
+  emoji, bold, and live `<t:…:R>` timestamps stay outside the backticks,
+  where Discord still renders them (code blocks would freeze both). Panel ids persist as
+  `econ_guide_channel_id` / `econ_guide_message_id`, the guide's pair, kept
+  because the merged panel *is* the guide's old message (same-channel repost
+  edits in place, another channel deletes + reposts).
+  `econ_leaderboard_channel_id` / `econ_leaderboard_message_id` do not exist
+  (deleted by migration 191).
+
+  **Refresh is event-driven:** every economy credit
+  (`apply_credit`), community-counter bump, and dashboard progress edit
+  marks the guild dirty in `economy/live_signal.py` (process-local,
+  import-free), and `leaderboard_live_loop` (20 s poll) repaints a dirty
+  panel at most once per 120 s, so the panel moves within ~2 minutes of
+  the action while a busy hour stays ≤30 edits. The hourly economy-loop
+  pass (`run_guild_leaderboard`) remains the backstop for restarts and
+  quiet drift. **Bottom-sticky:** a member message in
+  the panel's channel arms a debounced repost (`_restick_leaderboard_panel` →
+  `_place_leaderboard_panel`, delete + repost fresh at the bottom, 6 s
+  debounce, per-guild lock), so the stats panel stays the channel's last
+  message. Because a re-stick changes the message id, the loop's 404 handler
+  re-reads the id and only clears when it's unchanged; a moved panel is not
+  a deleted one, so deleting the message (id still stored) is still how staff
+  retire it. Collector + builder in
+  `economy/leaderboard.py` (pure; Discord I/O stays in the cog/loops);
+  ids are bot-managed and not dashboard-editable.
+- **Manager surface (dashboard):** the **Economy** nav section, gated on
+  `economy_manager_role_id` or admin (mirrors `games_editor_role` /
+  `require_game_host`). Under its Operations heading: **Bank** (grant (the
+  panel sends `member_id` as a string to keep
+  snowflake precision, and the endpoint 404s any id not in the guild's
+  member cache so a bad id can't credit a phantom wallet), **remove**,
+  rentals, ledger audit), **Statistics**, and admin-only
+  **Settings** (wiring and branding, hidden from non-admin
+  managers since its endpoints require admin). Under Earning: **Income Sources**
+  (trigger switches + faucet rates), **Quests** (library, authoring, community
+  progress and manual Settle), **Claims** (the pending
+  sign-off queue with Approve/Deny + a state filter over paid/denied/expired
+  history), **Mention Awards** and the admin-only **QOTD** page. Under Spending:
+  **Approvals** (every queue waiting on a person), admin-only **Shop & Perks**
+  (what is on sale, catalogs, custom items) and admin-only **Pricing** (every price
+  and rate). Under Wagering: **Casino** and **Pools**. It is the dashboard
+  counterpart to the `[mod]` `/bank grant` command. The
+  home dashboard's **Moderation tile** also surfaces the pending-claims
+  count (+ latest claimant/quest) via the `/api/home` moderation group, so
+  waiting sign-offs are visible without opening the Economy section.
+- **Remove Currency (`POST /api/economy/remove`)** is grant's mirror on the
+  Bank page: same manager gate, same string `member_id` + member-cache
+  404, same "economy disabled" 409, and a confirm dialog before it fires.
+  Two deliberate asymmetries: it applies **no booster multiplier** (a removal
+  is a correction, not an earning, so a booster must not be penalized 1.5x for
+  the same offense), and it **clamps at a zero balance** rather than refusing
+  or going negative, so the response reports `removed` alongside the
+  `requested` amount and the resulting `balance`, and the panel says "Removed
+  N (all they had)" when they differ. The clamp is `remove_currency` in
+  `economy.service` (`apply_debit` stays all-or-nothing for purchases); the
+  route rides `open_db_immediate` so the balance read can't be clamped against
+  a stale snapshot (and a wallet drained between the read and the debit yields
+  0, never an overstated figure). `admin_remove` joins `qa_void` in
+  `stats.BURN_EXCLUDED_KINDS`: it is a clawback, not spending, so it must not
+  put a member atop the "biggest spenders" board or inflate their `spent_7d`
+  velocity for having had coins taken off them. It is *not* excluded from the
+  pools mint/burn line, where the question is whether currency was destroyed,
+  and it was. Every removal writes an `admin_remove` ledger row for the
+  amount actually taken, with the actor and the typed reason; a no-op removal
+  from an empty wallet writes nothing at all.
+- **Role customization in v1** happens inside `/bank shop`'s ephemeral panel:
+  customize buttons opening modals (name / color hex / gradient / server-emoji
+  icon), plus `/bank role icon` for image uploads, proxied through the bot.
+- **v2 member dashboard:** wallet page (`require_perms(set())` like the home page;
+  balance, XP-today, streak + grace, quests, rentals with next-bill countdown, 30-day
+  history, mute toggle) and a role studio panel with live preview.
+
+## 8. Private Rooms (Stage 6)
+
+As V3 §8 (owner as landlord: invite cap 25, block list persisting across re-rentals,
+rename/topic/NSFW/slowmode/user-limit/bitrate/lock, Manage Messages+Threads inside,
+mods retain disclosed view access), built on existing machinery:
+
+- **Voice rooms:** Voice Control's owner registry, capped-FIFO trust/block lists
+  (`_add_target_with_cap`), pure overwrite planner (`plan_initial_overwrites`), and
+  startup reconciliation planner are reused/generalized.
+- **Text rooms:** Pen Pals' category-scoped private channel creation.
+- **Lapse:** text rooms archived 14 days then deleted using the hidden-channels
+  overwrite snapshot/restore (`serialize_overwrites`/`rebuild_overwrites`); voice rooms
+  deleted immediately.
+- NSFW flag inherits guild verification gates (never bypasses ID verification,
+  consistent with the Voice Control NSFW dial).
+
+## 9. Metrics & Per-Guild Tuning
+
+Every rate, price, and scaling parameter is editable in the Economy config panels
+(admin): conversion rate, login bases, streak cap, milestone amounts, all perk prices,
+quest reward bands, booster multiplier. XP coefficients remain on the existing XP config
+surface.
+
+Home dashboard gains an **Economy Metrics tile** (widget-registry entry + `tiles/`
+module): median & p90 weekly income, minted vs burned, faucet mix, rental uptake &
+churn, streak health, and **pricing hints** ("solid color ≈ 50% of median weekly
+income") computed from the ledger and shown beside each price field on the Pricing
+page.
+
+**Shipped (Stage 4).** A **weekly rollup** runs at the guild-local ISO-week roll
+(inside the same loop transaction as the weekly rotation / community settlement) and
+writes one immutable `econ_metrics_weekly` row per (guild, closed week), idempotent on
+its `(guild_id, iso_week)` primary key. Each row records, over the closed week:
+median / p90 income across **earners only** (positive credits, `transfer_in`
+excluded; transfers move currency, they neither mint nor burn), **minted** (positive
+credits ex-`transfer_in`) vs **burned** (`|negative|` ex-`transfer_out`), the
+**faucet mix** (minted share per group: logins / activity / quests / games / grants,
+`{}` when nothing minted), rental **holders / live / ended** (churn via the new
+`econ_rentals.ended_at`, stamped on every termination path), and streak health
+(`streaks_7plus`, `grace_used`). The admin-only home tile (`source: "economy"`,
+Health category) shows the latest week with a **week-over-week net-mint arrow**
+(minted − burned, direction only, needs ≥ 2 weeks); before the first rollup it shows a
+"rollup pending" empty state. **Pricing hints** are `round(median weekly income ×
+fixed per-perk factor)` served from `GET /api/economy/metrics` and rendered under each
+price field on the Pricing page; advisory only (no enforcement), and `{}` until the
+first rollup lands.
+
+**"Happening now" (Statistics page, top card).** The live quest pulse
+(`GET /api/economy/quests/live` → `compute_live`, manager-gated,
+45 s panel auto-refresh): the running community weekly(ies) as hero cards,
+one per active concurrency lane (§4.3), up to 2 at once, each with a
+progress bar, %, 40/70/100 tier chips, contributor count, daily-bucket
+pace flag "on track"/"needs a push", and time to the week roll (or a gap-week
+note when a lane is empty). Per-quest **anonymous** completion counts for the
+current period of
+every active daily/weekly/monthly quest (+ counted-quest in-flight counts),
+event-quest totals (7d / ever), quests-done-today / this-week tickers, and
+day/week reset countdowns. Aggregates only, never member names
+(by decision). The leaderboard card mirrors this live view in-channel; see
+the economy panel bullet in §7 for its content and its event-driven
+refresh (a tier-crossing bump repaints the panel within ~2 minutes, not on
+the next hourly tick).
+
+**Statistics page (Economy section).** A live, on-demand tuning surface
+(`GET /api/economy/stats`, gated on `require_economy_manager`, so manager
+role or admin; `limit` sets the member table's size and is refused outside 1-500),
+complementing the weekly rollup with a same-instant read of the ledger.
+
+**Every figure is scoped to members active in the last 30 days**, meaning those with a
+`member_activity.last_message_at` inside the trailing 30-day window (the same
+`active_member_ids` population the `active_members` count reports). A member who
+has gone quiet or left the guild still owns a wallet and a ledger history, but
+counting them would let a departed whale inflate supply and Gini, pad the member
+and spender tables with dead accounts, and distort flow / income / spender
+figures, so they are dropped from *every* section, not just the engagement
+counts. Transfer pairs require **both** parties active. The active set is
+materialized once into a temp table and every per-user query joins to it.
+
+It shows: **supply concentration** (total supply,
+holder count, median balance, top-10% share, and Gini, all computed over **positive
+balances only**, which measures inequality of who-holds-what rather than the zero-balance long tail); a
+fixed-bucket **balance histogram**; an **income-sources stacked bar** of minted coins
+per faucet group (logins / activity / quests / games / grants, the same `FAUCET_GROUPS`
+split the rollup's `faucet_mix` uses) across the last **8 trailing 7-day buckets**, so the
+*composition* of income and how it shifts week to week is visible at a glance (`transfer_in`
+excluded, same as every other mint figure); **7-day flow** (minted vs burned with a burn
+rate, plus transfer volume and grants (money definitions match the rollup: mint /
+income exclude `transfer_in`, burn excludes `transfer_out`)); a **per-member income
+velocity table** (top holders by balance) with 7/30-day income, coins/day, 7d spend
+(**every** sink kind, not just `rental`; it read rentals-only until consumables
+shipped), top faucet group, live rentals, streak, and last-earned; **engagement** (earner
+ratio (7d earners ÷ 30d active), spenders, quest claims, **quest approval rate**
+(resolved paid ÷ paid+denied over 30d, resolved-only), and **hoard-weeks** (median
+balance ÷ latest-rollup median weekly income)); **perk affordability** in days of
+median daily income per price field; the **biggest spenders board** (top 15 by
+**lifetime** currency burned, with each member's share of the guild's whole burn
+and the sink they spend most on); and the **top 5 transfer pairs** (30d, by
+`transfer_out` magnitude) as the alt-funnel audit surface for transfer abuse (§12).
+All ratios/divides are guarded (0 or `null` when there is no denominator).
+
+The spenders board is deliberately **all-time, not a trailing window**; its job
+is to make spending a standing status worth chasing, and a 7-day window would
+erase that standing every week. (The *time* window stays lifetime; only the
+page-wide 30-day-active scope applies, so a member who has since left drops off,
+but an active member's old spend still counts.) Burn excludes `transfer_out` (sideways: the coins
+land in another wallet, so nothing leaves the economy) and `qa_void` (a staff
+clawback is a real removal but not a purchase, and crediting it would rank
+someone top for having had a reward revoked). Shares are computed against the
+guild's **total** burn, not the sum of the visible rows, so the top-15 cut can't
+inflate its own percentages; ties break on user id so the table doesn't reshuffle
+between refreshes.
+
+## 10. Notifications
+
+DM-first via a shared `try_dm`-style helper; on failure, fall back to the bank channel.
+Per-member mute toggle via `/bank mute` (`econ_notify_prefs`; also surfaces on the v2
+wallet page). The dm_perms system is
+member-to-member consent and does **not** gate bot DMs, so there is no interaction there.
+
+| Event | Notify |
+|---|---|
+| Daily login digest (streak + quest recap, §3.1) | DM (opt-in role) |
+| Quest approved / denied (with reason) | Register channel, no DM (§4.2, §10.1) |
+| Rental grace entered / lapsed | DM |
+| Daily XP→currency conversion | Silent (ledger) |
+| Sign-off claims, community settlements | Mods' todo board (sign-offs); community host DM and Event Echo (community goals, §4.3) |
+
+### 10.1 Register channel (public transaction feed)
+
+`econ_register_channel_id` (dashboard: **Economy → Settings → Register Channel**)
+turns on a running public feed of the guild's currency movements, a bank
+register. Unset (`0`) is off; the picker **is** the toggle. It is deliberately
+a *separate* channel from `bank_channel_id`: the bank channel is the
+interactive approval surface (ceiling alerts, DM fallback), and posting
+register entries there would double up every signed-off quest. The
+register is also where a **denial or expiry** is announced
+(see the sign-off bullet in §4), which is the one thing in the feed that does
+not come from the ledger drain.
+
+**Source: the ledger, not the call sites.** The feed drains `econ_ledger` by
+`id`. Since `apply_credit` / `apply_debit` are the only paths that mutate a
+wallet, draining the ledger catches every movement (quest payouts, community
+settlements, rentals and renewals, transfers, milestones, QOTD, game rewards,
+and staff grants from both `/bank grant` and the dashboard) with no
+per-call-site hook to forget.
+
+**What it does NOT post** (`register.SKIP_KINDS`): `login` and `conversion` are
+the automated per-member faucets: they fire once per active member and all
+land together at the day roll, so posting them would bury every quest, purchase
+and transfer under a nightly burst of routine noise. They still hit the ledger,
+the wallet, and the metrics rollup; they are simply not news. `transfer_in` is
+skipped because a transfer writes two rows for one event: the register posts the
+`transfer_out` leg as a single consolidated "A → B" entry (unsigned: there is no color
+to carry the point on a Components V2 card, so the currency-moved-sideways
+signal is the missing +/− sign alone) with the sender's resulting balance. `admin_remove` (§ manager
+surface) is skipped on a privacy call rather than a noise one: broadcasting "we
+took N coins off <member>" to the whole server is a different act from
+celebrating a grant, and the Bank page's Ledger Audit already records it
+for staff. It keeps its `_KIND_DISPLAY` entry, so the member still sees
+"🧾 Removed by staff" in their own wallet history.
+
+**Anonymous quest payouts are never posted.** A payout for a quest whose `trigger_kind` is in
+`quests.ANON_KINDS` (confession, confession_reply, whisper, ama_ask,
+guess_post, pen_pal, pen_pal_complete) is dropped from the drain entirely:
+`register._anon_quest_ids` resolves the guild's anon quests and the collector
+excludes any row whose `meta.quest_id` matches, covering all three quest ledger
+kinds (`quest`, `quest_community`, `quest_community_bonus`).
+
+The quest id is not enough on its own, because a claim writes more than its own
+payout in the same transaction. `maybe_pay_set_bonus` credits `quest_bonus` with
+no quest id at all ("🎉 Quest board clear"), and `_fire_daily_completion` ticks
+the weekly `daily_complete` progression, whose payout carries *that* quest's id
+rather than the suppressed one. Either would post at the exact second the
+suppressed payout was hidden for: the timing correlation restated, one hop out,
+and for `guess_post` still naming the round's answer. So `claim_quest` derives
+an `anon` flag (its own kind, or inherited from the claim that triggered it) and
+stamps `meta.anon = 1` on everything it writes downstream, including the payout
+itself; the collector drops any stamped row whatever its kind. Stamping the
+payout too is deliberate belt-and-braces: `_anon_quest_ids` resolves quests
+live, so deleting an anon quest would otherwise let its undrained rows surface. A card reading
+"**X** earned *Send a Whisper*" posts seconds after the anonymous whisper lands
+in its feed, so the pair names the sender by timing correlation, the exact
+deanonymization the silent auto-claim exists to prevent. Redacting the title
+would not be enough: the member is still named at the telltale moment, so the
+row has to go. The credit is unaffected on every **private** surface: the
+member's own `/bank quests` log and `/bank wallet` read the ledger directly and never
+route through the register, so a quiet payout never reads as a missing one.
+
+The set covers two harms. **Anonymity**: the member acted under a name the
+surface hides: `confession`, `confession_reply`, `whisper`, `ama_ask` (AMA
+questions post anonymously and the trigger fires immediately after, so the card
+names the asker by the same timing correlation). **Correlation**: the payout is
+public but pairing it with a second signal reveals what neither shows alone:
+`pen_pal` and `pen_pal_complete` fire for *both* halves of a pairing in one
+transaction, so two adjacent cards name not just who was matched but who *with*,
+while the room itself defaults to `room_visibility: admin`.
+
+`guess_post` is neither, and is the sharpest case: in Guess Who the submitter
+**is** the answer (both call sites pass `answer_id=submitter_id`), so "**X**
+earned *Submit a Guess Who Round*" hands the room the solution before anyone
+guesses. Unsuppressed, it spoils live rounds; the suppression is drain-time, so cards already posted stay
+posted.
+
+Deliberately *not* suppressed, recorded so the next audit doesn't re-litigate
+them: `whisper_guess` (the guesser is the whisper's recipient, and the whisper
+cog already posts "@target solved the whisper!" to the same feed by name);
+`guess` (the guesser is never the answer, and the card names no round, so it
+reveals participation and nothing about the picture); `guess_win` (fires on the
+solve, which simultaneously edits the round into a public embed naming answer,
+submitter and solver); `bio_set` and `birthday_set` (both save data the bot then
+publishes itself, such as a bio post or a birthday announcement, and the `preference`
+column on `member_birthdays` is a gift wish, not a privacy dial).
+
+The skip list and the anon filter are both applied **in SQL, before the LIMIT**;
+filtering after it would let a midnight flood of login rows fill the batch and
+starve the entries anyone wants to read. For the anon filter the stake is
+higher than starvation: the drain cursor only advances over rows the collector
+*returns*, so a batch filtered to empty in Python would park the cursor, re-read
+the same rows every tick, and stall the feed permanently. Balance reconstruction
+still walks the *unfiltered* rows: a skipped login (or a suppressed whisper
+payout) between two posted entries moved the wallet, and ignoring it would print
+arithmetic that doesn't add up.
+
+**Completions only.** A ledger row exists only once a transaction has happened,
+so there is no per-tick progress spam. A counted quest's entry shows the final
+tally instead ("Daily Chatterbox (5/5)"); for a *banded* quest the tally is the
+member's own `effective_target`, resolved via the claim's period, never the
+library's raw `target_count`, which no member necessarily worked to.
+
+**Each entry says what it was for** (`register.render_memo`): `kind` + the
+`meta` blob become a human memo, and a `quest` row resolves `meta.quest_id` to
+the quest's title (the Venmo memo line). Every kind has a memo; an unknown
+future kind degrades to its title-cased name rather than rendering blank.
+The Components V2 card (`build_register_entry_layout`, `economy/register.py`, a
+**paradigm 7 (receipt)** card) carries no accent, so the credit-vs-debit signal lives entirely in the glyph and the
+leading +/− sign on the amount. Nothing here reads as ambiguous without the
+color; it was reinforcement, not the only tell. The trailing `-#` line
+carries the balance that row produced, reconstructed per row (the live wallet
+balance would be wrong for every entry but the last).
+
+**Cursor.** `econ_register_cursor_id` is bot-managed bookkeeping (like the
+`*_message_id` fields; readable via `GET /economy/config`, absent from the
+editable whitelist). `-1` means "never seeded": the first drain seeds it to the
+ledger's current `MAX(id)` and posts nothing, so switching the feed on never
+replays history. `-1` rather than `0` because `0` is a legitimate seeded cursor
+for a guild whose ledger is still empty, and conflating them would re-seed past
+that guild's first-ever transaction and swallow it. The cursor advances only
+over rows actually posted (or deliberately skipped), and only after the sends
+land, so a crash mid-drain replays the un-posted tail rather than losing it: at
+worst a duplicate entry, never a silent gap. A `Forbidden` (missing perms)
+leaves the cursor for a later retry.
+
+## 11. Scheduled Work
+
+Two loops, both registered via `bot.startup_task_factories` (each gets
+`_resilient_task` crash-restart). The main economy loop ticks hourly; the
+**register loop** (§10.1) ticks every `REGISTER_INTERVAL_SECONDS` (30s) because
+a transaction entry is only useful while it is still news; the hourly tick
+would batch a day's activity into lumps an hour apart. The register drain is
+capped at `REGISTER_MAX_PER_TICK` (8) entries per guild per tick so a burst (a
+community settlement paying dozens of members at once) spills into later ticks
+instead of hammering the channel's rate limit, and skips rows older than
+`REGISTER_STALE_SECONDS` (1h), since a backlog after downtime is noise, not news.
+
+The hourly economy loop:
+
+| On tick | Action |
+|---|---|
+| Guild-local day rolled | XP→currency conversion (only the most recent marked local day, with no retroactive backlog after an outage, §12); streak evaluation (grace/reset); daily quest rotation; QOTD reward window closes |
+| Every tick (hourly) | Rental billing + grace retries; pending-claim expiry; emoji-sponsor pending-review expiry (auto-refund); pin, themed-day and bounty expiry sweeps (§3.4); (v2) spotlight expiry; (rooms stage) room archive/purge |
+| Guild-local ISO week rolled | Weekly quest activation; community settlement; raffle draw (§6); demurrage sweep (§6); metrics rollup; (v2) spotlight inventory reset |
+
+The **coin-drops loop** (§3.5) is its own startup task on a 60 s tick:
+expiry sweep first, then the per-guild jittered drop scheduler. Its
+next-due times are deliberately in-memory; a restart just re-jitters each
+guild's next drop, and open pouches survive because their Claim button is
+a stateless `DynamicItem`.
+
+A second, lightweight startup task, `leaderboard_live_loop`, gives the
+economy panel its near-real-time cadence: a 20 s poll over the
+process-local dirty-guild set (`economy/live_signal.py`, marked by
+`apply_credit` / community bumps / dashboard progress edits), repainting each
+dirty panel at most once per 120 s. Deliberately in-memory: a mark lost to a
+restart costs at most one hour, because the hourly tick refreshes every
+panel anyway (§7).
+
+Event-driven (no polling): login + reaction XP on existing `events.cog` listeners;
+voice login on the existing voice-XP tick; game payouts at `end_game`/duel resolution;
+boost multiplier read live from `premium_since` at credit time (no flag to maintain);
+member leave/ban cleanup on the existing member-remove listener.
+
+All periodic actions are idempotent via per-period dedup rows: a restart replays
+nothing and misses nothing (catch-up on next tick).
+
+## 12. Edge Cases
+
+- Guild-local midnight (not UTC) removes V3's mid-hangout flip. `tz_offset_hours` has
+  no DST; acceptable, documented.
+- Voice login across midnight: a qualifying member in VC at 00:05 local gets the new
+  day's voice login, which is intended.
+- Grace gaming: rolling 7-day window; miss/login/miss still resets.
+- Transfer abuse: audit stream + per-guild toggle.
+- Sign-off re-claim loops: one pending at a time; deny history on the claim card.
+- Community payout scope: active-in-30-days (`member_activity`); a "contributors only"
+  tickbox is v2.
+- Reaction farming: one `reaction_given` award per (message, reactor), ever.
+- Wallets are integer; XP remainders carry as fractions on conversion rows only.
+- Multi-day outage: the conversion loop converts only the most recent marked local day
+  and jumps forward; intervening days' XP is not converted retroactively (prevents
+  backlog minting when a guild re-enables the economy; same trade the games scheduler
+  makes).
+- Game participation payouts cover 20 of 23 games: the six duel games,
+  ttl/traditional/legitlibs, and the 11 party cogs whose rosters were enriched in
+  Stage 2. ffa and fantasies stay excluded by design (anonymous submissions);
+  photo pays via the `photo_post` faucet (§4.5, on the post itself), not `end_game`.
+- Guild loses Level 2 / Enhanced Role Styles mid-rental: perk enters grace as if unpaid?
+  No: billing pauses the affected perk (icon/gradient) and DMs the owner; auto-resumes
+  when the feature returns (no charge while suspended).
+- **Dashboard grace-cancel de-projection (Stage 3):** the billing loop only walks *live*
+  (active/grace) rentals, so a manager force-cancelling a **grace** rental (which lands
+  it in `cancelled` at once) would otherwise leave the Discord role projected. The
+  cancel endpoint reconciles best-effort post-commit (`revoke_role_perks` on the
+  *beneficiary*, guarded on a ready bot, failures swallowed+logged, `role_updated`
+  reported); an active-rental cancel just sets `cancel_at_period_end` and de-projects at
+  the anniversary. A DB write always lands even if the Discord cleanup can't run.
+- **Suspend at anniversary (Stage 3):** if a perk is suspended (feature lost) exactly as
+  its `next_bill_at` comes due, the billing clock is frozen, so on resume the perk can be
+  billed immediately (the anniversary is already in the past). Benign: the member owed
+  that week's rent regardless and was not charged while the visual was suspended;
+  documented rather than special-cased.
+
+## 13. V2 (committed) & Parking Lot
+
+**V2 (committed, not parked; decided):** member wallet dashboard page · role studio
+panel with live preview · spotlight slots.
+
+**Parking lot** (unchanged from V3 unless noted): auto-tracked quest criteria
+(delivered: §4.4 trigger words plus the full §4.5 trigger-kind table:
+`photo_post`, `game_win`, `duel_win`, `active_day`, and the rest; nothing
+here remains parked) ·
+fines/tickets (Jail exists; integration stays parked by design call) ·
+room upgrades · streak-rental discount ·
+seasonal drops (live auctions, §3.4, and coin drops, §3.5, have shipped) · per-quest contributors-only payout · scheduled/auto
+QOTD · soundboard-sound sponsorship (the emoji-sponsorship machinery pointed
+at soundboard slots; build only if emoji lands well). *Delivered by sinks
+round 3: giveaway entries (as the weekly raffle) and emoji
+sponsorship; see §6.*

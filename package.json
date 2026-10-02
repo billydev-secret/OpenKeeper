@@ -1,0 +1,153 @@
+{
+  "name": "dungeon-keeper",
+  "private": true,
+  "devDependencies": {
+    "axe-core": "4.13.0",
+    "eslint": "8.57.1",
+    "stylelint": "16.14.1",
+    "stylelint-config-standard": "37.0.0"
+  },
+  "eslintConfig": {
+    "env": {
+      "browser": true,
+      "es2022": true
+    },
+    "parserOptions": {
+      "ecmaVersion": "latest",
+      "sourceType": "module"
+    },
+    "extends": "eslint:recommended",
+    "ignorePatterns": [
+      "src/web_server/static/vendor/**"
+    ],
+    "globals": {
+      "Chart": "readonly",
+      "Hammer": "readonly"
+    },
+    "rules": {
+      "no-unused-vars": [
+        "warn",
+        {
+          "argsIgnorePattern": "^_"
+        }
+      ],
+      "no-empty": [
+        "error",
+        {
+          "allowEmptyCatch": true
+        }
+      ],
+      "no-inner-declarations": "off",
+      "no-restricted-properties": [
+        "error",
+        {
+          "object": "window",
+          "property": "confirm",
+          "message": "Use confirmDialog() from ui.js — themed, focus-trapped and keyboard-accessible, and it looks like every other confirmation on the dashboard. A native confirm() is none of those."
+        },
+        {
+          "object": "window",
+          "property": "prompt",
+          "message": "Use promptDialog() from ui.js."
+        },
+        {
+          "object": "window",
+          "property": "alert",
+          "message": "Use toast() from ui.js, or showStatus() when the message belongs beside a control."
+        },
+        {
+          "object": "globalThis",
+          "property": "confirm",
+          "message": "Use confirmDialog() from ui.js."
+        },
+        {
+          "object": "globalThis",
+          "property": "prompt",
+          "message": "Use promptDialog() from ui.js."
+        },
+        {
+          "object": "globalThis",
+          "property": "alert",
+          "message": "Use toast() from ui.js."
+        },
+        {
+          "object": "self",
+          "property": "confirm",
+          "message": "Use confirmDialog() from ui.js."
+        },
+        {
+          "object": "self",
+          "property": "prompt",
+          "message": "Use promptDialog() from ui.js."
+        },
+        {
+          "object": "self",
+          "property": "alert",
+          "message": "Use toast() from ui.js."
+        }
+      ],
+      "no-restricted-globals": [
+        "error",
+        {
+          "name": "confirm",
+          "message": "Use confirmDialog() from ui.js. (window.confirm is banned too — this catches the bare call.)"
+        },
+        {
+          "name": "prompt",
+          "message": "Use promptDialog() from ui.js."
+        },
+        {
+          "name": "alert",
+          "message": "Use toast() from ui.js."
+        }
+      ],
+      "no-restricted-syntax": [
+        "error",
+        {
+          "selector": "CallExpression[callee.name='fetch']",
+          "message": "Network goes through api.js (api/apiPost/apiPut/apiDelete), which owns the credentials, the error envelope and the 401 redirect. A bare fetch() re-invents all three, differently."
+        },
+        {
+          "selector": "MemberExpression[object.name=/^(?:window|globalThis|self)$/][property.name='fetch']",
+          "message": "Network goes through api.js — see the bare fetch() rule."
+        },
+        {
+          "selector": "NewExpression[callee.name='XMLHttpRequest']",
+          "message": "Network goes through api.js."
+        },
+        {
+          "selector": "NewExpression[callee.property.name='XMLHttpRequest']",
+          "message": "Network goes through api.js — see the bare XMLHttpRequest rule."
+        }
+      ]
+    }
+  },
+  "stylelint": {
+    "extends": "stylelint-config-standard",
+    "rules": {
+      "rule-empty-line-before": null,
+      "at-rule-empty-line-before": null,
+      "comment-empty-line-before": null,
+      "declaration-block-single-line-max-declarations": null,
+      "declaration-block-no-redundant-longhand-properties": null,
+      "color-function-notation": null,
+      "alpha-value-notation": null,
+      "no-descending-specificity": null,
+      "no-duplicate-selectors": null,
+      "property-no-vendor-prefix": null,
+      "font-family-name-quotes": null,
+      "selector-class-pattern": null,
+      "media-feature-range-notation": null,
+      "declaration-property-value-keyword-no-deprecated": null,
+      "declaration-property-value-no-unknown": null,
+      "declaration-block-no-duplicate-properties": [
+        true,
+        {
+          "ignore": [
+            "consecutive-duplicates-with-different-values"
+          ]
+        }
+      ]
+    }
+  }
+}

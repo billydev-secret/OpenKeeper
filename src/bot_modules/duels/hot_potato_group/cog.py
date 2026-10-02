@@ -1,0 +1,401 @@
+"""Hot Potato (group) cog — pass-the-bomb for 2..N players with progressive elimination."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import Bot
+
+import asyncio
+import json
+import logging
+import random
+import time
+
+import discord
+from discord import app_commands
+
+from bot_modules.core.background import spawn
+from bot_modules.core.utils import allow_pings
+from bot_modules.duels.base_game import BaseGame
+from bot_modules.duels.filters import game_is_nick_stake
+from bot_modules.games.command_groups import games
+from bot_modules.shared.name_resolver import resolve_name_from
+
+from . import db as hpgdb
+from .game import (
+    HotPotatoGroupGame,
+    bravest,
+    cumulative_hold_times,
+    next_holder_clockwise,
+    shake_emoji,
+)
+from .layouts import build_holding_layout, build_result_layout
+from .views import PassGroupLayoutView
+
+log = logging.getLogger("dungeonkeeper.hot_potato_group")
+
+
+class HotPotatoGroupGameCog(BaseGame, name="HotPotatoGroupCog"):
+
+    GAME_KEY = "hot_potato_group"
+    # "(Group)" everywhere it renders: the duel is also "Hot Potato", and a
+    # refusal, lobby ping or audit-log reason naming the wrong one was
+    # unreadable (duels-party-120).
+    GAME_DISPLAY_NAME = "Hot Potato (Group)"
+
+    def __init__(self, bot: Bot) -> None:
+        super().__init__(bot)
+        self._timers: dict[int, asyncio.Task] = {}
+
+    hotpotatogroup = app_commands.Group(
+        name="hotpotatogroup",
+        description="Hot Potato (Group) — pass the bomb round the circle before it blows!",
+    )
+
+    # ── DB hooks ──────────────────────────────────────────────────────────────
+
+    async def _db_get_game(self, game_id: int) -> HotPotatoGroupGame | None:
+        return await hpgdb.get_game(self.db, game_id)
+
+    async def _db_write_state(self, game_id: int, state: str, **kw) -> None:
+        await hpgdb.set_game_state(self.db, game_id, state, **kw)
+
+    async def _db_create_lobby(
+        self, guild_id: int, channel_id: int, host_id: int, stakes_text: str | None,
+        nick_stake: bool = False,
+    ) -> int:
+        return await hpgdb.create_lobby(
+            self.db, guild_id, channel_id, host_id, stakes_text, nick_stake
+        )
+
+    async def _db_fetch_active_games(self) -> list[HotPotatoGroupGame]:
+        return await hpgdb.fetch_active_games(self.db)
+
+    async def _db_fetch_lobby_games(self) -> list[HotPotatoGroupGame]:
+        return await hpgdb.fetch_lobby_games(self.db)
+
+    async def _db_fetch_resolved_games(self) -> list[HotPotatoGroupGame]:
+        return await hpgdb.fetch_resolved_games(self.db)
+
+    async def _db_fetch_sweepable(self, now: float) -> list[HotPotatoGroupGame]:
+        return await hpgdb.fetch_sweepable_games(self.db, now)
+
+    async def get_lobby_params(self, guild_id: int) -> tuple[int, int]:
+        cfg = await hpgdb.get_config(self.db, guild_id)
+        return int(cfg["min_players"]), int(cfg["max_players"])
+
+    # ── Timer helpers ─────────────────────────────────────────────────────────
+
+    def _cancel_timer(self, game_id: int) -> None:
+        task = self._timers.pop(game_id, None)
+        # _detonate reaches here from inside the detonate task; cancelling the
+        # running task would land on its next await and drop the rest.
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _run_detonate_timer(self, game_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self._detonate(game_id)
+        except asyncio.CancelledError:
+            pass
+
+    async def _detonate(self, game_id: int) -> None:
+        """Fuse expired: current holder is eliminated. Re-round or resolve."""
+        resolved = False
+        async with self._get_lock(game_id):
+            game = await hpgdb.get_game(self.db, game_id)
+            if not game or game.state != "ACTIVE" or game.holder_id is None:
+                return
+
+            now = time.time()
+            loser = game.holder_id
+
+            new_log = list(game.pass_log)
+            if new_log and new_log[-1].get("passed_at") is None:
+                new_log[-1] = {**new_log[-1], "passed_at": now}
+
+            new_alive = [u for u in game.alive if u != loser]
+            new_elim = list(game.elimination_order) + [loser]
+
+            if len(new_alive) <= 1:
+                winner = new_alive[0] if new_alive else loser
+                game.alive = new_alive
+                game.elimination_order = new_elim
+                game.pass_log = new_log
+                await self._db_set_state(
+                    game_id, "ACTIVE",
+                    alive=json.dumps(new_alive),
+                    elimination_order=json.dumps(new_elim),
+                    pass_log=json.dumps(new_log),
+                    last_action_at=now,
+                )
+                await self._post_group_result(game, winner, loser)
+                resolved = True
+            else:
+                cfg = await hpgdb.get_config(self.db, game.guild_id)
+                fuse = random.uniform(cfg["min_fuse"], cfg["max_fuse"])
+                next_holder = next_holder_clockwise(game.alive, loser)
+                new_log.append(
+                    {"holder_id": next_holder, "received_at": now, "passed_at": None}
+                )
+                await self._db_set_state(
+                    game_id, "ACTIVE",
+                    round=game.round + 1,
+                    alive=json.dumps(new_alive),
+                    elimination_order=json.dumps(new_elim),
+                    holder_id=next_holder,
+                    fuse_seconds=fuse,
+                    phase_started_at=now,
+                    pass_log=json.dumps(new_log),
+                    last_action_at=now,
+                )
+                guild = self.bot.get_guild(game.guild_id)
+                game2 = await hpgdb.get_game(self.db, game_id)
+                if guild and game2 and game2.message_id:
+                    view = self.build_game_view(game_id)
+                    view.render(self.render_game_state(game2, guild))
+                    await self._edit_message_silent(
+                        game2.channel_id, game2.message_id, layout=view,
+                    )
+                channel = self.bot.get_channel(game.channel_id)
+                if guild and channel:
+                    lm = guild.get_member(loser)
+                    nh = guild.get_member(next_holder)
+                    ln = (
+                        discord.utils.escape_markdown(lm.display_name)
+                        if lm else str(loser)
+                    )
+                    nn = (
+                        discord.utils.escape_markdown(nh.display_name)
+                        if nh else str(next_holder)
+                    )
+                    try:
+                        await channel.send(  # type: ignore[union-attr]
+                            f"💥 BOOM! **{ln}** is out. ({len(new_alive)} left) "
+                            f"🔁 **{nn}** is holding now."
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                task = asyncio.create_task(self._run_detonate_timer(game_id, fuse))
+                self._timers[game_id] = task
+
+        if resolved:
+            self._cancel_timer(game_id)
+            self._game_locks.pop(game_id, None)
+
+    # ── Game hooks ────────────────────────────────────────────────────────────
+
+    async def on_game_start(self, game: HotPotatoGroupGame) -> None:
+        cfg = await hpgdb.get_config(self.db, game.guild_id)
+        fuse = random.uniform(cfg["min_fuse"], cfg["max_fuse"])
+        now = time.time()
+        holder = random.choice(game.alive)
+        init_log = json.dumps([{"holder_id": holder, "received_at": now, "passed_at": None}])
+        await self._db_set_state(
+            game.id, "ACTIVE",
+            round=1,
+            holder_id=holder,
+            fuse_seconds=fuse,
+            phase_started_at=now,
+            pass_log=init_log,
+            last_action_at=now,
+        )
+        task = asyncio.create_task(self._run_detonate_timer(game.id, fuse))
+        self._timers[game.id] = task
+
+    async def on_game_resume(self, game: HotPotatoGroupGame) -> None:
+        if not game.phase_started_at or not game.fuse_seconds:
+            spawn(self._detonate(game.id), label="hot potato group detonate", logger=log)
+            return
+        now = time.time()
+        remaining = (game.phase_started_at + game.fuse_seconds) - now
+
+        channel = self.bot.get_channel(game.channel_id)
+        if channel:
+            mentions = " ".join(f"<@{u}>" for u in game.alive)
+            try:
+                await channel.send(  # type: ignore[union-attr]
+                    f"🔄 Bot restarted — Hot Potato (Group) resuming. {mentions}",
+                    allowed_mentions=allow_pings(users=game.alive),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        if remaining <= 0:
+            spawn(self._detonate(game.id), label="hot potato group detonate", logger=log)
+        else:
+            task = asyncio.create_task(self._run_detonate_timer(game.id, remaining))
+            self._timers[game.id] = task
+
+    async def on_game_resolved(self, game_id: int) -> None:
+        self._cancel_timer(game_id)
+
+    async def on_player_left(self, game: HotPotatoGroupGame, user_id: int) -> None:
+        """A leaver who was holding the bomb hands it to the next player in
+        the circle; the fuse keeps burning. Without this the round pointed
+        at someone who was gone and nobody could pass until it blew — and
+        the detonation would have eliminated the leaver a second time."""
+        if game.holder_id != user_id:
+            return
+        now = time.time()
+        # ``alive`` no longer has the leaver, so walk the roster order with
+        # them still in it: the bomb goes to whoever sat after them.
+        circle = [u for u in game.roster if u in game.alive or u == user_id]
+        new_holder = next_holder_clockwise(circle or game.alive, user_id)
+        new_log = list(game.pass_log)
+        if new_log and new_log[-1].get("passed_at") is None:
+            new_log[-1] = {**new_log[-1], "passed_at": now}
+        new_log.append({"holder_id": new_holder, "received_at": now, "passed_at": None})
+        await self._db_set_state(
+            game.id, "ACTIVE",
+            holder_id=new_holder,
+            pass_log=json.dumps(new_log),
+            last_action_at=now,
+        )
+        guild = self.bot.get_guild(game.guild_id)
+        fresh = await hpgdb.get_game(self.db, game.id)
+        if guild and fresh and fresh.message_id:
+            view = self.build_game_view(game.id)
+            view.render(self.render_game_state(fresh, guild))
+            await self._edit_message_silent(
+                fresh.channel_id, fresh.message_id, layout=view,
+            )
+        await self._announce_to_channel(
+            game.id,
+            f"🔁 **{self._member_label(guild, new_holder)}** is holding now.",
+        )
+
+    def render_game_state(
+        self, game: HotPotatoGroupGame, guild: discord.Guild
+    ) -> list[discord.ui.Item[Any]]:
+        def name(uid: int) -> str:
+            return resolve_name_from(uid, guild=guild)
+
+        elapsed = max(0.0, time.time() - game.phase_started_at) if game.phase_started_at else 0.0
+        emoji = shake_emoji(elapsed, game.fuse_seconds or 0.0)
+
+        return build_holding_layout(
+            game.alive,
+            game.elimination_order,
+            game.holder_id,
+            emoji,
+            game.stakes_text,
+            name_fn=name,
+        )
+
+    def render_result_state(
+        self,
+        game: HotPotatoGroupGame,
+        guild: discord.Guild,
+        *,
+        imposed_nick: str | None = None,
+        original_name: str | None = None,
+        self_apply_nick: str | None = None,
+        sentence_hours: int | None = None,
+        **_kwargs,
+    ) -> list[discord.ui.Item[Any]]:
+        def name(uid: int) -> str:
+            return resolve_name_from(uid, guild=guild)
+
+        # original_name is unused here on purpose: the composed result card
+        # (BaseGame._result_layout) already names both winner and loser
+        # ahead of this content, so these items describe the outcome
+        # without re-naming either of them (guide § Mentions) — a role
+        # noun stands in for the shared nick_*_copy helpers' "who" instead
+        # of a resolved name. self_apply_nick/imposed_nick are typed text (a
+        # nickname) and go over raw: the helpers escape the nick themselves,
+        # because the same value is written to Discord as a real nickname.
+        nick_line: str | None = None
+        if self_apply_nick:
+            nick_line = "🏷️ " + self.nick_self_apply_copy(
+                "the loser", self_apply_nick, sentence_hours
+            )
+        elif imposed_nick:
+            nick_line = "🏷️ " + self.nick_applied_copy(
+                "The loser", imposed_nick, sentence_hours
+            )
+        elif game_is_nick_stake(game):
+            nick_line = "⏳ " + self.awaiting_nick_copy("The winner", sentence_hours)
+
+        end_ts = game.resolved_at or time.time()
+        holds = cumulative_hold_times(game.pass_log, end_ts)
+        bid = bravest(holds)
+
+        return build_result_layout(
+            len(game.roster),
+            game.stakes_text or self.nick_forfeit_copy(sentence_hours),
+            bravest_id=bid,
+            bravest_seconds=holds.get(bid, 0.0) if bid is not None else 0.0,
+            nick_line=nick_line,
+            name_fn=name,
+        )
+
+    def build_game_view(self, game_id: int) -> PassGroupLayoutView:
+        return self._frame(PassGroupLayoutView(game_id, self._handle_group_button), game_id)
+
+    async def handle_interaction(
+        self, interaction: discord.Interaction, game: HotPotatoGroupGame
+    ) -> tuple[str, int | None]:
+        uid = interaction.user.id
+
+        if uid not in game.alive:
+            await interaction.followup.send(
+                "You're not in this game (or you're already out).", ephemeral=True
+            )
+            return ("rejected", None)
+        if uid != game.holder_id:
+            await interaction.followup.send("You're not holding the bomb!", ephemeral=True)
+            return ("rejected", None)
+
+        cfg = await hpgdb.get_config(self.db, game.guild_id)
+        now = time.time()
+        if game.pass_log:
+            last = game.pass_log[-1]
+            if last.get("holder_id") == uid and last.get("received_at") is not None:
+                if now - last["received_at"] < cfg["min_hold"]:
+                    await interaction.followup.send(
+                        f"Hold it a moment — you can pass after {cfg['min_hold']:.0f}s.",
+                        ephemeral=True,
+                    )
+                    return ("rejected", None)
+
+        new_holder = next_holder_clockwise(game.alive, uid)
+        new_log = list(game.pass_log)
+        if new_log and new_log[-1].get("passed_at") is None:
+            new_log[-1] = {**new_log[-1], "passed_at": now}
+        new_log.append({"holder_id": new_holder, "received_at": now, "passed_at": None})
+
+        await self._db_set_state(
+            game.id, "ACTIVE",
+            holder_id=new_holder,
+            pass_log=json.dumps(new_log),
+            last_action_at=now,
+        )
+        game.holder_id = new_holder
+        game.pass_log = new_log
+        return ("continue", None)
+
+    # ── Slash commands ────────────────────────────────────────────────────────
+
+    @hotpotatogroup.command(name="start", description="Open a Hot Potato (Group) lobby")
+    @app_commands.describe(
+        stakes="Optional custom stakes text (max 200 chars)",
+        wager="Optional coin wager — every player antes this; winner takes the pot",
+        nickname="Also stake nicknames? The winner renames the loser (default: only when nothing else is staked)",
+    )
+    async def hpg_start(
+        self,
+        interaction: discord.Interaction,
+        stakes: str | None = None,
+        wager: int | None = None,
+        nickname: bool | None = None,
+    ) -> None:
+        await self._base_lobby(interaction, stakes, wager, nickname)
+
+async def setup(bot: Bot) -> None:
+    cog = HotPotatoGroupGameCog(bot)
+    await bot.add_cog(cog)
+    bot.tree.remove_command("hotpotatogroup")
+    games.add_command(cog.hotpotatogroup)

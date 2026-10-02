@@ -1,0 +1,1497 @@
+"""Tests for bot_modules.analytics.activity_graphs.
+
+The module is large (~1170 statements) and at ~21% coverage before this
+file.  Strategy: cover pure helpers,
+DB query helpers, and smoke-test PNG renderers.  Renderers are smoke-
+tested for matplotlib PNG magic; pixel content is not validated.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.analytics.activity_graphs import (
+    DropoffProfile,
+    _append_exclusions,
+    _percentile,
+    _BUCKET_BUILDERS,
+    _day_buckets,
+    _DOW_LABELS,
+    _hour_buckets,
+    _HOD_LABELS,
+    _month_buckets,
+    _strftime_expr,
+    _week_buckets,
+    _WINDOW_LABELS,
+    OVERLAY_SMOOTH_WINDOW,
+    OverlayChart,
+    OverlayResult,
+    overlay_labels,
+    overlay_period_cap,
+    overlay_period_start,
+    overlay_stride_days,
+    overlay_weekday_name,
+    week_start_indices,
+    query_activity_overlay,
+    query_dropoff_profiles,
+    query_greeter_response_times,
+    query_message_activity,
+    query_message_histogram,
+    query_message_rate_drops,
+    query_xp_activity,
+    query_xp_activity_with_breakdown,
+    query_xp_histogram,
+    query_xp_histogram_with_breakdown,
+    render_activity_chart,
+    render_greeter_response_chart,
+    render_join_histogram,
+    render_level_histogram,
+    render_overlay_panel,
+    render_mod_stats_panel,
+    query_xp_all_time_with_breakdown,
+    PresenceSeries,
+    StackedBarChart,
+    smooth_series,
+    split_provisional,
+)
+from tests.db_template import migrated_db
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+# ── Shared fixtures ──────────────────────────────────────────────────
+
+
+@pytest.fixture
+def db_conn(tmp_path):
+    """A migrated SQLite connection ready for activity-graph tests."""
+    path = tmp_path / "ag.db"
+    migrated_db(path)
+    with open_db(path) as conn:
+        yield conn
+
+
+# ── Bucket builders ──────────────────────────────────────────────────
+
+
+def test_hour_buckets_returns_24_entries():
+    now = datetime(2026, 5, 31, 12, 30, tzinfo=timezone.utc)
+    buckets, start_ts = _hour_buckets(now)
+    assert len(buckets) == 24
+    assert isinstance(start_ts, float)
+    # The last bucket label should be the current hour
+    assert buckets[-1][1].startswith("Sun")  # 2026-05-31 was Sunday
+
+
+def test_hour_buckets_keys_are_utc_strftime():
+    """Keys should match SQLite strftime('%Y-%m-%d %H', ...) format in UTC."""
+    now = datetime(2026, 5, 31, 12, 30, tzinfo=timezone.utc)
+    buckets, _ = _hour_buckets(now, utc_offset_hours=0)
+    # First key: 23 hours before noon on the 31st = 13:00 on the 30th
+    assert buckets[0][0] == "2026-05-30 13"
+    assert buckets[-1][0] == "2026-05-31 12"
+
+
+def test_hour_buckets_respects_utc_offset():
+    """Local labels should shift with utc_offset_hours, keys stay UTC."""
+    now = datetime(2026, 5, 31, 0, 0, tzinfo=timezone.utc)
+    buckets, _ = _hour_buckets(now, utc_offset_hours=5)
+    # Last label is in the user's local time (+5 from UTC midnight = 05:00)
+    assert buckets[-1][1].endswith("05:00")
+    # Last key is the UTC hour, so 00
+    assert buckets[-1][0].endswith(" 00")
+
+
+def test_day_buckets_returns_30_entries():
+    now = datetime(2026, 5, 31, 12, 0, tzinfo=timezone.utc)
+    buckets, start_ts = _day_buckets(now)
+    assert len(buckets) == 30
+    # 30 days back from now
+    span = now.timestamp() - start_ts
+    assert 29.5 * 86400 < span < 30.5 * 86400
+
+
+def test_week_buckets_returns_12_entries():
+    now = datetime(2026, 5, 31, 12, 0, tzinfo=timezone.utc)
+    buckets, _ = _week_buckets(now)
+    assert len(buckets) == 12
+    # Each key is an integer epoch (string repr)
+    for key, _label in buckets:
+        assert key.isdigit()
+
+
+def test_month_buckets_returns_12_entries():
+    now = datetime(2026, 5, 31, 12, 0, tzinfo=timezone.utc)
+    buckets, _ = _month_buckets(now)
+    assert len(buckets) == 12
+    for key, _label in buckets:
+        assert key.isdigit()
+
+
+def test_week_start_indices_land_on_monday_labels():
+    # A Thursday, so the marks cannot come out right by accident.
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    buckets, _ = _day_buckets(now)
+    marks = week_start_indices("day", now)
+    assert marks, "a 30-day window always contains at least four Mondays"
+    for i in marks:
+        # The label carries no year, so the bucket's own date is rebuilt from
+        # the window start rather than parsed back out of the label.
+        assert buckets[i][1] == (now - timedelta(days=29 - i)).strftime("%b %d")
+        assert (now - timedelta(days=29 - i)).weekday() == 0
+
+
+def test_week_start_indices_are_every_seventh_bar():
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    marks = week_start_indices("day", now)
+    assert all(b - a == 7 for a, b in zip(marks, marks[1:]))
+
+
+def test_week_start_indices_follow_the_viewer_offset():
+    # 23:30 UTC on a Sunday is already Monday for a reader 8 hours east, so
+    # the marks have to move with the offset the labels were built under.
+    now = datetime(2026, 5, 31, 23, 30, tzinfo=timezone.utc)
+    assert week_start_indices("day", now) != week_start_indices("day", now, 8)
+
+
+@pytest.mark.parametrize("resolution", ["hour", "week", "month", "hour_of_day"])
+def test_week_start_indices_empty_off_the_daily_view(resolution):
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    assert week_start_indices(resolution, now) == []
+
+
+def test_bucket_builders_dict_covers_four_resolutions():
+    assert set(_BUCKET_BUILDERS) == {"hour", "day", "week", "month"}
+
+
+def test_window_labels_cover_all_resolutions():
+    for r in ("hour", "day", "week", "month", "hour_of_day", "day_of_week"):
+        assert r in _WINDOW_LABELS
+
+
+# ── _strftime_expr ───────────────────────────────────────────────────
+
+
+def test_strftime_expr_hour_uses_calendar_buckets():
+    expr = _strftime_expr("hour")
+    assert "strftime" in expr
+    assert "%Y-%m-%d %H" in expr
+
+
+def test_strftime_expr_hour_applies_offset_secs():
+    expr = _strftime_expr("hour", utc_offset_secs=3600)
+    assert "+ 3600" in expr
+
+
+def test_strftime_expr_day_uses_rolling_window():
+    expr = _strftime_expr("day", since_ts=1000.0)
+    assert "86400" in expr
+    assert "1000.0" in expr
+
+
+def test_strftime_expr_week_uses_604800_seconds():
+    expr = _strftime_expr("week", since_ts=2000.0)
+    assert "604800" in expr
+
+
+def test_strftime_expr_month_uses_2592000_seconds():
+    expr = _strftime_expr("month", since_ts=3000.0)
+    assert "2592000" in expr
+
+
+# ── _append_exclusions ───────────────────────────────────────────────
+
+
+def test_append_exclusions_no_exclusions_unchanged():
+    params: list[object] = [1]
+    where = _append_exclusions("guild_id = ?", params, None, None)
+    assert where == "guild_id = ?"
+    assert params == [1]
+
+
+def test_append_exclusions_user_ids_adds_clause_and_params():
+    params: list[object] = [1]
+    where = _append_exclusions("guild_id = ?", params, {7, 8}, None)
+    assert "user_id NOT IN" in where
+    # The set order is non-deterministic but both ids must be appended
+    assert set(params) == {1, 7, 8}
+
+
+def test_append_exclusions_channel_ids_adds_clause_and_params():
+    params: list[object] = [1]
+    where = _append_exclusions("guild_id = ?", params, None, {42})
+    assert "channel_id IS NULL OR channel_id NOT IN" in where
+    assert 42 in params
+
+
+def test_append_exclusions_both_sets_apply():
+    params: list[object] = []
+    where = _append_exclusions("1=1", params, {1}, {2})
+    assert "user_id NOT IN" in where
+    assert "channel_id NOT IN" in where
+    assert set(params) == {1, 2}
+
+
+# ── DB seeding helpers ───────────────────────────────────────────────
+
+
+def _seed_messages(conn, guild_id=10, rows=None):
+    """rows: iterable of (message_id, channel_id, author_id, ts, reply_to, content).
+
+    The content slot is ignored: the bot stores no message text (migration 228).
+    """
+    for mid, cid, aid, ts, rep, _content in rows or []:
+        conn.execute(
+            "INSERT OR REPLACE INTO messages "
+            "(message_id, guild_id, channel_id, author_id, reply_to_id, ts)"
+            " VALUES (?,?,?,?,?,?)",
+            (mid, guild_id, cid, aid, rep, ts),
+        )
+
+
+def _seed_processed(conn, guild_id=10, rows=None):
+    """rows: iterable of (message_id, channel_id, user_id, created_at)."""
+    for mid, cid, uid, ts in rows or []:
+        conn.execute(
+            "INSERT OR REPLACE INTO processed_messages "
+            "(guild_id, message_id, channel_id, user_id, created_at, processed_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (guild_id, mid, cid, uid, ts, ts),
+        )
+
+
+def _seed_xp(conn, guild_id=10, rows=None):
+    """rows: iterable of (user_id, source, amount, created_at)."""
+    for uid, src, amt, ts in rows or []:
+        conn.execute(
+            "INSERT INTO xp_events (guild_id, user_id, source, amount, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (guild_id, uid, src, amt, ts),
+        )
+
+
+# ── query_message_activity ───────────────────────────────────────────
+
+
+def test_query_message_activity_empty_returns_zero_padded_lists(db_conn):
+    labels, msg_counts, member_counts = query_message_activity(
+        db_conn, guild_id=10, resolution="day"
+    )
+    assert len(labels) == 30
+    assert msg_counts == [0] * 30
+    assert member_counts == [0] * 30
+
+
+def test_query_message_activity_counts_messages_in_window(db_conn):
+    """Recent processed messages should be counted in the last day bucket."""
+    now_ts = datetime.now(timezone.utc).timestamp() - 60  # 1 min ago
+    _seed_processed(
+        db_conn,
+        rows=[
+            (1, 100, 7, now_ts),
+            (2, 100, 8, now_ts - 30),
+            (3, 100, 7, now_ts - 45),  # same author → 1 unique member for that row
+        ],
+    )
+    db_conn.commit()
+    labels, msgs, members = query_message_activity(
+        db_conn, guild_id=10, resolution="day"
+    )
+    assert len(labels) == 30
+    assert sum(msgs) == 3
+    assert max(members) >= 2  # at least the most-recent bucket sees both users
+
+
+def test_query_message_activity_filters_by_user(db_conn):
+    now_ts = datetime.now(timezone.utc).timestamp() - 60
+    _seed_processed(db_conn, rows=[(1, 1, 7, now_ts), (2, 1, 8, now_ts)])
+    db_conn.commit()
+    _, msgs, _ = query_message_activity(
+        db_conn, guild_id=10, resolution="day", user_id=7
+    )
+    assert sum(msgs) == 1
+
+
+def test_query_message_activity_filters_by_channel(db_conn):
+    now_ts = datetime.now(timezone.utc).timestamp() - 60
+    _seed_processed(
+        db_conn,
+        rows=[(1, 100, 7, now_ts), (2, 200, 7, now_ts)],
+    )
+    db_conn.commit()
+    _, msgs, _ = query_message_activity(
+        db_conn, guild_id=10, resolution="day", channel_id=100
+    )
+    assert sum(msgs) == 1
+
+
+def test_query_message_activity_honors_exclusions(db_conn):
+    now_ts = datetime.now(timezone.utc).timestamp() - 60
+    _seed_processed(
+        db_conn,
+        rows=[(1, 100, 7, now_ts), (2, 200, 8, now_ts)],
+    )
+    db_conn.commit()
+    _, msgs_excl_user, _ = query_message_activity(
+        db_conn, guild_id=10, resolution="day", exclude_user_ids={7}
+    )
+    _, msgs_excl_ch, _ = query_message_activity(
+        db_conn, guild_id=10, resolution="day", exclude_channel_ids={200}
+    )
+    assert sum(msgs_excl_user) == 1
+    assert sum(msgs_excl_ch) == 1
+
+
+def test_query_message_activity_hour_resolution_returns_24(db_conn):
+    labels, msgs, members = query_message_activity(
+        db_conn, guild_id=10, resolution="hour"
+    )
+    assert len(labels) == 24
+    assert msgs == [0] * 24
+
+
+# ── query_message_histogram ──────────────────────────────────────────
+
+
+def test_query_message_histogram_hour_of_day_returns_24(db_conn):
+    labels, counts = query_message_histogram(
+        db_conn, guild_id=10, resolution="hour_of_day"
+    )
+    assert labels == _HOD_LABELS
+    assert counts == [0] * 24
+
+
+def test_query_message_histogram_day_of_week_returns_7(db_conn):
+    labels, counts = query_message_histogram(
+        db_conn, guild_id=10, resolution="day_of_week"
+    )
+    assert labels == _DOW_LABELS
+    assert counts == [0] * 7
+
+
+def test_query_message_histogram_counts_messages(db_conn):
+    # Pick a ts at a known UTC hour
+    ts = int(datetime(2026, 5, 31, 14, 0, tzinfo=timezone.utc).timestamp())
+    _seed_processed(db_conn, rows=[(1, 100, 7, ts), (2, 100, 7, ts + 60)])
+    db_conn.commit()
+    _, counts = query_message_histogram(
+        db_conn, guild_id=10, resolution="hour_of_day"
+    )
+    assert counts[14] == 2
+
+
+def test_query_message_histogram_filter_by_channel_and_user(db_conn):
+    ts = int(datetime(2026, 5, 31, 14, 0, tzinfo=timezone.utc).timestamp())
+    _seed_processed(
+        db_conn,
+        rows=[(1, 100, 7, ts), (2, 200, 7, ts), (3, 100, 8, ts)],
+    )
+    db_conn.commit()
+    _, counts = query_message_histogram(
+        db_conn, guild_id=10, resolution="hour_of_day", channel_id=100, user_id=7
+    )
+    assert counts[14] == 1
+
+
+# ── query_xp_activity / xp_histogram ─────────────────────────────────
+
+
+def test_query_xp_activity_empty(db_conn):
+    labels, xps, members = query_xp_activity(
+        db_conn, guild_id=10, resolution="day"
+    )
+    assert len(labels) == 30
+    assert xps == [0.0] * 30
+    assert members == [0] * 30
+
+
+def test_query_xp_activity_sums_amounts(db_conn):
+    now_ts = datetime.now(timezone.utc).timestamp() - 60
+    _seed_xp(
+        db_conn,
+        rows=[(7, "text", 5.0, now_ts), (8, "voice", 2.5, now_ts)],
+    )
+    db_conn.commit()
+    _, xps, members = query_xp_activity(db_conn, guild_id=10, resolution="day")
+    assert sum(xps) == pytest.approx(7.5, abs=0.05)
+    assert max(members) == 2
+
+
+def _recent_utc_hour(hour: int) -> int:
+    """Yesterday at ``hour`` UTC — inside the histogram's 90-day window.
+
+    The window is measured from ``time.time()``, so a hard-coded date is a
+    time bomb: it passes when written and goes red weeks later with nobody
+    having touched the code (this pair detonated 2026-08-29, exactly 90 days
+    after the 2026-05-31 they pinned). Only the *hour* matters to an
+    hour-of-day bucket, so anchor the day to now and keep the hour fixed.
+    """
+    return int(
+        (datetime.now(timezone.utc) - timedelta(days=1))
+        .replace(hour=hour, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+
+
+def test_query_xp_histogram_sums_by_hour(db_conn):
+    ts = _recent_utc_hour(9)
+    _seed_xp(db_conn, rows=[(7, "text", 4.0, ts), (8, "text", 3.0, ts + 60)])
+    db_conn.commit()
+    _, counts = query_xp_histogram(
+        db_conn, guild_id=10, resolution="hour_of_day"
+    )
+    assert counts[9] == pytest.approx(7.0, abs=0.05)
+
+
+def test_query_xp_activity_with_breakdown_separates_sources(db_conn):
+    now_ts = datetime.now(timezone.utc).timestamp() - 60
+    _seed_xp(
+        db_conn,
+        rows=[(7, "text", 5.0, now_ts), (7, "voice", 3.0, now_ts)],
+    )
+    db_conn.commit()
+    _, totals, _, by_src = query_xp_activity_with_breakdown(
+        db_conn, guild_id=10, resolution="day"
+    )
+    assert sum(totals) == pytest.approx(8.0, abs=0.05)
+    assert "text" in by_src and "voice" in by_src
+    assert sum(by_src["text"]) == pytest.approx(5.0, abs=0.05)
+    assert sum(by_src["voice"]) == pytest.approx(3.0, abs=0.05)
+
+
+def test_query_xp_histogram_with_breakdown_separates_sources(db_conn):
+    ts = _recent_utc_hour(10)
+    _seed_xp(
+        db_conn,
+        rows=[(7, "text", 2.0, ts), (7, "reply", 1.0, ts + 60)],
+    )
+    db_conn.commit()
+    _, totals, by_src = query_xp_histogram_with_breakdown(
+        db_conn, guild_id=10, resolution="hour_of_day"
+    )
+    assert totals[10] == pytest.approx(3.0, abs=0.05)
+    assert by_src["text"][10] == pytest.approx(2.0, abs=0.05)
+    assert by_src["reply"][10] == pytest.approx(1.0, abs=0.05)
+
+
+# ── query_message_rate_drops ─────────────────────────────────────────
+
+
+def test_query_message_rate_drops_empty(db_conn):
+    drops = query_message_rate_drops(db_conn, guild_id=10, period_seconds=86400)
+    assert drops == []
+
+
+def test_query_message_rate_drops_identifies_users(db_conn):
+    """User 7 sends 10 in the previous half-window and 1 in the recent half."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    period = 3600  # 1 hour halves → 2 hour full window
+    prev_ts = now_ts - period - 60  # squarely in previous half
+    recent_ts = now_ts - 60
+    rows = []
+    mid = 1
+    for _ in range(10):
+        rows.append((mid, 100, 7, prev_ts))
+        mid += 1
+        prev_ts += 1
+    rows.append((mid, 100, 7, recent_ts))
+    _seed_processed(db_conn, rows=rows)
+    db_conn.commit()
+
+    drops = query_message_rate_drops(
+        db_conn, guild_id=10, period_seconds=period, min_previous=5
+    )
+    assert len(drops) == 1
+    uid, prev_count, recent_count = drops[0]
+    assert uid == 7
+    assert prev_count == 10
+    assert recent_count == 1
+
+
+def test_query_message_rate_drops_respects_channel_filter(db_conn):
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    period = 3600
+    prev_ts = now_ts - period - 60
+    recent_ts = now_ts - 60
+    rows = [(i, 200, 7, prev_ts + i) for i in range(1, 7)]  # 6 prev in channel 200
+    rows.append((100, 200, 7, recent_ts))  # 1 recent
+    rows.extend((200 + i, 100, 8, prev_ts + i) for i in range(6))  # noise channel
+    _seed_processed(db_conn, rows=rows)
+    db_conn.commit()
+
+    drops = query_message_rate_drops(
+        db_conn, guild_id=10, period_seconds=period, channel_id=200, min_previous=5
+    )
+    assert len(drops) == 1
+    assert drops[0][0] == 7
+
+
+# ── query_dropoff_profiles ───────────────────────────────────────────
+
+
+def test_query_dropoff_profiles_empty(db_conn):
+    profiles = query_dropoff_profiles(db_conn, guild_id=10, period_seconds=86400)
+    assert profiles == []
+
+
+def test_query_dropoff_profiles_target_user_returns_one(db_conn):
+    """Asking about a specific user returns a single profile even with no drop."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    period = 3600
+    prev_ts = now_ts - period - 60
+    _seed_processed(db_conn, rows=[(1, 100, 42, prev_ts)])
+    db_conn.commit()
+    profiles = query_dropoff_profiles(
+        db_conn, guild_id=10, period_seconds=period, target_user_id=42
+    )
+    assert len(profiles) == 1
+    assert isinstance(profiles[0], DropoffProfile)
+    assert profiles[0].user_id == 42
+
+
+def test_query_dropoff_profiles_returns_rich_metadata(db_conn):
+    """A user with messages in previous + recent windows gets a full profile."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    period = 86400  # 1 day halves
+    prev_ts = now_ts - period - 100
+    recent_ts = now_ts - 100
+
+    # Seed both processed_messages (for rate detection) and messages (for enrichment)
+    proc_rows = [(i, 100, 42, prev_ts + i) for i in range(10)]
+    proc_rows.extend((200 + i, 100, 42, recent_ts + i) for i in range(3))
+    _seed_processed(db_conn, rows=proc_rows)
+
+    msg_rows = [
+        (i, 100, 42, prev_ts + i, None, "hello") for i in range(10)
+    ]
+    msg_rows.extend(
+        (200 + i, 100, 42, recent_ts + i, None, "hi") for i in range(3)
+    )
+    _seed_messages(db_conn, rows=msg_rows)
+    db_conn.commit()
+
+    profiles = query_dropoff_profiles(
+        db_conn, guild_id=10, period_seconds=period, target_user_id=42
+    )
+    assert len(profiles) == 1
+    p = profiles[0]
+    assert p.user_id == 42
+    assert p.msgs_prev == 10
+    assert p.msgs_recent == 3
+    assert p.days_in_window >= 1
+
+
+# ── query_role_growth ────────────────────────────────────────────────
+
+
+# ── query_session_burst ──────────────────────────────────────────────
+
+
+# ── query_burst_ranking ──────────────────────────────────────────────
+
+
+# ── query_message_cadence ────────────────────────────────────────────
+
+
+# ── query_greeter_response_times ─────────────────────────────────────
+
+
+def test_query_greeter_response_times_no_inputs_returns_empty(db_conn):
+    assert query_greeter_response_times(
+        db_conn,
+        guild_id=10,
+        greeter_channel_id=100,
+        greeter_user_ids=set(),
+        join_times={},
+    ) == []
+
+
+def test_query_greeter_response_times_no_greeter_messages_returns_empty(db_conn):
+    assert query_greeter_response_times(
+        db_conn,
+        guild_id=10,
+        greeter_channel_id=100,
+        greeter_user_ids={42},
+        join_times={1: 1000.0},
+    ) == []
+
+
+def test_query_greeter_response_times_computes_deltas(db_conn):
+    """Greeter posts at t=1000, member joined at t=900 → response time = 100s."""
+    _seed_messages(
+        db_conn, rows=[(1, 100, 42, 1000, None, "welcome")]
+    )
+    db_conn.commit()
+    rts = query_greeter_response_times(
+        db_conn,
+        guild_id=10,
+        greeter_channel_id=100,
+        greeter_user_ids={42},
+        join_times={500: 900.0},
+    )
+    assert rts == [100]
+
+
+# ── query_message_rate_10min ─────────────────────────────────────────
+
+
+# ── Render functions (smoke tests for PNG output) ────────────────────
+
+
+def test_render_activity_chart_returns_png():
+    labels = [f"D{i}" for i in range(5)]
+    out = render_activity_chart(
+        labels, [1, 2, 3, 4, 5], [1, 1, 1, 1, 1], "Title", "day"
+    )
+    assert isinstance(out, bytes)
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_activity_chart_with_breakdown_uses_stacked_bars():
+    labels = ["A", "B"]
+    by_source = {"text": [1.0, 2.0], "voice": [0.5, 0.5]}
+    out = render_activity_chart(
+        labels, [1.5, 2.5], [0, 0], "title", "day", by_source=by_source
+    )
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_activity_chart_hides_member_overlay_when_zero():
+    out = render_activity_chart(
+        ["a", "b"], [1, 2], [0, 0], "title", "day", show_members=False
+    )
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_activity_chart_many_labels_thins_ticks():
+    """Trigger the >20-label thinning branch."""
+    labels = [f"B{i}" for i in range(50)]
+    counts = [1] * 50
+    members = [1] * 50
+    out = render_activity_chart(labels, counts, members, "t", "day")
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_level_histogram_returns_png():
+    durations: list[float] = [float(86400 * i) for i in range(1, 10)]
+    out = render_level_histogram(
+        durations,
+        target_level=5,
+        xp_required=1000,
+        mean_s=float(5 * 86400),
+        stddev_s=float(86400),
+        modal_days=3,
+    )
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_join_histogram_returns_png():
+    out = render_join_histogram(["a", "b", "c"], [1, 2, 3], "Joins")
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_join_histogram_many_labels_thins_ticks():
+    out = render_join_histogram([f"d{i}" for i in range(40)], list(range(40)), "Joins")
+    assert out[:8] == PNG_MAGIC
+
+
+
+
+
+
+
+
+def test_render_greeter_response_chart_returns_png():
+    # Mixed bucket of response times in seconds
+    out = render_greeter_response_chart(
+        [10, 200, 2000, 50000], "Greeter"
+    )
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_greeter_response_chart_empty_returns_png():
+    out = render_greeter_response_chart([], "Greeter")
+    assert out[:8] == PNG_MAGIC
+
+
+# ── DropoffProfile dataclass smoke ───────────────────────────────────
+
+
+def test_dropoff_profile_dataclass_has_expected_fields():
+    """Stable serialisation surface — guard against accidental field renames."""
+    fields = {f for f in DropoffProfile.__dataclass_fields__}
+    expected_subset = {
+        "user_id",
+        "msgs_prev",
+        "msgs_recent",
+        "voice_xp_prev",
+        "voice_xp_recent",
+        "days_in_window",
+        "channels_left",
+        "channels_joined",
+        "channels_stayed",
+        "deep_convos_prev",
+        "deep_convos_recent",
+        "server_msgs_prev",
+        "server_msgs_recent",
+    }
+    assert expected_subset.issubset(fields)
+
+
+# ── Edge cases for histogram-with-breakdown ──────────────────────────
+
+
+def test_query_xp_histogram_with_breakdown_returns_empty_on_no_data(db_conn):
+    labels, totals, by_src = query_xp_histogram_with_breakdown(
+        db_conn, guild_id=10, resolution="day_of_week"
+    )
+    assert labels == _DOW_LABELS
+    assert totals == [0.0] * 7
+    assert by_src == {}
+
+
+def test_query_xp_activity_with_breakdown_returns_empty_on_no_data(db_conn):
+    labels, totals, members, by_src = query_xp_activity_with_breakdown(
+        db_conn, guild_id=10, resolution="day"
+    )
+    assert len(labels) == 30
+    assert totals == [0.0] * 30
+    assert members == [0] * 30
+    assert by_src == {}
+
+
+# ── Period overlay (this day/week vs a band of the last N) ────────────
+
+_WEEK = 7 * 86400
+
+
+def test_overlay_period_start_anchors_to_local_midnight():
+    """The anchor is guild-local, not UTC — the off-by-one-timezone bug."""
+    # Thu 2026-08-27 03:00 UTC is Wed 2026-08-26 20:00 at UTC-7, so "today"
+    # began Wed 00:00 local (= Wed 07:00 UTC) and the week began the Sunday
+    # before that (Sun 2026-08-23 00:00 local = Sun 07:00 UTC).
+    now = datetime(2026, 8, 27, 3, 0, tzinfo=timezone.utc)
+    assert overlay_period_start(now, -7, "day") == datetime(
+        2026, 8, 26, 7, 0, tzinfo=timezone.utc
+    ).timestamp()
+    assert overlay_period_start(now, -7, "week") == datetime(
+        2026, 8, 23, 7, 0, tzinfo=timezone.utc
+    ).timestamp()
+
+
+def test_overlay_period_start_utc_is_plain_midnight():
+    now = datetime(2026, 8, 27, 3, 0, tzinfo=timezone.utc)
+    assert overlay_period_start(now, 0, "day") == datetime(
+        2026, 8, 27, tzinfo=timezone.utc
+    ).timestamp()
+    assert overlay_period_start(now, 0, "week") == datetime(
+        2026, 8, 23, tzinfo=timezone.utc
+    ).timestamp()
+
+
+def test_overlay_labels_shapes():
+    assert overlay_labels("day") == _HOD_LABELS
+    week = overlay_labels("week")
+    assert len(week) == 168
+    assert week[0] == "Sun 12am"
+    assert week[167] == "Sat 11pm"
+
+
+@pytest.mark.parametrize(
+    "q,expected",
+    [(0.25, 1.75), (0.5, 2.5), (0.75, 3.25)],
+)
+def test_percentile_interpolates(q, expected):
+    assert _percentile([4.0, 1.0, 3.0, 2.0], q) == expected
+
+
+def test_percentile_edges():
+    assert _percentile([], 0.5) == 0.0
+    assert _percentile([7.0], 0.5) == 7.0
+
+
+@pytest.mark.parametrize(
+    "period,mode,same_weekday,expected",
+    [
+        ("week", "messages", False, 26),
+        # The 90-day XP window is 12 whole weeks, which is why the panel
+        # offers 26 weeks in messages mode only.
+        ("week", "xp", False, 12),
+        ("day", "messages", False, 90),
+        ("day", "xp", False, 90),
+        # Same-weekday days step a week apart, so they are capped like weeks
+        # rather than like days: 26 back in messages, and in XP only as far as
+        # the XP window reaches — 12 x 7 = 84 days fits inside 90, 13 does not.
+        ("day", "messages", True, 26),
+        ("day", "xp", True, 12),
+        # A week is already every seventh day; the flag changes nothing there.
+        ("week", "xp", True, 12),
+    ],
+)
+def test_overlay_period_cap(period, mode, same_weekday, expected):
+    assert overlay_period_cap(period, mode, same_weekday) == expected
+
+
+@pytest.mark.parametrize(
+    "period,same_weekday,expected",
+    [("day", False, 1), ("day", True, 7), ("week", False, 7), ("week", True, 7)],
+)
+def test_overlay_stride_days(period, same_weekday, expected):
+    assert overlay_stride_days(period, same_weekday) == expected
+
+
+def test_overlay_weekday_name_reads_the_guild_clock():
+    """18:00 Saturday in a UTC-7 guild is already Sunday in UTC."""
+    now = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)  # Sunday 01:00 UTC
+    assert overlay_weekday_name(now, 0.0) == "Sunday"
+    assert overlay_weekday_name(now, -7.0) == "Saturday"
+
+
+def _seed_weeks(conn, tz, counts_by_week, hour_of_week=0):
+    """Seed `counts_by_week[k]` messages at `hour_of_week` of the week k back."""
+    start = overlay_period_start(datetime.now(timezone.utc), tz, "week")
+    mid = 1
+    rows = []
+    for weeks_back, count in counts_by_week.items():
+        ts = start - weeks_back * _WEEK + hour_of_week * 3600 + 1800
+        for _ in range(count):
+            rows.append((mid, 100, 7, ts))
+            mid += 1
+    _seed_processed(conn, rows=rows)
+    return start
+
+
+def test_overlay_buckets_by_local_hour_of_week(db_conn):
+    """23:30 local on a Saturday is hour-of-week 167, at a negative offset."""
+    _seed_weeks(db_conn, -7.0, {1: 1, 2: 1, 3: 1}, hour_of_week=167)
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=-7.0
+    )
+    assert res.periods_sampled == 3
+    assert res.band_mid[167] == 1.0
+    assert res.band_mid[0] == 0.0
+    assert res.labels[167] == "Sat 11pm"
+
+
+def test_overlay_band_is_percentiles_over_sampled_weeks(db_conn):
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3, 3: 2, 4: 1})
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=0.0
+    )
+    assert res.periods_sampled == 4
+    # Interpolated p25/p50/p75 of 1,2,3,4 — see test_percentile_interpolates
+    # for the exact values; the query rounds to 1dp like every other total here.
+    assert res.band_low[0] == 1.8
+    assert res.band_mid[0] == 2.5
+    assert res.band_high[0] == 3.2
+
+
+def test_overlay_skips_weeks_with_no_data_at_all(db_conn):
+    """Weeks before the archive starts must not be counted as zeros.
+
+    Asking for 8 weeks when only 4 exist has to sample the 4 — counting the
+    other 4 as rows of zeros would drag the median to 1.5 for a reason that is
+    an artefact of when logging started, not a fact about the server.
+    """
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3, 3: 2, 4: 1})
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=8, utc_offset_hours=0.0
+    )
+    assert res.periods_sampled == 4
+    assert res.band_mid[0] == 2.5
+
+
+def test_overlay_suppresses_band_below_minimum_sample(db_conn):
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3})
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=0.0
+    )
+    assert res.periods_sampled == 2
+    assert res.has_band is False
+    assert res.band_mid == []
+
+
+def test_overlay_current_period_stops_at_the_hour_we_are_in(db_conn):
+    """Unlived hours are None, never 0 — a zero would draw a cliff."""
+    now = datetime.now(timezone.utc)
+    start = overlay_period_start(now, 0.0, "day")
+    expected_lived = int((now.timestamp() - start) // 3600) + 1
+
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=7, utc_offset_hours=0.0
+    )
+    assert len(res.current) == 24
+    lived = sum(1 for c in res.current if c is not None)
+    # +-1 rather than equality only because the hour can roll between the two
+    # clock reads above; the shape assertion below is the real check.
+    assert abs(lived - expected_lived) <= 1
+    assert all(c is None for c in res.current[lived:])
+
+
+def test_overlay_xp_clamps_to_the_xp_window(db_conn):
+    """An XP overlay reaching past XP_HISTOGRAM_WINDOW_DAYS is shortened, and says so."""
+    now = datetime.now(timezone.utc)
+    start = overlay_period_start(now, 0.0, "week")
+    _seed_xp(db_conn, rows=[
+        (7, "text", 5.0, start - _WEEK + 1800),
+        # 20 weeks back: inside the requested 26, outside the 90-day window.
+        (7, "text", 9999.0, start - 20 * _WEEK + 1800),
+    ])
+
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="xp", compare_periods=26, utc_offset_hours=0.0
+    )
+
+    assert res.clamped is True
+    assert res.periods_requested == 26
+    assert res.periods_sampled < 26
+    assert 9999.0 not in res.band_mid
+
+
+@pytest.mark.parametrize(
+    "mode,periods",
+    [
+        pytest.param("xp", 4, id="xp-inside-the-window"),
+        pytest.param("messages", 26, id="messages-never-clamp"),
+    ],
+)
+def test_overlay_unclamped(db_conn, mode, periods):
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode=mode, compare_periods=periods, utc_offset_hours=0.0
+    )
+    assert res.clamped is False
+
+
+# ── same-weekday day overlay ──────────────────────────────────────────
+
+
+def _seed_days(conn, tz, counts_by_day, hour_of_day=0):
+    """Seed `counts_by_day[k]` messages at `hour_of_day` of the day k back."""
+    start = overlay_period_start(datetime.now(timezone.utc), tz, "day")
+    mid = 1
+    rows = []
+    for days_back, count in counts_by_day.items():
+        ts = start - days_back * 86400 + hour_of_day * 3600 + 1800
+        for _ in range(count):
+            rows.append((mid, 100, 7, ts))
+            mid += 1
+    _seed_processed(conn, rows=rows)
+    return start
+
+
+def test_overlay_same_weekday_samples_every_seventh_day(db_conn):
+    """The band is built from 7/14/21 days back, not from 1..21.
+
+    The six days between each sample carry ten times the traffic; if any of
+    them reached the band the median would be nowhere near 2.
+    """
+    counts = {d: (2 if d % 7 == 0 else 20) for d in range(1, 22)}
+    _seed_days(db_conn, 0.0, counts)
+
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=3,
+        same_weekday=True, utc_offset_hours=0.0,
+    )
+
+    assert res.same_weekday is True
+    assert res.periods_sampled == 3
+    assert res.band_low[0] == 2.0
+    assert res.band_mid[0] == 2.0
+    assert res.band_high[0] == 2.0
+
+
+def test_overlay_every_day_basis_still_sees_the_days_between(db_conn):
+    """The contrast case: the same fixture read day-by-day is mostly 20s."""
+    counts = {d: (2 if d % 7 == 0 else 20) for d in range(1, 22)}
+    _seed_days(db_conn, 0.0, counts)
+
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=21,
+        same_weekday=False, utc_offset_hours=0.0,
+    )
+
+    assert res.same_weekday is False
+    assert res.periods_sampled == 21
+    assert res.band_mid[0] == 20.0
+
+
+def test_overlay_same_weekday_keeps_the_local_hour(db_conn):
+    """Hour-of-day still divides by the day, not by the seven-day stride."""
+    _seed_days(db_conn, -7.0, {7: 1, 14: 1, 21: 1}, hour_of_day=23)
+
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=3,
+        same_weekday=True, utc_offset_hours=-7.0,
+    )
+
+    assert res.periods_sampled == 3
+    assert res.band_mid[23] == 1.0
+    assert res.band_mid[0] == 0.0
+
+
+def test_overlay_same_weekday_is_ignored_for_the_week_period(db_conn):
+    """A week is already every seventh day — the flag must not widen it."""
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3, 3: 2, 4: 1})
+
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4,
+        same_weekday=True, utc_offset_hours=0.0,
+    )
+
+    assert res.same_weekday is False
+    assert res.periods_sampled == 4
+    assert res.band_mid[0] == 2.5
+
+
+def test_overlay_same_weekday_xp_clamps_in_whole_strides(db_conn):
+    """The XP-window clamp counts same-weekdays, not days.
+
+    The 90-day window leaves exactly 12 same-weekdays reachable (84 days back;
+    the 13th is 91); asking for 26 must shorten to those rather than to 90.
+    """
+    start = overlay_period_start(datetime.now(timezone.utc), 0.0, "day")
+    # One event in every reachable same-weekday, plus one a stride past the
+    # window that the clamp must exclude.
+    _seed_xp(db_conn, rows=[
+        (7, "text", 3.0, start - d * 7 * 86400 + 1800) for d in range(1, 13)
+    ] + [(7, "text", 999.0, start - 13 * 7 * 86400 + 1800)])
+
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="xp", compare_periods=26,
+        same_weekday=True, utc_offset_hours=0.0,
+    )
+
+    assert res.clamped is True
+    assert res.periods_requested == 26
+    assert res.periods_sampled == 12
+    assert res.band_mid[0] == 3.0
+    assert 999.0 not in res.band_high
+
+
+# ── Current-line smoothing ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "values,window,expected",
+    [
+        # A window of 1 (or 0) is smoothing turned off — the series comes back
+        # as it went in, so the day overlay's raw shape is untouched.
+        ([1.0, 5.0, 1.0], 1, [1.0, 5.0, 1.0]),
+        ([1.0, 5.0, 1.0], 0, [1.0, 5.0, 1.0]),
+        # Centred mean of three, truncating at both ends rather than padding:
+        # hour 0 averages itself with hour 1 only.
+        ([0.0, 3.0, 0.0, 3.0, 0.0], 3, [1.5, 1.0, 2.0, 1.0, 1.5]),
+        # An unlived hour stays unlived, and the last lived hour averages only
+        # with what came before it — never across the gap.
+        ([2.0, 4.0, 6.0, None, None], 3, [3.0, 4.0, 5.0, None, None]),
+        # A period nobody has lived an hour of yet is all Nones, not zeros.
+        ([None, None], 3, [None, None]),
+        ([], 3, []),
+    ],
+)
+def test_smooth_series(values, window, expected):
+    assert smooth_series(values, window) == expected
+
+
+def test_smooth_series_never_overshoots_the_raw_range():
+    """A mean cannot leave the range it averages over.
+
+    Worth pinning because the chart's other softener, Chart.js `tension`, *can*
+    bow a curve below zero between two low points — which is the reason the
+    line is smoothed here in numbers rather than harder in the renderer.
+    """
+    raw = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0, 4.0]
+    smoothed = smooth_series(raw, 3)
+    assert min(smoothed) >= min(raw)
+    assert max(smoothed) <= max(raw)
+
+
+def test_overlay_week_smooths_the_current_line_only(db_conn):
+    """The week's line is averaged; the band it is read against is not.
+
+    Smoothing both would blur the envelope; smoothing neither leaves 168 hourly
+    points reading as hash. See docs/plans/weekly-activity-comparison.md.
+    """
+    # Week 0 is the one in progress; 1-4 are the history the band comes from.
+    _seed_weeks(db_conn, 0.0, {0: 6, 1: 4, 2: 3, 3: 2, 4: 1})
+
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=0.0
+    )
+
+    assert res.smooth_window == OVERLAY_SMOOTH_WINDOW["week"] == 3
+    assert len(res.current_smooth) == len(res.current) == 168
+    # The raw series keeps the spike whole - it is what the table and the
+    # period total are read from - while the drawn line is the same series
+    # under the shared helper.
+    assert res.current[0] == 6.0
+    assert res.current_smooth == smooth_series(res.current, 3)
+    # And the band is the untouched percentile of the four sampled weeks.
+    assert res.band_mid[0] == 2.5
+    assert res.band_low[0] == 1.8
+    assert res.band_high[0] == 3.2
+
+
+def test_overlay_week_smoothing_stops_at_the_live_edge(db_conn):
+    """Unlived hours stay None in the smoothed line too — never bridged."""
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3, 3: 2})
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=0.0
+    )
+    lived = sum(1 for c in res.current if c is not None)
+    assert [i for i, v in enumerate(res.current_smooth) if v is None] == list(
+        range(lived, 168)
+    )
+
+
+def test_overlay_day_is_drawn_raw(db_conn):
+    """24 points an hour apart are the reading; averaging them would blur it."""
+    _seed_days(db_conn, 0.0, {1: 4, 2: 3, 3: 2})
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=7, utc_offset_hours=0.0
+    )
+    assert res.smooth_window == 1
+    assert res.current_smooth == []
+
+
+# ── The live edge: the one hour that is drawn while still incomplete ───
+
+
+@pytest.mark.parametrize(
+    "values,partial_from,settled,provisional",
+    [
+        # Nothing provisional: a period that has already ended comes back whole,
+        # which is what the archive views want.
+        ([1.0, 2.0, 3.0], None, [1.0, 2.0, 3.0], [None, None, None]),
+        # The ordinary case. The tail KEEPS the last settled point, so the
+        # dashed segment joins the solid line instead of floating past its end.
+        ([1.0, 2.0, 3.0, None], 2, [1.0, 2.0, None, None], [None, 2.0, 3.0, None]),
+        # The first hour of a new day: there is no settled point to join to, so
+        # the whole line is provisional and it is one open ring.
+        ([5.0, None], 0, [None, None], [5.0, None]),
+        # A day nobody has lived an hour of has nothing to mark either way.
+        ([None, None], 0, [None, None], [None, None]),
+        ([], 0, [], []),
+        # A negative index means "nothing is provisional", not "all of it" —
+        # the same reading liveEdgeProps in charts.js takes, so the two
+        # renderers cannot draw different pictures from one series.
+        ([1.0, 2.0], -1, [1.0, 2.0], [None, None]),
+    ],
+)
+def test_split_provisional(values, partial_from, settled, provisional):
+    assert split_provisional(values, partial_from) == (settled, provisional)
+
+
+def test_split_provisional_leaves_the_input_alone():
+    """Both halves are copies: the raw series is read again for the totals."""
+    raw = [1.0, 2.0, 3.0]
+    split_provisional(raw, 1)
+    assert raw == [1.0, 2.0, 3.0]
+
+
+def test_overlay_names_the_hour_in_progress(db_conn):
+    """The live edge is the last drawn point, not the first undrawn one.
+
+    Regression: it was drawn like every settled hour, so a card rendered five
+    minutes past the hour showed the day falling off a cliff — the defect the
+    reader reported as "activity always crashes for this hour".
+    """
+    _seed_days(db_conn, 0.0, {1: 4, 2: 3})
+    res = query_activity_overlay(
+        db_conn, 10, "day", mode="messages", compare_periods=7, utc_offset_hours=0.0
+    )
+    lived = [i for i, v in enumerate(res.current) if v is not None]
+    assert res.partial_index == lived[-1]
+    # An unsmoothed line has nothing pulled toward the partial hour, so the
+    # provisional span is that hour and nothing else.
+    assert res.partial_from == res.partial_index
+
+
+def test_overlay_week_marks_the_smoothed_line_further_back(db_conn):
+    """A centred mean drags its neighbour toward the partial hour with it.
+
+    Marking only the live edge would leave that sag looking like a settled
+    measurement, which is the same misread one point to the left.
+    """
+    _seed_weeks(db_conn, 0.0, {1: 4, 2: 3})
+    res = query_activity_overlay(
+        db_conn, 10, "week", mode="messages", compare_periods=4, utc_offset_hours=0.0
+    )
+    assert res.smooth_window == 3
+    assert res.partial_from_smooth == max(0, res.partial_index - 1)
+
+
+def test_overlay_partial_span_is_absent_when_the_edge_is_unknown():
+    """Nothing to mark when nothing is in progress — a guard for the archive
+    views that build an OverlayResult without a live period."""
+    empty = OverlayResult(
+        labels=[], current=[], band_low=[], band_mid=[], band_high=[],
+        periods_requested=0, periods_sampled=0, clamped=False,
+    )
+    assert empty.partial_from is None
+    assert empty.partial_from_smooth is None
+
+
+# ── Overlay renderer (the moderator stats panel's image) ──────────────
+
+
+def _overlay_chart(*, band=True, current=None) -> OverlayChart:
+    hours = list(range(24))
+    return OverlayChart(
+        title="Today vs the last 8 days",
+        labels=list(_HOD_LABELS),
+        # Unlived hours are None, exactly as the query returns them.
+        current=current if current is not None else [float(h) for h in hours[:10]]
+        + [None] * 14,
+        band_low=[float(h) for h in hours] if band else [],
+        band_mid=[float(h) + 1 for h in hours] if band else [],
+        band_high=[float(h) + 2 for h in hours] if band else [],
+        empty_note="Not enough history to compare against yet.",
+    )
+
+
+def test_render_overlay_panel_stacks_charts_into_one_png():
+    """Two overlays, one image — Discord gives an embed a single image slot."""
+    png = render_overlay_panel([_overlay_chart(), _overlay_chart()])
+    assert png.startswith(PNG_MAGIC)
+
+
+def test_render_overlay_panel_draws_without_a_band():
+    """A young server has no band; the chart still has to render rather than
+    raise on the empty series, and says why the band is missing."""
+    png = render_overlay_panel([_overlay_chart(band=False)])
+    assert png.startswith(PNG_MAGIC)
+
+
+def test_render_overlay_panel_survives_a_day_with_no_data_at_all():
+    """Every hour unlived — a panel posted seconds after local midnight."""
+    png = render_overlay_panel([_overlay_chart(current=[None] * 24)])
+    assert png.startswith(PNG_MAGIC)
+
+
+def test_render_overlay_panel_needs_a_chart():
+    with pytest.raises(ValueError):
+        render_overlay_panel([])
+
+
+def test_render_overlay_panel_marks_the_hour_in_progress():
+    """The mark shares the line's colour and axes, so nothing about the
+    figure's shape would reveal it going missing — pin that it is drawn."""
+    plain = render_overlay_panel([_overlay_chart()])
+    marked = render_overlay_panel(
+        [dataclasses.replace(_overlay_chart(), partial_from=9)]
+    )
+    assert plain != marked
+
+
+def test_render_overlay_panel_ignores_a_live_edge_past_the_data():
+    """A partial index beyond the drawn points marks nothing rather than
+    raising — the clock can roll between the query and the render."""
+    png = render_overlay_panel(
+        [dataclasses.replace(_overlay_chart(), partial_from=23)]
+    )
+    assert png.startswith(PNG_MAGIC)
+    # Nothing provisional was drawn, so the figure is the unmarked one — the
+    # ring must not fall back onto the last SETTLED point and call a finished
+    # hour live.
+    assert png == render_overlay_panel([_overlay_chart()])
+
+
+def test_render_overlay_panel_ring_never_lands_on_a_settled_point():
+    """`_overlay_chart` stops at hour 9, so a live edge at 10 has no plotted
+    point of its own. The join point at 9 belongs to the settled line; marking
+    it would say a finished hour is still in progress."""
+    marked = render_overlay_panel(
+        [dataclasses.replace(_overlay_chart(), partial_from=10)]
+    )
+    assert marked == render_overlay_panel([_overlay_chart()])
+
+
+# ── The mod stats panel: all-time XP and its three-row renderer ───────
+
+
+def _seed_xp_event(conn, *, user, source, amount, created_at, guild=1):
+    conn.execute(
+        "INSERT INTO xp_events (guild_id, user_id, source, amount, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (guild, user, source, amount, created_at),
+    )
+
+
+def test_all_time_breakdown_buckets_from_the_first_event(db_conn):
+    """The window does not roll: it starts at the guild's first XP event.
+
+    Every other graph here is anchored to now and a fixed number of buckets;
+    this one grows with the server, so the bucket count is a fact about the
+    data rather than a constant.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    for week in range(4):
+        _seed_xp_event(
+            db_conn, user=1, source="text", amount=10.0,
+            created_at=now - (3 - week) * 7 * 86400 - 3600,
+        )
+
+    labels, totals, by_source, _starts = query_xp_all_time_with_breakdown(
+        db_conn, 1
+    )
+
+    assert len(labels) == len(totals) == 4
+    assert by_source["text"] == [10.0, 10.0, 10.0, 10.0]
+
+
+def test_all_time_breakdown_reports_where_each_source_started(db_conn):
+    """The chart's whole honesty rests on these.
+
+    A stack that grows two new colours in one week is the bot gaining XP
+    sources, not the community getting busier — and without a rule marking
+    where that happened the reader reads it as a surge.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    for week in range(4):
+        at = now - (3 - week) * 7 * 86400 - 3600
+        _seed_xp_event(db_conn, user=1, source="text", amount=10.0, created_at=at)
+        if week >= 2:
+            _seed_xp_event(db_conn, user=1, source="quest", amount=5.0, created_at=at)
+
+    _labels, _totals, _by_source, starts = (
+        query_xp_all_time_with_breakdown(db_conn, 1)
+    )
+
+    assert starts["text"] == 0
+    assert starts["quest"] == 2
+
+
+def test_all_time_breakdown_on_an_empty_guild(db_conn):
+    assert query_xp_all_time_with_breakdown(db_conn, 1) == ([], [], {}, {})
+
+
+def _stack(values):
+    return StackedBarChart(
+        title="XP", labels=[str(i) for i in range(len(values))],
+        series=[("text", values)],
+    )
+
+
+def _overlay_stub():
+    return OverlayChart(
+        title="Today", labels=[f"{h}" for h in range(24)],
+        current=[1.0] * 24, band_low=[], band_mid=[], band_high=[],
+    )
+
+
+def test_render_mod_stats_panel_returns_png():
+    out = render_mod_stats_panel(
+        _overlay_stub(),
+        PresenceSeries(values=[1] * 24),
+        [_stack([1.0, 2.0, 3.0])],
+    )
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_mod_stats_panel_without_a_presence_row():
+    out = render_mod_stats_panel(_overlay_stub(), None, [_stack([1.0, 2.0])])
+    assert out[:8] == PNG_MAGIC
+
+
+def test_render_mod_stats_panel_scales_each_axis_to_its_data():
+    """Regression: every axis came out pinned to matplotlib's empty 0-1 default.
+
+    The shared axis dressing called ``set_ylim(bottom=0)`` before anything was
+    drawn, which switches autoscaling *off* — so bars of 3 and bars of 30,000
+    both rendered as full-height blocks against an axis labelled 0.0 to 1.0,
+    and only the first series of a stack was visible at all. Two charts three
+    orders of magnitude apart must not come out as the same picture.
+    """
+    small = render_mod_stats_panel(
+        _overlay_stub(), None, [_stack([1.0, 2.0, 3.0])]
+    )
+    large = render_mod_stats_panel(
+        _overlay_stub(), None, [_stack([10000.0, 20000.0, 30000.0])]
+    )
+
+    assert small != large
+
+
+def test_presence_peak_ignores_the_unlived_hours():
+    """``None`` is "not yet", not a value the peak should trip over."""
+    assert PresenceSeries(values=[1, 4, 2] + [None] * 21).peak == 4
+    assert PresenceSeries(values=[None] * 24).peak == 0
+
+
+def test_presence_line_changes_what_is_drawn():
+    """The mods line shares the overlay's axes, so nothing about the figure's
+    shape would reveal it going missing — pin that it is actually drawn."""
+    without = render_mod_stats_panel(_overlay_stub(), None, [_stack([1.0, 2.0])])
+    with_mods = render_mod_stats_panel(
+        _overlay_stub(), PresenceSeries(values=[2] * 24), [_stack([1.0, 2.0])]
+    )
+
+    assert without != with_mods
+
+
+def test_mod_stats_panel_marks_the_hour_in_progress():
+    """Both lines run to the same live edge, and both are drawn there."""
+    settled = render_mod_stats_panel(
+        _overlay_stub(), PresenceSeries(values=[2] * 24), [_stack([1.0, 2.0])]
+    )
+    marked = render_mod_stats_panel(
+        dataclasses.replace(_overlay_stub(), partial_from=23),
+        PresenceSeries(values=[2] * 24, partial_from=23),
+        [_stack([1.0, 2.0])],
+    )
+    assert settled != marked
+
+
+def test_mod_stats_panel_captions_only_what_it_drew():
+    """The note explains a mark, so it is printed only when one went on the
+    picture — never from `partial_from` alone, which the clock can leave
+    pointing past the end of the data. Byte-identical to the same chart with no
+    live edge at all: no dash, no ring, and no sentence promising them."""
+    stopped_at_ten = dataclasses.replace(
+        _overlay_stub(), current=[1.0] * 10 + [None] * 14
+    )
+    presence = PresenceSeries(values=[2] * 10 + [None] * 14)
+
+    past_the_end = render_mod_stats_panel(
+        dataclasses.replace(stopped_at_ten, partial_from=20),
+        presence,
+        [_stack([1.0, 2.0])],
+    )
+
+    assert past_the_end == render_mod_stats_panel(
+        stopped_at_ten, presence, [_stack([1.0, 2.0])]
+    )
+
+
+def test_mod_stats_panel_marks_the_presence_line_on_its_own():
+    """Regression: the fix landed on the overlay only, and the purple line went
+    on diving to the floor at the same hour — half the reported defect, still
+    on screen."""
+    overlay_only = render_mod_stats_panel(
+        dataclasses.replace(_overlay_stub(), partial_from=23),
+        PresenceSeries(values=[2] * 24),
+        [_stack([1.0, 2.0])],
+    )
+    both = render_mod_stats_panel(
+        dataclasses.replace(_overlay_stub(), partial_from=23),
+        PresenceSeries(values=[2] * 24, partial_from=23),
+        [_stack([1.0, 2.0])],
+    )
+    assert overlay_only != both
+
+
+def test_unconfigured_presence_draws_no_line():
+    """No moderator role is a note, not a flat line at zero — the two say very
+    different things to whoever reads the panel."""
+    silent = render_mod_stats_panel(
+        _overlay_stub(),
+        PresenceSeries(values=[None] * 24, empty_note="No moderator role configured."),
+        [_stack([1.0, 2.0])],
+    )
+    assert silent[:8] == PNG_MAGIC

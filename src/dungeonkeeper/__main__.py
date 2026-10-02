@@ -1,0 +1,721 @@
+import argparse
+import asyncio
+import logging
+import logging.handlers
+import os
+import signal
+from pathlib import Path
+
+import discord
+from dotenv import load_dotenv
+
+from bot_modules.core.app_context import AppContext, Bot, resolve_guild_id
+from bot_modules.core.config import load_config
+from bot_modules.core.id_remap import build_remap
+from migrations import apply_migrations_sync
+from bot_modules.core.safety import check_bot_identity, check_db_path, check_guild_membership, print_startup_banner
+from bot_modules.moderation.watch.service import load_watched_users
+from bot_modules.core.db_utils import get_tz_offset_hours, migrate_grant_roles, open_db
+from bot_modules.shared.anon_audit_service import anon_audit_purge_loop
+from bot_modules.announcements.service import announcements_loop
+from bot_modules.auto_delete.service import auto_delete_loop
+from bot_modules.moderation.bulk_cleanup_service import bulk_cleanup_loop
+from bot_modules.event_echo.service import event_echo_loop
+from bot_modules.feature_rotation.service import feature_rotation_loop
+from bot_modules.games.start_ping_service import game_start_ping_loop
+from bot_modules.games.scheduled_service import scheduled_games_loop
+from bot_modules.economy.color_palette import PaletteColorButton
+from bot_modules.onboarding.intake.loop import intake_loop
+from bot_modules.onboarding.intake.service import warm as warm_intake
+from bot_modules.onboarding.intake.views import (
+    IntakeDismissButton,
+    IntakeGrantButton,
+    IntakeStepButton,
+)
+from bot_modules.xp.promotion_review_service import warm as warm_promo_review
+from bot_modules.xp.promotion_review_views import (
+    DismissButton as PromoReviewDismissButton,
+)
+from bot_modules.xp.promotion_review_views import (
+    GrantAccessButton as PromoReviewGrantButton,
+)
+from bot_modules.xp.promotion_review_views import (
+    Level5GrantButton as PromoReviewLevel5Button,
+)
+from bot_modules.inactive.prune_service import inactivity_prune_loop
+from bot_modules.roles.grant.audit_service import grant_audit_card_loop
+from bot_modules.announcements.buttons import AnnouncementRoleButton
+from bot_modules.chat_revive.actions import ReviveOptInButton
+from bot_modules.chat_revive.loop import chat_revive_loop
+from bot_modules.todo.cog_bug import bug_board_loop
+from bot_modules.todo.cog import todo_board_loop
+from bot_modules.economy.boost_reconcile import reconcile_boosters
+from bot_modules.economy.drops_loop import (
+    DropClaimButton,
+    economy_drops_loop,
+)
+from bot_modules.economy.loop import (
+    economy_loop,
+    leaderboard_live_loop,
+    register_loop,
+)
+from bot_modules.onboarding.greeting_watch.loop import greeting_watch_loop
+from bot_modules.xp.voice_xp_service import voice_xp_loop
+from bot_modules.admin.db_backup import db_backup_loop
+from bot_modules.xp.service import (
+    handle_level_progress,
+    nsfw_grant_role_id,
+    promotion_review_recheck_loop,
+)
+from bot_modules.core.utils import format_guild_for_log
+from bot_modules.games.db import GamesDb
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+_log_queue_listener: logging.handlers.QueueListener | None = None
+
+
+def _setup_logging() -> None:
+    """Route all log records through a queue so stream writes never block the event loop."""
+    global _log_queue_listener
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    log_path = _PROJECT_ROOT / "log.txt"
+    log_path.write_text("", encoding="utf-8")  # wipe on boot
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        encoding="utf-8",
+        maxBytes=10_000 * 200,
+        backupCount=1,  # ~10 000 lines
+    )
+    file_handler.setFormatter(formatter)
+
+    import queue
+
+    log_queue: queue.SimpleQueue = queue.SimpleQueue()
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    listener = logging.handlers.QueueListener(
+        log_queue, stream_handler, file_handler, respect_handler_level=True
+    )
+    listener.start()
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(queue_handler)
+
+    llm_level = os.getenv("LOG_LEVEL_LLM", "").upper()
+    if llm_level:
+        logging.getLogger("dungeonkeeper.llm").setLevel(
+            getattr(logging, llm_level, logging.DEBUG)
+        )
+
+    _log_queue_listener = listener
+
+
+def _record_deploy(log: logging.Logger) -> None:
+    """Move the `deployed` git tag to the booted commit so `git describe`
+    always answers "what's running in prod". Best-effort: never blocks boot."""
+    import subprocess
+
+    try:
+        desc = subprocess.run(
+            ["git", "describe", "--always", "--dirty"],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if desc.returncode != 0:
+            return
+        rev = desc.stdout.strip()
+        subprocess.run(
+            ["git", "tag", "-f", "deployed"],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            timeout=10,
+        )
+        if rev.endswith("-dirty"):
+            log.warning("Booted at %s — WORKING TREE IS DIRTY (uncommitted changes are live)", rev)
+        else:
+            log.info("Booted at %s (tag 'deployed' moved)", rev)
+    except (OSError, subprocess.TimeoutExpired):
+        log.warning("Could not record deploy tag", exc_info=True)
+
+
+def main() -> None:
+    load_dotenv(override=True)
+
+    parser = argparse.ArgumentParser(description="DungeonKeeper Discord bot")
+    parser.add_argument("--debug", action="store_true", help="Sync commands to dev guild only")
+    args = parser.parse_args()
+
+    _setup_logging()
+
+    log = logging.getLogger("dungeonkeeper.bot")
+
+    _record_deploy(log)
+
+    boot_cfg = load_config()
+    check_db_path(boot_cfg)
+
+    db_path = Path(boot_cfg.db_path)
+
+    # ==============================
+    # Database initialization
+    # ==============================
+    apply_migrations_sync(db_path)
+
+    # ==============================
+    # Runtime config + context
+    # ==============================
+    guild_id = resolve_guild_id(db_path, default_guild_id=boot_cfg.guild_id)
+
+    intents = discord.Intents.default()
+    intents.members = True
+    intents.presences = True
+    intents.message_content = True
+
+    bot = Bot(intents=intents, debug=args.debug, guild_id=guild_id)
+
+    ctx = AppContext(
+        bot=bot,
+        log=log,
+        db_path=db_path,
+        guild_id=guild_id,
+        debug=args.debug,
+    )
+
+    # ==============================
+    # Populate runtime state from DB
+    # ==============================
+    with open_db(db_path) as conn:
+        migrate_grant_roles(conn, guild_id)
+        ctx.watched_users = load_watched_users(conn, guild_id)
+
+    # ==============================
+    # Cog extensions
+    # ==============================
+    bot.ctx = ctx
+    bot.games_db = GamesDb(db_path)
+    bot.extension_names = [
+        "bot_modules.events.cog",
+        "bot_modules.analytics.cog_usage_telemetry",
+        "bot_modules.roles.grant.cog",
+        "bot_modules.invites.cog",
+        "bot_modules.admin.cog_support",
+        "bot_modules.moderation.jail.cog",
+        "bot_modules.inactive.cog",
+        "bot_modules.breaks.cog",
+        "bot_modules.moderation.cog",
+        "bot_modules.hidden_channels.cog",
+        "bot_modules.moderation.cog_rename",
+        "bot_modules.privacy.cog",
+        "bot_modules.member_info.cog",
+        "bot_modules.todo.cog",
+        "bot_modules.todo.cog_bug",
+        "bot_modules.moderation.cog_stats",
+        "bot_modules.word_cloud.cog",
+        "bot_modules.qa.cog",
+        "bot_modules.roles.menus.cog",
+        "bot_modules.advisor.cog",
+        "bot_modules.moderation.watch.cog",
+        "bot_modules.wellness.cog",
+        "bot_modules.xp.cog",
+        "bot_modules.privacy.cog_retention",
+        "bot_modules.privacy.cog_guild_purge",
+        "bot_modules.confessions.cog",
+        "bot_modules.dm.perms.cog",
+        "bot_modules.no_contact.cog",
+        "bot_modules.server_features.cog",
+        "bot_modules.moderation.settings.cog",
+        "bot_modules.panels.cog",
+        "bot_modules.birthday.cog",
+        "bot_modules.survivor.cog",
+        "bot_modules.games.mahjong.cog",
+        "bot_modules.admin.cog_dev",
+        "bot_modules.starboard.cog",
+        "bot_modules.music.cog",
+        "bot_modules.music.playlist.cog",
+        "bot_modules.voice.master.cog",
+        "bot_modules.games.guess.cog",
+        "bot_modules.quotes.cog",
+        "bot_modules.whisper.cog",
+        "bot_modules.dm.batch.cog",
+        "bot_modules.needle.cog",
+        "bot_modules.auto_react.cog",
+        "bot_modules.bump_tracker.cog",
+        "bot_modules.emoji_stealer.cog",
+        "bot_modules.games.risky_roll.cog",
+        "bot_modules.duels.pressure_cooker",
+        "bot_modules.duels.quickdraw",
+        "bot_modules.duels.hot_potato",
+        "bot_modules.duels.hot_potato_group",
+        "bot_modules.duels.musical_chairs",
+        "bot_modules.duels.chicken",
+        "bot_modules.bios.cog",
+        "bot_modules.economy.economy_cog",
+        "bot_modules.casino.cog",
+        # ── Party Games (PoppyBot) ────────────────────────────────
+        "bot_modules.games.session.cog",
+        "bot_modules.games.config.cog",
+        "bot_modules.games.help.cog",
+        "bot_modules.games.ffa.cog",
+        "bot_modules.games.photo.cog",
+        "bot_modules.games.traditional.cog",
+        "bot_modules.games.compliment.cog",
+        "bot_modules.games.mfk.cog",
+        "bot_modules.games.wyr.cog",
+        "bot_modules.games.nhie.cog",
+        "bot_modules.games.mlt.cog",
+        "bot_modules.games.ttl.cog",
+        "bot_modules.games.hottakes.cog",
+        "bot_modules.games.story.cog",
+        "bot_modules.games.ama.cog",
+        "bot_modules.games.fantasies.cog",
+        "bot_modules.games.price.cog",
+        "bot_modules.games.rushmore.cog",
+        "bot_modules.games.clapback.cog",
+        "bot_modules.games.legitlibs",
+        "bot_modules.pen_pals.cog",
+        "bot_modules.voice.transcription.cog",
+        "bot_modules.games.cog_dev",
+        "bot_modules.games.external.cog",
+        "bot_modules.mention_awards.cog",
+    ]
+
+    # ==============================
+    # Safety on_ready checks (spec §8)
+    # ==============================
+    @bot.event
+    async def on_ready() -> None:
+        if bot.user:
+            check_bot_identity(boot_cfg, bot.user)
+        print_startup_banner(boot_cfg, bot.user)
+        await check_guild_membership(boot_cfg, bot)
+
+        # Seed the returned-member watch set so members already owed a review
+        # card are spotted the moment they post after a restart.
+        await asyncio.to_thread(
+            warm_promo_review, db_path, [g.id for g in bot.guilds]
+        )
+
+        # Seed the intake watch set so open intake cards keep auto-ticking
+        # (greet/code/role events) across a restart.
+        await asyncio.to_thread(warm_intake, db_path, [g.id for g in bot.guilds])
+
+        if boot_cfg.is_dev:
+            guild = bot.get_guild(boot_cfg.guild_id)
+            if guild:
+                import aiosqlite
+                async with aiosqlite.connect(str(db_path)) as remap_db:
+                    remap_db.row_factory = aiosqlite.Row
+                    await build_remap(remap_db, guild)
+
+    # Register persistent palette swatch buttons so they survive restarts.
+    bot.add_dynamic_items(PaletteColorButton)
+
+    # Register persistent Chat Revive opt-in buttons so they survive restarts.
+    bot.add_dynamic_items(ReviveOptInButton)
+
+    # Register persistent announcement role buttons — posted announcements stay
+    # clickable indefinitely, long after their queue row is gone.
+    bot.add_dynamic_items(AnnouncementRoleButton)
+
+    # Register the persistent coin-drop Claim button — a pouch posted before a
+    # restart stays claimable after it.
+    bot.add_dynamic_items(DropClaimButton)
+
+    # Register persistent promotion-review buttons (return/sleeper Grant + Dismiss,
+    # and the Level 5 card's Grant) so a card posted before a restart stays
+    # actionable after it.
+    bot.add_dynamic_items(
+        PromoReviewGrantButton, PromoReviewDismissButton, PromoReviewLevel5Button
+    )
+
+    # Register persistent intake-card buttons (manual step toggles + Dismiss)
+    # so a card posted before a restart stays actionable after it.
+    bot.add_dynamic_items(IntakeStepButton, IntakeDismissButton, IntakeGrantButton)
+
+    # ==============================
+    # Background tasks
+    # ==============================
+    async def _handle_level_progress_cb(member, award, source):
+        cfg = ctx.guild_config(member.guild.id)
+        await handle_level_progress(
+            member,
+            award,
+            source,
+            level_5_role_id=cfg.level_5_role_id,
+            level_up_log_channel_id=cfg.level_up_log_channel_id,
+            level_5_log_channel_id=cfg.level_5_log_channel_id,
+            settings=cfg.xp_settings,
+            db_path=db_path,
+            nsfw_role_id=nsfw_grant_role_id(cfg.grant_roles, cfg.promotion_review_grant_role_id),
+        )
+
+    bot.startup_task_factories.append(
+        lambda: voice_xp_loop(
+            bot,
+            db_path,
+            _handle_level_progress_cb,
+            settings_for=lambda gid: ctx.guild_config(gid).xp_settings,
+            excluded_for=lambda gid: ctx.guild_config(gid).xp_excluded_channel_ids,
+        )
+    )
+
+    bot.startup_task_factories.append(
+        lambda: promotion_review_recheck_loop(bot, db_path, ctx.guild_config)
+    )
+
+    bot.startup_task_factories.append(lambda: auto_delete_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: bulk_cleanup_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: scheduled_games_loop(bot))
+
+    bot.startup_task_factories.append(lambda: feature_rotation_loop(bot))
+
+    bot.startup_task_factories.append(lambda: game_start_ping_loop(bot))
+
+    bot.startup_task_factories.append(lambda: event_echo_loop(bot))
+
+    bot.startup_task_factories.append(lambda: todo_board_loop(bot))
+
+    bot.startup_task_factories.append(lambda: bug_board_loop(bot))
+
+    bot.startup_task_factories.append(lambda: announcements_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: inactivity_prune_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: anon_audit_purge_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: intake_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: grant_audit_card_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: economy_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: register_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: leaderboard_live_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: economy_drops_loop(bot, db_path))
+
+    # One-shot: credit the boost trigger to members who were already boosting
+    # before the boost quest/listener shipped (the live transition never fires
+    # for them). Idempotent via the per-occurrence boost claim key.
+    bot.startup_task_factories.append(lambda: reconcile_boosters(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: chat_revive_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: greeting_watch_loop(bot, db_path))
+
+    bot.startup_task_factories.append(lambda: db_backup_loop(bot, db_path))
+
+    # ==============================
+    # Games — crash recovery (re-register in-flight views/timers on boot)
+    # ==============================
+    async def _game_recovery() -> None:
+        from bot_modules.games.utils.recovery import recover_active_games
+
+        await bot.wait_until_ready()
+        try:
+            await recover_active_games(bot)
+        except Exception:
+            log.exception("Game recovery sweep failed")
+
+    bot.startup_task_factories.append(lambda: _game_recovery())
+
+    # ==============================
+    # Games — 24-hour cleanup sweep
+    # ==============================
+    async def _game_cleanup_loop() -> None:
+        """Hourly sweep — end any party game older than 24 hours."""
+        from bot_modules.games.utils.expiry_service import sweep_expired_games  # type: ignore[import-untyped]
+
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            await asyncio.sleep(3600)
+            try:
+                await sweep_expired_games(bot, bot.games_db)  # type: ignore[attr-defined]
+            except Exception:
+                log.exception("Game cleanup error")
+
+    bot.startup_task_factories.append(lambda: _game_cleanup_loop())
+
+
+    # ==============================
+    # Health dashboard batch loop
+    # ==============================
+    async def _health_batch_loop() -> None:
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            for guild in list(bot.guilds):
+                try:
+                    gid = guild.id
+                    _member_count = guild.member_count or 0
+                    _voice_active = 0
+                    _nsfw_ids: list[int] = []
+                    _mod_ids: list[int] = []
+                    _recent_joins: dict[int, float] = {}
+                    import time as _t
+
+                    _now = _t.time()
+                    for _vc in guild.voice_channels:
+                        _voice_active += sum(1 for _m in _vc.members if not _m.bot)
+                    _nsfw_ids = [
+                        ch.id for ch in guild.channels if getattr(ch, "nsfw", False)
+                    ]
+                    for _m in guild.members:
+                        if _m.bot:
+                            continue
+                        _perms = _m.guild_permissions
+                        if (
+                            _perms.administrator
+                            or _perms.manage_guild
+                            or _perms.kick_members
+                            or _perms.ban_members
+                        ):
+                            _mod_ids.append(_m.id)
+                    for _m in guild.members:
+                        if not _m.bot and _m.joined_at:
+                            _age = _now - _m.joined_at.timestamp()
+                            if _age < 90 * 86400:
+                                _recent_joins[_m.id] = _m.joined_at.timestamp()
+
+                    def _batch(
+                        gid: int = gid,
+                        _member_count: int = _member_count,
+                        _voice_active: int = _voice_active,
+                        _nsfw_ids: list[int] = _nsfw_ids,
+                        _mod_ids: list[int] = _mod_ids,
+                        _recent_joins: dict[int, float] = _recent_joins,
+                    ) -> None:
+                        from bot_modules.analytics.health_metrics import (
+                            compute_channel_health,
+                            compute_cohort_retention,
+                            compute_dau_mau,
+                            compute_gini,
+                            compute_heatmap,
+                            compute_mod_workload,
+                            compute_newcomer_funnel,
+                            compute_sentiment,
+                        )
+                        from bot_modules.analytics.health_service import set_cached
+
+                        with open_db(db_path) as conn:
+                            data = compute_dau_mau(
+                                conn,
+                                gid,
+                                member_count=_member_count,
+                                voice_active_count=_voice_active,
+                            )
+                            set_cached(conn, gid, "dau_mau", data)
+                            data = compute_heatmap(conn, gid)
+                            set_cached(conn, gid, "heatmap", data)
+                            data = compute_channel_health(
+                                conn, gid, nsfw_channel_ids=_nsfw_ids
+                            )
+                            set_cached(conn, gid, "channel_health", data)
+                            data = compute_gini(conn, gid)
+                            set_cached(conn, gid, "gini", data)
+                            data = compute_sentiment(conn, gid)
+                            set_cached(conn, gid, "sentiment", data)
+                            data = compute_newcomer_funnel(
+                                conn, gid, recent_join_ids=_recent_joins
+                            )
+                            set_cached(conn, gid, "newcomer_funnel", data)
+                            data = compute_cohort_retention(
+                                conn, gid, join_times=_recent_joins
+                            )
+                            set_cached(conn, gid, "cohort_retention", data)
+                            data = compute_mod_workload(conn, gid, mod_ids=_mod_ids)
+                            set_cached(conn, gid, "mod_workload", data)
+
+                    await asyncio.to_thread(_batch)
+                    log.info(
+                        "Health metrics batch completed for guild %s",
+                        format_guild_for_log(guild),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Health metrics batch failed for guild %s",
+                        format_guild_for_log(guild),
+                    )
+            await asyncio.sleep(900)  # 15 minutes
+
+    bot.startup_task_factories.append(lambda: _health_batch_loop())
+
+    # ==============================
+    # Reports page cache warmer
+    # ==============================
+    async def _reports_batch_loop() -> None:
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            for guild in list(bot.guilds):
+                try:
+                    from bot_modules.analytics.reports_data import MemberSnapshot
+
+                    gid = guild.id
+                    with open_db(db_path) as conn:
+                        tz = get_tz_offset_hours(conn, gid)
+                    member_snapshots = [
+                        MemberSnapshot(
+                            user_id=m.id,
+                            display_name=m.display_name,
+                            is_bot=m.bot,
+                            joined_at=m.joined_at.timestamp() if m.joined_at else None,
+                            role_ids=tuple(r.id for r in m.roles),
+                        )
+                        for m in guild.members
+                    ]
+
+                    def _warm(
+                        gid: int = gid,
+                        tz: float = tz,
+                        member_snapshots: list = member_snapshots,
+                    ) -> None:
+                        from bot_modules.analytics import reports_data
+                        from web_server.deps import store_report_result
+
+                        TTL = 3600
+
+                        def _put(name, params, result):
+                            store_report_result(name, gid, params, result, TTL)
+
+                        with open_db(db_path) as conn:
+                            for fn, name, params, kwargs in [
+                                (reports_data.get_activity_data,
+                                 "activity",
+                                 {"resolution": "day", "mode": "xp", "user_id": None,
+                                  "channel_id": None, "exclude_channel_ids": "", "exclude_user_ids": ""},
+                                 {"resolution": "day", "utc_offset_hours": tz, "mode": "xp"}),
+                                (reports_data.get_invite_effectiveness_data,
+                                 "invite-effectiveness", {"days": None, "active_days": 30},
+                                 {"days": None, "active_days": 30}),
+                                (reports_data.get_retention_data,
+                                 "retention", {"period_days": 3, "min_previous": 5},
+                                 {"period_days": 3, "min_previous": 5}),
+                                (reports_data.get_voice_activity_data,
+                                 "voice-activity", {"days": None},
+                                 {"days": None, "utc_offset_hours": tz}),
+                                (reports_data.get_xp_leaderboard_data,
+                                 "xp-leaderboard", {"days": None},
+                                 {"days": None}),
+                                (reports_data.get_channel_comparison_data,
+                                 "channel-comparison", {"days": 1},
+                                 {"days": 1}),
+                            ]:
+                                try:
+                                    _put(name, params, fn(conn, gid, **kwargs))
+                                except Exception:
+                                    log.exception("Reports cache warming failed for %s", name)
+
+                            try:
+                                _put(
+                                    "join-times",
+                                    {"resolution": "hour_of_day"},
+                                    reports_data.get_join_times_data(member_snapshots, "hour_of_day", tz),
+                                )
+                            except Exception:
+                                log.exception("Reports cache warming failed for join-times")
+
+                    await asyncio.to_thread(_warm)
+                    log.info("Reports cache warmed for guild %s", format_guild_for_log(guild))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Reports cache warming failed for guild %s", format_guild_for_log(guild)
+                    )
+            await asyncio.sleep(3600)  # 1 hour
+
+    bot.startup_task_factories.append(lambda: _reports_batch_loop())
+
+    # ==============================
+    # Optional web dashboard (LAN, opt-in via DASHBOARD_ENABLED=1)
+    # ==============================
+    if os.getenv("DASHBOARD_ENABLED") == "1":
+        from web_server.server import serve_forever as _dashboard_serve_forever
+
+        # Default to loopback — public access should go through the Cloudflare
+        # tunnel, and open-auth on 0.0.0.0 would expose a full-admin dashboard.
+        _dashboard_host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+        _dashboard_port = int(os.getenv("DASHBOARD_PORT", "8080"))
+        bot.startup_task_factories.append(
+            lambda: _dashboard_serve_forever(ctx, _dashboard_host, _dashboard_port)
+        )
+        log.info("Dashboard enabled — will bind %s:%d", _dashboard_host, _dashboard_port)
+
+    # ==============================
+    # Graceful shutdown
+    # ==============================
+    async def _shutdown() -> None:
+        log.info("Shutting down gracefully...")
+
+        for task in bot.startup_tasks:
+            if not task.done():
+                task.cancel()
+        if bot.startup_tasks:
+            await asyncio.gather(*bot.startup_tasks, return_exceptions=True)
+        log.info("Background tasks cancelled")
+
+
+        try:
+            await asyncio.wait_for(
+                bot.unload_extension("bot_modules.music.cog"), timeout=15.0
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001 — shutdown must always complete regardless of what unloading the music cog raises
+            log.warning("music cog unload failed/timed out: %s", exc)
+
+        if not bot.is_closed():
+            await bot.close()
+        log.info("Bot closed")
+
+        if _log_queue_listener:
+            _log_queue_listener.stop()
+
+    async def _run_bot() -> None:
+        loop = asyncio.get_running_loop()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
+            except NotImplementedError:
+                pass
+
+        try:
+            async with bot:
+                await bot.start(boot_cfg.token)
+        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+            # The ordinary Ctrl-C / SIGTERM unwind lands here, so this is not an
+            # error -- but it is also where a cancellation raised *during*
+            # bot.close() would land after destroying the real exception, which
+            # is worth a line in the journal rather than a silent exit 0.
+            log.info("Bot loop stopped by %s", type(exc).__name__)
+        except Exception:
+            # Everything else: the bot died rather than stopped. Most of these
+            # come from setup_hook, where one bad cog takes the whole process
+            # down before on_ready -- so name the cause in the journal (this is
+            # the line to grep for after an unexplained death) and let it
+            # propagate, because a clean exit 0 is what once left the bot dead
+            # for 25 minutes with Restart=on-failure watching and nothing to
+            # act on.
+            log.critical("Bot exited abnormally — see traceback", exc_info=True)
+            raise
+        finally:
+            await _shutdown()
+
+    asyncio.run(_run_bot())
+
+
+if __name__ == "__main__":
+    main()

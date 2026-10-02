@@ -1,0 +1,1134 @@
+"""Tests for economy/rentals_service.py — the rental billing DB layer.
+
+Covers the money-critical paths: upfront charge + price snapshot, the live
+duplicate race (asserted via the public API), owner/force/grace cancels,
+member-remove cleanup on both owner and beneficiary sides, the full billing
+matrix (renewal no-drift, multi-week single charge, grace entry, retry
+recovery, 36h revoke, period-end cancel), the suspension clock freeze/resume,
+beneficiary-based entitlements, and personal-role CRUD.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.economy.rentals import COMPED_PERKS, GRACE_SECONDS, WEEK_SECONDS
+from bot_modules.economy.rentals_service import (
+    BillingResult,
+    RentalRefund,
+    bill_rental,
+    cancel_all_for_member,
+    cancel_rental,
+    delete_personal_role,
+    effective_entitlements,
+    entitlements,
+    get_personal_role,
+    get_refundable_rental,
+    list_member_rentals,
+    list_refundable_rentals,
+    list_rentals,
+    refund_rental,
+    rent_perk,
+    set_rental_suspended,
+    upsert_personal_role,
+)
+from bot_modules.economy.service import (
+    SHOP_TOGGLE_PERKS,
+    EconSettings,
+    apply_credit,
+    get_balance,
+    get_ledger,
+)
+from tests.db_template import migrated_db
+
+GUILD = 500
+USER = 1001
+OTHER = 1002
+THIRD = 1003
+T0 = 1_000_000.0
+
+SETTINGS = EconSettings(enabled=True, booster_multiplier=1.5)
+
+
+@pytest.fixture
+def db(tmp_path):
+    path = tmp_path / "test.db"
+    migrated_db(path)
+    return path
+
+
+def _fund(db, user, amount, guild=GUILD):
+    with open_db(db) as conn:
+        apply_credit(conn, guild, user, amount, "grant")
+
+
+def get_balance_helper(db, user):
+    with open_db(db) as conn:
+        return get_balance(conn, GUILD, user)
+
+
+def _rent(db, user, perk, *, beneficiary_id=None, now=T0, settings=SETTINGS):
+    with open_db(db) as conn:
+        row = rent_perk(
+            conn, settings, GUILD, user, perk,
+            beneficiary_id=beneficiary_id, now=now,
+        )
+        return dict(row)
+
+
+def _get(db, rental_id):
+    with open_db(db) as conn:
+        return dict(
+            conn.execute(
+                "SELECT * FROM econ_rentals WHERE id = ?", (rental_id,)
+            ).fetchone()
+        )
+
+
+def _set(db, rental_id, **cols):
+    assigns = ", ".join(f"{k} = ?" for k in cols)
+    with open_db(db) as conn:
+        conn.execute(
+            f"UPDATE econ_rentals SET {assigns} WHERE id = ?",
+            (*cols.values(), rental_id),
+        )
+
+
+# ── rent_perk ──────────────────────────────────────────────────────────
+
+
+def test_rent_charges_upfront_and_snapshots_price(db):
+    _fund(db, USER, 200)
+    row = _rent(db, USER, "role_color")
+    assert row["state"] == "active"
+    assert row["price"] == SETTINGS.price_role_color  # 50 default
+    assert row["beneficiary_id"] == USER
+    assert row["next_bill_at"] == T0 + WEEK_SECONDS
+    assert row["started_at"] == T0
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 200 - SETTINGS.price_role_color
+        led = get_ledger(conn, GUILD, USER, limit=1)[0]
+        assert led["kind"] == "rental"
+        assert led["amount"] == -SETTINGS.price_role_color
+
+
+def test_rent_holographic_charges_default_price(db):
+    # Exercises the migration-107 CHECK (the perk is accepted) and that the
+    # flat holographic price flows through _price_for.
+    _fund(db, USER, 400)
+    row = _rent(db, USER, "role_holographic")
+    assert row["state"] == "active"
+    assert row["price"] == SETTINGS.price_role_holographic == 300
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 400 - 300
+
+
+def test_rent_price_snapshot_uses_current_settings(db):
+    _fund(db, USER, 500)
+    pricey = EconSettings(price_role_color=99)
+    row = _rent(db, USER, "role_color", settings=pricey)
+    assert row["price"] == 99
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 500 - 99
+
+
+@pytest.mark.parametrize(
+    "perk,field",
+    [
+        ("role_color", "price_role_color"),
+        ("role_name", "price_role_name"),
+        ("role_gradient", "price_role_gradient"),
+        ("role_holographic", "price_role_holographic"),
+        ("voice_style", "price_voice_style"),
+    ],
+)
+def test_price_zero_is_free_to_rent_and_renew(db, perk, field):
+    """A price of 0 means free: no debit and no ledger row, rent or renewal."""
+    free = EconSettings(**{field: 0}, shop_voice_style_enabled=True)
+    r = _rent(db, USER, perk, settings=free)  # unfunded wallet
+    assert r["state"] == "active"
+    assert r["price"] == 0
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1, settings=free)
+    assert res.action == "charge"
+    assert _get(db, r["id"])["state"] == "active"
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 0
+        assert get_ledger(conn, GUILD, USER, limit=5) == []
+
+
+def test_free_rental_does_not_burn_a_voucher(db):
+    """A raffle voucher covers a debit; a price-0 rent has none to cover."""
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_vouchers "
+            "(guild_id, user_id, kind, state, source, created_at, expires_at) "
+            "VALUES (?, ?, 'free_week', 'issued', 'raffle:test', ?, ?)",
+            (GUILD, USER, T0, T0 + 86400 * 30),
+        )
+    free = EconSettings(price_role_color=0)
+    r = _rent(db, USER, "role_color", settings=free)
+    _bill(db, r["id"], T0 + WEEK_SECONDS + 1, settings=free)
+    with open_db(db) as conn:
+        left = conn.execute(
+            "SELECT COUNT(*) FROM econ_vouchers WHERE state = 'issued'"
+        ).fetchone()[0]
+    assert left == 1
+
+
+def test_rent_insufficient_is_zero_write(db):
+    _fund(db, USER, 30)  # role_color costs 50
+    # The ValueError must escape open_db so the rolled-back transaction unwinds
+    # the speculative rental INSERT (mirrors the cog letting it propagate).
+    with pytest.raises(ValueError, match="insufficient"):
+        with open_db(db) as conn:
+            rent_perk(conn, SETTINGS, GUILD, USER, "role_color", now=T0)
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 30
+        assert list_rentals(conn, GUILD) == []
+        # Only the seed grant remains — no "rental" debit row.
+        assert all(r["kind"] != "rental" for r in get_ledger(conn, GUILD, USER, limit=5))
+
+
+def test_rent_unknown_perk_rejected_no_charge(db):
+    _fund(db, USER, 200)
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="unknown perk"):
+            rent_perk(conn, SETTINGS, GUILD, USER, "role_wings", now=T0)
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 200
+
+
+def test_rent_duplicate_live_rejected_and_no_double_charge(db):
+    _fund(db, USER, 200)
+    _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="already rented"):
+            rent_perk(conn, SETTINGS, GUILD, USER, "role_color", now=T0 + 100)
+    with open_db(db) as conn:
+        # Charged exactly once, one live rental.
+        assert get_balance(conn, GUILD, USER) == 200 - SETTINGS.price_role_color
+        assert len(list_rentals(conn, GUILD)) == 1
+
+
+def test_rent_gift_duplicate_same_beneficiary_rejected(db):
+    _fund(db, USER, 300)
+    _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    with pytest.raises(ValueError, match="already rented"):
+        with open_db(db) as conn:
+            rent_perk(
+                conn, SETTINGS, GUILD, USER, "role_color",
+                beneficiary_id=OTHER, now=T0 + 5,
+            )
+
+
+def test_rent_gift_different_beneficiaries_both_succeed(db):
+    # Proves beneficiary_id participates in the live-rental unique index: the
+    # same payer + perk with two different beneficiaries is NOT a collision.
+    _fund(db, USER, 300)
+    a = _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    b = _rent(db, USER, "role_color", beneficiary_id=THIRD, now=T0 + 5)
+    assert a["id"] != b["id"]
+    assert a["beneficiary_id"] == OTHER
+    assert b["beneficiary_id"] == THIRD
+
+
+def test_rent_same_perk_allowed_after_lapse(db):
+    _fund(db, USER, 300)
+    first = _rent(db, USER, "role_color")
+    _set(db, first["id"], state="lapsed")
+    # A new rental of the same perk is fine once the old one is terminal.
+    second = _rent(db, USER, "role_color", now=T0 + 999)
+    assert second["id"] != first["id"]
+    assert second["state"] == "active"
+
+
+def test_rent_gift_beneficiary_is_the_friend(db):
+    _fund(db, USER, 200)
+    row = _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    assert row["user_id"] == USER  # payer
+    assert row["beneficiary_id"] == OTHER  # friend
+
+
+# ── cancel_rental ──────────────────────────────────────────────────────
+
+
+def test_cancel_active_by_owner_runs_to_period_end(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        out = cancel_rental(conn, GUILD, r["id"], requester_id=USER)
+    assert out["state"] == "active"  # still active until anniversary
+    assert out["cancel_at_period_end"] == 1
+
+
+def test_cancel_active_by_force(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        out = cancel_rental(conn, GUILD, r["id"], requester_id=9999, force=True)
+    assert out["cancel_at_period_end"] == 1
+
+
+def test_cancel_grace_is_immediate(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], state="grace", grace_since=T0)
+    with open_db(db) as conn:
+        out = cancel_rental(conn, GUILD, r["id"], requester_id=USER)
+    assert out["state"] == "cancelled"
+
+
+def test_cancel_not_owner_rejected(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="not your rental"):
+            cancel_rental(conn, GUILD, r["id"], requester_id=OTHER)
+
+
+def test_cancel_missing_rejected(db):
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="not found"):
+            cancel_rental(conn, GUILD, 424242, requester_id=USER)
+
+
+def test_cancel_terminal_rejected(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], state="lapsed")
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="not live"):
+            cancel_rental(conn, GUILD, r["id"], requester_id=USER)
+
+
+# ── refund_rental ────────────────────────────────────────────────────────
+
+
+def test_refund_active_credits_prorated_amount_and_ends_now(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")  # price 50, next_bill_at = T0 + WEEK
+    with open_db(db) as conn:
+        out = refund_rental(
+            conn, GUILD, r["id"], requester_id=USER, now=T0 + WEEK_SECONDS / 2,
+        )
+    assert isinstance(out, RentalRefund)
+    assert out.perk == "role_color"
+    assert out.refund == 25  # half the week left, half the price back
+    assert out.beneficiary_id == USER
+    row = _get(db, r["id"])
+    assert row["state"] == "cancelled"  # ends NOW, not at period end
+    assert row["ended_at"] == T0 + WEEK_SECONDS / 2
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 200 - 50 + 25
+        led = get_ledger(conn, GUILD, USER, limit=1)[0]
+        assert led["kind"] == "rental_refund"
+        assert led["amount"] == 25
+
+
+def test_refund_active_no_time_left_credits_zero(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        out = refund_rental(
+            conn, GUILD, r["id"], requester_id=USER, now=T0 + WEEK_SECONDS,
+        )
+    assert out.refund == 0
+    with open_db(db) as conn:
+        # No refund credit landed — balance is just the post-rent balance.
+        assert get_balance(conn, GUILD, USER) == 200 - 50
+
+
+def test_refund_grace_is_free_but_still_ends_now(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], state="grace", grace_since=T0)
+    with open_db(db) as conn:
+        out = refund_rental(conn, GUILD, r["id"], requester_id=USER, now=T0 + 10)
+    assert out.refund == 0
+    row = _get(db, r["id"])
+    assert row["state"] == "cancelled"
+
+
+def test_refund_not_payer_rejected(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    with open_db(db) as conn:
+        # OTHER wears the perk but didn't pay for it — can't refund it.
+        with pytest.raises(ValueError, match="not your rental"):
+            refund_rental(conn, GUILD, r["id"], requester_id=OTHER)
+
+
+def test_refund_terminal_rejected_exactly_once(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        out = refund_rental(conn, GUILD, r["id"], requester_id=USER, now=T0 + 10)
+    assert out.refund == 49  # floors just under the full 50 at T0+10
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="not live"):
+            refund_rental(conn, GUILD, r["id"], requester_id=USER, now=T0 + 20)
+    with open_db(db) as conn:
+        # A second attempt must not credit a second refund.
+        assert get_balance(conn, GUILD, USER) == 200 - 50 + 49
+
+
+def test_refund_missing_rejected(db):
+    with open_db(db) as conn:
+        with pytest.raises(ValueError, match="not found"):
+            refund_rental(conn, GUILD, 424242, requester_id=USER)
+
+
+def test_list_refundable_rentals_excludes_gift_beneficiary(db):
+    _fund(db, USER, 300)
+    _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    with open_db(db) as conn:
+        # USER paid for it — it's refundable by them, not by OTHER who wears it.
+        assert len(list_refundable_rentals(conn, GUILD, USER)) == 1
+        assert list_refundable_rentals(conn, GUILD, OTHER) == []
+
+
+def test_refund_rejects_admin_force_cancelled_rental(db):
+    # cancel_rental(force=True) marks cancel_at_period_end=1 but leaves
+    # state='active' (no refund intended) — self-refund must not reverse it.
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        cancel_rental(conn, GUILD, r["id"], requester_id=9999, force=True)
+        assert list_refundable_rentals(conn, GUILD, USER) == []
+        with pytest.raises(ValueError, match="already cancelled"):
+            refund_rental(conn, GUILD, r["id"], requester_id=USER)
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 200 - 50  # no refund credited
+
+
+def test_list_refundable_rentals_excludes_emoji_perk(db):
+    _fund(db, USER, 300)
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_rentals "
+            "(guild_id, user_id, perk, state, price, started_at, next_bill_at, "
+            " cancel_at_period_end, suspended, beneficiary_id, created_at) "
+            "VALUES (?, ?, 'emoji', 'active', 60, ?, ?, 0, 0, ?, ?)",
+            (GUILD, USER, T0, T0 + WEEK_SECONDS, USER, T0),
+        )
+        assert list_refundable_rentals(conn, GUILD, USER) == []
+
+
+def test_refund_rental_rejects_emoji_perk_directly(db):
+    # Defense in depth: even a direct call (bypassing the picker's filtering)
+    # must not refund a sponsored-emoji rental through this generic path.
+    _fund(db, USER, 300)
+    with open_db(db) as conn:
+        cur = conn.execute(
+            "INSERT INTO econ_rentals "
+            "(guild_id, user_id, perk, state, price, started_at, next_bill_at, "
+            " cancel_at_period_end, suspended, beneficiary_id, created_at) "
+            "VALUES (?, ?, 'emoji', 'active', 60, ?, ?, 0, 0, ?, ?)",
+            (GUILD, USER, T0, T0 + WEEK_SECONDS, USER, T0),
+        )
+        rental_id = cur.lastrowid
+        with pytest.raises(ValueError, match="not refundable here"):
+            refund_rental(conn, GUILD, rental_id, requester_id=USER)
+
+
+def test_get_refundable_rental_matches_list_refundable_rentals(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        row = get_refundable_rental(conn, GUILD, USER, r["id"])
+        assert row is not None
+        assert int(row["id"]) == r["id"]
+        # Not the payer -> None, mirroring list_refundable_rentals's exclusion.
+        assert get_refundable_rental(conn, GUILD, OTHER, r["id"]) is None
+        # Missing id -> None.
+        assert get_refundable_rental(conn, GUILD, USER, 424242) is None
+
+
+# ── cancel_all_for_member ──────────────────────────────────────────────
+
+
+def test_cancel_all_for_member_hits_owner_and_beneficiary(db):
+    _fund(db, USER, 200)
+    _fund(db, OTHER, 200)
+    _fund(db, THIRD, 200)
+    owned = _rent(db, USER, "role_color")  # USER owns
+    gift = _rent(db, OTHER, "role_color", beneficiary_id=USER)  # USER benefits
+    unrelated = _rent(db, THIRD, "role_color")  # untouched
+    with open_db(db) as conn:
+        affected = cancel_all_for_member(conn, GUILD, USER, now=T0 + 1)
+    ids = {r["id"] for r in affected}
+    assert ids == {owned["id"], gift["id"]}
+    assert all(r["state"] == "cancelled" for r in affected)
+    assert _get(db, unrelated["id"])["state"] == "active"
+
+
+def test_cancel_all_for_member_none_live_returns_empty(db):
+    with open_db(db) as conn:
+        assert cancel_all_for_member(conn, GUILD, USER, now=T0) == []
+
+
+# ── ended_at stamping (Stage 4: churn numerator) ───────────────────────
+
+
+def test_cancel_grace_stamps_ended_at(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], state="grace", grace_since=T0)
+    with open_db(db) as conn:
+        cancel_rental(conn, GUILD, r["id"], requester_id=USER, now=T0 + 5)
+    row = _get(db, r["id"])
+    assert row["state"] == "cancelled"
+    assert row["ended_at"] == T0 + 5
+
+
+def test_cancel_active_period_end_leaves_ended_at_null(db):
+    # An active cancel only flags cancel_at_period_end — the rental is still live,
+    # so ended_at stays NULL until the anniversary tick finalises it.
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        cancel_rental(conn, GUILD, r["id"], requester_id=USER, now=T0 + 5)
+    assert _get(db, r["id"])["ended_at"] is None
+
+
+def test_cancel_all_for_member_stamps_ended_at(db):
+    _fund(db, USER, 200)
+    _fund(db, OTHER, 200)
+    owned = _rent(db, USER, "role_color")
+    gift = _rent(db, OTHER, "role_color", beneficiary_id=USER)
+    with open_db(db) as conn:
+        cancel_all_for_member(conn, GUILD, USER, now=T0 + 9)
+    assert _get(db, owned["id"])["ended_at"] == T0 + 9
+    assert _get(db, gift["id"])["ended_at"] == T0 + 9
+
+
+def test_bill_revoke_stamps_ended_at(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    grace_start = T0 + WEEK_SECONDS
+    _set(db, r["id"], state="grace", grace_since=grace_start)
+    when = grace_start + GRACE_SECONDS
+    res = _bill(db, r["id"], when)
+    assert res.action == "revoke"
+    row = _get(db, r["id"])
+    assert row["state"] == "lapsed"
+    assert row["ended_at"] == when
+
+
+def test_bill_cancel_period_end_stamps_ended_at(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], cancel_at_period_end=1)
+    when = T0 + WEEK_SECONDS + 1
+    res = _bill(db, r["id"], when)
+    assert res.action == "cancel_period_end"
+    row = _get(db, r["id"])
+    assert row["state"] == "cancelled"
+    assert row["ended_at"] == when
+
+
+def test_bill_renewal_charge_leaves_ended_at_null(db):
+    # A live renewal is not a termination — ended_at must stay NULL.
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1)
+    assert res.action == "charge"
+    assert _get(db, r["id"])["ended_at"] is None
+
+
+# ── bill_rental: the billing matrix ────────────────────────────────────
+
+
+def _bill(db, rental_id, now, settings=SETTINGS):
+    with open_db(db) as conn:
+        row = conn.execute(
+            "SELECT * FROM econ_rentals WHERE id = ?", (rental_id,)
+        ).fetchone()
+        return bill_rental(conn, settings, row, now)
+
+
+def test_bill_not_due_is_noop(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    res = _bill(db, r["id"], T0 + 10)  # next_bill is T0 + WEEK
+    assert isinstance(res, BillingResult)
+    assert res.action == "none"
+    assert res.charged == 0
+    assert _get(db, r["id"])["next_bill_at"] == T0 + WEEK_SECONDS
+
+
+def test_bill_renewal_advances_from_scheduled_not_now(db):
+    _fund(db, USER, 200)
+    r = _rent(db, USER, "role_color")
+    # Loop runs 100s late past the anniversary.
+    late = T0 + WEEK_SECONDS + 100
+    res = _bill(db, r["id"], late)
+    assert res.action == "charge"
+    assert res.charged == SETTINGS.price_role_color
+    row = _get(db, r["id"])
+    # No drift: exactly two weeks from T0, NOT now + WEEK.
+    assert row["next_bill_at"] == T0 + 2 * WEEK_SECONDS
+    assert row["state"] == "active"
+    with open_db(db) as conn:
+        # rent + one renewal debit.
+        rows = [x for x in get_ledger(conn, GUILD, USER, limit=9) if x["kind"] == "rental"]
+        assert len(rows) == 2
+
+
+def test_bill_multiweek_downtime_charges_once(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    # Loop was down for ~5 weeks.
+    now = T0 + 5 * WEEK_SECONDS + 50
+    res = _bill(db, r["id"], now)
+    assert res.action == "charge"
+    row = _get(db, r["id"])
+    # Charged ONCE; next anniversary jumps to the first future one.
+    assert row["next_bill_at"] == T0 + 6 * WEEK_SECONDS
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 500 - 2 * SETTINGS.price_role_color
+        renewals = [
+            x for x in get_ledger(conn, GUILD, USER, limit=20) if x["kind"] == "rental"
+        ]
+        assert len(renewals) == 2  # upfront + one renewal
+
+
+def test_bill_renewal_uses_current_price(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")  # snapshot 50
+    dearer = EconSettings(price_role_color=80)
+    with open_db(db) as conn:
+        row = conn.execute("SELECT * FROM econ_rentals WHERE id = ?", (r["id"],)).fetchone()
+        res = bill_rental(conn, dearer, row, T0 + WEEK_SECONDS + 1)
+    assert res.charged == 80
+    assert _get(db, r["id"])["price"] == 80  # snapshot refreshed to current
+
+
+def test_bill_insufficient_enters_grace(db):
+    _fund(db, USER, SETTINGS.price_role_color)  # exactly one week
+    r = _rent(db, USER, "role_color")  # balance now 0
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1)
+    assert res.action == "enter_grace"
+    assert res.charged == 0
+    row = _get(db, r["id"])
+    assert row["state"] == "grace"
+    assert row["grace_since"] == T0 + WEEK_SECONDS + 1
+    # next_bill unchanged while in grace.
+    assert row["next_bill_at"] == T0 + WEEK_SECONDS
+
+
+def test_bill_retry_still_failing_stays_grace_silent(db):
+    _fund(db, USER, SETTINGS.price_role_color)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], state="grace", grace_since=T0 + WEEK_SECONDS)
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 3600)  # 1h into grace, still broke
+    assert res.action == "retry"
+    row = _get(db, r["id"])
+    assert row["state"] == "grace"
+    assert row["grace_since"] == T0 + WEEK_SECONDS  # anchor unchanged
+
+
+def test_bill_retry_recovers_and_advances_from_scheduled(db):
+    _fund(db, USER, SETTINGS.price_role_color)
+    r = _rent(db, USER, "role_color")  # balance 0
+    _set(db, r["id"], state="grace", grace_since=T0 + WEEK_SECONDS)
+    _fund(db, USER, SETTINGS.price_role_color)  # top up
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 7200)  # 2h into grace
+    assert res.action == "charge"
+    assert res.charged == SETTINGS.price_role_color
+    row = _get(db, r["id"])
+    assert row["state"] == "active"
+    assert row["grace_since"] is None
+    # Advances from the ORIGINAL scheduled anniversary, not from now.
+    assert row["next_bill_at"] == T0 + 2 * WEEK_SECONDS
+
+
+def test_bill_grace_36h_revokes_without_charging(db):
+    _fund(db, USER, 500)  # funded, but revoke must NOT charge
+    r = _rent(db, USER, "role_color")
+    grace_start = T0 + WEEK_SECONDS
+    _set(db, r["id"], state="grace", grace_since=grace_start)
+    before = get_balance_helper(db, USER)
+    res = _bill(db, r["id"], grace_start + GRACE_SECONDS)  # exactly 36h → revoke
+    assert res.action == "revoke"
+    assert res.charged == 0
+    assert _get(db, r["id"])["state"] == "lapsed"
+    assert get_balance_helper(db, USER) == before  # no debit on revoke
+
+
+def test_bill_cancel_at_period_end_finalizes_without_charge(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    _set(db, r["id"], cancel_at_period_end=1)
+    before = get_balance_helper(db, USER)
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1)
+    assert res.action == "cancel_period_end"
+    assert res.charged == 0
+    assert _get(db, r["id"])["state"] == "cancelled"
+    assert get_balance_helper(db, USER) == before
+
+
+# ── the guild stopped selling the perk (Shop & Perks checkboxes) ───────
+
+
+#: SETTINGS with one perk withdrawn, the way an admin unchecking a box leaves it.
+NO_GRADIENT = EconSettings(
+    enabled=True, booster_multiplier=1.5, shop_role_gradient_enabled=False
+)
+
+
+def test_rent_refuses_a_perk_the_guild_stopped_selling(db):
+    _fund(db, USER, 500)
+    before = get_balance_helper(db, USER)
+    with pytest.raises(ValueError, match="not for sale"), open_db(db) as conn:
+        rent_perk(conn, NO_GRADIENT, GUILD, USER, "role_gradient", now=T0)
+    # Refused BEFORE any money moves and without opening a row — a checkbox
+    # that charged you and then failed would be worse than no checkbox.
+    assert get_balance_helper(db, USER) == before
+    with open_db(db) as conn:
+        assert list_rentals(conn, GUILD) == []
+
+
+def test_rent_refuses_a_gift_of_a_withdrawn_perk(db):
+    # `/bank gift` reaches rent_perk by its own route, so the guard has to be
+    # here rather than on the shop's buttons.
+    _fund(db, USER, 500)
+    with pytest.raises(ValueError, match="not for sale"), open_db(db) as conn:
+        rent_perk(
+            conn, NO_GRADIENT, GUILD, USER, "role_gradient",
+            beneficiary_id=OTHER, now=T0,
+        )
+
+
+def test_rent_still_allows_the_perks_left_on_sale(db):
+    _fund(db, USER, 500)
+    with open_db(db) as conn:
+        row = rent_perk(conn, NO_GRADIENT, GUILD, USER, "role_color", now=T0)
+    assert row["state"] == "active"
+
+
+def test_custom_items_are_not_governed_by_the_perk_checkboxes(db):
+    """A custom shop item carries its own ``enabled`` column.
+
+    ``custom_item`` is outside SHOP_TOGGLE_PERKS, so ``perk_on_sale`` must let
+    it through — otherwise every custom item in the guild would vanish the
+    moment an admin unchecked an unrelated perk.
+    """
+    from bot_modules.economy.perks import perk_on_sale
+
+    all_off = EconSettings(
+        enabled=True,
+        **{f"shop_{p}_enabled": False for p in SHOP_TOGGLE_PERKS},
+    )
+    assert perk_on_sale(all_off, "custom_item") is True
+    assert perk_on_sale(all_off, "emoji") is True
+
+
+def test_a_live_rental_runs_to_its_anniversary_then_stops_renewing(db):
+    """The decision Billy made: run to expiry, don't cut anyone off mid-week."""
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_gradient")  # bought while still on sale
+    paid = get_balance_helper(db, USER)
+
+    # Admin unchecks the box. Mid-week, nothing happens at all: they keep the
+    # perk they paid for, and they are not charged.
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS - 1, settings=NO_GRADIENT)
+    assert res.action == "none"
+    assert _get(db, r["id"])["state"] == "active"
+    assert get_balance_helper(db, USER) == paid
+
+    # At the anniversary it ends — unbilled, and reported distinctly from a
+    # member's own cancel so the loop knows to DM them.
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS, settings=NO_GRADIENT)
+    assert res.action == "discontinued"
+    assert res.charged == 0
+    assert _get(db, r["id"])["state"] == "cancelled"
+    assert get_balance_helper(db, USER) == paid
+
+
+def test_re_checking_the_box_before_the_anniversary_renews_normally(db):
+    """Nothing is written when a perk goes off sale, so it is reversible.
+
+    An admin who unchecks a box and thinks better of it before anyone's week
+    runs out leaves no trace: the rental renews at the normal price.
+    """
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_gradient")
+    # Off, then on again, all before the anniversary.
+    assert _bill(db, r["id"], T0 + 10, settings=NO_GRADIENT).action == "none"
+    assert _get(db, r["id"])["cancel_at_period_end"] == 0  # no stored flag
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS, settings=SETTINGS)
+    assert res.action == "charge"
+    assert res.charged == SETTINGS.price_role_gradient
+    assert _get(db, r["id"])["state"] == "active"
+
+
+def test_a_members_own_cancel_wins_over_the_switch(db):
+    # Same ending, but "cancel_period_end" is silent and "discontinued" DMs.
+    # Telling someone the server withdrew a perk they cancelled themselves
+    # would be a lie about who decided.
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_gradient")
+    _set(db, r["id"], cancel_at_period_end=1)
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS, settings=NO_GRADIENT)
+    assert res.action == "cancel_period_end"
+
+
+def test_a_withdrawn_perk_in_grace_is_never_charged_to_recover(db):
+    """The regression this guards: grace + withdrawn must not bill a new week.
+
+    A grace rental with funds available recovers by paying — which for a perk
+    the server has stopped selling would mean charging someone a fresh week for
+    something they can no longer buy. Grace has no paid week left to honour
+    (the anniversary passed, the debit failed), so it ends instead.
+    """
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_gradient")
+    _set(db, r["id"], state="grace", grace_since=T0 + WEEK_SECONDS)
+    funded = get_balance_helper(db, USER)  # deliberately solvent
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 10, settings=NO_GRADIENT)
+    assert res.action == "discontinued"
+    assert res.charged == 0
+    assert get_balance_helper(db, USER) == funded
+    assert _get(db, r["id"])["state"] == "cancelled"
+
+
+def test_a_withdrawn_perk_can_still_be_refunded(db):
+    # Ending a rental early stays the member's call. Withdrawing the perk must
+    # not trap them in it — the refund path is not gated by the switch.
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_gradient")
+    with open_db(db) as conn:
+        out = refund_rental(
+            conn, GUILD, r["id"], requester_id=USER, now=T0 + 10
+        )
+    assert out.refund > 0
+    assert _get(db, r["id"])["state"] == "cancelled"
+
+
+def test_staff_comp_drops_a_withdrawn_perk(db):
+    """The comp is derived live, so unchecking a box takes it off mods too."""
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO config (guild_id, key, value) VALUES (?, ?, ?)",
+            (GUILD, "econ_mod_perk_comp", "1"),
+        )
+        conn.execute(
+            "INSERT INTO config (guild_id, key, value) VALUES (?, ?, ?)",
+            (GUILD, "econ_shop_role_gradient_enabled", "0"),
+        )
+        ent = effective_entitlements(conn, GUILD, USER, is_staff=True)
+    assert "role_gradient" not in ent
+    assert "role_color" in ent  # still sold, still comped
+
+
+# ── suspension clock ───────────────────────────────────────────────────
+
+
+def test_suspend_freezes_billing(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_icon")
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], True, now=T0 + 10)
+    row = _get(db, r["id"])
+    assert row["suspended"] == 1
+    assert row["suspended_since"] == T0 + 10
+    # Even past the anniversary, a suspended rental does not bill.
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 500)
+    assert res.action == "none"
+    assert _get(db, r["id"])["state"] == "active"
+
+
+def test_resume_pushes_next_bill_by_suspension_span(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_icon")
+    orig_next = _get(db, r["id"])["next_bill_at"]
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], True, now=T0 + 100)
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], False, now=T0 + 100 + 3600)  # 1h frozen
+    row = _get(db, r["id"])
+    assert row["suspended"] == 0
+    assert row["suspended_since"] is None
+    assert row["next_bill_at"] == orig_next + 3600
+
+
+def test_resume_also_pushes_grace_since_when_set(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_icon")
+    _set(db, r["id"], state="grace", grace_since=T0 + 50)
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], True, now=T0 + 60)
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], False, now=T0 + 60 + 200)
+    assert _get(db, r["id"])["grace_since"] == T0 + 50 + 200
+
+
+def test_suspend_is_idempotent(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_icon")
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], True, now=T0 + 10)
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], True, now=T0 + 99)  # no-op
+    assert _get(db, r["id"])["suspended_since"] == T0 + 10  # first wins
+
+
+def test_resume_when_not_suspended_is_noop(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_icon")
+    orig_next = _get(db, r["id"])["next_bill_at"]
+    with open_db(db) as conn:
+        set_rental_suspended(conn, r["id"], False, now=T0 + 5000)
+    assert _get(db, r["id"])["next_bill_at"] == orig_next
+
+
+# ── entitlements ───────────────────────────────────────────────────────
+
+
+def test_entitlements_owner_and_gift_beneficiary(db):
+    _fund(db, USER, 500)
+    _fund(db, OTHER, 500)
+    _rent(db, USER, "role_color")  # USER owns + benefits
+    _rent(db, OTHER, "role_name", beneficiary_id=USER)  # USER benefits, OTHER pays
+    with open_db(db) as conn:
+        assert entitlements(conn, GUILD, USER) == {"role_color", "role_name"}
+        # OTHER paid but is not the beneficiary of the gift.
+        assert entitlements(conn, GUILD, OTHER) == set()
+
+
+def test_entitlements_grace_grants_lapsed_does_not(db):
+    _fund(db, USER, 500)
+    r1 = _rent(db, USER, "role_color")
+    r2 = _rent(db, USER, "role_icon")
+    _set(db, r1["id"], state="grace", grace_since=T0)
+    _set(db, r2["id"], state="lapsed")
+    with open_db(db) as conn:
+        assert entitlements(conn, GUILD, USER) == {"role_color"}
+
+
+# ── effective_entitlements (the staff perk comp) ───────────────────────
+
+
+def _set_comp(db, on: bool) -> None:
+    from bot_modules.economy.service import save_econ_settings
+
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD, {"mod_perk_comp": on})
+
+
+def test_effective_entitlements_comps_staff(db):
+    """The comp covers every perk the guild actually sells.
+
+    Not ``COMPED_PERKS`` outright: the voice lease ships unsold (its checkbox
+    defaults off, matching the price-0 dark default it replaced), so a guild
+    that has configured nothing comps the six role perks and not the lease.
+    Comping a line the server doesn't sell is exactly what the switches exist
+    to prevent.
+    """
+    _set_comp(db, True)
+    with open_db(db) as conn:
+        ent = effective_entitlements(conn, GUILD, USER, is_staff=True)
+    assert ent == set(COMPED_PERKS) - {"voice_style"}
+
+
+def test_effective_entitlements_comps_the_voice_lease_once_it_is_sold(db):
+    from bot_modules.economy.service import save_econ_settings
+
+    _set_comp(db, True)
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD, {"shop_voice_style_enabled": True})
+        ent = effective_entitlements(conn, GUILD, USER, is_staff=True)
+    assert ent == set(COMPED_PERKS)
+
+
+def test_effective_entitlements_refuses_non_staff(db):
+    """The enforcement side: an ordinary member still has to rent."""
+    _set_comp(db, True)
+    with open_db(db) as conn:
+        assert effective_entitlements(conn, GUILD, USER, is_staff=False) == set()
+
+
+def test_effective_entitlements_ignores_staff_while_comp_is_off(db):
+    # Default state — the guild never opted in, so a mod is an ordinary buyer.
+    with open_db(db) as conn:
+        assert effective_entitlements(conn, GUILD, USER, is_staff=True) == set()
+
+
+def test_comp_writes_no_rental_and_no_ledger_row(db):
+    """A comp is not a purchase.
+
+    The whole point of deriving it: nothing lands in ``econ_rentals`` (so the
+    billing loop never charges for it) and nothing lands in ``econ_ledger``
+    (so the economy's spend figures never see money that didn't move).
+    """
+    _set_comp(db, True)
+    with open_db(db) as conn:
+        assert effective_entitlements(conn, GUILD, USER, is_staff=True)
+        assert list_rentals(conn, GUILD) == []
+        assert get_ledger(conn, GUILD, USER) == []
+
+
+def test_comp_leaves_a_staff_members_own_rental_billable(db):
+    """A mod who was already paying keeps the rental, and it still bills.
+
+    ``entitlements`` stays the raw rental truth — if the comp leaked into it,
+    the billing loop and the refund picker would lose sight of a live row.
+    """
+    _fund(db, USER, 500)
+    _rent(db, USER, "role_color")
+    _set_comp(db, True)
+    with open_db(db) as conn:
+        assert entitlements(conn, GUILD, USER) == {"role_color"}
+        # Minus the voice lease, which this guild doesn't sell (see
+        # test_effective_entitlements_comps_staff).
+        assert effective_entitlements(conn, GUILD, USER, is_staff=True) == (
+            set(COMPED_PERKS) - {"voice_style"}
+        )
+        assert len(list_rentals(conn, GUILD)) == 1
+
+
+# ── list helpers ───────────────────────────────────────────────────────
+
+
+def test_list_rentals_default_live_only(db):
+    _fund(db, USER, 500)
+    live = _rent(db, USER, "role_color")
+    dead = _rent(db, USER, "role_icon")
+    _set(db, dead["id"], state="lapsed")
+    with open_db(db) as conn:
+        ids = {r["id"] for r in list_rentals(conn, GUILD)}
+        assert ids == {live["id"]}
+        all_ids = {r["id"] for r in list_rentals(conn, GUILD, states=("active", "lapsed"))}
+        assert all_ids == {live["id"], dead["id"]}
+
+
+def test_list_member_rentals_owner_or_beneficiary(db):
+    _fund(db, USER, 500)
+    _fund(db, OTHER, 500)
+    owned = _rent(db, USER, "role_color")
+    gift = _rent(db, OTHER, "role_color", beneficiary_id=USER)
+    with open_db(db) as conn:
+        ids = {r["id"] for r in list_member_rentals(conn, GUILD, USER)}
+    assert ids == {owned["id"], gift["id"]}
+
+
+# ── personal-role CRUD ─────────────────────────────────────────────────
+
+
+def test_personal_role_none_initially(db):
+    with open_db(db) as conn:
+        assert get_personal_role(conn, GUILD, USER) is None
+
+
+def test_personal_role_upsert_partial_then_patch(db):
+    with open_db(db) as conn:
+        upsert_personal_role(conn, GUILD, USER, {"name": "Stardust"})
+    with open_db(db) as conn:
+        row = get_personal_role(conn, GUILD, USER)
+        assert row is not None
+        assert row["name"] == "Stardust"
+        assert row["color"] == -1  # default preserved
+    with open_db(db) as conn:
+        upsert_personal_role(conn, GUILD, USER, {"color": 0xFF00FF})
+    with open_db(db) as conn:
+        row = get_personal_role(conn, GUILD, USER)
+        assert row is not None
+        assert row["name"] == "Stardust"  # preserved across patch
+        assert row["color"] == 0xFF00FF
+
+
+def test_personal_role_unknown_field_rejected(db):
+    with open_db(db) as conn:
+        with pytest.raises(KeyError):
+            upsert_personal_role(conn, GUILD, USER, {"bogus": 1})
+
+
+def test_personal_role_delete(db):
+    with open_db(db) as conn:
+        upsert_personal_role(conn, GUILD, USER, {"name": "x", "role_id": 42})
+    with open_db(db) as conn:
+        delete_personal_role(conn, GUILD, USER)
+    with open_db(db) as conn:
+        assert get_personal_role(conn, GUILD, USER) is None
+
+
+# ── shop_purchase quest trigger ───────────────────────────────────────
+
+
+def _shop_activity(db, user):
+    with open_db(db) as conn:
+        return conn.execute(
+            "SELECT COALESCE(SUM(count), 0) AS n FROM econ_kind_activity "
+            "WHERE guild_id = ? AND user_id = ? AND kind = 'shop_purchase'",
+            (GUILD, user),
+        ).fetchone()["n"]
+
+
+def test_rent_fires_shop_purchase_trigger(db):
+    from bot_modules.economy.service import save_econ_settings
+
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD, {"enabled": True})
+    _fund(db, USER, 500)
+    _rent(db, USER, "role_color")
+    assert _shop_activity(db, USER) == 1
+
+
+def test_renewal_billing_never_fires_shop_purchase(db):
+    # The voluntary rent fires; the loop's automatic weekly charge must not —
+    # no quest credit for a charge the member didn't act on.
+    from bot_modules.economy.service import save_econ_settings
+
+    with open_db(db) as conn:
+        save_econ_settings(conn, GUILD, {"enabled": True})
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    with open_db(db) as conn:
+        conn.execute("DELETE FROM econ_kind_activity")
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1)
+    assert res.action == "charge"
+    assert _shop_activity(db, USER) == 0
+
+
+# ── renewal reprice notice (2026-08 review, economy A2) ────────────────
+
+
+def test_bill_renewal_reports_previous_price_when_price_changed(db):
+    """An admin reprice between cycles must surface on the BillingResult so
+    the loop can DM the owner — the 07-30 reprice billed silently."""
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")  # snapshots the 50 default
+    with open_db(db) as conn:
+        row = conn.execute(
+            "SELECT * FROM econ_rentals WHERE id = ?", (r["id"],)
+        ).fetchone()
+        res = bill_rental(
+            conn, EconSettings(price_role_color=65), row, T0 + WEEK_SECONDS + 1
+        )
+    assert res.action == "charge"
+    assert res.charged == 65
+    assert res.previous_price == 50
+
+
+def test_bill_renewal_previous_price_zero_when_unchanged(db):
+    _fund(db, USER, 500)
+    r = _rent(db, USER, "role_color")
+    res = _bill(db, r["id"], T0 + WEEK_SECONDS + 1)
+    assert res.action == "charge"
+    assert res.previous_price == 0
+
+
+def test_a_custom_item_rental_without_an_item_id_is_refused(tmp_path):
+    """There is no flat `price_custom_item` to fall back on, so pricing at 0
+    would open a permanently free, silently renewing rental."""
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.economy.rentals_service import rent_perk
+    from bot_modules.economy.service import EconSettings
+    from tests.db_template import migrated_db
+
+    path = tmp_path / "custom.db"
+    migrated_db(path)
+    with open_db(path) as conn, pytest.raises(ValueError, match="catalog_item_id"):
+        rent_perk(conn, EconSettings(enabled=True), 900, 5, "custom_item")

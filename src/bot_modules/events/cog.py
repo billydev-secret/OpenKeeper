@@ -1,0 +1,2010 @@
+"""Discord event listeners (Cog)."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from bot_modules.breaks.service import reapply_on_join
+from bot_modules.moderation.jail.jail_commands import check_jail_rejoin
+from bot_modules.economy import quests as quest_rules
+from bot_modules.core.post_monitoring import (
+    enforce_gif_guard,
+    enforce_spoiler_requirement,
+)
+from bot_modules.auto_delete.service import (
+    remove_tracked_auto_delete_message,
+    remove_tracked_auto_delete_messages,
+    should_track_auto_delete_message,
+    track_auto_delete_message,
+)
+from bot_modules.birthday.service import (
+    announced_birthday_ids,
+    is_birthday_wish,
+)
+from bot_modules.core.channel_rollup import thread_parent_id
+from bot_modules.shared.age_gate import is_age_gated_channel
+from bot_modules.shared.discord_scan import collect_messageable_channels
+from bot_modules.event_echo.service import echo_discord_event
+from bot_modules.onboarding.greeting_watch.service import (
+    acknowledge_by_reaction,
+    acknowledge_greetings,
+    directed_target_ids,
+    is_greeting,
+    pending_greetings_for,
+    record_greeting,
+)
+from bot_modules.invites.tracker import (
+    cache_invite_create,
+    cache_invite_delete,
+    detect_inviter,
+    record_invite,
+    refresh_invite_cache,
+)
+from bot_modules.onboarding.intake import service as intake_svc
+from bot_modules.core.role_provision import ensure_config_role
+from bot_modules.core.role_safety import grant_block_reason
+from bot_modules.shared.feature_roles import WELCOME_PING
+from bot_modules.xp import promotion_review_service as promo_review
+from bot_modules.shared.message_store import (
+    DELETE_SOURCE_DISCORD,
+    adjust_reaction_count,
+    classify_media_kind,
+    mark_member_left,
+    mark_messages_deleted,
+    record_member_event,
+    set_reaction_count,
+    store_message,
+    upsert_known_channel,
+    upsert_known_user,
+)
+from bot_modules.ping_tracker import service as ping_tracker_service
+from bot_modules.xp.message_xp_service import (
+    award_image_reaction_xp,
+    award_message_xp,
+    award_reaction_given_xp,
+)
+from bot_modules.onboarding.welcome.login_card_service import (
+    all_personal_done,
+    build_login_embed,
+    card_handle,
+    card_signature,
+    record_card,
+)
+from bot_modules.analytics.sentiment_service import score_text
+from bot_modules.todo.recurring_service import auto_complete_chores
+from bot_modules.onboarding.welcome.service import (
+    build_leave_embed,
+    build_welcome_embed,
+    render_arrival_message,
+)
+from bot_modules.wellness.enforcement import wellness_on_message
+from bot_modules.wellness.service import (
+    login_digest_value as wellness_login_digest_value,
+)
+from bot_modules.xp.service import handle_level_progress, nsfw_grant_role_id
+from bot_modules.core.branding import DEFAULT_ACCENT_COLOR, safe_resolve_accent
+from bot_modules.core.db_utils import get_tz_offset_hours
+from bot_modules.core.utils import (
+    format_guild_for_log,
+    get_guild_channel_or_thread,
+    jump_url,
+    template_pings,
+)
+from bot_modules.core.xp_system import count_xp_events, log_role_event, record_member_activity
+from bot_modules.economy.logic import (
+    is_economy_manager,
+    QOTD_CHORE_TRIGGER,
+    local_day_for,
+    qotd_marker,
+)
+from bot_modules.economy.quests import previous_local_day
+from bot_modules.economy.quests_service import (
+    community_gains_for_day,
+    fire_trigger_inline,
+    fire_trigger_quests,
+    load_member_quest_board,
+)
+from bot_modules.economy.service import (
+    EconSettings,
+    LoginOutcome,
+    create_qotd,
+    load_econ_settings,
+    deliver_econ_dm,
+    process_login,
+    qotd_for_message,
+    try_award_qotd,
+)
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import AppContext, Bot, GuildConfig
+
+log = logging.getLogger("dungeonkeeper.events")
+
+
+def _message_mention_ids(
+    recorded_bot_user_ids: frozenset[int] | set[int], message: discord.Message
+) -> list[int]:
+    return [
+        user.id
+        for user in message.mentions
+        if (not user.bot or user.id in recorded_bot_user_ids)
+        and user.id != message.author.id
+    ]
+
+
+def _counts_as_member_activity(message: discord.Message) -> bool:
+    return message.type in {
+        discord.MessageType.default,
+        discord.MessageType.reply,
+    }
+
+
+_collect_backfill_channels = collect_messageable_channels
+
+
+async def _backfill_messages(bot: Bot, ctx: AppContext) -> None:
+    for g in bot.guilds:
+        me = g.me
+        guild_count = 0
+        for channel in await _collect_backfill_channels(g, me):
+            _g_id = g.id
+            _ch_id = channel.id
+
+            def _do_channel_query(_g_id=_g_id, _ch_id=_ch_id):
+                with ctx.open_db() as conn:
+                    _row = conn.execute(
+                        "SELECT MAX(message_id) FROM messages WHERE guild_id = ? AND channel_id = ?",
+                        (_g_id, _ch_id),
+                    ).fetchone()
+                return _row
+
+            row = await asyncio.to_thread(_do_channel_query)
+            max_id = row[0] if row and row[0] else None
+            history_kwargs: dict = {"limit": None, "oldest_first": True}
+            if max_id:
+                history_kwargs["after"] = discord.Object(id=max_id)
+
+            channel_count = 0
+            batch: list[discord.Message] = []
+            BATCH_SIZE = 200
+
+            def _flush(msgs: list[discord.Message], _g=g, _channel=channel) -> None:
+                if not msgs:
+                    return
+                with ctx.open_db() as conn:
+                    gcfg = ctx.guild_config(_g.id)
+                    for msg in msgs:
+                        msg_ts = msg.created_at.timestamp() if msg.created_at else time.time()
+                        sentiment, emotion = score_text(msg.content)
+                        mention_ids = (
+                            []
+                            if msg.author.bot
+                            else _message_mention_ids(gcfg.recorded_bot_user_ids, msg)
+                        )
+                        reply_to_id = (
+                            msg.reference.message_id
+                            if msg.reference and msg.reference.message_id
+                            else None
+                        )
+                        if should_track_auto_delete_message(
+                            conn, _g.id, _channel.id, has_media=bool(msg.attachments)
+                        ):
+                            track_auto_delete_message(
+                                conn,
+                                _g.id,
+                                _channel.id,
+                                msg.id,
+                                msg_ts,
+                            )
+                        store_message(
+                            conn,
+                            message_id=msg.id,
+                            guild_id=_g.id,
+                            channel_id=_channel.id,
+                            author_id=msg.author.id,
+                            reply_to_id=reply_to_id,
+                            ts=int(msg_ts),
+                            mention_ids=mention_ids,
+                            sentiment=sentiment,
+                            emotion=emotion,
+                            media_kind=classify_media_kind(
+                                [a.filename for a in msg.attachments]
+                            ),
+                        )
+                        for reaction in msg.reactions:
+                            set_reaction_count(
+                                conn, msg.id, str(reaction.emoji), reaction.count
+                            )
+                        if sentiment is not None:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO message_sentiment "
+                                "(message_id, guild_id, channel_id, sentiment, emotion, computed_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (msg.id, _g.id, _channel.id, sentiment, emotion, msg_ts),
+                            )
+                        upsert_known_user(
+                            conn,
+                            guild_id=_g.id,
+                            user_id=msg.author.id,
+                            username=str(msg.author),
+                            display_name=msg.author.display_name,
+                            ts=msg_ts,
+                            is_bot=msg.author.bot,
+                        )
+                        upsert_known_channel(
+                            conn,
+                            guild_id=_g.id,
+                            channel_id=_channel.id,
+                            channel_name=getattr(_channel, "name", str(_channel.id)),
+                            ts=msg_ts,
+                            parent_id=thread_parent_id(_channel),
+                            is_thread=thread_parent_id(_channel) is not None,
+                        )
+
+            try:
+                async for msg in channel.history(**history_kwargs):
+                    batch.append(msg)
+                    channel_count += 1
+                    if len(batch) >= BATCH_SIZE:
+                        _flush(batch)
+                        batch = []
+                _flush(batch)
+            except discord.Forbidden:
+                _flush(batch)
+                continue
+            except Exception:
+                _flush(batch)
+                log.exception(
+                    "Backfill failed in guild %s channel #%s",
+                    format_guild_for_log(g),
+                    getattr(channel, "name", channel.id),
+                )
+                continue
+            if channel_count:
+                log.info(
+                    "Backfilled %d messages in guild %s channel #%s.",
+                    channel_count,
+                    format_guild_for_log(g),
+                    getattr(channel, "name", channel.id),
+                )
+                guild_count += channel_count
+        if guild_count:
+            log.info(
+                "Backfill complete for guild %s: %d messages.",
+                format_guild_for_log(g),
+                guild_count,
+            )
+
+
+async def _on_tree_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    # `CommandTree.error` is a single-slot hook — registering a second handler
+    # replaces the first — so this function is the process's only app-command
+    # error path. Re-broadcast as a normal bot event so other cogs (usage
+    # telemetry) can observe failures via the ordinary listener mechanism
+    # instead of wrapping `tree.on_error` and depending on extension load
+    # order. `on_app_command_error` is not a discord.py built-in, so the name
+    # is ours; the bot-level `on_app_command_completion` is its success twin.
+    interaction.client.dispatch("app_command_error", interaction, error)
+
+    if isinstance(error, app_commands.CommandNotFound):
+        missing_name = getattr(error, "name", "unknown")
+        log.warning(
+            "Received unknown slash command '%s' in guild %s (user %s). "
+            "This is usually stale command registration.",
+            missing_name,
+            interaction.guild.name if interaction.guild else interaction.guild_id,
+            interaction.user,
+        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ That command is out of date on this server. Please try again in a moment.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            pass
+        return
+
+    log.exception("Unhandled app command error: %s", error)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ Command failed. Please try again.", ephemeral=True
+            )
+    except discord.HTTPException:
+        pass
+
+
+class EventsCog(commands.Cog):
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        self._message_backfill_task: asyncio.Task[None] | None = None
+        # Strong refs for fire-and-forget card refreshes, so they aren't GC'd
+        # mid-flight. Discarded as each finishes.
+        self._card_refresh_tasks: set[asyncio.Task[None]] = set()
+        super().__init__()
+
+    async def cog_load(self) -> None:
+        self.bot.tree.error(_on_tree_error)
+
+    def _log_background_task_result(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Background message backfill crashed.")
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self.bot.user is None:
+            log.warning("Bot user was not available during on_ready.")
+            return
+
+        log.info("Logged in as %s (ID: %s)", self.bot.user, self.bot.user.id)
+        _primary_guild = (
+            self.bot.get_guild(self.bot.ctx.guild_id) if self.bot.ctx.guild_id else None
+        )
+
+        def _ch(cid: int) -> str:
+            c = _primary_guild.get_channel(cid) if _primary_guild else None
+            return f"#{c.name}" if c else str(cid)
+
+        def _ro(rid: int) -> str:
+            r = _primary_guild.get_role(rid) if _primary_guild else None
+            return f"@{r.name}" if r else str(rid)
+
+        cfg = self.bot.ctx.guild_config(self.bot.ctx.guild_id)
+        log.info(
+            "Primary guild %s (ID: %s)",
+            _primary_guild.name if _primary_guild else self.bot.ctx.guild_id,
+            self.bot.ctx.guild_id,
+        )
+        log.info(
+            "XP config loaded: level-%s role=%s level-up-log=%s level-%s-log=%s.",
+            cfg.xp_settings.role_grant_level,
+            _ro(cfg.level_5_role_id),
+            _ch(cfg.level_up_log_channel_id),
+            cfg.xp_settings.role_grant_level,
+            _ch(cfg.level_5_log_channel_id),
+        )
+        log.debug("XP excluded channels: %s", sorted(cfg.xp_excluded_channel_ids))
+
+        now_ts = time.time()
+        for g in self.bot.guilds:
+            await refresh_invite_cache(g)
+            _guild_members = [(m.id, str(m), m.display_name, m.bot) for m in g.members]
+            _guild_channels = [(ch.id, ch.name) for ch in g.channels if hasattr(ch, "name")]
+            _guild_id = g.id
+            _guild_log = format_guild_for_log(g)
+
+            def _do_upserts(
+                _guild_members=_guild_members,
+                _guild_channels=_guild_channels,
+                _guild_id=_guild_id,
+                _guild_log=_guild_log,
+            ):
+                with self.bot.ctx.open_db() as conn:
+                    for uid, uname, dname, is_bot in _guild_members:
+                        upsert_known_user(
+                            conn,
+                            guild_id=_guild_id,
+                            user_id=uid,
+                            username=uname,
+                            display_name=dname,
+                            ts=now_ts,
+                            is_bot=is_bot,
+                            current_member=True,
+                        )
+                    for ch_id, ch_name in _guild_channels:
+                        upsert_known_channel(
+                            conn,
+                            guild_id=_guild_id,
+                            channel_id=ch_id,
+                            channel_name=ch_name,
+                            ts=now_ts,
+                        )
+                    log.debug(
+                        "XP event rows stored for guild %s: %s",
+                        _guild_log,
+                        count_xp_events(conn, _guild_id),
+                    )
+
+            await asyncio.to_thread(_do_upserts)
+            log.info(
+                "Backfilled guild %s: %d known users, %d known channels.",
+                g.name,
+                len(g.members),
+                len(g.channels),
+            )
+
+        if self._message_backfill_task is None or self._message_backfill_task.done():
+            self._message_backfill_task = asyncio.create_task(
+                _backfill_messages(self.bot, self.bot.ctx)
+            )
+            self._message_backfill_task.add_done_callback(
+                self._log_background_task_result
+            )
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if not message.guild:
+            return
+        # Bound to a local so the narrowing survives into the _persist_*
+        # closures below (pyright can't narrow `message.guild` across a
+        # nested-function boundary).
+        guild_id = message.guild.id
+        cfg = self.bot.ctx.guild_config(guild_id)
+        is_bot_author = message.author.bot
+        # Recorded on the channel registry so the analytics can attribute a
+        # thread's messages to the channel it was started from — the stored
+        # channel_id is the thread's own, and nothing else distinguishes the
+        # two after the fact (services/channel_rollup).
+        channel_parent_id = thread_parent_id(message.channel)
+
+        message_ts = (
+            message.created_at.timestamp() if message.created_at else time.time()
+        )
+
+        reply_to_id: int | None = None
+        if message.reference and message.reference.message_id:
+            reply_to_id = message.reference.message_id
+
+        # Role pings, read off Discord's structured mention lists rather than
+        # the text — the bot stores no text to parse — and so a member typing "@everyone" without the
+        # permission to use it isn't recorded as having pinged the server.
+        # Derived here, once, because all three persistence paths below want
+        # it and only this scope still has the discord.Message.
+        role_ping_ids, ping_everyone = ping_tracker_service.role_pings_from_message(
+            message
+        )
+        # Three-way, not two: most role pings in a busy server come from
+        # unrelated third-party bots, and lumping those in with our own
+        # announcements makes the report unreadable.
+        _self_id = getattr(self.bot.user, "id", 0)
+        ping_source = ping_tracker_service.ingest_source(
+            is_bot=is_bot_author,
+            is_self=bool(_self_id) and message.author.id == _self_id,
+        )
+        # media_kind is metadata (an attachment classification, not a URL), and
+        # it is what keeps the media metrics working without stored attachments.
+        media_kind = classify_media_kind([a.filename for a in message.attachments])
+
+        if is_bot_author:
+            sentiment, emotion = await asyncio.to_thread(score_text, message.content)
+
+            def _persist_bot_message():
+                with self.bot.ctx.open_db() as conn:
+                    if should_track_auto_delete_message(
+                        conn,
+                        guild_id,
+                        message.channel.id,
+                        has_media=bool(message.attachments),
+                    ):
+                        track_auto_delete_message(
+                            conn,
+                            guild_id,
+                            message.channel.id,
+                            message.id,
+                            message_ts,
+                        )
+                    store_message(
+                        conn,
+                        message_id=message.id,
+                        guild_id=guild_id,
+                        channel_id=message.channel.id,
+                        author_id=message.author.id,
+                        reply_to_id=reply_to_id,
+                        ts=int(message_ts),
+                        mention_ids=[],
+                        sentiment=sentiment,
+                        emotion=emotion,
+                        media_kind=media_kind,
+                        role_mention_ids=role_ping_ids,
+                        mention_everyone=ping_everyone,
+                        ping_source=ping_source,
+                    )
+                    if sentiment is not None:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO message_sentiment "
+                            "(message_id, guild_id, channel_id, sentiment, emotion, computed_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                message.id,
+                                guild_id,
+                                message.channel.id,
+                                sentiment,
+                                emotion,
+                                message_ts,
+                            ),
+                        )
+                    upsert_known_user(
+                        conn,
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        username=str(message.author),
+                        display_name=message.author.display_name,
+                        ts=message_ts,
+                        is_bot=message.author.bot,
+                    )
+                    upsert_known_channel(
+                        conn,
+                        guild_id=guild_id,
+                        channel_id=message.channel.id,
+                        channel_name=getattr(message.channel, "name", str(message.channel.id)),
+                        ts=message_ts,
+                        parent_id=channel_parent_id,
+                        is_thread=channel_parent_id is not None,
+                    )
+
+            await asyncio.to_thread(_persist_bot_message)
+            return
+
+        if not _counts_as_member_activity(message):
+            mention_ids = _message_mention_ids(cfg.recorded_bot_user_ids, message)
+
+            def _persist_nonmember_message():
+                with self.bot.ctx.open_db() as conn:
+                    if should_track_auto_delete_message(
+                        conn,
+                        guild_id,
+                        message.channel.id,
+                        has_media=bool(message.attachments),
+                    ):
+                        track_auto_delete_message(
+                            conn,
+                            guild_id,
+                            message.channel.id,
+                            message.id,
+                            message_ts,
+                        )
+                    store_message(
+                        conn,
+                        message_id=message.id,
+                        guild_id=guild_id,
+                        channel_id=message.channel.id,
+                        author_id=message.author.id,
+                        reply_to_id=reply_to_id,
+                        ts=int(message_ts),
+                        mention_ids=mention_ids,
+                        media_kind=media_kind,
+                        role_mention_ids=role_ping_ids,
+                        mention_everyone=ping_everyone,
+                        ping_source=ping_source,
+                    )
+                    upsert_known_user(
+                        conn,
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        username=str(message.author),
+                        display_name=message.author.display_name,
+                        ts=message_ts,
+                    )
+                    upsert_known_channel(
+                        conn,
+                        guild_id=guild_id,
+                        channel_id=message.channel.id,
+                        channel_name=getattr(
+                            message.channel, "name", str(message.channel.id)
+                        ),
+                        ts=message_ts,
+                        parent_id=channel_parent_id,
+                        is_thread=channel_parent_id is not None,
+                    )
+
+            await asyncio.to_thread(_persist_nonmember_message)
+            return
+
+        # A member who lost access (auto-sweep prune, or an inactive/"sleeper"
+        # hold) has come back — post a promotion-review card. is_watched is an
+        # O(1) in-memory filter, so the common (not-watched) case costs nothing;
+        # the DB-truth trigger evaluation + dedup happens inside post_review_card.
+        if promo_review.is_watched(guild_id, message.author.id) and isinstance(
+            message.author, discord.Member
+        ):
+            from bot_modules.xp.promotion_review_views import post_review_card
+
+            await post_review_card(self.bot.ctx, message.author, message.channel.id)
+
+        # Intake: a message addressing a newcomer with an open card may be
+        # the greeting (greeter, in the intake channel), a step code, or the
+        # completion code. Replying counts as addressing them, and a reply
+        # with its ping suppressed isn't in message.mentions at all — so the
+        # reply target joins the pre-filter, not just the mention list.
+        # is_watched keeps the common case to set lookups; the DB-truth
+        # evaluation happens inside handle_intake_message.
+        _intake_ids = [u.id for u in message.mentions]
+        _replied_to = intake_svc.reply_target_id(message)
+        if _replied_to:
+            _intake_ids.append(_replied_to)
+        if any(intake_svc.is_watched(guild_id, uid) for uid in _intake_ids):
+            from bot_modules.onboarding.intake.views import handle_intake_message
+
+            # Guarded: an intake failure must never abort the rest of the
+            # pipeline (spoiler enforcement, wellness, persistence, XP).
+            try:
+                await handle_intake_message(self.bot.ctx, message)
+            except Exception:
+                log.exception("intake: message hook failed in guild %s", guild_id)
+
+        try:
+            post_deleted = await enforce_spoiler_requirement(
+                message,
+                bypass_role_ids=cfg.bypass_role_ids,
+                log=log,
+            )
+        except Exception:
+            # Guarded like the intake hook above: a failure here must not abort
+            # persistence, wellness and XP for the rest of the message.
+            log.exception(
+                "spoiler enforcement failed in guild %s", guild_id
+            )
+            post_deleted = False
+
+        if not post_deleted:
+            try:
+                post_deleted = await enforce_gif_guard(
+                    message,
+                    guarded_channel_ids=cfg.gif_guard_channel_ids,
+                    bypass_role_ids=cfg.bypass_role_ids,
+                    log=log,
+                )
+            except Exception:
+                log.exception("GIF Guard failed in guild %s", guild_id)
+
+        mention_ids = _message_mention_ids(cfg.recorded_bot_user_ids, message)
+
+        # Either gate deleting the post ends the pipeline: no XP, wellness or
+        # persistence for a message that no longer exists.
+        if post_deleted:
+            return
+
+        if await wellness_on_message(self.bot.ctx, message):
+            return
+
+        sentiment, emotion = await asyncio.to_thread(score_text, message.content)
+
+        def _persist_member_message():
+            with self.bot.ctx.open_db() as conn:
+                record_member_activity(
+                    conn,
+                    guild_id,
+                    message.author.id,
+                    message.channel.id,
+                    message.id,
+                    message_ts,
+                )
+                if should_track_auto_delete_message(
+                    conn,
+                    guild_id,
+                    message.channel.id,
+                    has_media=bool(message.attachments),
+                ):
+                    track_auto_delete_message(
+                        conn,
+                        guild_id,
+                        message.channel.id,
+                        message.id,
+                        message_ts,
+                    )
+
+                store_message(
+                    conn,
+                    message_id=message.id,
+                    guild_id=guild_id,
+                    channel_id=message.channel.id,
+                    author_id=message.author.id,
+                    reply_to_id=reply_to_id,
+                    ts=int(message_ts),
+                    mention_ids=mention_ids,
+                    sentiment=sentiment,
+                    emotion=emotion,
+                    media_kind=media_kind,
+                    role_mention_ids=role_ping_ids,
+                    mention_everyone=ping_everyone,
+                    ping_source=ping_source,
+                )
+
+                if sentiment is not None:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO message_sentiment "
+                        "(message_id, guild_id, channel_id, sentiment, emotion, computed_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            message.id,
+                            guild_id,
+                            message.channel.id,
+                            sentiment,
+                            emotion,
+                            message_ts,
+                        ),
+                    )
+
+                upsert_known_user(
+                    conn,
+                    guild_id=guild_id,
+                    user_id=message.author.id,
+                    username=str(message.author),
+                    display_name=message.author.display_name,
+                    ts=message_ts,
+                    is_bot=message.author.bot,
+                )
+
+                upsert_known_channel(
+                    conn,
+                    guild_id=guild_id,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, "name", str(message.channel.id)),
+                    ts=message_ts,
+                    parent_id=channel_parent_id,
+                    is_thread=channel_parent_id is not None,
+                )
+
+        await asyncio.to_thread(_persist_member_message)
+
+        # Greeting watch: if this is a "good morning"/"hello" in a watched
+        # channel, stamp it so the background loop can ping staff when nobody
+        # answers the greeter in time. record_greeting also counts it as a
+        # hello back to anyone whose greeting is pending here. Content is
+        # judged here in-memory — the bot stores no message text, so it can't
+        # be matched after the fact. A reply is
+        # addressed to whoever it replies to, not the room, so it's excluded
+        # even when the text happens to open with a hello-ish token (e.g.
+        # "hey, no worries" replying to someone).
+        if (
+            cfg.greeting_watch_enabled
+            and message.channel.id in cfg.greeting_watch_channel_ids
+            and not reply_to_id
+            and is_greeting(message.content, cfg.greeting_watch_extra_words)
+        ):
+
+            def _record_greeting():
+                with self.bot.ctx.open_db() as conn:
+                    record_greeting(
+                        conn,
+                        guild_id=guild_id,
+                        message_id=message.id,
+                        channel_id=message.channel.id,
+                        author_id=message.author.id,
+                        created_ts=int(message_ts),
+                    )
+
+            await asyncio.to_thread(_record_greeting)
+
+        # Greeting watch acknowledgment: a reply to, or @mention of, a member
+        # whose greeting is pending in this channel (or the thread's parent)
+        # marks it answered, so the loop won't ping about it. Processed here and
+        # never stored — the row learns only that someone answered, not who.
+        if cfg.greeting_watch_enabled:
+            ref_msg = message.reference.resolved if message.reference else None
+            ack_targets = directed_target_ids(
+                message.author.id,
+                (ref_msg.author.id, ref_msg.author.bot)
+                if isinstance(ref_msg, discord.Message)
+                else None,
+                ((u.id, u.bot) for u in message.mentions),
+            )
+            if ack_targets:
+                ack_channels = tuple(
+                    c for c in (message.channel.id, channel_parent_id) if c is not None
+                )
+
+                def _acknowledge_greetings():
+                    with self.bot.ctx.open_db() as conn:
+                        acknowledge_greetings(
+                            conn,
+                            guild_id,
+                            message.author.id,
+                            ack_channels,
+                            ack_targets,
+                        )
+
+                await asyncio.to_thread(_acknowledge_greetings)
+
+        result = await award_message_xp(
+            message,
+            bot=self.bot,
+            db_path=self.bot.ctx.db_path,
+            xp_pair_states=self.bot.ctx.xp_pair_states,
+            excluded_channel_ids=cfg.xp_excluded_channel_ids,
+            settings=cfg.xp_settings,
+        )
+        if result is not None and isinstance(message.author, discord.Member):
+            await handle_level_progress(
+                message.author,
+                result,
+                "text_message",
+                level_5_role_id=cfg.level_5_role_id,
+                level_up_log_channel_id=cfg.level_up_log_channel_id,
+                level_5_log_channel_id=cfg.level_5_log_channel_id,
+                settings=cfg.xp_settings,
+                db_path=self.bot.ctx.db_path,
+                nsfw_role_id=nsfw_grant_role_id(cfg.grant_roles, cfg.promotion_review_grant_role_id),
+            )
+
+        # Economy faucets — daily text login + QOTD reward. Optional and fully
+        # fail-safe: an economy error must never break message/XP processing.
+        if isinstance(message.author, discord.Member):
+            try:
+                await self._process_economy_message(message)
+            except Exception:
+                log.exception("economy on_message hook failed")
+
+    async def _process_economy_message(self, message: discord.Message) -> None:
+        """Pay the daily text login, and the QOTD reward when this is a reply.
+
+        Also registers the QOTD itself: a mod message tagging the QOTD role
+        becomes that day's question, and replies to it are what pay.
+
+        The DB work (settings load, streak read, login, QOTD award) runs in one
+        off-loop transaction; the streak read *before* ``process_login`` captures
+        the pre-login streak so a trivial 1→short reset omits its own callout in
+        the daily digest DM (spec §10) rather than reading as a real break.
+        """
+        assert message.guild is not None
+        guild_id = message.guild.id
+        user_id = message.author.id
+        channel_id = message.channel.id
+        booster = (
+            isinstance(message.author, discord.Member)
+            and message.author.premium_since is not None
+        )
+        message_id = message.id
+        parent_id = getattr(message.channel, "parent_id", None)
+        channel_ids = tuple(c for c in (channel_id, parent_id) if c is not None)
+        # A reply counts only against someone ELSE's message. When the
+        # reference isn't resolved in cache we can't verify the author, so it
+        # counts — the dedup and target still bound the payout.
+        ref = message.reference
+        resolved = ref.resolved if ref is not None else None
+        is_reply = ref is not None and not (
+            isinstance(resolved, discord.Message) and resolved.author.id == user_id
+        )
+        # The message this one replies to — the QOTD faucet's key. Present even
+        # when the reference didn't resolve in cache, which is the point: the
+        # id is all the lookup needs.
+        replied_to_id = ref.message_id if ref is not None else None
+
+        # QOTD marker facts, resolved on-loop: a mod tagging the QOTD role
+        # makes that message the day's question. The manager check can't run
+        # here (manager_role_id lives in settings, loaded in the DB thread), so
+        # carry the raw ids across and decide there.
+        role_mention_ids = [r.id for r in message.role_mentions]
+        author_role_ids = (
+            [r.id for r in message.author.roles]
+            if isinstance(message.author, discord.Member)
+            else []
+        )
+        author_is_admin = (
+            isinstance(message.author, discord.Member)
+            and message.author.guild_permissions.administrator
+        )
+        content = message.content or ""
+        # The spicy QOTD role only registers where NSFW is allowed. Only a
+        # message tagging a role can be a marker, so the channel/category walk
+        # is skipped for the ordinary message this hot path mostly sees.
+        age_gated = bool(role_mention_ids) and is_age_gated_channel(message.channel)
+
+        # Social-kind context, resolved on-loop (Discord objects don't cross
+        # into the DB thread). Partner facts only exist when the reference
+        # resolved to a REAL other human's message — unresolvable references
+        # still count for reply_sent, but partner kinds need the partner.
+        partner_id: int | None = None
+        partner_booster = False
+        partner_is_newcomer = False
+        if (
+            isinstance(resolved, discord.Message)
+            and resolved.author.id != user_id
+            and not resolved.author.bot
+        ):
+            partner_id = resolved.author.id
+            partner = message.guild.get_member(partner_id)
+            if partner is not None:
+                partner_booster = partner.premium_since is not None
+                joined = partner.joined_at
+                partner_is_newcomer = joined is not None and (
+                    time.time() - joined.timestamp()
+                    < quest_rules.WELCOME_WINDOW_SECONDS
+                )
+        # Directed targets for the community kinds (greeting_answered /
+        # birthday_wish), resolved on-loop like the partner facts. The same
+        # rule Greeting Watch's acknowledgment uses (directed_target_ids).
+        directed_targets = directed_target_ids(
+            user_id,
+            (resolved.author.id, resolved.author.bot)
+            if isinstance(resolved, discord.Message)
+            else None,
+            ((u.id, u.bot) for u in message.mentions),
+        )
+        wish_phrase = is_birthday_wish(content)
+        # Thread depth check: message_count is on the thread object at
+        # ingest — approximate per Discord, exact enough for a threshold.
+        thread_deep_id: int | None = None
+        if (
+            isinstance(message.channel, discord.Thread)
+            and (message.channel.message_count or 0) >= quest_rules.THREAD_DEEP_MIN
+        ):
+            thread_deep_id = message.channel.id
+        hop_channel_id = parent_id or channel_id
+
+        #: Chore instances the QOTD registration below signed off, carried out
+        #: of the worker thread so the board can be repainted on the loop.
+        chores_ticked: list[int] = []
+
+        def _econ_work() -> (
+            tuple[EconSettings, LoginOutcome, int, list[dict], list[dict], str | None, str]
+            | None
+        ):
+            with self.bot.ctx.open_db() as conn:
+                settings = load_econ_settings(conn, guild_id)
+                if not settings.enabled:
+                    return None
+                offset = get_tz_offset_hours(conn, guild_id)
+                today = local_day_for(time.time(), offset)
+                prior = conn.execute(
+                    "SELECT current_streak FROM econ_streaks "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                ).fetchone()
+                prior_streak = int(prior["current_streak"]) if prior else 0
+                outcome = process_login(
+                    conn,
+                    settings,
+                    guild_id,
+                    user_id,
+                    local_day=today,
+                    source="text",
+                    booster=booster,
+                )
+                # A mod tagging the QOTD role (or, in an age-gated channel, the
+                # spicy QOTD role) registers this message as today's question
+                # of that kind — no command, no rendered card. Registration and
+                # payout are mutually exclusive by construction: the marker
+                # isn't a reply to itself.
+                marker = qotd_marker(
+                    content=content,
+                    role_mention_ids=role_mention_ids,
+                    qotd_role_id=settings.qotd_ping_role_id,
+                    spicy_role_id=settings.qotd_spicy_role_id,
+                    age_gated=age_gated,
+                    author_is_manager=is_economy_manager(
+                        is_admin=author_is_admin,
+                        role_ids=author_role_ids,
+                        manager_role_id=settings.manager_role_id,
+                    ),
+                )
+                if marker is not None and (
+                    qotd_for_message(conn, guild_id, message_id) is None
+                ):
+                    kind, question = marker
+                    create_qotd(
+                        conn, guild_id, channel_id, message_id, question,
+                        user_id, today, kind=kind,
+                    )
+                    # The chore board's "Do a QOTD" (or "Do a spicy QOTD")
+                    # signs itself off here — each kind only its own chore.
+                    # This branch is already the once-per-message registration
+                    # gate, so the tick inherits its exactly-once property, and
+                    # a second QOTD later in the day finds no open instance and
+                    # does nothing. Credited to the poster, not the bot —
+                    # ``completed_by`` is a real member everywhere else on the
+                    # board, and a mod reading it wants to know who did it.
+                    #
+                    # The repaint happens after this worker thread returns —
+                    # the board loop only repaints what it spawned itself, so
+                    # an unrepainted sign-off would leave the chore looking
+                    # outstanding on the surface a mod actually reads.
+                    try:
+                        chores_ticked.extend(
+                            auto_complete_chores(
+                                conn, guild_id, QOTD_CHORE_TRIGGER[kind],
+                                completed_by=user_id, now_ts=time.time(),
+                            )
+                        )
+                    except Exception:
+                        log.exception("QOTD chore auto sign-off failed")
+                # Reward: a real reply to a registered question, and only while
+                # that question is still today's — old QOTD messages stay in
+                # the table forever and would otherwise be a coin farm.
+                qotd = (
+                    qotd_for_message(conn, guild_id, replied_to_id)
+                    if replied_to_id is not None
+                    else None
+                )
+                if qotd is not None and str(qotd["local_day"]) == today:
+                    newly_awarded = try_award_qotd(
+                        conn,
+                        settings,
+                        int(qotd["id"]),
+                        guild_id,
+                        user_id,
+                        booster=booster,
+                    )
+                    if newly_awarded:
+                        # First qualifying reply → the qotd_reply quest
+                        # trigger (silent; wallet/quests carry the news).
+                        fire_trigger_quests(
+                            conn, settings, guild_id, "qotd_reply", user_id,
+                            local_day=today,
+                            occurrence=str(int(qotd["id"])),
+                            booster=booster,
+                        )
+                # Message/reply quest triggers (usually counted quests —
+                # occurrence = the message, so nothing double-counts).
+                fire_trigger_quests(
+                    conn, settings, guild_id, "message_sent", user_id,
+                    local_day=today, occurrence=str(message_id),
+                    booster=booster, channel_ids=channel_ids,
+                )
+                if is_reply:
+                    fire_trigger_quests(
+                        conn, settings, guild_id, "reply_sent", user_id,
+                        local_day=today, occurrence=str(message_id),
+                        booster=booster, channel_ids=channel_ids,
+                    )
+                # Social kinds (quest-variety social round). Entity-keyed
+                # occurrences make the counted-quest marks table count
+                # DISTINCT channels/days/partners for free.
+                fire_trigger_quests(
+                    conn, settings, guild_id, "channel_hop", user_id,
+                    local_day=today, occurrence=str(hop_channel_id),
+                    booster=booster, channel_ids=channel_ids,
+                )
+                fire_trigger_quests(
+                    conn, settings, guild_id, "active_day", user_id,
+                    local_day=today, occurrence=today, booster=booster,
+                )
+                if thread_deep_id is not None:
+                    fire_trigger_quests(
+                        conn, settings, guild_id, "thread_deep", user_id,
+                        local_day=today, occurrence=str(thread_deep_id),
+                        booster=booster, channel_ids=channel_ids,
+                    )
+                if partner_id is not None:
+                    fire_trigger_quests(
+                        conn, settings, guild_id, "conversed", user_id,
+                        local_day=today, occurrence=str(partner_id),
+                        booster=booster, channel_ids=channel_ids,
+                    )
+                    fire_trigger_quests(
+                        conn, settings, guild_id, "replied_to", partner_id,
+                        local_day=today, occurrence=str(user_id),
+                        booster=partner_booster, channel_ids=channel_ids,
+                    )
+                    if partner_is_newcomer:
+                        fire_trigger_quests(
+                            conn, settings, guild_id, "welcome", user_id,
+                            local_day=today, occurrence=str(partner_id),
+                            booster=booster, channel_ids=channel_ids,
+                        )
+                    # conversation_starter: record this distinct replier and
+                    # fire for the target author exactly on the crossing.
+                    target_msg_id = int(resolved.id)  # type: ignore[union-attr]
+                    inserted = conn.execute(
+                        "INSERT OR IGNORE INTO econ_msg_replies "
+                        "(guild_id, target_message_id, target_author_id, "
+                        "replier_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (guild_id, target_msg_id, partner_id, user_id,
+                         time.time()),
+                    )
+                    if (inserted.rowcount or 0) > 0:
+                        n = conn.execute(
+                            "SELECT COUNT(*) AS n FROM econ_msg_replies "
+                            "WHERE guild_id = ? AND target_message_id = ?",
+                            (guild_id, target_msg_id),
+                        ).fetchone()
+                        if int(n["n"]) == quest_rules.CONVERSATION_STARTER_REPLIERS:
+                            fire_trigger_quests(
+                                conn, settings, guild_id,
+                                "conversation_starter", partner_id,
+                                local_day=today,
+                                occurrence=str(target_msg_id),
+                                booster=partner_booster,
+                                channel_ids=channel_ids,
+                            )
+                # greeting_answered: this reply/mention lands on a member
+                # whose greeting is still pending in Greeting Watch (same
+                # channel). Occurrence = the greeting message, so one hello
+                # credits an answerer once. Self-gates on the feature: no
+                # watched channels → no pending rows → no fires.
+                if directed_targets:
+                    for g_msg_id, _greeter in pending_greetings_for(
+                        conn, guild_id, channel_ids, directed_targets
+                    ):
+                        fire_trigger_quests(
+                            conn, settings, guild_id, "greeting_answered",
+                            user_id, local_day=today,
+                            occurrence=str(g_msg_id),
+                            booster=booster, channel_ids=channel_ids,
+                        )
+                # birthday_wish: only birthdays the bot publicly announced
+                # today count (quiet birthdays never become quest bait).
+                # A directed reply/mention of the birthday member wins; a
+                # bare "happy birthday!" (no target) falls back to a
+                # per-day occurrence. One fire per message.
+                if directed_targets or wish_phrase:
+                    announced = announced_birthday_ids(conn, guild_id, today)
+                    if announced:
+                        wished = False
+                        for t in directed_targets:
+                            if t in announced:
+                                fire_trigger_quests(
+                                    conn, settings, guild_id,
+                                    "birthday_wish", user_id,
+                                    local_day=today,
+                                    occurrence=f"{t}:{today}",
+                                    booster=booster,
+                                    channel_ids=channel_ids,
+                                )
+                                wished = True
+                        if (
+                            not wished
+                            and wish_phrase
+                            and announced - {user_id}
+                        ):
+                            fire_trigger_quests(
+                                conn, settings, guild_id,
+                                "birthday_wish", user_id,
+                                local_day=today,
+                                occurrence=f"day:{today}",
+                                booster=booster, channel_ids=channel_ids,
+                            )
+                if outcome is None:
+                    return None
+                quests_out = load_member_quest_board(
+                    conn, settings, guild_id, user_id, today
+                )
+                # The community goals that moved the most yesterday — empty
+                # until the day roll has snapshotted both days.
+                gains = community_gains_for_day(
+                    conn, guild_id, previous_local_day(today)
+                )
+                # Wellness streak blurb for opted-in, non-paused members
+                # (None hides the section entirely).
+                wellness_value = wellness_login_digest_value(
+                    conn, guild_id, user_id
+                )
+                return (
+                    settings, outcome, prior_streak, quests_out, gains,
+                    wellness_value, today,
+                )
+
+        result = await asyncio.to_thread(_econ_work)
+
+        # BEFORE the `result is None` return, not after. _econ_work returns
+        # None once the poster has already had their daily login for this local
+        # day — which is most QOTD posts, since a mod usually chats before
+        # posting the question. The registration (and its chore sign-off) sits
+        # above that return and still happened, so keying the repaint on a
+        # non-None result would leave the board stale in exactly the common
+        # case, which is the bug the repaint exists to fix.
+        if chores_ticked:
+            from bot_modules.todo.cog import repaint_board
+
+            await repaint_board(self.bot, guild_id)
+
+        if result is None:
+            return
+        (
+            settings, outcome, prior_streak, quests_out, gains,
+            wellness_value, today_local,
+        ) = result
+
+        # Two individual opt-ins, one DM: the digest itself requires the
+        # opt-in economy game role (deliver_econ_dm's gate); the wellness
+        # part additionally requires the member's own notifications_pref to
+        # include DMs (enforced inside login_digest_value). Wellness content
+        # only ever rides this economy morning message — there is no
+        # standalone wellness daily DM.
+        #
+        # This one is DM-or-nothing (public_fallback=False). It is recurring
+        # opt-in engagement content, not a transactional notice, so a member
+        # who has closed their DMs to the bot has already answered the
+        # question — publishing their streak and quest progress in the bank
+        # channel with a ping would be the loud reply to a quiet request.
+        # That also retires the wellness-scrubbed second render: the only
+        # thing it existed for was the public fallback.
+        accent = await safe_resolve_accent(self.bot.ctx, message.guild, log_label="events", default=DEFAULT_ACCENT_COLOR)
+        embed = build_login_embed(
+            settings, outcome, prior_streak, quests_out, gains, accent,
+            wellness_value=wellness_value,
+        )
+        # deliver_econ_dm rather than notify_member: this card is edited in
+        # place all day, so it needs the Message back — and it needs to know
+        # the message really is a DM. A muted member, one without the opt-in
+        # game role, and one with closed DMs all report "dropped" with no
+        # message, so no handle is stored and the hourly sweep never chases a
+        # card that was never sent.
+        delivery = await deliver_econ_dm(
+            self.bot,
+            self.bot.ctx.db_path,
+            guild_id,
+            user_id,
+            embed=embed,
+            require_game_role=True,
+            public_fallback=False,
+        )
+        handle = card_handle(delivery)
+        if handle is None or not settings.login_card_live_updates:
+            return
+        dm_channel_id, message_id = handle
+        # Already finished everything at first activity (it happens — the
+        # message that triggered the login can complete the last quest), so
+        # this render is also the last one.
+        final = all_personal_done(quests_out)
+        signature = card_signature(embed)
+
+        def _record() -> None:
+            with self.bot.ctx.open_db() as conn:
+                record_card(
+                    conn, guild_id, user_id,
+                    local_day=today_local,
+                    dm_channel_id=dm_channel_id,
+                    message_id=message_id,
+                    signature=signature,
+                    outcome=outcome,
+                    prior_streak=prior_streak,
+                    final=final,
+                    now_ts=time.time(),
+                )
+
+        await asyncio.to_thread(_record)
+
+    async def _fetch_reaction_message(
+        self, payload: discord.RawReactionActionEvent
+    ) -> discord.Message | None:
+        """Fetch the reacted-to message once, shared by both reaction XP awards.
+
+        Retries transient 5xx with capped backoff (matching the prior inline
+        loop); returns None on a permanent failure so the handler stays robust.
+        """
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if guild is None:
+            return None
+        channel = get_guild_channel_or_thread(guild, payload.channel_id)
+        if channel is None:
+            return None
+        delay = 1
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30
+        while True:
+            try:
+                return await channel.fetch_message(payload.message_id)
+            except (discord.Forbidden, discord.NotFound):
+                return None
+            except discord.HTTPException as exc:
+                if exc.status < 500 or loop.time() + delay > deadline:
+                    log.warning(
+                        "reaction message fetch got %s; giving up", exc.status
+                    )
+                    return None
+                log.warning(
+                    "reaction message fetch got %s, retrying in %ss", exc.status, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 16)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.guild_id is None:
+            return  # DM reactions earn no XP and have no reaction-count tracking
+        cfg = self.bot.ctx.guild_config(payload.guild_id)
+
+        # Greeting watch: a member's reaction on a pending greeting answers it
+        # (a wave under a "good morning"). Only that someone reacted is kept,
+        # never who. Fail-safe, and ahead of the fetch the XP awards need.
+        if (
+            cfg.greeting_watch_enabled
+            and payload.channel_id in cfg.greeting_watch_channel_ids
+            and not (payload.member is not None and payload.member.bot)
+        ):
+            guild_id, message_id, reactor_id = (
+                payload.guild_id, payload.message_id, payload.user_id,
+            )
+
+            def _acknowledge_by_reaction():
+                with self.bot.ctx.open_db() as conn:
+                    acknowledge_by_reaction(conn, guild_id, message_id, reactor_id)
+
+            try:
+                await asyncio.to_thread(_acknowledge_by_reaction)
+            except Exception:
+                log.exception("greeting watch: reaction acknowledgment failed")
+
+        # One fetch feeds both awards (author's image XP + reactor's given XP).
+        message = await self._fetch_reaction_message(payload)
+
+        # Reaction-given XP pays the reactor; keep it fail-safe so a hiccup here
+        # never blocks the image-react award below.
+        try:
+            given = await award_reaction_given_xp(
+                payload,
+                bot=self.bot,
+                db_path=self.bot.ctx.db_path,
+                excluded_channel_ids=cfg.xp_excluded_channel_ids,
+                settings=cfg.xp_settings,
+                message=message,
+            )
+        except Exception:
+            log.exception("award_reaction_given_xp failed")
+            given = None
+        if given is not None:
+            reactor, given_award = given
+            await handle_level_progress(
+                reactor,
+                given_award,
+                "reaction_given",
+                level_5_role_id=cfg.level_5_role_id,
+                level_up_log_channel_id=cfg.level_up_log_channel_id,
+                level_5_log_channel_id=cfg.level_5_log_channel_id,
+                settings=cfg.xp_settings,
+                db_path=self.bot.ctx.db_path,
+                nsfw_role_id=nsfw_grant_role_id(cfg.grant_roles, cfg.promotion_review_grant_role_id),
+            )
+            # Reaction quest trigger — `given` is non-None only when the XP
+            # dedup admitted a NEW (message, reactor) pair, so the quest
+            # inherits the farm guard (no self-reacts, no repeats, no bots).
+            _guild_id = payload.guild_id
+            _channel = getattr(message, "channel", None)
+            _parent_id = getattr(_channel, "parent_id", None)
+            _channel_ids = tuple(
+                c for c in (payload.channel_id, _parent_id) if c is not None
+            )
+            _booster = (
+                isinstance(reactor, discord.Member)
+                and reactor.premium_since is not None
+            )
+
+            # Author of the reacted-to message, for the distinct-partner
+            # kind (the XP guard already excluded self-reacts and bots).
+            _author_id = (
+                message.author.id
+                if message is not None and not message.author.bot
+                else None
+            )
+
+            def _fire_reaction_quests():
+                with self.bot.ctx.open_db() as conn:
+                    fire_trigger_inline(
+                        conn,
+                        _guild_id,
+                        "reaction_given",
+                        reactor.id,
+                        occurrence=str(payload.message_id),
+                        booster=_booster,
+                        channel_ids=_channel_ids,
+                    )
+                    if _author_id is not None and _author_id != reactor.id:
+                        # Occurrence = the AUTHOR: a counted quest reads
+                        # "react to N different members".
+                        fire_trigger_inline(
+                            conn,
+                            _guild_id,
+                            "reacted_to_member",
+                            reactor.id,
+                            occurrence=str(_author_id),
+                            booster=_booster,
+                            channel_ids=_channel_ids,
+                        )
+
+            await asyncio.to_thread(_fire_reaction_quests)
+
+        try:
+            result = await award_image_reaction_xp(
+                payload,
+                bot=self.bot,
+                db_path=self.bot.ctx.db_path,
+                excluded_channel_ids=cfg.xp_excluded_channel_ids,
+                settings=cfg.xp_settings,
+                message=message,
+            )
+        except discord.HTTPException as exc:
+            log.warning("award_image_reaction_xp failed: %s", exc)
+            result = None
+        if result is not None:
+            member, award = result
+            await handle_level_progress(
+                member,
+                award,
+                "image_reaction",
+                level_5_role_id=cfg.level_5_role_id,
+                level_up_log_channel_id=cfg.level_up_log_channel_id,
+                level_5_log_channel_id=cfg.level_5_log_channel_id,
+                settings=cfg.xp_settings,
+                db_path=self.bot.ctx.db_path,
+                nsfw_role_id=nsfw_grant_role_id(cfg.grant_roles, cfg.promotion_review_grant_role_id),
+            )
+
+        if payload.guild_id:
+            def _record_reaction_add():
+                with self.bot.ctx.open_db() as conn:
+                    adjust_reaction_count(conn, payload.message_id, str(payload.emoji), +1)
+
+            await asyncio.to_thread(_record_reaction_add)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(
+        self, payload: discord.RawReactionActionEvent
+    ) -> None:
+        if payload.guild_id:
+            def _record_reaction_remove():
+                with self.bot.ctx.open_db() as conn:
+                    adjust_reaction_count(conn, payload.message_id, str(payload.emoji), -1)
+
+            await asyncio.to_thread(_record_reaction_remove)
+
+    async def _flag_messages_deleted(
+        self, guild_id: int, message_ids: set[int]
+    ) -> None:
+        """Record that Discord deleted these messages, keeping the archive.
+
+        The messages table is a permanent metadata archive (it holds no text):
+        rows are never removed when Discord deletes a message, so activity
+        reports, sentiment trends and XP audits survive. What is recorded is
+        *that* it happened, and whether it was a plain deletion or an
+        auto-delete sweep, so a report can tell a deleted message from a live
+        one.
+
+        Discord's raw payload names no actor, so this is the unattributed
+        source. Our own delete paths stamp themselves before calling the API and
+        the IS NULL guard in mark_messages_deleted leaves those alone.
+        """
+        def _write():
+            with self.bot.ctx.open_db() as conn:
+                mark_messages_deleted(
+                    conn, guild_id, message_ids, DELETE_SOURCE_DISCORD, int(time.time())
+                )
+
+        await asyncio.to_thread(_write)
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(
+        self, payload: discord.RawMessageDeleteEvent
+    ) -> None:
+        if payload.guild_id is None:
+            return
+        # Auto-delete tracking is per-message bookkeeping; clear it so we
+        # don't try to re-delete a Discord message that's already gone.
+        remove_tracked_auto_delete_message(
+            self.bot.ctx.db_path, payload.guild_id, payload.channel_id, payload.message_id
+        )
+        await self._flag_messages_deleted(payload.guild_id, {payload.message_id})
+
+    async def _dm_admin_permission_warning(
+        self, guild: discord.Guild, message: str
+    ) -> None:
+        owner = guild.owner
+        if owner is None:
+            return
+        try:
+            await owner.send(f"⚠️ **{guild.name}** — {message}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _send_welcome(
+        self, member: discord.Member, cfg: "GuildConfig"
+    ) -> None:
+        from bot_modules.bios.resurrect import resolve_member_bio_link
+        from bot_modules.bios.trigger import resolve_bio_placeholders
+        from bot_modules.core.db_utils import get_config_value
+        from bot_modules.onboarding.welcome.service import (
+            server_guide_mention_for,
+        )
+
+        channel = member.guild.get_channel(cfg.welcome_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        _guild_id = member.guild.id
+
+        def _do_welcome_db():
+            with self.bot.ctx.open_db() as conn:
+                _bio_link, _bios_ch_mention = resolve_bio_placeholders(conn, _guild_id)
+                try:
+                    _sg_channel_id = int(
+                        get_config_value(conn, "server_guide_channel_id", "0", _guild_id)
+                    )
+                except (TypeError, ValueError):
+                    _sg_channel_id = 0
+            return _bio_link, _bios_ch_mention, _sg_channel_id
+
+        bio_link, bios_channel_mention, server_guide_channel_id = await asyncio.to_thread(_do_welcome_db)
+        try:
+            member_bio_link = await resolve_member_bio_link(self.bot.ctx, member)
+        except Exception:
+            log.exception("Failed to resolve member bio link for %d", member.id)
+            member_bio_link = ""
+        # Mentions inside an embed don't notify anyone, so the user/role ping
+        # has to ride in the message content to actually fire a notification.
+        ping_parts: list[str] = []
+        ping_role_id = cfg.welcome_ping_role_id
+        if ping_role_id <= 0:
+            # Nothing configured. Either the dial was never touched — in which
+            # case make @Welcome Ping now — or an admin stored "(none)", which
+            # comes back None and keeps the welcome silent. Only ever reached
+            # on an unconfigured guild, so a configured one still pings off the
+            # cached snapshot without touching the DB.
+            provisioned = await ensure_config_role(
+                self.bot.ctx, member.guild, WELCOME_PING.key, WELCOME_PING.spec,
+                feature=WELCOME_PING.feature,
+                allow_legacy_fallback=WELCOME_PING.legacy_fallback,
+            )
+            ping_role_id = provisioned.id if provisioned is not None else 0
+        if ping_role_id > 0:
+            ping_parts.append(f"<@&{ping_role_id}>")
+        if cfg.welcome_ping_member:
+            ping_parts.append(member.mention)
+        ping = " ".join(ping_parts) or None
+        accent = await safe_resolve_accent(self.bot.ctx, member.guild, log_label="events")
+        try:
+            await channel.send(
+                content=ping,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+                embed=build_welcome_embed(
+                    member,
+                    cfg.welcome_message,
+                    bio_link=bio_link,
+                    bios_channel_mention=bios_channel_mention,
+                    member_bio_link=member_bio_link,
+                    server_guide_mention=server_guide_mention_for(
+                        server_guide_channel_id
+                    ),
+                    color=accent,
+                ),
+            )
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to send welcome message in #%s.", channel.name
+            )
+            await self._dm_admin_permission_warning(
+                member.guild,
+                f"Missing permission to send welcome messages in <#{cfg.welcome_channel_id}>.",
+            )
+        except discord.HTTPException:
+            log.exception("Failed to send welcome message.")
+
+    @commands.Cog.listener()
+    async def on_member_update(
+        self, before: discord.Member, after: discord.Member
+    ) -> None:
+        before_ids = {r.id for r in before.roles}
+        after_ids = {r.id for r in after.roles}
+        if before_ids == after_ids:
+            return
+        now = time.time()
+        _guild_id = after.guild.id
+        _member_id = after.id
+        _granted = [r.name for r in after.roles if r.id not in before_ids]
+        _removed = [r.name for r in before.roles if r.id not in after_ids]
+
+        def _do_log_role_events():
+            with self.bot.ctx.open_db() as conn:
+                for name in _granted:
+                    log_role_event(conn, _guild_id, _member_id, name, "grant", ts=now)
+                for name in _removed:
+                    log_role_event(conn, _guild_id, _member_id, name, "remove", ts=now)
+
+        await asyncio.to_thread(_do_log_role_events)
+        cfg = self.bot.ctx.guild_config(after.guild.id)
+        # Keep the Level 5 card's "Spicy access" field honest — it is rendered
+        # once at post time (see docs/specs/promotion_review_spec.md). Detached rather
+        # than awaited: its two HTTP round trips for a cosmetic embed edit must
+        # not delay the welcome or greeter ping, and spawning it up here means an
+        # exception from that later work can't skip it either (nothing replays a
+        # missed refresh). refresh_level_5_cards never raises on its own.
+        nsfw_role_id = nsfw_grant_role_id(cfg.grant_roles, cfg.promotion_review_grant_role_id)
+        has_nsfw = nsfw_role_id in after_ids
+        if nsfw_role_id > 0 and has_nsfw != (nsfw_role_id in before_ids):
+            from bot_modules.xp.promotion_review_views import (
+                refresh_level_5_cards,
+            )
+
+            task = asyncio.create_task(refresh_level_5_cards(self.bot.ctx, after, has_nsfw))
+            self._card_refresh_tasks.add(task)
+            task.add_done_callback(self._card_refresh_tasks.discard)
+        # A Level 5 card withheld for want of the NSFW opt-in posts the moment
+        # the member picks it (docs/specs/promotion_review_spec.md). Detached for the
+        # same reason as the refresh above; it never raises.
+        added_ids = after_ids - before_ids
+        if added_ids:
+            from bot_modules.xp.service import maybe_post_level_5_on_optin
+
+            task = asyncio.create_task(
+                maybe_post_level_5_on_optin(after, added_ids, cfg, self.bot.ctx.db_path)
+            )
+            self._card_refresh_tasks.add(task)
+            task.add_done_callback(self._card_refresh_tasks.discard)
+        # Welcome fires the moment the unverified role is stripped (e.g. once
+        # DoubleCounter finishes its alt scan and lifts the gate). No bio is
+        # required — {member_bio_link} simply resolves to "" when absent.
+        if (
+            cfg.welcome_trigger == "verified"
+            and cfg.unverified_role_id > 0
+            and cfg.unverified_role_id in (before_ids - after_ids)
+            and cfg.welcome_channel_id > 0
+        ):
+            await self._send_welcome(after, cfg)
+            # Suppress the arrival ping only when this member actually has an
+            # open intake card (the card is the replacement surface). A
+            # per-guild enabled check isn't enough: a member who joined while
+            # the bot was down / intake was off / the card post failed has no
+            # card, and their verification must still reach the greeters.
+            if cfg.greeter_chat_channel_id > 0 and not intake_svc.is_watched(
+                _guild_id, _member_id
+            ):
+                greeter_channel = after.guild.get_channel(cfg.greeter_chat_channel_id)
+                arrival_line = render_arrival_message(
+                    cfg.greeter_arrival_message, after
+                )
+                if isinstance(greeter_channel, discord.TextChannel) and arrival_line:
+                    try:
+                        # The line is an admin's template, so the allow-list
+                        # comes from the template text — the default's @here
+                        # still fires, the newcomer is still pinged, and a
+                        # display name spliced into the render cannot widen it.
+                        await greeter_channel.send(
+                            arrival_line,
+                            allowed_mentions=template_pings(
+                                cfg.greeter_arrival_message, users=[after]
+                            ),
+                        )
+                    except discord.Forbidden:
+                        log.warning(
+                            "Missing permission to send greeter ping in #%s.",
+                            greeter_channel.name,
+                        )
+                    except discord.HTTPException:
+                        log.exception("Failed to send greeter chat ping.")
+
+        # Intake auto-ticks: roles gained (member/NSFW grant steps) and the
+        # unverified role coming off (the Verified step). is_watched pre-filters
+        # so role churn on members without an open card costs one set lookup.
+        if intake_svc.is_watched(_guild_id, _member_id):
+            gained = sorted(after_ids - before_ids)
+            unverified_removed = (
+                cfg.unverified_role_id > 0
+                and cfg.unverified_role_id in (before_ids - after_ids)
+            )
+            if gained or unverified_removed:
+                from bot_modules.onboarding.intake.views import handle_role_changes
+
+                await handle_role_changes(self.bot.ctx, after, gained, unverified_removed)
+
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        is_jailed = await check_jail_rejoin(self.bot.ctx, member)
+        # A member who left mid-break and came back inside the departure
+        # settle window gets the break again. Jail wins over a break.
+        on_break = False if is_jailed else await reapply_on_join(self.bot.ctx, member)
+        held = is_jailed or on_break
+
+        _guild_id = member.guild.id
+        _member_id = member.id
+        _username = str(member)
+        _display_name = member.display_name
+        _is_bot = member.bot
+
+        def _do_member_join():
+            _now = time.time()
+            with self.bot.ctx.open_db() as conn:
+                upsert_known_user(
+                    conn,
+                    guild_id=_guild_id,
+                    user_id=_member_id,
+                    username=_username,
+                    display_name=_display_name,
+                    ts=_now,
+                    is_bot=_is_bot,
+                    current_member=True,
+                )
+                record_member_event(conn, _guild_id, _member_id, "join", _now)
+
+        await asyncio.to_thread(_do_member_join)
+
+        try:
+            inviter_id, invite_code = await detect_inviter(member.guild)
+        except Exception:
+            log.exception("detect_inviter failed for %s in guild %s", member, member.guild.id)
+            inviter_id, invite_code = None, None
+        if inviter_id is not None:
+            _inv_id: int = inviter_id
+            _inv_code = invite_code
+            _inviter = member.guild.get_member(_inv_id)
+            _inv_booster = _inviter is not None and _inviter.premium_since is not None
+
+            def _do_record_invite():
+                with self.bot.ctx.open_db() as conn:
+                    record_invite(conn, _guild_id, _inv_id, _member_id, _inv_code)
+                    # Invite quest trigger for the inviter. Occurrence = the
+                    # invitee, so a rejoin (or a re-fire off the OR IGNOREd
+                    # edge) never double-pays the same recruit.
+                    fire_trigger_inline(
+                        conn,
+                        _guild_id,
+                        "invite",
+                        _inv_id,
+                        occurrence=str(_member_id),
+                        booster=_inv_booster,
+                    )
+
+            await asyncio.to_thread(_do_record_invite)
+            log.info(
+                "Invite tracked: %s invited by %s (code: %s)",
+                member,
+                inviter_id,
+                invite_code,
+            )
+
+        cfg = self.bot.ctx.guild_config(member.guild.id)
+
+        if cfg.welcome_channel_id > 0 and cfg.welcome_trigger == "join":
+            await self._send_welcome(member, cfg)
+
+        # With intake enabled, the card (greeter-role ping + checklist) is the
+        # arrival surface; the legacy bare @here line only fires while intake
+        # is dark. Bots and jailed or on-a-break rejoiners never get a card,
+        # matching the auto-role guard below.
+        intake_posted = False
+        if not member.bot and not held:
+            from bot_modules.onboarding.intake.views import post_intake_card
+
+            try:
+                intake_posted = await post_intake_card(self.bot.ctx, member)
+            except Exception:
+                log.exception("intake: card post failed for %s", member.id)
+
+        if not intake_posted and cfg.greeter_chat_channel_id > 0:
+            greeter_channel = member.guild.get_channel(cfg.greeter_chat_channel_id)
+            arrival_line = render_arrival_message(cfg.greeter_arrival_message, member)
+            if isinstance(greeter_channel, discord.TextChannel) and arrival_line:
+                try:
+                    await greeter_channel.send(
+                        arrival_line,
+                        allowed_mentions=template_pings(
+                            cfg.greeter_arrival_message, users=[member]
+                        ),
+                    )
+                except discord.Forbidden:
+                    log.warning(
+                        "Missing permission to send greeter ping in #%s.",
+                        greeter_channel.name,
+                    )
+                except discord.HTTPException:
+                    log.exception("Failed to send greeter chat ping.")
+
+        if cfg.auto_role_ids and not member.bot and not held:
+            # Every newcomer gets these unasked, so an elevated role is refused
+            # along with the managed and too-high ones (each logged by reason).
+            assignable = [
+                r
+                for rid in cfg.auto_role_ids
+                if (r := member.guild.get_role(rid)) is not None
+                and grant_block_reason(r, member.guild, feature="auto_role") is None
+            ]
+            skipped = cfg.auto_role_ids - {r.id for r in assignable}
+            if skipped:
+                log.warning(
+                    "auto_role: skipping unassignable role ids %s for %s in guild %s",
+                    skipped,
+                    member,
+                    member.guild.id,
+                )
+            if assignable:
+                try:
+                    await member.add_roles(*assignable, reason="auto-role on join")
+                except discord.Forbidden:
+                    log.warning(
+                        "auto_role: missing permission to assign roles to %s in guild %s",
+                        member,
+                        member.guild.id,
+                    )
+                except discord.HTTPException:
+                    log.exception("auto_role: failed to assign roles to %s.", member)
+
+    @commands.Cog.listener()
+    async def on_message_edit(
+        self, before: discord.Message, after: discord.Message
+    ) -> None:
+        """GIF Guard's second look at a message.
+
+        A link's preview arrives as an edit after the message itself, and a
+        member can edit a GIF link in. The Tenor/Giphy links the GIF picker
+        posts were already caught in ``on_message``; this catches the rest.
+        """
+        if not after.guild:
+            return
+        cfg = self.bot.ctx.guild_config(after.guild.id)
+        if not cfg.gif_guard_channel_ids:
+            return
+        try:
+            await enforce_gif_guard(
+                after,
+                guarded_channel_ids=cfg.gif_guard_channel_ids,
+                bypass_role_ids=cfg.bypass_role_ids,
+                log=log,
+            )
+        except Exception:
+            log.exception("GIF Guard (edit) failed in guild %s", after.guild.id)
+
+    @commands.Cog.listener()
+    async def on_invite_create(self, invite: discord.Invite) -> None:
+        if invite.guild is not None:
+            cache_invite_create(invite.guild.id, invite)
+
+    @commands.Cog.listener()
+    async def on_invite_delete(self, invite: discord.Invite) -> None:
+        if invite.guild is not None:
+            cache_invite_delete(invite.guild.id, invite.code)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_update(
+        self, before: discord.ScheduledEvent, after: discord.ScheduledEvent
+    ) -> None:
+        """Echo a native Discord event into main chat when it actually starts.
+
+        The transition is the trigger, not the status: an event created
+        already-active, or a repeated update while active, must not re-post.
+        (``echo_discord_event`` also dedupes on the event id, so this is belt
+        and braces — Discord emits this listener generously.)
+        """
+        if (
+            before.status is not discord.EventStatus.active
+            and after.status is discord.EventStatus.active
+        ):
+            await echo_discord_event(self.bot, after)
+
+    @commands.Cog.listener()
+    async def on_member_ban(
+        self, guild: discord.Guild, user: discord.User | discord.Member
+    ) -> None:
+        # A ban also fires on_member_remove; closing here first records the
+        # sharper resolution, and the remove hook then finds no open card.
+        if intake_svc.is_watched(guild.id, user.id):
+            from bot_modules.onboarding.intake.views import close_member_card
+
+            try:
+                await close_member_card(
+                    self.bot.ctx, guild, user.id, intake_svc.RESOLUTION_BANNED
+                )
+            except Exception:
+                log.exception("intake: ban-close failed for %s", user.id)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        _guild_id = member.guild.id
+        _member_id = member.id
+
+        def _do_member_leave():
+            _now = time.time()
+            with self.bot.ctx.open_db() as conn:
+                mark_member_left(conn, _guild_id, _member_id)
+                record_member_event(conn, _guild_id, _member_id, "leave", _now)
+
+        await asyncio.to_thread(_do_member_leave)
+
+        if intake_svc.is_watched(_guild_id, _member_id):
+            from bot_modules.onboarding.intake.views import close_member_card
+
+            # Guarded: a card-close failure must not swallow the
+            # leave-channel announcement below.
+            try:
+                await close_member_card(
+                    self.bot.ctx, member.guild, _member_id, intake_svc.RESOLUTION_LEFT
+                )
+            except Exception:
+                log.exception("intake: leave-close failed for %s", _member_id)
+
+        cfg = self.bot.ctx.guild_config(member.guild.id)
+        if cfg.leave_channel_id <= 0:
+            return
+        channel = member.guild.get_channel(cfg.leave_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        from bot_modules.bios import db as bios_db
+        from bot_modules.bios.trigger import resolve_bio_placeholders
+        from bot_modules.core.db_utils import get_config_value
+        from bot_modules.onboarding.welcome.service import server_guide_mention_for
+
+        def _do_leave_db():
+            with self.bot.ctx.open_db() as conn:
+                _bio_link, _bios_ch_mention = resolve_bio_placeholders(conn, _guild_id)
+                _stored = bios_db.get_user_bio(conn, _guild_id, _member_id)
+                try:
+                    _sg_channel_id = int(
+                        get_config_value(conn, "server_guide_channel_id", "0", _guild_id)
+                    )
+                except (TypeError, ValueError):
+                    _sg_channel_id = 0
+            return _bio_link, _bios_ch_mention, _stored, _sg_channel_id
+
+        bio_link, bios_channel_mention, stored, server_guide_channel_id = await asyncio.to_thread(_do_leave_db)
+
+        # If the member has a still-live bio embed (BiosCog may or may
+        # not have archived it yet — listener order is undefined), the
+        # snapshotted (channel_id, message_id) gives a working jump URL.
+        if stored is not None and stored.message_id != 0 and stored.channel_id != 0:
+            member_bio_link = jump_url(
+                member.guild.id, stored.channel_id, stored.message_id
+            )
+        else:
+            member_bio_link = ""
+
+        accent = await safe_resolve_accent(self.bot.ctx, member.guild, log_label="events")
+        try:
+            await channel.send(
+                embed=build_leave_embed(
+                    member,
+                    cfg.leave_message,
+                    bio_link=bio_link,
+                    bios_channel_mention=bios_channel_mention,
+                    member_bio_link=member_bio_link,
+                    server_guide_mention=server_guide_mention_for(
+                        server_guide_channel_id
+                    ),
+                    color=accent,
+                )
+            )
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to send leave message in #%s.", channel.name
+            )
+            await self._dm_admin_permission_warning(
+                member.guild,
+                f"Missing permission to send leave messages in <#{cfg.leave_channel_id}>.",
+            )
+        except discord.HTTPException:
+            log.exception("Failed to send leave message.")
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(
+        self, payload: discord.RawBulkMessageDeleteEvent
+    ) -> None:
+        if payload.guild_id is None:
+            return
+        # The messages table is a permanent archive (see on_raw_message_delete
+        # for the rationale) — clear the auto-delete queue, then flag the rows.
+        remove_tracked_auto_delete_messages(
+            self.bot.ctx.db_path, payload.guild_id, payload.channel_id, payload.message_ids
+        )
+        await self._flag_messages_deleted(payload.guild_id, set(payload.message_ids))
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        if (
+            interaction.type == discord.InteractionType.application_command
+            and interaction.data
+        ):
+            data: dict = interaction.data  # type: ignore[assignment]
+            cmd = data.get("name", "?")
+            opts: list[dict] = data.get("options") or []
+            parts: list[str] = [str(cmd)]
+            for opt in opts:
+                if opt.get("type") in (1, 2) and opt.get("options"):
+                    parts.append(str(opt["name"]))
+                    for sub in opt["options"]:
+                        parts.append(f"{sub['name']}={sub.get('value', '')}")
+                else:
+                    parts.append(f"{opt['name']}={opt.get('value', '')}")
+            guild_name = interaction.guild.name if interaction.guild else "DM"
+            channel = getattr(interaction.channel, "name", interaction.channel_id)
+            log.info(
+                "Command /%s by %s (%s) in #%s [%s]",
+                " ".join(parts),
+                interaction.user.display_name,
+                interaction.user.id,
+                channel,
+                guild_name,
+            )
+
+
+async def setup(bot: Bot) -> None:
+    await bot.add_cog(EventsCog(bot))

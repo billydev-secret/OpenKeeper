@@ -1,0 +1,741 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from collections.abc import Callable, Coroutine, Sequence
+
+import discord
+from discord.ext import commands
+
+from bot_modules.core.background import record_give_up
+from bot_modules.core.db_utils import (
+    GrantRoleConfig,
+    add_config_id,
+    can_use_grant,
+    clear_config_id_bucket,
+    delete_config_value,
+    get_config_id_set,
+    get_config_value,
+    get_grant_roles,
+    open_db,
+    parse_bool,
+    remove_config_id,
+    set_config_value as _db_set_config_value,
+)
+from bot_modules.core.xp_system import XpSettings, load_xp_settings
+
+if TYPE_CHECKING:
+    from bot_modules.games.utils.recovery import RecoverySentinel
+    from bot_modules.games.db import GamesDb
+
+GuildTextLike: TypeAlias = discord.TextChannel | discord.Thread
+
+
+def _parse_int_config(raw_value: str, *, key: str, default: int = 0) -> int:
+    """Parse integer config values safely with fallback."""
+    normalized = raw_value.strip()
+    if not normalized:
+        return default
+    try:
+        return int(normalized)
+    except ValueError:
+        logging.warning(
+            "Invalid integer config for %s: %r; using %s.", key, raw_value, default
+        )
+        return default
+
+
+def resolve_guild_id(db_path: Path, *, default_guild_id: int = 0) -> int:
+    """Resolve the home guild id: config-table row, then caller default,
+    then the ``GUILD_ID`` environment variable."""
+    with open_db(db_path) as conn:
+        guild_id = _parse_int_config(
+            get_config_value(conn, "guild_id", "0"), key="guild_id"
+        )
+    if guild_id == 0:
+        guild_id = default_guild_id or _parse_int_config(
+            os.environ.get("GUILD_ID", "0"), key="GUILD_ID"
+        )
+    return guild_id
+
+
+# ---------------------------------------------------------------------------
+# Game runtime registry types
+# ---------------------------------------------------------------------------
+# Value stored in ``Bot.active_views``: the live top-level View for a game
+# (a ``discord.ui.View``, or a Components V2 ``discord.ui.LayoutView`` — a
+# sibling type, not a subclass — for a converted game), or a
+# RecoverySentinel placeholder while a crashed game is being re-driven.
+ActiveGameView: TypeAlias = "discord.ui.View | discord.ui.LayoutView | RecoverySentinel"
+
+
+class GameLauncher(Protocol):
+    """Interaction-free game launcher, registered per game_type in cog setup().
+
+    Called by the scheduler and /games start. Returns the new game_id, or
+    ``None`` when the launch was refused (missing perms, channel busy, ...).
+    ``channel`` is deliberately ``Any``: channel-union narrowing is an
+    explicit follow-up outside this refactor.
+    """
+
+    def __call__(
+        self,
+        *,
+        channel: Any,
+        host_id: int,
+        host_name: str,
+        guild_id: int,
+        options: dict[str, Any],
+    ) -> Coroutine[Any, Any, str | None]: ...
+
+
+# Crash-recovery handler: (games_active_games row, decoded JSON payload,
+# resolved anchor channel, anchor message or None) -> True if re-armed.
+GameRecoverer: TypeAlias = Callable[
+    [sqlite3.Row, dict[str, Any], Any, discord.Message | None],
+    Coroutine[Any, Any, bool],
+]
+# Optional "channel busy" check for games that track active rounds outside
+# the games_active_games table (e.g. risky_roll, in-memory).
+GameBusyCheck: TypeAlias = Callable[[int], Coroutine[Any, Any, bool]]
+# Optional "close whatever is running in this channel" handler, for the same
+# games — the counterpart to GameBusyCheck. Returns whether anything closed.
+GameChannelCloser: TypeAlias = Callable[[int], Coroutine[Any, Any, bool]]
+# Mid-game roster handler:
+#   (channel, game_id, member) -> (ok, user_message[, user_ids_to_ping])
+# The dispatcher (`/games join` / `/games leave`) posts ``user_message``, so a
+# handler whose message names somebody with a raw <@id> has to say who may be
+# notified: the bot pings nobody by default, and the dispatcher is in another
+# file and cannot read the text to find out. The ids are the handler's, never
+# scraped back out of the rendered message — a display name is member-written
+# and could otherwise smuggle a mention into the allow-list. Omit the third
+# element (the common case) and the message goes out silent.
+GameRosterHandler: TypeAlias = Callable[
+    [Any, str, discord.Member],
+    Coroutine[Any, Any, tuple[bool, str] | tuple[bool, str, Sequence[int]]],
+]
+# Countdown auto-start: (active-game row, payload, channel) -> started. A
+# lobby game that can take itself from lobby to play registers one; the
+# start-ping sweep calls it when the advertised start arrives with enough
+# players joined. Returning False means "not startable as it stands" and the
+# host is nudged the ordinary way instead.
+LobbyAutoStarter: TypeAlias = Callable[[Any, dict, Any], Coroutine[Any, Any, bool]]
+
+
+class Bot(commands.Bot):
+    ctx: AppContext  # set by the entry point before bot.run()
+    games_db: GamesDb  # set by the entry point before bot.run() (needs db_path)
+
+    def __init__(self, *, intents: discord.Intents, debug: bool, guild_id: int | str):
+        # The bot pings nobody unless a send says so. discord.py's default is
+        # "allow everything the text happens to contain", which was survivable
+        # while every card was an embed (an embed mention displays but never
+        # notifies). A Components V2 card's text behaves like message content —
+        # the pilot on 2026-09-20 confirmed a <@id> in a Text Display does
+        # notify — so converting a builder under the old default would have
+        # made a formerly silent card ping everyone it names. Suppressing by
+        # construction designs that regression class out instead of reviewing
+        # for it card by card; the sends that *should* notify pass their own
+        # allow-list (core.utils.role_ping_kwargs is the model), and
+        # tests/contracts/test_mention_default_audit.py keeps the list of sends that
+        # ping without one at zero.
+        super().__init__(
+            intents=intents,
+            command_prefix=commands.when_mentioned,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self.debug = debug
+        self.guild_id = _parse_int_config(str(guild_id), key="guild_id")
+        self.startup_task_factories: list[Callable[[], Coroutine[Any, Any, None]]] = []
+        self.startup_tasks: list[asyncio.Task[None]] = []
+        self.extension_names: list[str] = []
+        # Game runtime registries. Created here (not injected by the entry
+        # point) so they exist before setup_hook() loads extensions — cog
+        # setup() functions write into them.
+        # Live views (or RecoverySentinel placeholders) for in-flight games,
+        # keyed by game_id.
+        self.active_views: dict[str, ActiveGameView] = {}
+        # Interaction-free launchers, keyed by game_type. Each party game cog
+        # registers its launch() here in setup(); the scheduler calls them.
+        self.game_launchers: dict[str, GameLauncher] = {}
+        # Crash-recovery handlers, keyed by game_type. Each party game cog
+        # registers its recover_game() here in setup(); the startup recovery
+        # task re-registers in-flight games' views/timers after a restart.
+        self.game_recoverers: dict[str, GameRecoverer] = {}
+        # Optional "channel busy" checks, keyed by game_type. Games that track
+        # active rounds outside the games_active_games table (e.g. risky_roll,
+        # in-memory) register an async check(channel_id) -> bool here so the
+        # scheduler can see they're busy and skip the occurrence instead of
+        # pinging then failing.
+        self.game_busy_checks: dict[str, GameBusyCheck] = {}
+        # Optional "close the round in this channel" handlers, keyed by
+        # game_type — the counterpart to game_busy_checks, for the same games
+        # whose rounds the games_active_games table cannot see. The feature
+        # rotation calls these to resolve a room's game when the room stops
+        # being the featured one.
+        self.game_channel_closers: dict[str, GameChannelCloser] = {}
+        # Mid-game roster handlers, keyed by game_type. Roster-based games
+        # register async add/remove callbacks here in setup(); /games join and
+        # /games leave dispatch to them so people can join or leave a game
+        # that's already running.
+        self.game_joiners: dict[str, GameRosterHandler] = {}
+        self.game_leavers: dict[str, GameRosterHandler] = {}
+        # Countdown auto-starters, keyed by game_type. A lobby game whose cog
+        # can start it without a button press registers one in setup(); the
+        # start-ping sweep (game_start_ping_service) calls it at start_epoch.
+        # A type absent here keeps the old contract: the host is nudged.
+        self.lobby_auto_starters: dict[str, LobbyAutoStarter] = {}
+
+    async def setup_hook(self) -> None:
+        from bot_modules.core.command_sync import sync_if_changed
+
+        self._warn_on_extension_drift()
+        for ext in self.extension_names:
+            await self.load_extension(ext)
+
+        # Launch background loops *after* the extensions load: cogs register
+        # their own factories from cog_load(), so anything started earlier
+        # would silently skip every cog-owned loop.
+        self._start_background_tasks()
+
+        if self.debug:
+            if self.guild_id <= 0:
+                print(
+                    "WARNING: debug=True but guild_id is not configured; skipping guild command sync."
+                )
+            else:
+                db_path = self.ctx.db_path
+                guild = discord.Object(id=self.guild_id)
+                try:
+                    self.tree.copy_global_to(guild=guild)
+                    synced, did = await sync_if_changed(
+                        self.tree, db_path, guild=guild
+                    )
+                    if did:
+                        print(
+                            f"Synced {len(synced)} commands to development guild {self.guild_id}."
+                        )
+                    else:
+                        print(
+                            f"Command tree unchanged for guild {self.guild_id} — skipping sync."
+                        )
+                    # Clear any stale global commands so they don't appear alongside guild commands.
+                    self.tree.clear_commands(guild=None)
+                    _, did_global = await sync_if_changed(
+                        self.tree, db_path, guild=None
+                    )
+                    if did_global:
+                        print("Cleared global commands (debug mode).")
+                except discord.Forbidden as exc:
+                    print(
+                        "WARNING: missing access while syncing commands to "
+                        f"guild {self.guild_id}: {exc}. Ensure the bot is in this guild and has applications.commands "
+                        f"scope."
+                    )
+        else:
+            db_path = self.ctx.db_path
+            try:
+                synced, did = await sync_if_changed(self.tree, db_path, guild=None)
+            except discord.app_commands.CommandSyncFailure:
+                # A tree Discord refuses must not take the bot down with it.
+                # This crash-looped prod on 2026-09-06: /games grew past the
+                # 8000-byte per-command ceiling, sync raised, setup_hook let it
+                # escape, and the process exited — taking the dashboard, the
+                # games, the economy and every scheduled job with it, five
+                # times over, for a problem that only affects *updating* the
+                # command list. Discord keeps serving the previously synced
+                # commands, so staying up is strictly better than dying.
+                #
+                # The stored hash is deliberately not written, so the next boot
+                # retries rather than assuming the tree landed.
+                logging.getLogger("dungeonkeeper.startup").exception(
+                    "COMMAND SYNC REFUSED — the bot is running with its "
+                    "PREVIOUSLY synced commands. Anything added or renamed "
+                    "since then is not visible in Discord until this is fixed."
+                )
+            else:
+                if did:
+                    print(f"Synced {len(synced)} commands globally.")
+                else:
+                    print("Command tree unchanged — skipping global sync.")
+            # Clear any stale guild commands left from a previous debug-mode run.
+            if self.guild_id > 0:
+                try:
+                    guild = discord.Object(id=self.guild_id)
+                    self.tree.clear_commands(guild=guild)
+                    _, did_guild = await sync_if_changed(
+                        self.tree, db_path, guild=guild
+                    )
+                    if did_guild:
+                        print(f"Cleared stale guild commands for {self.guild_id}.")
+                except discord.HTTPException as exc:
+                    print(
+                        f"WARNING: could not clear guild commands for {self.guild_id}: {exc}"
+                    )
+
+    def _warn_on_extension_drift(self) -> None:
+        """Fail loud (in the logs) when a cog exists on disk but isn't in the
+        hand-maintained ``extension_names`` list — otherwise a new cog is
+        silently never loaded."""
+        _log = logging.getLogger("dungeonkeeper.startup")
+        try:
+            import bot_modules as _pkg
+            from bot_modules.core.extension_discovery import discover_extensions
+
+            discovered = set(discover_extensions(Path(next(iter(_pkg.__path__)))))
+        except Exception:  # noqa: BLE001 — best-effort startup diagnostic; must never block boot
+            _log.exception("Extension drift check failed to scan bot_modules")
+            return
+        missing = sorted(discovered - set(self.extension_names))
+        if missing:
+            _log.error(
+                "Extension drift: %d cog(s) on disk are NOT in extension_names "
+                "and will not load: %s — add them in dungeonkeeper/__main__.py",
+                len(missing),
+                ", ".join(missing),
+            )
+
+    def _start_background_tasks(self) -> None:
+        """Spawn every registered background loop under the restart supervisor.
+
+        Called once from ``setup_hook`` after the extensions are loaded, so it
+        sees both the factories the entry point registers up front and the ones
+        cogs append from their ``cog_load``.
+        """
+        for factory in self.startup_task_factories:
+            self.startup_tasks.append(asyncio.create_task(
+                self._resilient_task(factory)
+            ))
+
+    @staticmethod
+    async def _resilient_task(
+        factory: Callable[[], Coroutine[Any, Any, None]],
+        restart_delay: float = 30.0,
+        max_restarts: int = 10,
+    ) -> None:
+        """Run a background task with automatic restart on failure.
+
+        Respects CancelledError (shutdown) but restarts on other exceptions,
+        with a delay between restarts and a cap on total restarts. A task it
+        gives up on is recorded with ``background.record_give_up`` so the
+        dashboard's Config Problems card can say so — the log line alone is
+        gone at the next boot.
+
+        The name is the coroutine's, not the factory's: nearly every factory
+        is a ``lambda``, and "<lambda> exceeded max restarts" names nothing.
+        """
+        _log = logging.getLogger("dungeonkeeper.tasks")
+        name = getattr(factory, "__name__", repr(factory))
+        restarts = 0
+
+        while restarts <= max_restarts:
+            try:
+                coro = factory()
+                name = getattr(coro, "__qualname__", name)
+                await coro
+                return  # Exited cleanly (one-shot task like backfill)
+            except asyncio.CancelledError:
+                raise  # Propagate — shutdown is happening
+            except Exception as exc:  # noqa: BLE001 — supervisor for arbitrary factory coroutines; the raise set isn't knowable here
+                restarts += 1
+                _log.exception(
+                    "Background task %s crashed (restart %d/%d) — "
+                    "restarting in %.0fs",
+                    name, restarts, max_restarts, restart_delay,
+                )
+                if restarts > max_restarts:
+                    _log.error(
+                        "Background task %s exceeded max restarts — giving up",
+                        name,
+                    )
+                    record_give_up(name, crashes=restarts, error=exc)
+                    return
+                await asyncio.sleep(restart_delay)
+
+
+def _parse_id_csv(raw: str) -> frozenset[int]:
+    """Parse a comma-separated string of integer IDs into a frozenset."""
+    return frozenset(int(x) for x in raw.split(",") if x.strip().isdigit())
+
+
+@dataclass(frozen=True)
+class GuildConfig:
+    """Immutable snapshot of one guild's config (core-slice fields).
+
+    Built lazily and cached per guild on :class:`AppContext` via
+    ``ctx.guild_config(guild_id)``. For the home guild, reads its own
+    ``guild_id`` with the legacy ``guild_id=0`` fallback; for other guilds,
+    reads strictly (``allow_legacy_fallback=False``) so an unconfigured guild
+    gets real defaults instead of silently inheriting the home/legacy values.
+    """
+
+    guild_id: int
+    # welcome / leave
+    welcome_channel_id: int
+    welcome_message: str
+    welcome_ping_role_id: int
+    welcome_ping_member: bool
+    welcome_trigger: str
+    unverified_role_id: int
+    greeter_role_id: int
+    greeter_chat_channel_id: int
+    #: The arrival line dropped in greeter chat when a newcomer arrives without
+    #: an intake card. Blank means "post nothing".
+    greeter_arrival_message: str
+    leave_channel_id: int
+    leave_message: str
+    join_leave_log_channel_id: int
+    # moderation / permissions
+    mod_channel_id: int
+    mod_role_ids: frozenset[int]
+    admin_role_ids: frozenset[int]
+    # greeting watch — flag unanswered "good morning"/"hello" in watched chats
+    greeting_watch_enabled: bool
+    greeting_watch_channel_ids: frozenset[int]
+    greeting_watch_window_minutes: int
+    # dashboard-configured server-specific greeting words (lowercased tuple)
+    greeting_watch_extra_words: tuple[str, ...]
+    # message archival / spoiler enforcement
+    bypass_role_ids: frozenset[int]
+    recorded_bot_user_ids: frozenset[int]
+    # XP / leveling
+    xp_excluded_channel_ids: frozenset[int]
+    xp_grant_allowed_user_ids: frozenset[int]
+    level_5_role_id: int
+    level_5_log_channel_id: int
+    level_up_log_channel_id: int
+    xp_settings: XpSettings
+    # role-grant definitions (member self-assignable roles)
+    grant_roles: dict[str, GrantRoleConfig]
+    # roles automatically applied to every new member on join
+    auto_role_ids: frozenset[int]
+    # the access role a promotion-review card's Grant button hands out — also
+    # what the Level 5 card's "Spicy access" field reports on (xp_service.
+    # nsfw_grant_role_id). Defaulted so a stub/partial construction still works.
+    promotion_review_grant_role_id: int = 0
+    # GIF Guard — channels (and their threads) where GIFs are deleted. Empty
+    # means the feature is off. Defaulted like the field above.
+    gif_guard_channel_ids: frozenset[int] = frozenset()
+    # jail & tickets — defaulted for the same reason
+    jailed_role_id: int = 0
+    ticket_category_id: int = 0
+    transcript_channel_id: int = 0
+    #: The general mod log. Jail and tickets post here, and a ticket transcript
+    #: falls back to it when no transcript channel is set.
+    log_channel_id: int = 0
+
+    @classmethod
+    def load(
+        cls,
+        conn: sqlite3.Connection,
+        guild_id: int,
+        *,
+        allow_legacy_fallback: bool,
+    ) -> "GuildConfig":
+        from bot_modules.onboarding.greeting_watch.service import parse_extra_words
+        from bot_modules.onboarding.welcome.service import (
+            DEFAULT_ARRIVAL_MESSAGE,
+            DEFAULT_LEAVE_MESSAGE,
+            DEFAULT_WELCOME_MESSAGE,
+        )
+
+        def _val(key: str, default: str = "") -> str:
+            return get_config_value(
+                conn,
+                key,
+                default,
+                guild_id,
+                allow_legacy_fallback=allow_legacy_fallback,
+            )
+
+        def _int(key: str, default: int = 0) -> int:
+            return _parse_int_config(_val(key, str(default)), key=key, default=default)
+
+        def _ids(bucket: str) -> frozenset[int]:
+            return frozenset(
+                get_config_id_set(
+                    conn,
+                    bucket,
+                    guild_id,
+                    allow_legacy_fallback=allow_legacy_fallback,
+                )
+            )
+
+        leave_channel_id = _int("leave_channel_id")
+        return cls(
+            guild_id=guild_id,
+            welcome_channel_id=_int("welcome_channel_id"),
+            welcome_message=_val("welcome_message", DEFAULT_WELCOME_MESSAGE),
+            welcome_ping_role_id=_int("welcome_ping_role_id"),
+            welcome_ping_member=parse_bool(_val("welcome_ping_member", "false")),
+            welcome_trigger=_val("welcome_trigger", "join"),
+            unverified_role_id=_int("unverified_role_id"),
+            greeter_role_id=_int("greeter_role_id"),
+            greeter_chat_channel_id=_int("greeter_chat_channel_id"),
+            greeter_arrival_message=_val(
+                "greeter_arrival_message", DEFAULT_ARRIVAL_MESSAGE
+            ),
+            leave_channel_id=leave_channel_id,
+            leave_message=_val("leave_message", DEFAULT_LEAVE_MESSAGE),
+            join_leave_log_channel_id=_parse_int_config(
+                _val("join_leave_log_channel_id", str(leave_channel_id)),
+                key="join_leave_log_channel_id",
+                default=leave_channel_id,
+            ),
+            mod_channel_id=_int("mod_channel_id"),
+            mod_role_ids=_parse_id_csv(_val("mod_role_ids")),
+            admin_role_ids=_parse_id_csv(_val("admin_role_ids")),
+            greeting_watch_enabled=parse_bool(
+                _val("greeting_watch_enabled", "false")
+            ),
+            greeting_watch_channel_ids=_parse_id_csv(
+                _val("greeting_watch_channel_ids")
+            ),
+            greeting_watch_window_minutes=_int(
+                "greeting_watch_window_minutes", 10
+            ),
+            greeting_watch_extra_words=parse_extra_words(
+                _val("greeting_watch_extra_words")
+            ),
+            bypass_role_ids=_ids("bypass_role_ids"),
+            recorded_bot_user_ids=_ids("recorded_bot_user_ids"),
+            xp_excluded_channel_ids=_ids("xp_excluded_channel_ids"),
+            xp_grant_allowed_user_ids=_ids("xp_grant_allowed_user_ids"),
+            level_5_role_id=_int("xp_level_5_role_id"),
+            level_5_log_channel_id=_int("xp_level_5_log_channel_id"),
+            level_up_log_channel_id=_int("xp_level_up_log_channel_id"),
+            # XP coefficients keep the legacy guild_id=0 fallback intentionally:
+            # they are global algorithm tuning, not guild identity, and home's
+            # coeffs live under home's real id (guild_id=0 holds only ai/tree-hash
+            # rows), so a second guild falls back to DEFAULT_XP_SETTINGS, never
+            # home's tuning. Do not "fix" this to strict.
+            xp_settings=load_xp_settings(conn, guild_id),
+            grant_roles=get_grant_roles(conn, guild_id),
+            auto_role_ids=_ids("auto_role_ids"),
+            promotion_review_grant_role_id=_int("promotion_review_grant_role_id"),
+            gif_guard_channel_ids=_ids("gif_guard_channel_ids"),
+            jailed_role_id=_int("jailed_role_id"),
+            ticket_category_id=_int("ticket_category_id"),
+            transcript_channel_id=_int("transcript_channel_id"),
+            log_channel_id=_int("log_channel_id"),
+        )
+
+    def member_is_mod(self, member: discord.Member) -> bool:
+        """True if the member holds a configured mod or admin role.
+
+        The Discord ``manage_guild``/``administrator`` short-circuit is the
+        caller's responsibility (see ``AppContext.is_mod``).
+        """
+        configured = self.mod_role_ids | self.admin_role_ids
+        return bool(configured & {r.id for r in member.roles})
+
+    def member_is_admin(self, member: discord.Member) -> bool:
+        """True if the member holds a configured admin role."""
+        return bool(self.admin_role_ids & {r.id for r in member.roles})
+
+
+
+@dataclass
+class AppContext:
+    """Process-global runtime state. All guild-scoped config is read via
+    :meth:`guild_config`; there are deliberately no per-guild fields here."""
+
+    bot: Bot
+    log: logging.Logger
+    db_path: Path
+    guild_id: int
+    debug: bool
+    xp_pair_states: dict[int, Any] = field(default_factory=dict)
+    watched_users: dict[int, set[int]] = field(default_factory=dict)
+    _guild_config_cache: dict[int, GuildConfig] = field(default_factory=dict)
+
+    def open_db(self) -> contextlib.AbstractContextManager[sqlite3.Connection]:
+        return open_db(self.db_path)
+
+    def guild_config(self, guild_id: int) -> GuildConfig:
+        """Return the cached per-guild config snapshot, loading it on first use.
+
+        The home guild reads with the legacy ``guild_id=0`` fallback; other
+        guilds read strictly so an unconfigured guild gets real defaults.
+        """
+        cfg = self._guild_config_cache.get(guild_id)
+        if cfg is None:
+            with self.open_db() as conn:
+                cfg = GuildConfig.load(
+                    conn,
+                    guild_id,
+                    allow_legacy_fallback=(guild_id == self.guild_id),
+                )
+            self._guild_config_cache[guild_id] = cfg
+        return cfg
+
+    def invalidate_guild_config(self, guild_id: int) -> None:
+        """Drop the cached snapshot for a guild so the next read reloads it.
+
+        Call after any config write so runtime readers pick up the change.
+        """
+        self._guild_config_cache.pop(guild_id, None)
+
+    def add_config_id_value(self, bucket: str, value: int) -> set[int]:
+        with self.open_db() as conn:
+            add_config_id(conn, bucket, value, self.guild_id)
+            result = get_config_id_set(conn, bucket, self.guild_id)
+        # Always the home guild — refresh the per-guild snapshot so guild_config()
+        # readers (spoiler/bypass/xp-excluded/…) see the change without a restart.
+        self.invalidate_guild_config(self.guild_id)
+        return result
+
+    def remove_config_id_value(self, bucket: str, value: int) -> set[int]:
+        with self.open_db() as conn:
+            remove_config_id(conn, bucket, value, self.guild_id)
+            result = get_config_id_set(conn, bucket, self.guild_id)
+        self.invalidate_guild_config(self.guild_id)
+        return result
+
+    def clear_config_id_bucket(self, bucket: str) -> None:
+        with self.open_db() as conn:
+            clear_config_id_bucket(conn, bucket, self.guild_id)
+        self.invalidate_guild_config(self.guild_id)
+
+    def set_config_value(
+        self, key: str, value: str, guild_id: int | None = None
+    ) -> str:
+        """Write a config value for ``guild_id`` (defaults to the home guild).
+
+        Invalidates the per-guild snapshot so ``guild_config()`` readers see
+        the write.
+        """
+        gid = self.guild_id if guild_id is None else guild_id
+        with self.open_db() as conn:
+            _db_set_config_value(conn, key, value, gid)
+            result = get_config_value(conn, key, value, gid)
+        self.invalidate_guild_config(gid)
+        return result
+
+    def delete_config_value(self, key: str) -> None:
+        with self.open_db() as conn:
+            delete_config_value(conn, key, self.guild_id)
+        self.invalidate_guild_config(self.guild_id)
+
+    def get_interaction_member(
+        self, interaction: discord.Interaction
+    ) -> discord.Member | None:
+        from bot_modules.core.utils import get_interaction_member as _impl
+
+        return _impl(interaction)
+
+    def get_bot_member(self, guild: discord.Guild) -> discord.Member | None:
+        return guild.me
+
+    def get_guild_channel_or_thread(
+        self, guild: discord.Guild, channel_id: int
+    ) -> GuildTextLike | None:
+        from bot_modules.core.utils import get_guild_channel_or_thread as _impl
+
+        return _impl(guild, channel_id)
+
+    def get_xp_config_target_channel(
+        self, interaction: discord.Interaction
+    ) -> GuildTextLike | None:
+        channel = interaction.channel
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        return None
+
+    def is_mod(self, interaction: discord.Interaction) -> bool:
+        _log = logging.getLogger("dungeonkeeper.perms")
+        perms = interaction.permissions
+        member = self.get_interaction_member(interaction)
+        _log.info(
+            "is_mod user=%s perms_value=%d manage_guild=%s administrator=%s member=%s member_perms=%s",
+            interaction.user.id,
+            perms.value,
+            perms.manage_guild,
+            perms.administrator,
+            member,
+            member.guild_permissions.value if member else None,
+        )
+        if perms.manage_guild or perms.administrator:
+            return True
+        if member is None or interaction.guild_id is None:
+            return False
+        return self.guild_config(interaction.guild_id).member_is_mod(member)
+
+    def member_is_mod(self, member: discord.Member) -> bool:
+        """``is_mod`` for a Member with no interaction in hand.
+
+        Same definition — Discord's manage_guild/administrator short-circuit,
+        then the guild's configured mod/admin roles — reachable from the paths
+        that hold a member object instead of an interaction (the perk-role
+        reconcile, the gift-recipient check, the voice-style paywall). Keeping
+        one definition matters: a second answer to "who is staff" would let the
+        perk comp and the moderation gates disagree about the same person.
+        """
+        perms = member.guild_permissions
+        if perms.manage_guild or perms.administrator:
+            return True
+        return self.guild_config(member.guild.id).member_is_mod(member)
+
+    def is_admin(self, interaction: discord.Interaction) -> bool:
+        if interaction.permissions.administrator:
+            return True
+        member = self.get_interaction_member(interaction)
+        if member is None or interaction.guild_id is None:
+            return False
+        return self.guild_config(interaction.guild_id).member_is_admin(member)
+
+    def can_grant_any_role(self, interaction: discord.Interaction) -> bool:
+        """Returns True if user can grant ANY configured grant role."""
+        if self.is_admin(interaction):
+            return True
+        member = self.get_interaction_member(interaction)
+        if member is None or interaction.guild_id is None:
+            return False
+        gid = interaction.guild_id
+        role_ids = [r.id for r in member.roles]
+        with self.open_db() as conn:
+            for grant_name in self.guild_config(gid).grant_roles:
+                if can_use_grant(conn, gid, grant_name, member.id, role_ids):
+                    return True
+        return False
+
+    def can_use_grant_role(
+        self, interaction: discord.Interaction, grant_name: str
+    ) -> bool:
+        """Per-grant gate: the allow-list decides, admins excepted.
+
+        Deliberately ``is_admin``, not ``is_mod``. Under ``is_mod`` the
+        per-grant list could only ever *add* people — every moderator could
+        hand out every grant and no list could take that away, so "this role
+        is one keeper's to give" was unexpressable. Administrators keep the
+        bypass so a guild can't lock itself out of its own grants.
+        """
+        if self.is_admin(interaction):
+            return True
+        member = self.get_interaction_member(interaction)
+        if member is None or interaction.guild_id is None:
+            return False
+        role_ids = [r.id for r in member.roles]
+        with self.open_db() as conn:
+            return can_use_grant(
+                conn, interaction.guild_id, grant_name, member.id, role_ids
+            )
+
+    def can_use_xp_grant(self, interaction: discord.Interaction) -> bool:
+        if self.is_mod(interaction):
+            return True
+        if interaction.guild_id is None:
+            return False
+        allowed = self.guild_config(interaction.guild_id).xp_grant_allowed_user_ids
+        return interaction.user.id in allowed
+
+    def get_member_last_activity_map(self, conn, guild_id: int, user_ids: list[int]):
+        from bot_modules.core.xp_system import get_member_last_activity_map
+
+        return get_member_last_activity_map(conn, guild_id, user_ids)

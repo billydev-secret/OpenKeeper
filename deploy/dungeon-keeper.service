@@ -1,0 +1,117 @@
+# systemd service for dungeon-keeper (Discord community/games bot + web dashboard)
+#
+# Install: see deploy/README.md in this folder.
+# Logs:    journalctl -u dungeon-keeper -f
+#
+# NOTE: this is the heavy one.
+#   - src/ layout: run as a module with PYTHONPATH=src (set below).
+#   - Music features need a Lavalink server (see lavalink/application.yml).
+#     If you run Lavalink as its own unit, uncomment the After/Wants lines.
+#   - Pulls a large ML stack (llama-cpp-python, mediapipe, nudenet, Pillow…)
+#     plus a ~350 MB sqlite DB — give it time/RAM on first boot.
+
+[Unit]
+Description=dungeon-keeper Discord bot
+PartOf=discord-bots.target
+After=network-online.target
+Wants=network-online.target
+# After=lavalink.service
+# Wants=lavalink.service
+
+[Service]
+Type=simple
+User=<user>
+Group=ben
+WorkingDirectory=/home/<user>/discord-bots/dungeon-keeper
+# src/ layout: make the in-tree packages importable.
+Environment=PYTHONPATH=/home/<user>/discord-bots/dungeon-keeper/src
+# __main__ calls load_dotenv() itself; no EnvironmentFile needed.
+ExecStart=/home/<user>/discord-bots/dungeon-keeper/.venv/bin/python -m dungeonkeeper
+
+Restart=on-failure
+RestartSec=10
+# ML model load can be slow; give it room before systemd gives up.
+TimeoutStartSec=180
+
+# ---------------------------------------------------------------------------
+# Hardening
+# ---------------------------------------------------------------------------
+# Brought up to dk-mcp.service's set on 2026-09-19 (audit row 3.10). That unit
+# was hardened properly because it is internet-reachable; this one holds the
+# Discord token and the live database and had barely half the directives. Each
+# line below was checked against what this process actually does rather than
+# copied on faith -- see "Verified, and what was deliberately left out".
+
+# -- filesystem -------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=read-only
+# Writes DB, log.txt, and backups/ inside the repo.
+ReadWritePaths=/home/<user>/discord-bots/dungeon-keeper
+PrivateTmp=true
+# A private /dev with null/zero/full/random/urandom/tty only. Nothing here
+# needs a real device: Discord voice is Lavalink's problem (its own JVM, over
+# the network), and the vision stack is CPU-only.
+PrivateDevices=true
+
+# -- privilege surface ------------------------------------------------------
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+
+# -- kernel surface ---------------------------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+# Hides OTHER users' processes. Not ProcSubset=pid -- see below.
+ProtectProc=invisible
+
+# -- syscalls and sockets ---------------------------------------------------
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+# EPERM, not SIGSYS: a blocked call returns an error the runtime can handle
+# instead of killing the bot mid-event.
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# ---------------------------------------------------------------------------
+# Verified, and what was deliberately left out
+# ---------------------------------------------------------------------------
+# Checked 2026-09-19 by running the real workloads under each restriction (a
+# transient unit for the seccomp/capability set, a user namespace with the same
+# mounts for the /dev and /proc ones), not by reading the manual:
+#
+#   PrivateDevices      psutil, sqlite writes, DNS, outbound TLS, llama_cpp,
+#                       mediapipe's FaceDetector on the real model file, and
+#                       nudenet all fine. The running bot holds no /dev fd but
+#                       /dev/null and maps no device.
+#   ProtectProc         same set, all fine. It only hides other UIDs' pids, and
+#                       nothing here enumerates processes.
+#   SystemCallFilter    same set, plus a full Lavalink boot -- JVM start,
+#                       Spring, netty, plugin loading and outbound HTTPS all
+#                       succeeded. Lavalink runs as a CHILD of this unit
+#                       (lavalink_manager spawns it), so it inherits the
+#                       filter; that is why it was worth booting rather than
+#                       assuming.
+#
+# NOT ported from dk-mcp.service, on purpose:
+#
+#   ProcSubset=pid      It removes /proc/meminfo, /proc/stat and /proc/net/dev.
+#                       The dashboard's system-status panel is psutil, and four
+#                       of its five calls raise FileNotFoundError under it
+#                       (measured). dk-mcp serves files and never asks.
+#
+#   RemoveIPC=yes       It deletes every POSIX and SysV IPC object owned by the
+#                       UID when the unit stops -- and seven services plus
+#                       Billy's own logins share uid ben. /dev/shm already
+#                       holds a semaphore from an unrelated process. This unit
+#                       creates no IPC of its own, so the setting buys nothing
+#                       and can take someone else's work with it on a restart.
+
+[Install]
+WantedBy=multi-user.target discord-bots.target

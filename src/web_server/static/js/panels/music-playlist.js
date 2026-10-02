@@ -1,0 +1,631 @@
+// Config — Music Playlist. The watched-channel → rolling-Spotify-playlist
+// feature's whole admin surface: the connection chip (the stored grant's
+// shape, so a read-only token names itself instead of surfacing as a bare
+// 403), the watch/behavior dials, the live window, the unmatched review
+// queue, history with removal reasons, and the two maintenance actions.
+// Everything talks to /api/music-playlist/* (routes/music_playlist.py).
+import { api, esc, fmtAge } from "../api.js";
+import {
+  apiDelete,
+  apiPost,
+  apiPut,
+  checkbox,
+  field,
+  guardForm,
+  loadChannels,
+  memberNames,
+  mountAsync,
+  mountChannelPicker,
+  numInput,
+  renderMetaWarning,
+  sectionCard,
+  showStatus,
+  guardedSubmit,
+} from "../config-helpers.js";
+import { renderSortableTable } from "../table.js";
+import { confirmDialog, toast } from "../ui.js";
+import { mountTabs } from "../tabs.js";
+
+// The three shapes connection_status() reports. Wording matches the spec —
+// "Read-only, needs re-consent" is the whole diagnosis, not a code.
+const CONNECTION = {
+  connected: { label: "Connected", cls: "chip chip-success", btn: "Re-connect" },
+  read_only: { label: "Read-only, needs re-consent", cls: "chip chip-warning", btn: "Re-consent" },
+  not_connected: { label: "Not connected", cls: "chip chip-danger", btn: "Connect Spotify" },
+};
+
+const REASONS = {
+  rolled_off: { label: "Rolled off", cls: "badge badge-dim" },
+  message_deleted: { label: "Message deleted", cls: "badge badge-warning" },
+  admin: { label: "Removed by admin", cls: "badge" },
+};
+
+function nowSec() { return Date.now() / 1000; }
+
+// Client-side twin of the route's playlist-id normalization, so pasting a
+// link to the *same* playlist doesn't trip the change warning.
+function extractPlaylistId(raw) {
+  const value = String(raw || "").trim();
+  const m = value.match(/(?:open\.spotify\.com\/playlist\/|spotify:playlist:)([A-Za-z0-9]+)/);
+  return m ? m[1] : value;
+}
+
+function ageCell(ts) {
+  return ts ? `${fmtAge(nowSec() - ts)} ago` : "—";
+}
+
+// Source URLs are member-posted text. Only link http(s); label by host so the
+// cell reads "open.spotify.com" / "youtube.com" instead of a full URL.
+function sourceCell(url) {
+  if (!url) return "—";
+  if (!/^https?:\/\//i.test(url)) return esc(url);
+  let host;
+  try {
+    host = new URL(url).hostname.replace(/^www\./, "");
+  } catch (_) {
+    return esc(url);
+  }
+  return `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(host)}</a>`;
+}
+
+function reasonCell(reason) {
+  const r = REASONS[reason] || { label: reason || "—", cls: "badge badge-dim" };
+  return `<span class="${esc(r.cls)}">${esc(r.label)}</span>`;
+}
+
+// Maintenance responses are small dicts ({ok, scanned, added, …}); show the
+// counts without hard-coding which keys a given action reports.
+function summarize(result) {
+  const parts = Object.entries(result || {})
+    .filter(([k, v]) => k !== "ok" && (typeof v === "number" || typeof v === "string"))
+    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`);
+  return parts.length ? parts.join(", ") : "Done";
+}
+
+function errorBox(host, err) {
+  host.innerHTML = `<div class="error">${esc(err.message)}</div>`;
+}
+
+// Names for the member ids a payload references, departed members included
+// (memberNames reaches past the bounded roster page for exact ids).
+async function nameLookup(rows, key = "added_by") {
+  try {
+    return await memberNames(rows.map((r) => r[key]));
+  } catch (_) {
+    return (id) => String(id); // ids still render; names arrive on refresh
+  }
+}
+
+export function mount(container) {
+  container.innerHTML = `<div class="panel"><div class="empty">Loading Music Playlist…</div></div>`;
+  return mountAsync(container, async () => {
+    const [status, channels] = await Promise.all([
+      api("/api/music-playlist/status"),
+      loadChannels(),
+    ]);
+    return render(container, status, channels);
+  }, { errorMsg: "Couldn’t load the Music Playlist settings." });
+}
+
+// Tabbed like Bios (config-bios.js is the reference implementation — see
+// tabs.js for the lazy-load / retry contract): Settings bundles the
+// admin-only config plus the two occasional maintenance actions, and each of
+// the three data tables gets its own lazily-loaded tab so an admin who only
+// ever checks Settings never pays for the other three fetches.
+function render(container, status, channels) {
+  const s = status.settings || {};
+  // Tracks the last-saved playlist id across saves in this panel session,
+  // for the change warning below.
+  let savedPlaylistId = s.playlist_id || "";
+
+  container.textContent = "";
+  const panel = document.createElement("div");
+  panel.className = "panel";
+
+  const hdr = document.createElement("header");
+  const h2 = document.createElement("h2");
+  h2.textContent = "Music Playlist";
+  const sub = document.createElement("div");
+  sub.className = "subtitle";
+  sub.textContent =
+    "One watched channel becomes a rolling Spotify playlist: music links " +
+    "posted there are resolved to tracks, deduped, and kept as the last " +
+    "N songs.";
+  hdr.append(h2, sub);
+  panel.appendChild(hdr);
+
+  const warning = renderMetaWarning();
+  if (warning) {
+    const w = document.createElement("div");
+    w.innerHTML = warning;
+    panel.appendChild(w.firstElementChild);
+  }
+
+  const tabsHost = document.createElement("div");
+  panel.appendChild(tabsHost);
+  container.appendChild(panel);
+
+  // ── Live Window (host built once; reused across tab opens/retries so the
+  // Settings tab's Save and the Maintenance actions below can always refresh
+  // it, even before its own tab has ever been opened) ────────────────────
+  const windowHint = document.createElement("div");
+  windowHint.className = "field-hint";
+  windowHint.style.marginBottom = "8px";
+  const windowHost = document.createElement("div");
+  windowHost.style.overflowX = "auto";
+
+  let windowRows = [];
+  async function refreshWindow({ throwOnError = false } = {}) {
+    let payload;
+    try {
+      payload = await api("/api/music-playlist/window");
+    } catch (err) {
+      // throwOnError is set only by the Live Window tab's own first open —
+      // that lets the rejection reach mountTabs' per-pane mountAsync so a
+      // failed load gets a real Retry button (F1) instead of this inline
+      // box, which every other caller (row actions, Save, Maintenance) still
+      // wants: it must not blow away a tab the admin is actively looking at.
+      if (throwOnError) throw err;
+      errorBox(windowHost, err);
+      return;
+    }
+    windowRows = payload.tracks || [];
+    windowHint.textContent =
+      `${windowRows.length} of ${payload.window_size} songs, newest first. ` +
+      "Removing a row also removes the track from Spotify.";
+    const nameOf = await nameLookup(windowRows);
+    for (const r of windowRows) r.added_by_name = nameOf(r.added_by);
+    renderSortableTable(windowHost, {
+      columns: [
+        { key: "title", label: "Title" },
+        { key: "artist", label: "Artist" },
+        { key: "added_by_name", label: "Added by" },
+        { key: "added_at", label: "Added", format: ageCell },
+        { key: "source_url", label: "Source", html: true, format: sourceCell },
+        // Row id is server-issued and numeric; the delegated handler below
+        // survives table.js's re-render on every sort.
+        { key: "id", label: "", html: true,
+          format: (v) => `<button type="button" class="btn btn-ghost btn-sm" data-remove-track="${Number(v)}">Remove</button>` },
+      ],
+      data: windowRows,
+      defaultSort: "added_at",
+      defaultAsc: false,
+      emptyMsg: "The window is empty — nothing has been added yet.",
+    });
+  }
+
+  windowHost.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-remove-track]");
+    if (!btn) return;
+    const id = btn.dataset.removeTrack;
+    const row = windowRows.find((r) => String(r.id) === id);
+    const title = row ? `“${row.title}”` : "this track";
+    const ok = await confirmDialog(
+      `Remove ${title} from the playlist? It stays in History as an admin removal.`,
+      { title: "Remove track", danger: true, confirmLabel: "Remove" },
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+      const res = await apiDelete(`/api/music-playlist/window/${id}`);
+      if (res.error) {
+        toast(`Removed from the window, but Spotify refused: ${res.error} — run Reconcile once the connection is fixed.`, "error");
+      } else {
+        toast("Removed", "success");
+      }
+      refreshWindow();
+      refreshHistory();
+    } catch (err) {
+      toast(err.message, "error");
+      btn.disabled = false;
+    }
+  });
+
+  // ── Review queue ─────────────────────────────────────────────────────
+  const queueHint = document.createElement("div");
+  queueHint.className = "field-hint";
+  queueHint.style.marginBottom = "8px";
+  const queueHost = document.createElement("div");
+  queueHost.style.overflowX = "auto";
+
+  async function refreshQueue({ throwOnError = false } = {}) {
+    let payload;
+    try {
+      payload = await api("/api/music-playlist/unmatched");
+    } catch (err) {
+      if (throwOnError) throw err;
+      errorBox(queueHost, err);
+      return;
+    }
+    const rows = payload.items || [];
+    queueHint.textContent =
+      (rows.length
+        ? `${rows.length} link${rows.length === 1 ? "" : "s"} waiting for review. `
+        : "Nothing waiting for review right now. ") +
+      "Links the pipeline had nothing to add for — no metadata, no Spotify " +
+      "candidates, or an unreadable album/playlist. A decision here is " +
+      "remembered: the same link never comes back for review. While the " +
+      "connection is read-only, approvals fail until re-consent and can " +
+      "simply be retried after.";
+    const nameOf = await nameLookup(rows);
+    for (const r of rows) {
+      r.added_by_name = nameOf(r.added_by);
+      r.candidate = r.candidate_name
+        ? `${r.candidate_name} — ${r.candidate_artist || "?"}`
+        : "(no candidate)";
+    }
+    renderSortableTable(queueHost, {
+      columns: [
+        { key: "extracted_title", label: "Posted",
+          format: (v, row) => v || row.source_url || "—" },
+        { key: "candidate", label: "Best Candidate" },
+        { key: "confidence", label: "Score",
+          format: (v) => (v == null ? "—" : Number(v).toFixed(2)) },
+        { key: "reason", label: "Reason" },
+        { key: "added_by_name", label: "Posted by" },
+        { key: "created_at", label: "Age", format: ageCell },
+        { key: "id", label: "", html: true,
+          format: (v) =>
+            `<button type="button" class="btn btn-primary btn-sm" data-approve="${Number(v)}">Approve</button> ` +
+            `<button type="button" class="btn btn-ghost btn-sm" data-reject="${Number(v)}">Reject</button>` },
+      ],
+      data: rows,
+      defaultSort: "created_at",
+      defaultAsc: false,
+      emptyMsg: "Nothing waiting for review.",
+    });
+  }
+
+  queueHost.addEventListener("click", async (e) => {
+    const approve = e.target.closest("[data-approve]");
+    const reject = e.target.closest("[data-reject]");
+    const btn = approve || reject;
+    if (!btn) return;
+    const id = approve ? btn.dataset.approve : btn.dataset.reject;
+    if (reject) {
+      const ok = await confirmDialog(
+        "Reject this candidate? The link is dropped without adding anything.",
+        { title: "Reject candidate", danger: true, confirmLabel: "Reject" },
+      );
+      if (!ok) return;
+    }
+    btn.disabled = true;
+    try {
+      if (approve) {
+        const res = await apiPost(`/api/music-playlist/unmatched/${id}/approve`, {});
+        toast(res.was_duplicate ? "Already in the window — marked approved." : "Added to the playlist.", "success");
+      } else {
+        await apiPost(`/api/music-playlist/unmatched/${id}/reject`, {});
+        toast("Rejected", "success");
+      }
+      refreshQueue();
+      refreshWindow();
+    } catch (err) {
+      toast(err.message, "error");
+      btn.disabled = false;
+    }
+  });
+
+  // ── History ──────────────────────────────────────────────────────────
+  const historyHint = document.createElement("div");
+  historyHint.className = "field-hint";
+  historyHint.style.marginBottom = "8px";
+  historyHint.textContent =
+    "Tracks that left the window and why — rolled off the end, source " +
+    "message deleted, or removed by an admin. Newest removals first.";
+  const historyHost = document.createElement("div");
+  historyHost.style.overflowX = "auto";
+
+  async function refreshHistory({ throwOnError = false } = {}) {
+    let payload;
+    try {
+      payload = await api("/api/music-playlist/history");
+    } catch (err) {
+      if (throwOnError) throw err;
+      errorBox(historyHost, err);
+      return;
+    }
+    const rows = payload.history || [];
+    const nameOf = await nameLookup(rows);
+    for (const r of rows) r.added_by_name = nameOf(r.added_by);
+    renderSortableTable(historyHost, {
+      columns: [
+        { key: "title", label: "Title" },
+        { key: "artist", label: "Artist" },
+        { key: "removal_reason", label: "Reason", html: true, format: reasonCell },
+        { key: "removed_at", label: "Removed", format: ageCell },
+        { key: "added_by_name", label: "Posted by" },
+      ],
+      data: rows,
+      defaultSort: "removed_at",
+      defaultAsc: false,
+      emptyMsg: "No track has left the window yet.",
+      maxRows: 100,
+    });
+  }
+
+  // ── Maintenance (rendered on the Settings tab, below) ───────────────
+  const maintRow = document.createElement("div");
+  maintRow.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; margin:6px 0;";
+  const rescanBtn = document.createElement("button");
+  rescanBtn.type = "button";
+  rescanBtn.className = "btn";
+  rescanBtn.textContent = "Re-scan Channel";
+  const reconcileBtn = document.createElement("button");
+  reconcileBtn.type = "button";
+  reconcileBtn.className = "btn";
+  reconcileBtn.textContent = "Reconcile with Spotify";
+  const maintStatus = document.createElement("span");
+  maintRow.append(rescanBtn, reconcileBtn, maintStatus);
+  const maintHint = document.createElement("div");
+  maintHint.className = "field-hint";
+  maintHint.textContent =
+    "Re-scan runs the pipeline over the watched channel's recent messages " +
+    "(already-processed ones are skipped, so it's safe to repeat) — it is " +
+    "also how you recover songs the bot couldn't add at the time. " +
+    "Reconcile squares the actual Spotify playlist with the window shown " +
+    "here, and will ask before deleting anything it doesn't recognise. " +
+    "Both need the bot online.";
+
+  async function runMaintenance(path, body) {
+    rescanBtn.disabled = reconcileBtn.disabled = true;
+    try {
+      const res = await apiPost(path, body || {});
+      // Reconcile withholds a bulk delete until it's confirmed: "on Spotify
+      // but not in the window" also describes every song on a playlist the
+      // bot didn't fill, and the removal is a real, irreversible write.
+      const pending = res && res.needs_confirmation;
+      if (pending) {
+        const n = Number(pending.would_remove) || 0;
+        const ok = await confirmDialog(
+          `${n} track${n === 1 ? "" : "s"} on the Spotify playlist ${n === 1 ? "is" : "are"} not in this window. `
+          + "Deleting them removes them from the real playlist for good — including any song "
+          + "the bot never added, if this playlist existed before you pointed the bot at it. "
+          + "Check the playlist id under Watch is the one the bot manages.",
+          {
+            title: `Delete ${n} track${n === 1 ? "" : "s"} from Spotify?`,
+            confirmLabel: `Delete ${n}`,
+            danger: true,
+          },
+        );
+        if (!ok) {
+          // Not a success, and not a no-op: the additions ran before this
+          // prompt appeared. A toast says what landed without clearing the
+          // unsaved-edits flag on the settings form above.
+          toast(`Added ${res.added || 0}; left ${n} unrecognised track${n === 1 ? "" : "s"} alone.`);
+          return;
+        }
+        rescanBtn.disabled = reconcileBtn.disabled = false;
+        await runMaintenance(
+          "/api/music-playlist/reconcile?confirm_removals=true", {},
+        );
+        return;
+      }
+      showStatus(maintStatus, true, summarize(res));
+      refreshWindow();
+      refreshQueue();
+      refreshHistory();
+    } catch (err) {
+      showStatus(maintStatus, false, err.message);
+    } finally {
+      rescanBtn.disabled = reconcileBtn.disabled = false;
+    }
+  }
+  rescanBtn.addEventListener("click", () => runMaintenance("/api/music-playlist/rescan"));
+  reconcileBtn.addEventListener("click", () => runMaintenance("/api/music-playlist/reconcile"));
+
+  // ── Settings tab: Connection, Watch, Behavior, Maintenance ───────────
+  function renderSettingsTab(pane) {
+    pane.innerHTML = "";
+    // A local flex column recreates app.css's shared "adjacent top-level
+    // boxes" spacing (`.panel > :is(...) + :is(...)`), which only reaches a
+    // panel's *direct* children — once these cards live inside a tab pane
+    // that rule can't see them, so the Connection/Watch collision Billy
+    // reported would come right back without this.
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "display:flex; flex-direction:column; gap:var(--s-5);";
+    pane.appendChild(wrap);
+
+    const conn = CONNECTION[status.connection] || CONNECTION.not_connected;
+    const cardConn = sectionCard(wrap, "Connection");
+    const connRow = document.createElement("div");
+    connRow.style.cssText = "display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:6px 0;";
+    connRow.innerHTML =
+      `<span class="${esc(conn.cls)}">${esc(conn.label)}</span>` +
+      // A real navigation, not a fetch: /spotify/authorize redirects to
+      // Spotify's consent page. New tab so the panel survives the round trip.
+      `<a class="btn btn-primary" href="/spotify/authorize" target="_blank" rel="noopener">${esc(conn.btn)}</a>`;
+    cardConn.appendChild(connRow);
+    const connHint = document.createElement("div");
+    connHint.className = "field-hint";
+    connHint.textContent =
+      "The playlist is written with the bot owner's Spotify account. " +
+      "Read-only means the stored grant predates the write scopes — click " +
+      "through the consent page once more, then reload this page. Nothing " +
+      "below can write to Spotify until the chip says Connected.";
+    cardConn.appendChild(connHint);
+
+    // ── Watch + Behavior (one form, one Save) ──────────────────────────
+    const form = document.createElement("form");
+    form.className = "form form-cards";
+    // app.css only widens a form-cards form to the full panel with
+    // `.panel > .form.form-cards` — a direct-child selector that can't reach
+    // it once it's nested inside a tab pane, so its Watch/Behavior cards
+    // would otherwise sit narrower (capped at .form's 640px) than the
+    // full-width Connection/Maintenance cards around them.
+    form.style.maxWidth = "none";
+    wrap.appendChild(form);
+
+    const cardWatch = sectionCard(form, "Watch");
+    const chanSlot = document.createElement("span");
+    cardWatch.appendChild(field(
+      "Watched Channel",
+      chanSlot,
+      "The one channel whose music links feed the playlist. \"(disabled)\" " +
+        "stops watching entirely.",
+    ));
+    const chanPicker = mountChannelPicker(
+      chanSlot, channels, String(s.channel_id || "0"),
+      { emptyValue: "0", emptyLabel: "(disabled)", label: "Watched Channel" },
+    );
+    const playlistInput = document.createElement("input");
+    playlistInput.type = "text";
+    playlistInput.name = "playlist_id";
+    playlistInput.value = s.playlist_id || "";
+    playlistInput.placeholder = "Playlist link, spotify:playlist: URI, or bare id";
+    playlistInput.style.maxWidth = "420px";
+    cardWatch.appendChild(field(
+      "Target Playlist",
+      playlistInput,
+      "The Spotify playlist the window is written to. Paste an " +
+        "open.spotify.com/playlist link — it's stored as the bare id. Leave " +
+        "empty to clear. Changing it does not move anything: songs already " +
+        "added stay in the old playlist, and already-processed messages " +
+        "never follow the new one.",
+    ));
+    const watchToggles = document.createElement("div");
+    watchToggles.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px;";
+    watchToggles.append(checkbox("enabled", s.enabled === true, "Watch the channel"));
+    cardWatch.appendChild(field(
+      "Enable",
+      watchToggles,
+      "Unchecked pauses the watcher without losing any settings. Links " +
+        "posted while paused are only picked up by a later Re-scan.",
+    ));
+
+    const cardBehavior = sectionCard(form, "Behavior");
+    cardBehavior.appendChild(field(
+      "Window Size",
+      numInput("window_size", s.window_size ?? 30, 1, "1", 200),
+      "How many songs the rolling playlist holds. Song N+1 pushes the " +
+        "oldest one out. Between 1 and 200; 30 is the default.",
+    ));
+    const behaviorToggles = document.createElement("div");
+    behaviorToggles.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px;";
+    behaviorToggles.append(
+      checkbox("remove_on_delete", s.remove_on_delete !== false, "Remove when the message is deleted"),
+    );
+    cardBehavior.appendChild(field(
+      "Re-scan Depth",
+      numInput("rescan_depth", s.rescan_depth ?? 200, 1, "1", 2000),
+      "How far back Re-scan reads the channel. This is the only way to " +
+        "recover songs the bot could not add at the time (a read-only " +
+        "connection, or a Spotify outage), so raise it if writes were blocked " +
+        "for longer than this many messages. Between 1 and 2000; 200 is the " +
+        "default.",
+    ));
+    cardBehavior.appendChild(field(
+      "Options",
+      behaviorToggles,
+      "Remove-on-delete drops a track when its source message is deleted, " +
+        "unless another live message still references it. Album and playlist " +
+        "links always contribute their single most popular track.",
+    ));
+
+    const saveRow = document.createElement("div");
+    saveRow.style.cssText = "display:flex; gap:8px; align-items:center;";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "submit";
+    saveBtn.className = "btn btn-primary";
+    saveBtn.textContent = "Save";
+    const saveStatus = document.createElement("span");
+    saveRow.append(saveBtn, saveStatus);
+    form.appendChild(saveRow);
+
+    guardForm(form);
+
+    guardedSubmit(form, async () => {
+      const fd = new FormData(form);
+      const windowSize = parseInt(String(fd.get("window_size") ?? "").trim(), 10);
+      if (!Number.isFinite(windowSize) || windowSize < 1 || windowSize > 200) {
+        showStatus(saveStatus, false, "Window Size must be a whole number between 1 and 200.");
+        form.querySelector('[name="window_size"]').focus();
+        return;
+      }
+      const rescanDepth = parseInt(String(fd.get("rescan_depth") ?? "").trim(), 10);
+      if (!Number.isFinite(rescanDepth) || rescanDepth < 1 || rescanDepth > 2000) {
+        showStatus(saveStatus, false, "Re-scan Depth must be a whole number between 1 and 2000.");
+        form.querySelector('[name="rescan_depth"]').focus();
+        return;
+      }
+      // Repointing the dial strands the back catalogue: the processed-message
+      // ledger is playlist-agnostic, so already-processed messages never
+      // follow, and nothing already added moves. Deliberate (2026-08-18) —
+      // warned about here rather than re-keying the ledger.
+      if (
+        savedPlaylistId &&
+        extractPlaylistId(playlistInput.value) !== savedPlaylistId
+      ) {
+        const ok = await confirmDialog(
+          "Songs already in the current playlist stay there, and messages " +
+            "the bot has already processed will never be re-added to the new " +
+            "one — a Re-scan only picks up messages that never landed. " +
+            "Change the target playlist?",
+          { title: "Change target playlist", confirmLabel: "Change playlist" },
+        );
+        if (!ok) return;
+      }
+      try {
+        const saved = await apiPut("/api/music-playlist/settings", {
+          enabled: fd.has("enabled"),
+          channel_id: chanPicker.getValue() || "0", // string — snowflake rule
+          playlist_id: playlistInput.value.trim(),
+          window_size: windowSize,
+          remove_on_delete: fd.has("remove_on_delete"),
+          rescan_depth: rescanDepth,
+        });
+        savedPlaylistId = (saved && saved.settings
+          ? saved.settings.playlist_id
+          : extractPlaylistId(playlistInput.value)) || "";
+        showStatus(saveStatus, true);
+        refreshWindow(); // a changed playlist or window size redraws the table
+      } catch (err) {
+        showStatus(saveStatus, false, err.message);
+      }
+    });
+
+    const cardMaint = sectionCard(wrap, "Maintenance");
+    // Guarded so its own showStatus attributes the save to this card. Without
+    // it, [data-maint-status] sits outside every guarded container and a
+    // successful Re-scan falls back to the page-wide clear, disarming the
+    // unsaved-edits warning on the settings form above.
+    guardForm(cardMaint);
+    cardMaint.appendChild(maintRow);
+    cardMaint.appendChild(maintHint);
+  }
+
+  // Each of these runs again on Retry (tabs.js re-invokes `render` on the
+  // same pane), so `pane` must be cleared first — appending onto whatever a
+  // failed attempt left behind (its Retry UI) would leave both on screen.
+  function renderWindowTab(pane) {
+    pane.innerHTML = "";
+    pane.append(windowHint, windowHost);
+    windowHost.innerHTML = '<div class="empty">Loading…</div>';
+    return refreshWindow({ throwOnError: true });
+  }
+
+  function renderQueueTab(pane) {
+    pane.innerHTML = "";
+    pane.append(queueHint, queueHost);
+    queueHost.innerHTML = '<div class="empty">Loading…</div>';
+    return refreshQueue({ throwOnError: true });
+  }
+
+  function renderHistoryTab(pane) {
+    pane.innerHTML = "";
+    pane.append(historyHint, historyHost);
+    historyHost.innerHTML = '<div class="empty">Loading…</div>';
+    return refreshHistory({ throwOnError: true });
+  }
+
+  return mountTabs(tabsHost, [
+    { key: "settings", label: "Settings", render: renderSettingsTab,
+      errorMsg: "Couldn’t load the Music Playlist settings." },
+    { key: "window", label: "Live Window", render: renderWindowTab,
+      errorMsg: "Couldn’t load the live window." },
+    { key: "queue", label: "Review Queue", render: renderQueueTab,
+      errorMsg: "Couldn’t load the review queue." },
+    { key: "history", label: "History", render: renderHistoryTab,
+      errorMsg: "Couldn’t load the history." },
+  ], { ariaLabel: "Music Playlist sections" });
+}

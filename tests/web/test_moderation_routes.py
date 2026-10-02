@@ -1,0 +1,1561 @@
+"""Tests for /api/moderation/* endpoints."""
+
+from __future__ import annotations
+
+import json
+import time
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.shared.anon_audit_service import (
+    EVENT_CONFESSION_POSTED,
+    EVENT_REPLY_POSTED,
+    FEATURE_AMA,
+    FEATURE_CONFESSIONS,
+    insert_event,
+)
+from bot_modules.moderation.service import (
+    close_ticket,
+    create_jail,
+    create_ticket,
+    create_warning,
+    delete_warning,
+    write_audit,
+)
+
+
+def _seed_jail(db_path, guild_id=123, user_id=1001, moderator_id=2001):
+    with open_db(db_path) as conn:
+        jail_id = create_jail(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            moderator_id=moderator_id,
+            reason="test jail",
+            stored_roles=[],
+            channel_id=0,
+            duration_seconds=3600,
+        )
+    return jail_id
+
+
+def _seed_ticket(db_path, guild_id=123, user_id=1001):
+    with open_db(db_path) as conn:
+        ticket_id = create_ticket(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=0,
+            description="test ticket",
+        )
+    return ticket_id
+
+
+def _seed_warning(db_path, guild_id=123, user_id=1001, moderator_id=2001):
+    with open_db(db_path) as conn:
+        warn_id = create_warning(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            moderator_id=moderator_id,
+            reason="test warning",
+        )
+    return warn_id
+
+
+# ── GET /api/moderation/jails ─────────────────────────────────────────
+
+def test_jails_empty_on_fresh_db(open_client):
+    resp = open_client.get("/api/moderation/jails")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "jails" in data
+    assert data["jails"] == []
+
+
+def test_jails_returns_seeded_jail(open_client, fake_ctx):
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.get("/api/moderation/jails")
+    assert resp.status_code == 200
+    jails = resp.json()["jails"]
+    assert len(jails) == 1
+    assert jails[0]["user_id"] == str(1001)
+    assert jails[0]["reason"] == "test jail"
+
+
+# ── GET /api/moderation/tickets ───────────────────────────────────────
+
+def test_tickets_empty_on_fresh_db(open_client):
+    resp = open_client.get("/api/moderation/tickets")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "tickets" in data
+    assert data["tickets"] == []
+
+
+def test_tickets_returns_seeded_ticket(open_client, fake_ctx):
+    _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.get("/api/moderation/tickets")
+    assert resp.status_code == 200
+    tickets = resp.json()["tickets"]
+    assert len(tickets) == 1
+    assert tickets[0]["user_id"] == str(1001)
+
+
+# ── GET /api/moderation/warnings ─────────────────────────────────────
+
+def test_warnings_empty_on_fresh_db(open_client):
+    resp = open_client.get("/api/moderation/warnings")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "warnings" in data
+    assert data["warnings"] == []
+
+
+def test_warnings_returns_seeded_warning(open_client, fake_ctx):
+    _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.get("/api/moderation/warnings")
+    assert resp.status_code == 200
+    warnings = resp.json()["warnings"]
+    assert len(warnings) == 1
+    assert warnings[0]["user_id"] == str(1001)
+    assert warnings[0]["reason"] == "test warning"
+
+
+# ── GET /api/moderation/stats ─────────────────────────────────────────
+
+
+def test_stats_returns_zeroes_on_empty_db(open_client):
+    body = open_client.get("/api/moderation/stats").json()
+    assert body["active_jails"] == 0
+    assert body["total_jails"] == 0
+    assert body["open_tickets"] == 0
+    assert body["closed_tickets"] == 0
+    assert body["active_warnings"] == 0
+    assert body["recent_actions"] == 0
+
+
+def test_stats_counts_seeded_state(open_client, fake_ctx):
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        # recent_actions counts moderation only, so this has to be one.
+        write_audit(
+            conn, guild_id=fake_ctx.guild_id, action="warning_issue", actor_id=1,
+        )
+
+    body = open_client.get("/api/moderation/stats").json()
+    assert body["active_jails"] == 1  # seeded with default 'active' status
+    assert body["total_jails"] == 1
+    assert body["open_tickets"] == 1
+    assert body["closed_tickets"] == 0
+    assert body["active_warnings"] == 1
+    assert body["recent_actions"] == 1
+
+
+def test_stats_isolates_by_guild(open_client, fake_ctx):
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    _seed_jail(fake_ctx.db_path, guild_id=999)  # other guild
+    body = open_client.get("/api/moderation/stats").json()
+    assert body["total_jails"] == 1
+
+
+# ── GET /api/moderation/jails — filters ──────────────────────────────
+
+
+def test_jails_filter_by_status(open_client, fake_ctx):
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1)
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=2)
+    # Mark one as released
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute("UPDATE jails SET status = 'released' WHERE user_id = 2")
+
+    active = open_client.get("/api/moderation/jails?status=active").json()
+    released = open_client.get("/api/moderation/jails?status=released").json()
+    assert len(active["jails"]) == 1
+    assert active["jails"][0]["user_id"] == "1"
+    assert len(released["jails"]) == 1
+    assert released["jails"][0]["user_id"] == "2"
+
+
+def test_jails_filter_by_user_id(open_client, fake_ctx):
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=100)
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=200)
+    body = open_client.get("/api/moderation/jails?user_id=100").json()
+    assert {j["user_id"] for j in body["jails"]} == {"100"}
+
+
+# ── GET /api/moderation/jails — in_guild presence flag ───────────────
+
+
+def test_jails_flags_a_subject_who_left_the_server(open_client, fake_ctx):
+    """The panel warns about lost roles, so absence has to be visible."""
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1002)
+
+    present = MagicMock()
+    present.id = 1001
+    present.display_name = "still-here"
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id  # name resolution falls back to a DB lookup keyed on this
+    guild.get_member = MagicMock(side_effect=lambda uid: present if int(uid) == 1001 else None)
+    fake_ctx.bot = MagicMock()
+    fake_ctx.bot.get_guild = MagicMock(return_value=guild)
+
+    jails = {j["user_id"]: j for j in open_client.get("/api/moderation/jails").json()["jails"]}
+    assert jails["1001"]["in_guild"] is True
+    assert jails["1002"]["in_guild"] is False
+
+
+def test_jails_in_guild_is_null_when_bot_is_disconnected(open_client, fake_ctx):
+    """Unknown ≠ departed — a disconnected bot must not label everyone gone."""
+    _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    fake_ctx.bot = None
+
+    jails = open_client.get("/api/moderation/jails").json()["jails"]
+    assert jails[0]["in_guild"] is None
+
+
+# ── POST /api/moderation/jails/{id}/release ──────────────────────────
+
+
+def _release_ctx(fake_ctx, *, member_present: bool, user_exists: bool = True):
+    """Wire fake_ctx.bot with a guild whose member may or may not be present."""
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.name = "Test Guild"
+    guild.roles = []
+    # OpenAuth authenticates as user_id 0; the route resolves the actor as a
+    # guild member before it will act.
+    moderator = MagicMock()
+    moderator.id = 0
+    moderator.mention = "<@0>"
+    moderator.display_name = "mod"
+
+    target = MagicMock()
+    target.id = 1001
+    target.mention = "<@1001>"
+    target.display_name = "target"  # the release audit card names, never mentions
+    target.roles = []
+    target.remove_roles = AsyncMock()
+    target.add_roles = AsyncMock()
+    target.send = AsyncMock()
+
+    def _get_member(uid):
+        uid = int(uid)
+        if uid == 1001:
+            return target if member_present else None
+        return moderator
+
+    guild.get_member = MagicMock(side_effect=_get_member)
+    guild.get_channel = MagicMock(return_value=None)
+    guild.get_role = MagicMock(return_value=None)
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    departed = MagicMock(spec=discord.User)
+    departed.id = 1001
+    departed.mention = "<@1001>"
+    departed.send = AsyncMock()
+    bot.get_user = MagicMock(return_value=departed if user_exists else None)
+    bot.fetch_user = AsyncMock(
+        side_effect=discord.NotFound(MagicMock(status=404), "gone")
+    )
+    fake_ctx.bot = bot
+    return bot
+
+
+def test_jail_release_for_departed_member_marks_row_released(open_client, fake_ctx):
+    """A member who left is releasable — the gap that started all this."""
+    jail_id = _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    _release_ctx(fake_ctx, member_present=False)
+
+    resp = open_client.post(
+        f"/api/moderation/jails/{jail_id}/release", json={"reason": "left, closing out"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute("SELECT * FROM jails WHERE id = ?", (jail_id,)).fetchone()
+    assert row["status"] == "released"
+
+
+def test_jail_release_for_present_member_still_works(open_client, fake_ctx):
+    jail_id = _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    _release_ctx(fake_ctx, member_present=True)
+
+    resp = open_client.post(
+        f"/api/moderation/jails/{jail_id}/release", json={"reason": "appeal granted"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute("SELECT * FROM jails WHERE id = ?", (jail_id,)).fetchone()
+    assert row["status"] == "released"
+
+
+def test_jail_release_closes_row_for_a_deleted_account(open_client, fake_ctx):
+    """Nobody to notify, but the row must not stay active forever."""
+    jail_id = _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    _release_ctx(fake_ctx, member_present=False, user_exists=False)
+
+    resp = open_client.post(f"/api/moderation/jails/{jail_id}/release", json={})
+
+    assert resp.status_code == 200, resp.text
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute("SELECT * FROM jails WHERE id = ?", (jail_id,)).fetchone()
+        audit = conn.execute(
+            "SELECT extra FROM audit_log WHERE action = 'jail_release'"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "released"
+    assert json.loads(audit["extra"])["note"] == "user_unresolvable"
+
+
+def test_jail_release_rejects_an_already_released_jail(open_client, fake_ctx):
+    jail_id = _seed_jail(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute("UPDATE jails SET status = 'released' WHERE id = ?", (jail_id,))
+    _release_ctx(fake_ctx, member_present=False)
+
+    resp = open_client.post(f"/api/moderation/jails/{jail_id}/release", json={})
+
+    assert resp.status_code == 409
+
+
+# ── GET /api/moderation/tickets — filters ─────────────────────────────
+
+
+def test_tickets_excludes_deleted_by_default(open_client, fake_ctx):
+    """Soft-deleted tickets must NOT appear in the default listing."""
+    open_id = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1)
+    deleted_id = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=2)
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "UPDATE tickets SET status = 'deleted' WHERE id = ?", (deleted_id,)
+        )
+
+    body = open_client.get("/api/moderation/tickets").json()
+    assert {t["id"] for t in body["tickets"]} == {open_id}
+
+
+def test_tickets_status_closed_includes_deleted(open_client, fake_ctx):
+    """status=closed merges both 'closed' and 'deleted' so admins can audit."""
+    closed_id = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1)
+    deleted_id = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=2)
+    with open_db(fake_ctx.db_path) as conn:
+        close_ticket(conn, closed_id, closed_by=99, reason="done")
+        conn.execute(
+            "UPDATE tickets SET status = 'deleted' WHERE id = ?", (deleted_id,)
+        )
+
+    body = open_client.get("/api/moderation/tickets?status=closed").json()
+    assert {t["id"] for t in body["tickets"]} == {closed_id, deleted_id}
+
+
+def test_tickets_filter_by_user_id(open_client, fake_ctx):
+    _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=100)
+    _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=200)
+    body = open_client.get("/api/moderation/tickets?user_id=100").json()
+    assert {t["user_id"] for t in body["tickets"]} == {"100"}
+
+
+# ── GET /api/moderation/tickets/{id} (detail) ────────────────────────
+
+
+def test_get_ticket_detail_returns_404_for_missing(open_client):
+    resp = open_client.get("/api/moderation/tickets/99999")
+    assert resp.status_code == 404
+
+
+def test_get_ticket_detail_includes_subject_and_history(open_client, fake_ctx):
+    ticket_id = _seed_ticket(
+        fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42
+    )
+    _seed_warning(
+        fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42, moderator_id=1
+    )
+    _seed_jail(
+        fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42, moderator_id=1
+    )
+
+    body = open_client.get(f"/api/moderation/tickets/{ticket_id}").json()
+    assert body["subject"]["user_id"] == "42"
+    assert body["subject"]["warn_count_active"] == 1
+    assert body["subject"]["jail_count_total"] == 1
+    kinds = {h["kind"] for h in body["history"]}
+    assert kinds == {"warn", "jail"}
+
+
+# ── Ticket mutations: claim / close / reopen / dismiss / escalate ─────
+
+
+def test_ticket_claim_writes_audit_and_sets_claimer(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/claim")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT claimer_id FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+        audit = conn.execute(
+            "SELECT action FROM audit_log WHERE guild_id = ?", (fake_ctx.guild_id,)
+        ).fetchall()
+    assert row["claimer_id"] is not None
+    assert any(r["action"] == "ticket_claim" for r in audit)
+
+
+def test_ticket_claim_rejects_non_open_status(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        close_ticket(conn, tid, closed_by=99, reason="done")
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/claim")
+    assert resp.status_code == 409
+
+
+def test_ticket_claim_404_for_unknown(open_client):
+    resp = open_client.post("/api/moderation/tickets/99999/claim")
+    assert resp.status_code == 404
+
+
+def test_ticket_close_persists_reason(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/close", json={"reason": "spam"}
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT status, close_reason FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "spam"
+
+
+def test_ticket_close_uses_default_reason_when_empty(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    open_client.post(f"/api/moderation/tickets/{tid}/close", json={"reason": "  "})
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT close_reason FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["close_reason"] == "Closed from dashboard"
+
+
+def test_ticket_close_rejects_already_closed(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        close_ticket(conn, tid, closed_by=1, reason="x")
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/close", json={"reason": "again"}
+    )
+    assert resp.status_code == 409
+
+
+def test_ticket_reopen_restores_open_status(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        close_ticket(conn, tid, closed_by=1, reason="x")
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/reopen")
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT status, closed_at, close_reason FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["status"] == "open"
+    assert row["closed_at"] is None
+
+
+def test_ticket_reopen_rejects_open_ticket(open_client, fake_ctx):
+    """Trying to reopen a still-open ticket is 409."""
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/reopen")
+    assert resp.status_code == 409
+
+
+def test_ticket_dismiss_closes_with_prefixed_reason(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/dismiss", json={"reason": "duplicate"}
+    )
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT status, close_reason FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "Dismissed: duplicate"
+
+
+def test_ticket_dismiss_without_reason_uses_bare_label(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    open_client.post(f"/api/moderation/tickets/{tid}/dismiss", json={"reason": ""})
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT close_reason FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["close_reason"] == "Dismissed"
+
+
+def test_ticket_escalate_sets_flag(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/escalate")
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT escalated FROM tickets WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["escalated"] == 1
+
+
+def test_ticket_escalate_idempotent(open_client, fake_ctx):
+    """Re-escalating an already-escalated ticket returns success without error."""
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    open_client.post(f"/api/moderation/tickets/{tid}/escalate")
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/escalate")
+    assert resp.status_code == 200
+    assert "Already escalated" in resp.json()["message"]
+
+
+def test_ticket_escalate_rejects_closed_ticket(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        close_ticket(conn, tid, closed_by=1, reason="x")
+    resp = open_client.post(f"/api/moderation/tickets/{tid}/escalate")
+    assert resp.status_code == 409
+
+
+# ── Ticket-derived warnings / jails / notes ──────────────────────────
+
+
+def test_ticket_warn_requires_reason(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/warn", json={"reason": "   "}
+    )
+    assert resp.status_code == 400
+
+
+def test_ticket_warn_creates_warning_and_audit(open_client, fake_ctx):
+    tid = _seed_ticket(
+        fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42
+    )
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/warn", json={"reason": "rude"}
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        w = conn.execute(
+            "SELECT user_id, reason FROM warnings WHERE guild_id = ?",
+            (fake_ctx.guild_id,),
+        ).fetchone()
+        audit = conn.execute(
+            "SELECT action FROM audit_log WHERE guild_id = ?",
+            (fake_ctx.guild_id,),
+        ).fetchall()
+    assert w["user_id"] == 42
+    assert w["reason"] == "rude"
+    assert any(r["action"] == "ticket_warn" for r in audit)
+
+
+def test_ticket_jail_rejects_invalid_duration(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/jail",
+        json={"reason": "spam", "duration": "forever"},
+    )
+    assert resp.status_code == 400
+
+
+def test_ticket_jail_503_when_bot_unavailable(open_client, fake_ctx):
+    """The dashboard jail endpoint now actually applies the role via the bot.
+    Without a live bot guild it must refuse loudly rather than silently
+    record a row that doesn't reflect Discord state."""
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/jail",
+        json={"reason": "spam", "duration": "1h"},
+    )
+    assert resp.status_code == 503
+    assert "Bot" in resp.json()["detail"]
+
+
+def test_ticket_jail_404_when_target_left_guild(open_client, fake_ctx):
+    """If the ticket subject has left the guild, refuse — can't apply a role
+    to a member that isn't there."""
+    from unittest.mock import MagicMock
+
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.get_member = MagicMock(return_value=None)
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/jail",
+        json={"reason": "spam", "duration": "1h"},
+    )
+    assert resp.status_code == 404
+
+
+def test_ticket_jail_invokes_apply_jail_and_returns_jail_id(open_client, fake_ctx):
+    """Happy path: route resolves guild + target + moderator, calls
+    apply_jail, persists the linked ticket_jail audit entry, returns the
+    canonical jail_id from apply_jail."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from bot_modules.moderation.jail.apply import JailOutcome
+
+    target = MagicMock()
+    target.id = 42
+    moderator = MagicMock()
+    moderator.id = 0  # OpenAuth's user_id
+    by_id = {42: target, 0: moderator}
+
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.get_member = MagicMock(side_effect=lambda uid: by_id.get(int(uid)))
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42)
+
+    fake_outcome = JailOutcome(ok=True, jail_id=999, channel_id=8888)
+    with patch(
+        "web_server.routes.moderation.apply_jail",
+        new=AsyncMock(return_value=fake_outcome),
+    ) as mock_apply:
+        resp = open_client.post(
+            f"/api/moderation/tickets/{tid}/jail",
+            json={"reason": "spam", "duration": "1h"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert "999" in body["message"]
+
+    mock_apply.assert_awaited_once()
+    kwargs = mock_apply.call_args.kwargs
+    assert kwargs["reason"] == "spam"
+    assert kwargs["duration_seconds"] == 3600
+    assert kwargs["source"] == "dashboard"
+    # The ticket linkage rides on apply_jail's source_extra rather than a
+    # separate audit row, so there's exactly one audit entry per jail.
+    assert kwargs["source_extra"] == {"ticket_id": tid}
+
+    # No duplicate ticket_jail row was written — apply_jail is the single
+    # audit source of truth.
+    with open_db(fake_ctx.db_path) as conn:
+        rows = conn.execute(
+            "SELECT action FROM audit_log WHERE guild_id = ?",
+            (fake_ctx.guild_id,),
+        ).fetchall()
+    assert [r["action"] for r in rows] == []  # mocked apply_jail wrote nothing
+
+
+def test_ticket_jail_409_when_apply_jail_rejects_target(open_client, fake_ctx):
+    """Precondition failures (admin/mod/bot/self/already_jailed) come back
+    as 409 — these reflect a conflict with the target's state, not a
+    bot-configuration problem."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from bot_modules.moderation.jail.apply import JailOutcome
+
+    target = MagicMock()
+    target.id = 42
+    moderator = MagicMock()
+    moderator.id = 0
+    by_id = {42: target, 0: moderator}
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.get_member = MagicMock(side_effect=lambda uid: by_id.get(int(uid)))
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42)
+
+    rejection = JailOutcome(
+        ok=False, error_kind="admin_target", error_message="Cannot jail an admin."
+    )
+    with patch(
+        "web_server.routes.moderation.apply_jail",
+        new=AsyncMock(return_value=rejection),
+    ):
+        resp = open_client.post(
+            f"/api/moderation/tickets/{tid}/jail",
+            json={"reason": "spam", "duration": "1h"},
+        )
+    assert resp.status_code == 409
+    assert "admin" in resp.json()["detail"].lower()
+
+
+def test_ticket_jail_500_when_apply_jail_has_permission_error(open_client, fake_ctx):
+    """Bot-perm failures (no_role_perms, no_channel_perms, no_member_perms)
+    come back as 500 — these are operator-config problems, not target state."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from bot_modules.moderation.jail.apply import JailOutcome
+
+    target = MagicMock()
+    target.id = 42
+    moderator = MagicMock()
+    moderator.id = 0
+    by_id = {42: target, 0: moderator}
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.get_member = MagicMock(side_effect=lambda uid: by_id.get(int(uid)))
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=42)
+
+    rejection = JailOutcome(
+        ok=False,
+        error_kind="no_role_perms",
+        error_message="Missing Manage Roles.",
+    )
+    with patch(
+        "web_server.routes.moderation.apply_jail",
+        new=AsyncMock(return_value=rejection),
+    ):
+        resp = open_client.post(
+            f"/api/moderation/tickets/{tid}/jail",
+            json={"reason": "spam", "duration": "1h"},
+        )
+    assert resp.status_code == 500
+
+
+def test_ticket_note_requires_body(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/note", json={"body": "  "}
+    )
+    assert resp.status_code == 400
+
+
+def test_ticket_note_writes_audit_with_body(open_client, fake_ctx):
+    tid = _seed_ticket(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(
+        f"/api/moderation/tickets/{tid}/note", json={"body": "Spoke to user."}
+    )
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT action, extra FROM audit_log WHERE guild_id = ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (fake_ctx.guild_id,),
+        ).fetchone()
+    import json as _json
+    assert row["action"] == "ticket_note"
+    assert _json.loads(row["extra"])["body"] == "Spoke to user."
+
+
+# ── Warnings: filters ────────────────────────────────────────────────
+
+
+def test_warnings_filter_by_user_id(open_client, fake_ctx):
+    _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1)
+    _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=2)
+    body = open_client.get("/api/moderation/warnings?user_id=1").json()
+    assert {w["user_id"] for w in body["warnings"]} == {"1"}
+
+
+def test_warnings_active_only_excludes_revoked(open_client, fake_ctx):
+    revoked_id = _seed_warning(
+        fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1
+    )
+    _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=2)
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "UPDATE warnings SET revoked = 1 WHERE id = ?", (revoked_id,)
+        )
+
+    body = open_client.get("/api/moderation/warnings?active_only=true").json()
+    assert all(not w["revoked"] for w in body["warnings"])
+    assert body["active_count"] == len(body["warnings"])
+
+
+# ── Warnings: revoke / delete from the dashboard ─────────────────────
+#
+# The Warnings panel's two buttons. Revoke is the ordinary correction and
+# keeps the row; delete is the admin-only escape hatch for a warning that
+# should never have existed, so it gets the gate and guild-scoping tests.
+
+
+def _audit_rows(db_path, action):
+    with open_db(db_path) as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM audit_log WHERE action = ? ORDER BY id", (action,)
+            ).fetchall()
+        ]
+
+
+def _mod_only_client(fake_ctx):
+    """A signed-in moderator who is NOT an admin (MANAGE_MESSAGES only)."""
+    from fastapi.testclient import TestClient
+
+    from web_server.auth import SESSION_COOKIE, DiscordOAuthAuth
+    from web_server.server import create_app
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    client = TestClient(create_app(fake_ctx, auth=auth), raise_server_exceptions=False)
+    client.cookies.set(
+        SESSION_COOKIE,
+        auth.create_session_cookie(
+            user_id=7,
+            username="mod",
+            access_token="token",
+            permission_bits=0x2000,  # MANAGE_MESSAGES → moderator, not admin
+            guild_id=fake_ctx.guild_id,
+            guilds=[{"id": fake_ctx.guild_id, "name": "Test Guild", "icon": None}],
+        ),
+    )
+    return client
+
+
+def test_warning_revoke_marks_row_and_writes_audit(open_client, fake_ctx):
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+
+    resp = open_client.post(
+        f"/api/moderation/warnings/{warn_id}/revoke", json={"reason": "issued in error"}
+    )
+    assert resp.status_code == 200
+    assert "0 active warning(s) remain" in resp.json()["message"]
+
+    with open_db(fake_ctx.db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM warnings WHERE id = ?", (warn_id,)
+        ).fetchone()
+    # Revoked, not gone — the record is the whole point of a soft delete.
+    assert row is not None
+    assert row["revoked"] == 1
+    assert row["revoke_reason"] == "issued in error"
+
+    audit = _audit_rows(fake_ctx.db_path, "warning_revoke")
+    assert len(audit) == 1
+    assert audit[0]["target_id"] == 1001
+    assert json.loads(audit[0]["extra"])["reason"] == "issued in error"
+
+
+def test_warning_revoke_accepts_a_blank_reason(open_client, fake_ctx):
+    """The panel's prompt is optional, so an empty reason must still revoke."""
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    resp = open_client.post(f"/api/moderation/warnings/{warn_id}/revoke", json={})
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        assert conn.execute(
+            "SELECT revoked FROM warnings WHERE id = ?", (warn_id,)
+        ).fetchone()["revoked"] == 1
+
+
+def test_warning_revoke_404_when_missing(open_client):
+    assert (
+        open_client.post("/api/moderation/warnings/9999/revoke", json={}).status_code
+        == 404
+    )
+
+
+def test_warning_revoke_409_when_already_revoked(open_client, fake_ctx):
+    """The panel hides Revoke on a revoked warning; the server refuses anyway."""
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    assert (
+        open_client.post(
+            f"/api/moderation/warnings/{warn_id}/revoke", json={}
+        ).status_code
+        == 200
+    )
+    assert (
+        open_client.post(
+            f"/api/moderation/warnings/{warn_id}/revoke", json={}
+        ).status_code
+        == 409
+    )
+    # One revocation, one audit row — the refused call must not log a second.
+    assert len(_audit_rows(fake_ctx.db_path, "warning_revoke")) == 1
+
+
+def test_warning_revoke_does_not_reach_another_guild(open_client, fake_ctx):
+    """Warning ids are a global AUTOINCREMENT, so the id alone isn't a secret."""
+    other = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id + 1)
+    assert (
+        open_client.post(
+            f"/api/moderation/warnings/{other}/revoke", json={}
+        ).status_code
+        == 404
+    )
+    with open_db(fake_ctx.db_path) as conn:
+        assert conn.execute(
+            "SELECT revoked FROM warnings WHERE id = ?", (other,)
+        ).fetchone()["revoked"] == 0
+
+
+def test_warning_delete_removes_row_and_keeps_it_in_the_audit(open_client, fake_ctx):
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id, user_id=1001)
+
+    resp = open_client.delete(f"/api/moderation/warnings/{warn_id}")
+    assert resp.status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT * FROM warnings WHERE id = ?", (warn_id,)
+            ).fetchone()
+            is None
+        )
+
+    # The row is gone but the deletion isn't a silent gap: the audit entry
+    # carries what it held, which is what the data register promises.
+    audit = _audit_rows(fake_ctx.db_path, "warning_delete")
+    assert len(audit) == 1
+    assert audit[0]["target_id"] == 1001
+    extra = json.loads(audit[0]["extra"])
+    assert extra["warning_id"] == warn_id
+    assert extra["reason"] == "test warning"
+    assert extra["was_revoked"] is False
+
+
+def test_warning_delete_404_when_missing(open_client):
+    assert open_client.delete("/api/moderation/warnings/9999").status_code == 404
+
+
+def test_warning_delete_does_not_reach_another_guild(open_client, fake_ctx):
+    other = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id + 1)
+    assert open_client.delete(f"/api/moderation/warnings/{other}").status_code == 404
+    with open_db(fake_ctx.db_path) as conn:
+        assert (
+            conn.execute("SELECT id FROM warnings WHERE id = ?", (other,)).fetchone()
+            is not None
+        )
+
+
+def test_warning_delete_forbidden_for_a_moderator(fake_ctx):
+    """Deleting is admin-only. Hiding the button is cosmetic; this is the gate."""
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    client = _mod_only_client(fake_ctx)
+    try:
+        assert client.delete(f"/api/moderation/warnings/{warn_id}").status_code == 403
+        # And revoke, which is moderator-level, still works for the same caller.
+        assert (
+            client.post(
+                f"/api/moderation/warnings/{warn_id}/revoke", json={}
+            ).status_code
+            == 200
+        )
+    finally:
+        client.close()
+    with open_db(fake_ctx.db_path) as conn:
+        assert (
+            conn.execute("SELECT id FROM warnings WHERE id = ?", (warn_id,)).fetchone()
+            is not None
+        )
+
+
+def test_delete_warning_service_is_guild_scoped(fake_ctx):
+    warn_id = _seed_warning(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        assert delete_warning(conn, fake_ctx.guild_id + 1, warn_id) is None
+        row = delete_warning(conn, fake_ctx.guild_id, warn_id)
+        assert row is not None
+        assert row["reason"] == "test warning"
+        assert delete_warning(conn, fake_ctx.guild_id, warn_id) is None
+
+
+# ── Policy tickets ───────────────────────────────────────────────────
+
+
+def test_policy_tickets_lists_seeded_rows(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        for status in ("open", "voting", "closed"):
+            conn.execute(
+                "INSERT INTO policy_tickets (guild_id, creator_id, channel_id, title,"
+                " description, status, vote_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (fake_ctx.guild_id, 1, 0, f"{status} title", "desc", status, "vote?", time.time()),
+            )
+
+    body = open_client.get("/api/moderation/policy-tickets").json()
+    assert body["open_count"] == 1
+    assert body["voting_count"] == 1
+    assert body["closed_count"] == 1
+    assert body["total_count"] == 3
+
+
+def test_policy_tickets_filter_by_status(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO policy_tickets (guild_id, creator_id, channel_id, title,"
+            " description, status, vote_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 1, 0, "vote", "desc", "voting", "?", time.time()),
+        )
+        conn.execute(
+            "INSERT INTO policy_tickets (guild_id, creator_id, channel_id, title,"
+            " description, status, vote_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 1, 0, "done", "desc", "closed", "?", time.time()),
+        )
+
+    body = open_client.get("/api/moderation/policy-tickets?status=voting").json()
+    assert {t["status"] for t in body["policy_tickets"]} == {"voting"}
+
+
+
+# ── Community ballots ────────────────────────────────────────────────
+
+
+def _seed_ballot(db_path, *, guild_id, question="Quiet hours?", closes_at=0.0):
+    from bot_modules.moderation.service import create_policy_ticket
+    from bot_modules.moderation.jail import policy_ballot_service as pbs
+
+    with open_db(db_path) as conn:
+        policy_id = create_policy_ticket(
+            conn, guild_id=guild_id, creator_id=7, channel_id=0,
+            title=question, description="",
+        )
+        return pbs.open_ballot(
+            conn, guild_id=guild_id, policy_id=policy_id, channel_id=500,
+            question=question, opened_by=7, closes_at=closes_at, now=1000.0,
+        )
+
+
+def test_policy_ballots_lists_an_open_ballot_with_its_live_tally(open_client, fake_ctx):
+    from bot_modules.moderation.jail import policy_ballot_service as pbs
+
+    ballot_id = _seed_ballot(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        for uid, choice in ((1, "yes"), (2, "yes"), (3, "no"), (4, "abstain")):
+            pbs.cast_ballot_vote(
+                conn, ballot_id=ballot_id, guild_id=fake_ctx.guild_id,
+                user_id=uid, choice=choice, now=1100.0,
+            )
+
+    body = open_client.get("/api/moderation/policy-ballots").json()
+
+    assert body["total_count"] == 1
+    assert body["open_count"] == 1
+    entry = body["ballots"][0]
+    assert (entry["yes_count"], entry["no_count"], entry["abstain_count"]) == (2, 1, 1)
+    assert entry["outcome"] == ""
+    # Fully public by decision: the tally card in Discord already names every
+    # voter, so the panel showing them is not a privileged disclosure.
+    assert {v["user_id"] for v in entry["votes"]} == {"1", "2", "3", "4"}
+
+
+def test_policy_ballots_reports_the_frozen_counts_of_a_closed_ballot(
+    open_client, fake_ctx
+):
+    """Not re-derived from the vote rows: a member erased after the ballot
+    closed must not be able to move a result that was already announced."""
+    from bot_modules.moderation.jail import policy_ballot_service as pbs
+
+    ballot_id = _seed_ballot(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        for uid, choice in ((1, "yes"), (2, "yes"), (3, "no")):
+            pbs.cast_ballot_vote(
+                conn, ballot_id=ballot_id, guild_id=fake_ctx.guild_id,
+                user_id=uid, choice=choice, now=1100.0,
+            )
+        pbs.close_ballot(conn, ballot_id, closed_by=9, now=1500.0)
+        conn.execute(
+            "DELETE FROM policy_ballot_votes WHERE ballot_id = ? AND user_id = 1",
+            (ballot_id,),
+        )
+
+    entry = open_client.get("/api/moderation/policy-ballots").json()["ballots"][0]
+
+    assert entry["outcome"] == "passed"
+    assert (entry["yes_count"], entry["no_count"]) == (2, 1)
+    assert len(entry["votes"]) == 2
+    assert open_client.get("/api/moderation/policy-ballots").json()["open_count"] == 0
+
+
+def test_policy_ballots_is_guild_scoped(open_client, fake_ctx):
+    _seed_ballot(fake_ctx.db_path, guild_id=fake_ctx.guild_id, question="mine")
+    _seed_ballot(fake_ctx.db_path, guild_id=fake_ctx.guild_id + 1, question="theirs")
+
+    body = open_client.get("/api/moderation/policy-ballots").json()
+
+    assert [b["question"] for b in body["ballots"]] == ["mine"]
+
+
+def test_policy_ballot_snowflakes_are_strings(open_client, fake_ctx):
+    """A channel, thread or member id exceeds JavaScript's safe integer range."""
+    from bot_modules.moderation.jail import policy_ballot_service as pbs
+
+    ballot_id = _seed_ballot(fake_ctx.db_path, guild_id=fake_ctx.guild_id)
+    with open_db(fake_ctx.db_path) as conn:
+        pbs.attach_ballot_message(
+            conn, ballot_id, thread_id=1469491362444480666, message_id=1
+        )
+        pbs.cast_ballot_vote(
+            conn, ballot_id=ballot_id, guild_id=fake_ctx.guild_id,
+            user_id=1469999999999999777, choice="yes", now=1100.0,
+        )
+
+    entry = open_client.get("/api/moderation/policy-ballots").json()["ballots"][0]
+
+    assert entry["thread_id"] == "1469491362444480666"
+    assert entry["opened_by"] == "7"
+    assert entry["votes"][0]["user_id"] == "1469999999999999777"
+
+# ── Transcripts ──────────────────────────────────────────────────────
+
+
+def test_transcript_rejects_invalid_record_type(open_client):
+    resp = open_client.get("/api/moderation/transcript?record_type=bogus&record_id=1")
+    assert resp.status_code == 400
+
+
+def test_transcript_returns_none_when_missing(open_client):
+    body = open_client.get(
+        "/api/moderation/transcript?record_type=ticket&record_id=99"
+    ).json()
+    assert body["transcripts"] == []
+
+
+def test_transcript_returns_stored_content(open_client, fake_ctx):
+    import json as _json
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO transcripts (guild_id, record_type, record_id, content, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                fake_ctx.guild_id,
+                "ticket",
+                42,
+                _json.dumps({"messages": [{"author": "alice", "content": "hi"}]}),
+                time.time(),
+            ),
+        )
+
+    body = open_client.get(
+        "/api/moderation/transcript?record_type=ticket&record_id=42"
+    ).json()
+    assert body["transcripts"][0]["messages"][0]["author"] == "alice"
+
+
+def test_transcript_returns_every_save_oldest_first(open_client, fake_ctx):
+    """A jail archived on departure and again on release keeps both halves."""
+    import json as _json
+    now = time.time()
+    with open_db(fake_ctx.db_path) as conn:
+        for stage, created in (("released", now), ("member left", now - 3600)):
+            conn.execute(
+                "INSERT INTO transcripts (guild_id, record_type, record_id, content, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    fake_ctx.guild_id,
+                    "jail",
+                    77,
+                    _json.dumps({"transcript_stage": stage, "messages": []}),
+                    created,
+                ),
+            )
+
+    body = open_client.get(
+        "/api/moderation/transcript?record_type=jail&record_id=77"
+    ).json()
+    assert [t["transcript_stage"] for t in body["transcripts"]] == [
+        "member left",
+        "released",
+    ]
+
+
+# ── Audit log endpoints ──────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_audit_cache():
+    """The endpoint memoises totals and the action vocabulary for 60s, keyed by
+    guild — and every test here runs as guild 123. Without this, one test's
+    seeded rows answer the next one's request."""
+    from web_server.routes.moderation import _AUDIT_TOTAL_CACHE, _AUDIT_VOCAB_CACHE
+
+    _AUDIT_TOTAL_CACHE.clear()
+    _AUDIT_VOCAB_CACHE.clear()
+    yield
+    _AUDIT_TOTAL_CACHE.clear()
+    _AUDIT_VOCAB_CACHE.clear()
+
+
+def test_audit_log_shows_only_moderation(open_client, fake_ctx):
+    """The page is titled the moderation log, so it holds five families:
+    jails, tickets, warnings, channel moves and Level 5 grants. Read raw it was
+    1,602 rows on the main guild against 204 that are moderation — 1,316 of
+    them Voice Control writing its own lifecycle, plus survivor season admin,
+    policy votes, role-menu edits and inactivity sweeps."""
+    with open_db(fake_ctx.db_path) as conn:
+        for action in ("vm_channel_create", "survivor_season_create",
+                       "policy_open", "role_menu.create", "inactive_apply"):
+            write_audit(conn, guild_id=fake_ctx.guild_id, action=action, actor_id=1)
+        for action in ("jail_create", "ticket_open", "warning_issue", "channel_pull",
+                       "promotion_review_grant"):
+            write_audit(conn, guild_id=fake_ctx.guild_id, action=action, actor_id=1)
+
+    body = open_client.get("/api/moderation/audit").json()
+    assert sorted(e["action"] for e in body["entries"]) == [
+        "channel_pull", "jail_create", "promotion_review_grant", "ticket_open",
+        "warning_issue",
+    ]
+    # The count has to describe the same set as the rows, or the page says it
+    # is showing 5 of 10.
+    assert body["total"] == 5
+
+
+def test_audit_log_admits_a_new_action_in_a_moderation_family(open_client, fake_ctx):
+    """Prefix-matched on purpose. A hand-kept allow-list is what drifted in the
+    first place — six of the panel's twelve entries named strings the bot never
+    writes — so a ticket_* action added tomorrow shows up without anyone
+    remembering to extend a list."""
+    with open_db(fake_ctx.db_path) as conn:
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="ticket_invented_tomorrow", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit").json()
+    assert [e["action"] for e in body["entries"]] == ["ticket_invented_tomorrow"]
+
+
+def test_audit_log_prefixes_do_not_match_a_lookalike(open_client, fake_ctx):
+    """`_` is a LIKE wildcard, so an unescaped `jail_%` would also match
+    `jailX…`. The ESCAPE is what keeps the families exact."""
+    with open_db(fake_ctx.db_path) as conn:
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="jailbreak_game", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="channelsurf", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit").json()
+    assert body["entries"] == [], "a lookalike action leaked into the moderation log"
+
+
+def test_audit_log_reports_the_vocabulary_it_holds(open_client, fake_ctx):
+    """The Action filter is built from this. It used to be a hand-kept list in
+    the panel, six of whose twelve entries named strings the bot never writes —
+    so Jail, Unjail, Warning, Warning Revoke, Pull and Remove each matched
+    nothing at all."""
+    with open_db(fake_ctx.db_path) as conn:
+        for _ in range(3):
+            write_audit(conn, guild_id=fake_ctx.guild_id, action="ticket_open", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="warning_issue", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="vm_channel_create", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="survivor_season_create", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit").json()
+    assert "vm_channel_create" not in body["actions"]
+    assert "survivor_season_create" not in body["actions"], (
+        "the filter offers an action the page will not show"
+    )
+    # Commonest first, so the useful filters are at the top of the list.
+    assert body["actions"] == ["ticket_open", "warning_issue"]
+
+
+def test_audit_vocabulary_is_not_narrowed_by_the_active_filter(open_client, fake_ctx):
+    """Picking an action must not reduce the dropdown to that one action."""
+    with open_db(fake_ctx.db_path) as conn:
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="ticket_open", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="jail_create", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit?action=jail_create").json()
+    assert body["total"] == 1
+    assert sorted(body["actions"]) == ["jail_create", "ticket_open"]
+
+
+def test_recent_actions_stat_counts_only_moderation(open_client, fake_ctx):
+    """The same conflation on the same page: the Moderation summary's "recent
+    actions" counted voice-channel churn and season admin as moderator work.
+    Measured on the main guild, 105 rows in seven days against 14 non-voice and
+    6 that are actually moderation."""
+    with open_db(fake_ctx.db_path) as conn:
+        for action in ("vm_channel_create", "vm_channel_delete",
+                       "survivor_tasks_run", "inactive_apply"):
+            write_audit(conn, guild_id=fake_ctx.guild_id, action=action, actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="warning_issue", actor_id=1)
+
+    body = open_client.get("/api/moderation/stats").json()
+    assert body["recent_actions"] == 1
+
+
+
+def test_audit_log_returns_entries_newest_first(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        for i in range(3):
+            write_audit(
+                conn, guild_id=fake_ctx.guild_id, action=f"ticket_act_{i}", actor_id=1,
+                extra={"i": i},
+            )
+            time.sleep(0.001)
+
+    body = open_client.get("/api/moderation/audit").json()
+    actions = [e["action"] for e in body["entries"]]
+    assert actions == ["ticket_act_2", "ticket_act_1", "ticket_act_0"]
+    assert body["total"] == 3
+
+
+def test_audit_log_filter_by_action(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="warning_issue", actor_id=1)
+        write_audit(conn, guild_id=fake_ctx.guild_id, action="jail_create", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit?action=jail_create").json()
+    assert body["total"] == 1
+    assert body["entries"][0]["action"] == "jail_create"
+
+
+def test_audit_log_caps_limit_at_200(open_client, fake_ctx):
+    """Requesting a huge limit returns at most 200 rows."""
+    with open_db(fake_ctx.db_path) as conn:
+        for i in range(5):
+            write_audit(conn, guild_id=fake_ctx.guild_id, action="ticket_open", actor_id=1)
+
+    body = open_client.get("/api/moderation/audit?limit=10000").json()
+    # We only seeded 5 rows so this can't actually exceed; the assertion is
+    # that the request succeeds and returns the rows that exist.
+    assert len(body["entries"]) == 5
+
+
+def test_audit_log_decodes_extra_json(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        write_audit(
+            conn, guild_id=fake_ctx.guild_id, action="ticket_note", actor_id=1,
+            extra={"ticket_id": 99, "reason": "spam"},
+        )
+    body = open_client.get("/api/moderation/audit").json()
+    assert body["entries"][0]["extra"] == {"ticket_id": 99, "reason": "spam"}
+
+
+# ── DM audit log ─────────────────────────────────────────────────────
+
+
+def test_dm_audit_returns_seeded_rows(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO dm_audit_log (guild_id, actor_id, user_a_id, user_b_id,"
+            " action, timestamp, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 1, 10, 20, "open", time.time(), "type=ticket"),
+        )
+    body = open_client.get("/api/moderation/dm-audit").json()
+    assert body["total"] == 1
+    assert body["entries"][0]["action"] == "open"
+
+
+def test_dm_audit_filter_by_action_and_type(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO dm_audit_log (guild_id, actor_id, user_a_id, user_b_id,"
+            " action, timestamp, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 1, 10, 20, "open", time.time(), "type=ticket"),
+        )
+        conn.execute(
+            "INSERT INTO dm_audit_log (guild_id, actor_id, user_a_id, user_b_id,"
+            " action, timestamp, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 1, 30, 40, "close", time.time(), "type=other"),
+        )
+
+    body = open_client.get(
+        "/api/moderation/dm-audit?action=open&type=ticket"
+    ).json()
+    assert body["total"] == 1
+    assert body["entries"][0]["action"] == "open"
+
+
+# ── Whisper audit log ────────────────────────────────────────────────
+
+
+def _seed_whisper(db_path, guild_id, *, sender=10, target=20, state="active"):
+    with open_db(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO whispers (guild_id, sender_id, target_id, message, created_at,"
+            " state, solved, exposed, guesses_left) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 3)",
+            (guild_id, sender, target, "secret", time.time(), state),
+        )
+        return cur.lastrowid
+
+
+def test_whisper_audit_returns_seeded_rows(open_client, fake_ctx):
+    _seed_whisper(fake_ctx.db_path, fake_ctx.guild_id)
+    body = open_client.get("/api/moderation/whisper-audit").json()
+    assert body["total"] == 1
+    assert body["entries"][0]["sender_id"] == "10"
+    assert body["entries"][0]["report_count"] == 0
+
+
+def test_whisper_audit_filter_by_state(open_client, fake_ctx):
+    _seed_whisper(fake_ctx.db_path, fake_ctx.guild_id, state="active")
+    _seed_whisper(fake_ctx.db_path, fake_ctx.guild_id, sender=11, state="solved")
+    body = open_client.get("/api/moderation/whisper-audit?state=solved").json()
+    assert body["total"] == 1
+    assert body["entries"][0]["state"] == "solved"
+
+
+def test_whisper_audit_reported_only_filters_to_reported(open_client, fake_ctx):
+    no_report = _seed_whisper(fake_ctx.db_path, fake_ctx.guild_id)
+    reported = _seed_whisper(fake_ctx.db_path, fake_ctx.guild_id, sender=11)
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO whisper_reports (whisper_id, reporter_id, reason, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (reported, 99, "bad", time.time()),
+        )
+
+    body = open_client.get(
+        "/api/moderation/whisper-audit?reported_only=true"
+    ).json()
+    ids = {int(e["id"]) for e in body["entries"]}
+    assert ids == {reported}
+    assert no_report not in ids
+
+
+# ── Confessions audit ────────────────────────────────────────────────
+
+
+def test_confessions_audit_returns_seeded_rows(open_client, fake_ctx):
+    """Reads `anon_audit_log`, filtered to the confessions slug."""
+    with open_db(fake_ctx.db_path) as conn:
+        insert_event(
+            conn, guild_id=fake_ctx.guild_id, feature=FEATURE_CONFESSIONS,
+            event=EVENT_CONFESSION_POSTED, actor_id=42,
+            message_id=1, channel_id=100,
+            extra={"root_message_id": "1"},
+        )
+
+    body = open_client.get("/api/moderation/confessions-audit").json()
+    assert body["total"] == 1
+    entry = body["entries"][0]
+    assert entry["author_id"] == "42"
+    assert entry["kind"] == "confession"
+    assert entry["root_message_id"] == "1"
+
+
+def test_confessions_audit_ignores_the_seven_day_operational_table(open_client, fake_ctx):
+    """A confession_threads row alone must not surface — that table is a
+    seven-day operational cache, and reading it made this panel a rolling week
+    rather than the durable moderation record it is now."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO confession_threads (guild_id, message_id, channel_id,"
+            " root_message_id, original_author_id, notify_original_author, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fake_ctx.guild_id, 9, 100, 9, 42, 1, int(time.time())),
+        )
+
+    body = open_client.get("/api/moderation/confessions-audit").json()
+    assert body["total"] == 0
+
+
+def test_confessions_audit_labels_replies(open_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        insert_event(
+            conn, guild_id=fake_ctx.guild_id, feature=FEATURE_CONFESSIONS,
+            event=EVENT_REPLY_POSTED, actor_id=77, target_id=42,
+            message_id=2, channel_id=100,
+            extra={"root_message_id": "1"},
+        )
+
+    entry = open_client.get("/api/moderation/confessions-audit").json()["entries"][0]
+    assert entry["kind"] == "reply"
+    assert entry["replied_to_id"] == "42"
+
+
+def test_confessions_audit_excludes_other_features(open_client, fake_ctx):
+    """The games surfaces share the table; they must not leak into this panel."""
+    with open_db(fake_ctx.db_path) as conn:
+        insert_event(
+            conn, guild_id=fake_ctx.guild_id, feature=FEATURE_AMA,
+            event="question_asked", actor_id=42, message_id=3, channel_id=100,
+        )
+
+    assert open_client.get("/api/moderation/confessions-audit").json()["total"] == 0
+
+
+# ── Auth guard ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("GET", "/api/moderation/stats", None),
+        ("GET", "/api/moderation/jails", None),
+        ("GET", "/api/moderation/tickets", None),
+        ("GET", "/api/moderation/tickets/1", None),
+        ("GET", "/api/moderation/warnings", None),
+        ("GET", "/api/moderation/policy-tickets", None),
+        ("GET", "/api/moderation/policy-ballots", None),
+        ("GET", "/api/moderation/audit", None),
+        ("GET", "/api/moderation/whisper-audit", None),
+        ("POST", "/api/moderation/tickets/1/claim", None),
+        ("POST", "/api/moderation/tickets/1/close", {"reason": "x"}),
+        ("POST", "/api/moderation/tickets/1/warn", {"reason": "x"}),
+    ],
+)
+def test_moderation_endpoints_require_auth(fake_ctx, method, path, body):
+    """Every moderation endpoint must reject unauthenticated callers when
+    Discord auth is in use. The original LAN/OpenAuth tests above just
+    confirm the routes work; this matrix confirms the auth gate is on."""
+    from fastapi.testclient import TestClient
+
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app, raise_server_exceptions=False)
+    if method == "GET":
+        resp = client.get(path)
+    else:
+        resp = client.post(path, json=body or {})
+    assert resp.status_code in (401, 403), f"{method} {path} should require auth"
+    client.close()
+
+
+def test_moderation_requires_auth(fake_ctx):
+    """With Discord auth mode, moderation endpoints require a session."""
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+    from fastapi.testclient import TestClient
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app, raise_server_exceptions=False)
+    # No session cookie set
+    resp = client.get("/api/moderation/jails")
+    assert resp.status_code in (401, 403)
+    client.close()
+
+
+def test_transcript_does_not_leak_across_guilds(open_client, fake_ctx):
+    """Ticket/jail ids are a global AUTOINCREMENT, so the id alone isn't a secret.
+
+    Without a guild predicate a moderator of one guild could read another
+    guild's private support conversations by enumerating record ids.
+    """
+    import json as _json
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO transcripts (guild_id, record_type, record_id, content, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                fake_ctx.guild_id + 999,  # a different guild entirely
+                "ticket",
+                4242,
+                _json.dumps({"messages": [{"author": "bob", "content": "secret"}]}),
+                time.time(),
+            ),
+        )
+
+    body = open_client.get(
+        "/api/moderation/transcript?record_type=ticket&record_id=4242"
+    ).json()
+    assert body["transcripts"] == []

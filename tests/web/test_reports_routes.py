@@ -1,0 +1,612 @@
+"""Tests for /api/reports/* endpoints.
+
+Most tests are shape-only: seed minimal data, call the endpoint, assert the
+response has the expected top-level keys and a non-error status.  Heavy
+computation endpoints get a smoke-only test (200 + valid JSON).
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.analytics.activity_graphs import overlay_period_start
+from web_server.deps import invalidate_report_cache
+
+
+def _seed_messages(db_path, guild_id=123, count=5):
+    """Insert minimal message rows for data-presence tests."""
+    with open_db(db_path) as conn:
+        for i in range(count):
+            conn.execute(
+                """INSERT OR IGNORE INTO messages
+                   (message_id, guild_id, channel_id, author_id, ts)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (1000 + i, guild_id, 2001, 3001 + i, int(time.time()) - i * 3600),
+            )
+        conn.commit()
+
+
+def _seed_xp(db_path, guild_id=123):
+    with open_db(db_path) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO member_xp (guild_id, user_id, total_xp, level)
+               VALUES (?, ?, ?, ?)""",
+            (guild_id, 3001, 500, 2),
+        )
+        conn.commit()
+
+
+# ── xp-leaderboard ────────────────────────────────────────────────────
+
+
+def test_xp_leaderboard_empty(open_client):
+    resp = open_client.get("/api/reports/xp-leaderboard")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "leaderboard" in data
+    assert data["leaderboard"] == []
+
+
+def test_xp_leaderboard_with_data(open_client, fake_ctx):
+    invalidate_report_cache()
+    _seed_xp(fake_ctx.db_path, fake_ctx.guild_id)
+    resp = open_client.get("/api/reports/xp-leaderboard")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["leaderboard"]) == 1
+    assert data["leaderboard"][0]["total_xp"] == 500
+
+
+# ── activity ──────────────────────────────────────────────────────────
+
+
+def test_activity_shape(open_client):
+    resp = open_client.get("/api/reports/activity")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "labels" in data
+    assert "counts" in data
+    assert "resolution" in data
+
+
+@pytest.mark.parametrize(
+    "resolution,points,x_label,smooth_window",
+    [
+        # The day is drawn raw (24 points ARE the reading); the week's 168
+        # hourly points get a 3-hour centred mean, carried as a second series
+        # so the exact counts survive for the table and the totals.
+        ("day_overlay", 24, "Hour of day", 1),
+        ("week_overlay", 168, "Hour of week", 3),
+    ],
+)
+def test_activity_overlay_shape(
+    open_client, resolution, points, x_label, smooth_window
+):
+    invalidate_report_cache()
+    resp = open_client.get(
+        f"/api/reports/activity?resolution={resolution}&mode=messages"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["labels"]) == points
+    assert len(data["counts"]) == points
+    assert data["x_label"] == x_label
+    # The overlay drops both — the series axis is now "now vs history".
+    assert data["series"] == []
+    assert data["show_members"] is False
+    assert data["smooth_window"] == smooth_window
+    assert len(data["counts_smooth"]) == (points if smooth_window > 1 else 0)
+    # Which point the panel must draw as provisional. The smoothed line's
+    # reaches back the half-window a centred mean has already dragged toward
+    # the partial hour; the raw line's is the partial hour itself.
+    assert isinstance(data["partial_from"], int)
+    assert data["partial_from_smooth"] == max(
+        0, data["partial_from"] - smooth_window // 2
+    )
+
+
+@pytest.mark.parametrize(
+    "resolution,marked",
+    [
+        # `_hour_buckets` snaps to calendar-hour boundaries, so the rightmost
+        # bar is however many minutes old the hour is — the same partial bucket
+        # the overlay views mark, drawn as a bar.
+        ("hour", True),
+        # The rest are rolling windows ending at *now*, so their last bucket is
+        # complete by construction...
+        ("day", False),
+        ("week", False),
+        ("month", False),
+        # ...and a histogram has no latest bucket at all: hour-of-day is a
+        # shape, not a timeline, so "the hour in progress" names nothing in it.
+        ("hour_of_day", False),
+        ("day_of_week", False),
+    ],
+)
+def test_only_the_hourly_timeline_has_a_bucket_still_filling(
+    open_client, resolution, marked
+):
+    invalidate_report_cache()
+    resp = open_client.get(
+        f"/api/reports/activity?resolution={resolution}&mode=messages"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    if marked:
+        assert data["partial_from"] == len(data["labels"]) - 1
+    else:
+        assert data["partial_from"] is None
+    # Nothing on a timeline is smoothed, so the two indices never diverge here.
+    assert data["partial_from_smooth"] == data["partial_from"]
+
+
+@pytest.mark.parametrize(
+    "resolution,marked",
+    [
+        # Thirty undifferentiated bars: the axis marks the week boundaries so
+        # the reader can see where one week ends and the next begins.
+        ("day", True),
+        # Every other view is either coarser than a week (weekly, monthly),
+        # already prints a weekday in each label (hourly), or is a shape rather
+        # than a timeline — nothing to mark in any of them.
+        ("hour", False),
+        ("week", False),
+        ("month", False),
+        ("day_of_week", False),
+    ],
+)
+def test_only_the_daily_timeline_marks_week_boundaries(
+    open_client, resolution, marked
+):
+    invalidate_report_cache()
+    resp = open_client.get(
+        f"/api/reports/activity?resolution={resolution}&mode=messages"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    if marked:
+        # Four or five Mondays fall in any 30-day window, one every seven bars.
+        assert 4 <= len(data["week_marks"]) <= 5
+        assert all(0 <= i < len(data["labels"]) for i in data["week_marks"])
+        assert all(
+            b - a == 7 for a, b in zip(data["week_marks"], data["week_marks"][1:])
+        )
+    else:
+        assert data["week_marks"] == []
+
+
+def _seed_overlay_history(db_path, guild_id, weeks, period="week"):
+    """One message and one XP event per week, `weeks` weeks back.
+
+    ``period`` picks the anchor the weekly steps count back from, and it must
+    match what the request under test overlays on:
+
+    * ``"week"`` anchors to the start of this week, so the rows land on past
+      **week starts** — what a ``week_overlay`` compares.
+    * ``"day"`` anchors to today's midnight, so the rows land on **today's
+      weekday**, a whole number of weeks back — what a ``same_weekday=true``
+      ``day_overlay`` compares.
+
+    They are not interchangeable, though they look it: weeks start on Sunday
+    (``overlay_period_start``), so a week-anchored seed only lands on today's
+    weekday when today happens to *be* Sunday. Anchoring the same-weekday
+    tests to the week made them pass on Sundays and fail the other six days.
+    """
+    start = overlay_period_start(datetime.now(timezone.utc), 0.0, period)
+    with open_db(db_path) as conn:
+        for back in range(1, weeks + 1):
+            ts = start - back * 7 * 86400 + 1800
+            conn.execute(
+                "INSERT OR REPLACE INTO processed_messages (guild_id, message_id,"
+                " channel_id, user_id, created_at, processed_at) VALUES (?,?,?,?,?,?)",
+                (guild_id, 900000 + back, 55, 3001, ts, ts),
+            )
+            conn.execute(
+                "INSERT INTO xp_events (guild_id, user_id, source, amount, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (guild_id, 3001, "text", 5.0, ts),
+            )
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    "mode,expected_sampled",
+    [
+        # 90 days of raw XP retention is 12 whole weeks; messages read the
+        # whole archive, so the same request reaches all 20 weeks seeded.
+        ("xp", 12),
+        ("messages", 20),
+    ],
+)
+def test_activity_overlay_clamps_compare_periods_by_mode(
+    open_client, fake_ctx, mode, expected_sampled
+):
+    """The panel greys out 26 weeks in XP mode; the route is what enforces it."""
+    invalidate_report_cache()
+    _seed_overlay_history(fake_ctx.db_path, fake_ctx.guild_id, weeks=20)
+    resp = open_client.get(
+        f"/api/reports/activity?resolution=week_overlay&mode={mode}"
+        "&compare_periods=26&include_bots=true"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["periods_sampled"] == expected_sampled
+
+
+@pytest.mark.parametrize(
+    "mode,expected_sampled",
+    [
+        # A same-weekday day steps a week at a time, so it clamps exactly like
+        # the weekly overlay above: 12 in XP, all 20 seeded in messages.
+        ("xp", 12),
+        ("messages", 20),
+    ],
+)
+def test_activity_same_weekday_clamps_compare_periods_by_mode(
+    open_client, fake_ctx, mode, expected_sampled
+):
+    invalidate_report_cache()
+    # Day-anchored: a same-weekday overlay looks for past *todays*, so the
+    # fixture has to step back a week at a time from today, not from Sunday.
+    _seed_overlay_history(
+        fake_ctx.db_path, fake_ctx.guild_id, weeks=20, period="day"
+    )
+    resp = open_client.get(
+        f"/api/reports/activity?resolution=day_overlay&mode={mode}"
+        "&compare_periods=26&same_weekday=true&include_bots=true"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["periods_sampled"] == expected_sampled
+
+
+def test_activity_same_weekday_names_the_weekday(open_client, fake_ctx):
+    """The caption and the band say which weekday, not just "day"."""
+    invalidate_report_cache()
+    _seed_overlay_history(
+        fake_ctx.db_path, fake_ctx.guild_id, weeks=20, period="day"
+    )
+    resp = open_client.get(
+        "/api/reports/activity?resolution=day_overlay&mode=messages"
+        "&compare_periods=8&same_weekday=true&include_bots=true"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Derived from the offset the response itself reports rather than from
+    # UTC: a fixture guild on a negative offset would otherwise make this pass
+    # or fail depending on the hour the suite happens to run at.
+    offset = float((data["tz_label"] or "UTC").removeprefix("UTC") or 0)
+    today = (datetime.now(timezone.utc) + timedelta(hours=offset)).strftime("%A")
+    assert data["window_label"] == f"Today vs Last 8 {today}s"
+    assert data["band_label"] == f"Typical {today}"
+
+
+def test_activity_every_day_basis_keeps_the_generic_label(open_client, fake_ctx):
+    invalidate_report_cache()
+    _seed_overlay_history(fake_ctx.db_path, fake_ctx.guild_id, weeks=20)
+    resp = open_client.get(
+        "/api/reports/activity?resolution=day_overlay&mode=messages"
+        "&compare_periods=28&include_bots=true"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["band_label"] == "Typical day"
+
+
+# ── quality-score (retired) ───────────────────────────────────────
+
+
+def test_retired_contributors_route_is_gone(open_client):
+    """Contributors was removed 2026-09-16 (docs/plans/remove-contributors.md).
+    The id stays frozen in app.js's MOVED_PAGES; the API route must not linger."""
+    assert open_client.get("/api/reports/quality-score").status_code == 404
+
+
+# ── Auth guard ────────────────────────────────────────────────────────
+
+
+def test_reports_require_auth(fake_ctx):
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+    from fastapi.testclient import TestClient
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    app = create_app(fake_ctx, auth=auth)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get("/api/reports/xp-leaderboard")
+    assert resp.status_code in (401, 403)
+    client.close()
+
+
+# ── grant-audit ───────────────────────────────────────────────────────
+
+
+class _FakeRole:
+    def __init__(self, role_id, members=()):
+        self.id = role_id
+        self.name = "NSFW"
+        self.members = list(members)
+
+
+class _FakeMember:
+    def __init__(self, user_id, display_name="", bot=False, roles=()):
+        self.id = user_id
+        self.display_name = display_name or str(user_id)
+        self.bot = bot
+        self.roles = list(roles)
+
+
+class _FakeGuild:
+    def __init__(self, role, members):
+        self._role = role
+        self._members = {m.id: m for m in members}
+
+    def get_role(self, role_id):
+        return self._role if role_id == self._role.id else None
+
+    def get_member(self, user_id):
+        return self._members.get(user_id)
+
+
+class _FakeBot:
+    def __init__(self, guild):
+        self._guild = guild
+
+    def get_guild(self, guild_id):
+        return self._guild
+
+
+def _seed_grant_audit(db_path, guild_id, role_id):
+    now = time.time()
+    with open_db(db_path) as conn:
+        conn.execute(
+            "INSERT INTO grant_roles (guild_id, grant_name, label, role_id) "
+            "VALUES (?, 'nsfw', 'NSFW', ?)",
+            (guild_id, role_id),
+        )
+        # 3001: level 6, never granted, never pruned → waiting bucket.
+        # 3002: pruned 5d ago, active again yesterday → stripped-returned.
+        # 3003: pruned 3d ago, last active 60d ago → recent-inactive.
+        for uid, level in ((3001, 6), (3002, 7)):
+            conn.execute(
+                "INSERT INTO member_xp (guild_id, user_id, total_xp, level) "
+                "VALUES (?, ?, 0, ?)",
+                (guild_id, uid, level),
+            )
+        for uid, pruned_days in ((3002, 5), (3003, 3)):
+            conn.execute(
+                "INSERT INTO role_prune_events (guild_id, user_id, role_id, pruned_at) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, uid, role_id, now - pruned_days * 86400),
+            )
+        for uid, active_days in ((3001, 1), (3002, 1), (3003, 60)):
+            conn.execute(
+                "INSERT INTO member_activity (guild_id, user_id, last_channel_id, "
+                "last_message_id, last_message_at) VALUES (?, ?, 1, 1, ?)",
+                (guild_id, uid, now - active_days * 86400),
+            )
+        conn.commit()
+
+
+def test_grant_audit_buckets(open_client, fake_ctx):
+    role_id = 555
+    _seed_grant_audit(fake_ctx.db_path, fake_ctx.guild_id, role_id)
+    role = _FakeRole(role_id)
+    guild = _FakeGuild(role, [_FakeMember(uid) for uid in (3001, 3002, 3003)])
+    fake_ctx.bot = _FakeBot(guild)
+
+    resp = open_client.get("/api/reports/grant-audit?grant_name=nsfw&min_level=5")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["label"] == "NSFW"
+    assert data["role_id"] == str(role_id)
+    assert [r["user_id"] for r in data["waiting_first_grant"]] == ["3001"]
+    assert [r["user_id"] for r in data["stripped_returned"]] == ["3002"]
+    assert data["stripped_returned"][0]["level"] == 7
+    assert [r["user_id"] for r in data["recent_inactive"]] == ["3003"]
+    assert data["recent_inactive"][0]["pruned_at"] is not None
+
+
+def test_grant_audit_unknown_grant_404(open_client, fake_ctx):
+    role = _FakeRole(555)
+    fake_ctx.bot = _FakeBot(_FakeGuild(role, []))
+    resp = open_client.get("/api/reports/grant-audit?grant_name=nope")
+    assert resp.status_code == 404
+
+
+def test_grant_audit_no_guild_503(open_client):
+    resp = open_client.get("/api/reports/grant-audit")
+    assert resp.status_code == 503
+
+
+# ── inactive-report ───────────────────────────────────────────────────
+
+
+def test_inactive_report_no_guild_503(open_client):
+    resp = open_client.get("/api/reports/inactive-report")
+    assert resp.status_code == 503
+
+
+def test_inactive_report_role_scope_wiring(open_client, fake_ctx):
+    """Route glue: live members + role scope reach the service, ids come back
+    as strings, and the role filter actually excludes non-holders."""
+    role_id = 555
+    role = _FakeRole(role_id)
+    holder = _FakeMember(3001, "Holder", roles=[role])
+    outsider = _FakeMember(3002, "Outsider")
+    role.members = [holder]
+    guild = _FakeGuild(role, [holder, outsider])
+    guild.members = [holder, outsider]
+    fake_ctx.bot = _FakeBot(guild)
+
+    resp = open_client.get(f"/api/reports/inactive-report?role_id={role_id}&days=0")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["role_name"] == "NSFW"
+    assert [r["user_id"] for r in data["members"]] == ["3001"]
+    assert data["total_scoped"] == 1
+
+    resp = open_client.get(
+        f"/api/reports/inactive-report?role_id={role_id}&role_mode=without&days=0"
+    )
+    assert [r["user_id"] for r in resp.json()["members"]] == ["3002"]
+
+
+def test_inactive_report_unknown_role_404(open_client, fake_ctx):
+    fake_ctx.bot = _FakeBot(_FakeGuild(_FakeRole(555), []))
+    resp = open_client.get("/api/reports/inactive-report?role_id=999")
+    assert resp.status_code == 404
+
+
+# ── intake-report ─────────────────────────────────────────────────────
+
+
+def test_intake_report_empty_shape(open_client):
+    resp = open_client.get("/api/reports/intake-report")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["enabled"] is False
+    assert data["open_cards"] == []
+    assert data["welcomers"] == []
+    assert data["skipped_steps"] == []
+
+
+def test_intake_report_with_data(open_client, fake_ctx):
+    from bot_modules.onboarding.intake import service as svc
+    from web_server.deps import invalidate_report_cache
+
+    gid = fake_ctx.guild_id
+    now = time.time()
+    with open_db(fake_ctx.db_path) as conn:
+        open_card = svc.create_card(conn, gid, 7, now - 3600)
+        assert open_card is not None
+        svc.create_card(conn, gid, 8, now - 7200)
+        svc.set_step_state(
+            conn, open_card, "sfw_questions", done=True, actor_id=99, at=now - 1800
+        )
+        svc.complete_card(conn, gid, 8, 99, now - 3600)
+    invalidate_report_cache()
+
+    data = open_client.get("/api/reports/intake-report").json()
+    # Snowflake-precision: ids as strings; open queue excludes the completed card.
+    assert [c["user_id"] for c in data["open_cards"]] == ["7"]
+    assert data["open_cards"][0]["done"] == 1
+    assert data["counts"] == {"completed": 1}
+    assert data["welcomers"][0]["user_id"] == "99"
+    assert data["welcomers"][0]["completions"] == 1
+    # Every default step except none was skipped on the completed card.
+    skipped = {s["key"]: s["skipped"] for s in data["skipped_steps"]}
+    assert skipped["sfw_questions"] == 1
+
+
+def test_intake_report_panel_columns_are_not_rendered_as_html():
+    """Source-scan guard (no Node in this repo) on the panel's XSS contract.
+
+    The invariant is unchanged — the newcomer/welcomer names and the step label
+    are member- and admin-supplied, and must never reach innerHTML as markup —
+    but *who enforces it* moved. table.js escapes every cell by default now
+    (S1, 2026-08-06 website review), so these columns must simply not opt out
+    with `html: true`; the esc() wrappers they used to carry now double-escape,
+    rendering a member called "Tom & Jerry" as "Tom &amp; Jerry".
+
+    The general form of this check — every column of every table consumer, in
+    both directions — lives in tests/web/test_frontend_wiring.py. This keeps a
+    named guard on the panel whose columns are the most exposed.
+    """
+    from pathlib import Path
+
+    src = Path("src/web_server/static/js/panels/intake-report.js").read_text(
+        encoding="utf-8"
+    )
+    for key in ('key: "user_name"', 'key: "label"', 'key: "pending"'):
+        assert key in src, f"{key} column disappeared — re-check this guard"
+        at = src.index(key)
+        spec = src[at : src.index("\n", at)]
+        assert "html: true" not in spec, (
+            f"{key} opted out of table.js escaping — it carries member-supplied "
+            "text, so that is stored XSS in a moderator's dashboard"
+        )
+        assert "esc(" not in spec, (
+            f"{key} escapes text that table.js already escapes (double-escaping)"
+        )
+
+
+# ── time-to-level-5 name resolution ───────────────────────────────────
+
+
+def test_time_to_level5_resolves_names_for_departed_members(open_client, fake_ctx):
+    """A member the guild cache no longer knows must not render as a raw ID.
+
+    resolve_names() only fills a name field that is falsy, so seeding the
+    response with str(user_id) silently defeated both its known_users lookup
+    and its "User <id>" fallback. This asserts the fallback actually fires.
+    """
+    invalidate_report_cache()
+    guild_id = fake_ctx.guild_id
+    user_id = 4242
+    now = int(time.time())
+    # Enough XP in one go to clear level 5, with a gap so the duration is > 0.
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            """INSERT INTO xp_events (guild_id, user_id, amount, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (guild_id, user_id, 1, "message", now - 86400),
+        )
+        conn.execute(
+            """INSERT INTO xp_events (guild_id, user_id, amount, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (guild_id, user_id, 100_000, "message", now),
+        )
+        conn.commit()
+
+    resp = open_client.get("/api/reports/time-to-level-5")
+    assert resp.status_code == 200
+    members = resp.json()["members"]
+    assert members, "expected the seeded member to have reached level 5"
+    row = next(m for m in members if int(m["user_id"]) == user_id)
+    assert row["display_name"] != str(user_id)
+    assert row["display_name"] == f"User {user_id}"
+
+
+@pytest.mark.parametrize(
+    ("curve_factor", "expected_required", "expect_crossing"),
+    [
+        # Default curve: level 5 costs 15.6 × 16 = 249.6, so 300 XP clears it.
+        (None, 249.6, True),
+        # A guild that raised the Level Curve Factor needs 20 × 16 = 320 —
+        # the report has to use the guild's dial, not the default.
+        (20.0, 320.0, False),
+    ],
+)
+def test_time_to_level5_honours_the_level_curve_factor(
+    open_client, fake_ctx, curve_factor, expected_required, expect_crossing
+):
+    from bot_modules.core.db_utils import set_config_value
+
+    invalidate_report_cache()
+    guild_id = fake_ctx.guild_id
+    user_id = 5150
+    now = int(time.time())
+    with open_db(fake_ctx.db_path) as conn:
+        if curve_factor is not None:
+            set_config_value(
+                conn, "xp_coeff_level_curve_factor", str(curve_factor), guild_id
+            )
+        conn.execute(
+            """INSERT INTO xp_events (guild_id, user_id, amount, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (guild_id, user_id, 1, "message", now - 86400),
+        )
+        conn.execute(
+            """INSERT INTO xp_events (guild_id, user_id, amount, source, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (guild_id, user_id, 299, "message", now),
+        )
+        conn.commit()
+
+    body = open_client.get("/api/reports/time-to-level-5").json()
+    assert body["xp_required"] == pytest.approx(expected_required)
+    reached = [m for m in body["members"] if int(m["user_id"]) == user_id]
+    assert bool(reached) is expect_crossing

@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import asyncio
+import weakref
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from .models import PendingQuestionState, PostedQuestionState, RiskyRollState
+
+if TYPE_CHECKING:
+    from bot_modules.core.branding_service import PanelArt
+
+    from .store import StateStore
+
+store: StateStore | None = None  # set by RiskyRollCog.cog_load()
+
+# Set alongside ``store``. The no-contact gate reads the list directly on every
+# roll and close rather than caching it — a stale no-contact cache fails toward
+# letting a blocked member through, which is the one way this must not fail
+# (docs/specs/no_contact_spec.md, "Why not an in-memory cache").
+db_path: Path | None = None
+
+active_games: dict[str, RiskyRollState] = {}
+pending_questions: dict[str, PendingQuestionState] = {}
+posted_questions: dict[int, PostedQuestionState] = {}
+ping_roles: dict[int, int] = {}
+min_game_seconds: dict[int, int] = {}
+max_games_per_channel: dict[int, int] = {}
+auto_close_tasks: dict[str, asyncio.Task] = {}
+# game_id -> the lobby art its board wears (``views._board_art``), read once
+# when the board first renders so every roll's edit frames the same way
+# without another read. Bounded; a restored round re-reads on its first edit.
+board_art: dict[str, PanelArt] = {}
+
+# user_id -> display name, captured when a player rolls so the roster embed can
+# print names instead of raw <@id> mentions (embeds don't resolve mentions for
+# members the viewer's client hasn't cached — mainly people who've left).
+display_names: dict[int, str] = {}
+
+_channel_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+_game_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_message_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def get_channel_lock(channel_id: int) -> asyncio.Lock:
+    lock = _channel_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _channel_locks[channel_id] = lock
+    return lock
+
+
+def get_game_lock(game_id: str) -> asyncio.Lock:
+    lock = _game_locks.get(game_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _game_locks[game_id] = lock
+    return lock
+
+
+def get_message_lock(message_id: int) -> asyncio.Lock:
+    lock = _message_locks.get(message_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _message_locks[message_id] = lock
+    return lock

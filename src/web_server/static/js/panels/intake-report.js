@@ -1,0 +1,153 @@
+import { api, fmtAge } from "../api.js";
+import { rangePicker, withLoading } from "../report-helpers.js";
+import { renderSortableTable } from "../table.js";
+import { renderError } from "../states.js";
+
+/**
+ * Intake Queue — the open welcome cards (Reports → Greeter).
+ * Moderator-level information — no gating applies here. The procedure and
+ * card behaviour live on Config → Members → Intake Cards (config-intake),
+ * cross-linked via `related:`.
+ *
+ * Three separate boxes — Queue, Welcomers, Skipped steps — rather than one
+ * long tile, so each reads as its own thing at a glance (Billy: "it seems
+ * like these should also be separate boxes, like skip steps, welcomers,
+ * that kind of stuff"). The content and controls are unchanged, just
+ * regrouped.
+ */
+export function mount(container, initialParams = {}) {
+  container.innerHTML = `
+    <div class="panel">
+      <header>
+        <h2>Intake Queue</h2>
+        <div class="subtitle">Open welcome cards, and how intakes are going</div>
+      </header>
+
+      <div class="controls"></div>
+      <div data-stats class="subtitle" style="margin-bottom:8px;"></div>
+
+      <section class="card">
+        <div class="section-label">Queue</div>
+        <div class="field-hint" style="margin-bottom:10px;">Open intake cards and how the welcome procedure is actually going</div>
+        <div data-open></div>
+      </section>
+
+      <section class="card">
+        <div class="section-label">Welcomers</div>
+        <div data-welcomers></div>
+      </section>
+
+      <section class="card">
+        <div class="section-label">Skipped steps</div>
+        <div class="subtitle">Steps marked skipped when the completion code closed a card early, showing which steps the team doesn’t run.</div>
+        <div data-skipped></div>
+      </section>
+    </div>
+  `;
+
+  const rangeEl = rangePicker({ value: initialParams.days || 30, label: "Range" });
+  container.querySelector(".controls").appendChild(rangeEl);
+  const daysEl = rangeEl.querySelector("select");
+  const statsEl = container.querySelector("[data-stats]");
+  const openWrap = container.querySelector("[data-open]");
+  const welcomersWrap = container.querySelector("[data-welcomers]");
+  const skippedWrap = container.querySelector("[data-skipped]");
+
+  const bar = (done, total) => {
+    const width = 10;
+    const filled = total ? Math.round((done / total) * width) : 0;
+    return `${"▰".repeat(filled)}${"▱".repeat(width - filled)} ${done}/${total}`;
+  };
+
+  async function refresh() {
+    const days = parseInt(daysEl.value) || 30;
+    history.replaceState(null, "", `#/intake-report?days=${days}`);
+    try {
+      const data = await withLoading(openWrap, api("/api/reports/intake-report", { days }));
+
+      if (!data.enabled) {
+        statsEl.textContent =
+          "Intake cards aren't running. An admin can turn them on under "
+          + "Config → Intake Cards, once a card channel is set.";
+      } else {
+        const c = data.counts || {};
+        const parts = [
+          `${data.open_cards.length} open now`,
+          `${c.completed || 0} completed`,
+          `${c.advanced || 0} moved on to Stage 2`,
+          `${c.dismissed || 0} dismissed`,
+          `${(c.left || 0) + (c.banned || 0)} left/banned`,
+        ];
+        if (c.completed) {
+          parts.push(`median time to complete: ${fmtAge(data.median_seconds)}`);
+          parts.push(`mean: ${fmtAge(data.mean_seconds)}`);
+        }
+        statsEl.textContent = `${data.window_label}  ·  ${parts.join("  ·  ")}`;
+      }
+
+      if (!data.open_cards.length) {
+        openWrap.innerHTML = `<div class="empty">No open intake cards. The queue is clear. 🎉</div>`;
+      } else {
+        renderSortableTable(openWrap, {
+          columns: [
+            // table.js escapes every cell now — these formats return plain text.
+            { key: "user_name", label: "Newcomer", format: (v, r) => v || r.user_id },
+            // Stage 1 = the join card; Stage 2 opens on a Level 5 Grant press.
+            { key: "stage", label: "Stage", format: (v) => (v === 2 ? "2 · Level 5" : "1 · Join") },
+            { key: "created_at", label: "Waiting", format: (v) => fmtAge(Date.now() / 1000 - v) },
+            { key: "done", label: "Progress", format: (v, r) => bar(r.done, r.total) },
+            { key: "pending", label: "Still to do", format: (v) => (v || []).join(", ") || "—" },
+            { key: "nudged", label: "Nudged", format: (v) => (v ? "yes" : "") },
+          ],
+          data: data.open_cards,
+          defaultSort: "created_at",
+          defaultAsc: true,
+        });
+      }
+
+      welcomersWrap.innerHTML = "";
+      if (data.welcomers.length) {
+        renderSortableTable(welcomersWrap, {
+          columns: [
+            { key: "user_name", label: "Welcomer", format: (v, r) => v || r.user_id },
+            { key: "completions", label: "Intakes completed" },
+            { key: "ticks", label: "Steps ticked" },
+          ],
+          data: data.welcomers,
+          defaultSort: "completions",
+        });
+      } else {
+        welcomersWrap.innerHTML = `<div class="empty">No completed intakes in this window yet.</div>`;
+      }
+
+      skippedWrap.innerHTML = "";
+      const skipped = (data.skipped_steps || []).filter((s) => s.appeared > 0);
+      if (skipped.length) {
+        renderSortableTable(skippedWrap, {
+          columns: [
+            { key: "label", label: "Step" },
+            { key: "appeared", label: "On completed cards" },
+            { key: "skipped", label: "Skipped" },
+            {
+              key: "key", label: "Skip rate",
+              format: (v, r) => `${Math.round((r.skipped / r.appeared) * 100)}%`,
+            },
+          ],
+          data: skipped,
+          defaultSort: "label",
+        });
+      } else {
+        skippedWrap.innerHTML = `<div class="empty">Nothing to show yet.</div>`;
+      }
+    } catch (err) {
+      // A failed fetch is an error, not an empty queue — .empty reads as
+      // "nothing to do here", which is the opposite of what happened. Every
+      // refresh pass (the initial load and every range change) is guarded by
+      // this same try/catch, so a later failure surfaces the same way.
+      openWrap.innerHTML = renderError(`Couldn't load the intake queue — try again. (${err.message})`);
+    }
+  }
+
+  daysEl.addEventListener("change", refresh);
+  refresh();
+}

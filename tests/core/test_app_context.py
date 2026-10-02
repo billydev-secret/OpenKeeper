@@ -1,0 +1,619 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
+import pytest
+
+from bot_modules.core.app_context import AppContext, Bot, GuildConfig
+from bot_modules.core.db_utils import open_db, set_config_value as _db_set
+from bot_modules.core.xp_system import DEFAULT_XP_SETTINGS
+from bot_modules.onboarding.welcome.service import (
+    DEFAULT_LEAVE_MESSAGE,
+    DEFAULT_WELCOME_MESSAGE,
+)
+from tests.db_template import migrated_db
+
+
+def _make_ctx(db_path, guild_id: int = 123) -> AppContext:
+    """Construct a minimal AppContext backed by a real (migrated) temp DB."""
+    migrated_db(db_path)
+    return AppContext(
+        bot=MagicMock(),
+        log=logging.getLogger("test"),
+        db_path=db_path,
+        guild_id=guild_id,
+        debug=True,
+    )
+
+
+def test_set_config_value_invalidates_guild_config_cache(tmp_path):
+    """A bot-side config write must refresh the per-guild snapshot, not just flats."""
+    ctx = _make_ctx(tmp_path / "ctx.db")
+
+    # Prime the cache with the empty snapshot.
+    assert ctx.guild_config(ctx.guild_id).mod_role_ids == frozenset()
+
+    # Write mod roles the way an in-Discord setup flow does.
+    ctx.set_config_value("mod_role_ids", "900,901")
+
+    # The next read must reflect the write (cache was invalidated).
+    assert ctx.guild_config(ctx.guild_id).mod_role_ids == frozenset({900, 901})
+
+
+def test_delete_config_value_invalidates_guild_config_cache(tmp_path):
+    ctx = _make_ctx(tmp_path / "ctx2.db")
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "mod_role_ids", "900", ctx.guild_id)
+
+    assert ctx.guild_config(ctx.guild_id).mod_role_ids == frozenset({900})
+    ctx.delete_config_value("mod_role_ids")
+    assert ctx.guild_config(ctx.guild_id).mod_role_ids == frozenset()
+
+
+def test_bucket_mutators_invalidate_guild_config_cache(tmp_path):
+    """add/remove/clear config-id bucket writes must refresh the per-guild snapshot."""
+    ctx = _make_ctx(tmp_path / "ctx_bucket.db")
+
+    # Prime cache (empty), then add an XP-excluded channel via the ctx mutator.
+    assert ctx.guild_config(ctx.guild_id).xp_excluded_channel_ids == frozenset()
+    ctx.add_config_id_value("xp_excluded_channel_ids", 555)
+    assert ctx.guild_config(ctx.guild_id).xp_excluded_channel_ids == frozenset({555})
+
+    ctx.remove_config_id_value("xp_excluded_channel_ids", 555)
+    assert ctx.guild_config(ctx.guild_id).xp_excluded_channel_ids == frozenset()
+
+    ctx.add_config_id_value("xp_excluded_channel_ids", 777)
+    ctx.clear_config_id_bucket("xp_excluded_channel_ids")
+    assert ctx.guild_config(ctx.guild_id).xp_excluded_channel_ids == frozenset()
+
+
+# ── GuildConfig.load ──────────────────────────────────────────────────
+
+
+def test_guild_config_load_returns_defaults_when_unconfigured(tmp_path):
+    db_path = tmp_path / "gc1.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        cfg = GuildConfig.load(conn, guild_id=999, allow_legacy_fallback=False)
+
+    assert cfg.guild_id == 999
+    assert cfg.welcome_channel_id == 0
+    assert cfg.welcome_message == DEFAULT_WELCOME_MESSAGE
+    assert cfg.leave_message == DEFAULT_LEAVE_MESSAGE
+    assert cfg.mod_role_ids == frozenset()
+    assert cfg.admin_role_ids == frozenset()
+    assert cfg.jailed_role_id == 0
+    assert cfg.transcript_channel_id == 0
+
+
+def test_guild_config_load_reads_guild_specific_values(tmp_path):
+    db_path = tmp_path / "gc2.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        _db_set(conn, "welcome_channel_id", "111", guild_id=42)
+        _db_set(conn, "welcome_message", "hi {mention}", guild_id=42)
+        _db_set(conn, "welcome_ping_role_id", "222", guild_id=42)
+        _db_set(conn, "leave_channel_id", "333", guild_id=42)
+        _db_set(conn, "leave_message", "bye {name}", guild_id=42)
+        _db_set(conn, "mod_role_ids", "500,501", guild_id=42)
+        _db_set(conn, "admin_role_ids", "600,601", guild_id=42)
+        _db_set(conn, "mod_channel_id", "777", guild_id=42)
+        _db_set(conn, "greeter_role_id", "444", guild_id=42)
+        _db_set(conn, "jailed_role_id", "801", guild_id=42)
+        _db_set(conn, "ticket_category_id", "802", guild_id=42)
+        _db_set(conn, "transcript_channel_id", "803", guild_id=42)
+        _db_set(conn, "log_channel_id", "804", guild_id=42)
+
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+
+    assert cfg.welcome_channel_id == 111
+    assert cfg.welcome_message == "hi {mention}"
+    assert cfg.welcome_ping_role_id == 222
+    assert cfg.leave_channel_id == 333
+    assert cfg.leave_message == "bye {name}"
+    assert cfg.mod_role_ids == frozenset({500, 501})
+    assert cfg.admin_role_ids == frozenset({600, 601})
+    assert cfg.mod_channel_id == 777
+    assert cfg.greeter_role_id == 444
+    assert cfg.jailed_role_id == 801
+    assert cfg.ticket_category_id == 802
+    assert cfg.transcript_channel_id == 803
+    assert cfg.log_channel_id == 804
+
+
+def test_guild_config_load_greeter_arrival_message(tmp_path):
+    """The arrival line is a per-guild dial: default, edited, and cleared."""
+    from bot_modules.onboarding.welcome.service import DEFAULT_ARRIVAL_MESSAGE
+
+    db_path = tmp_path / "gc_arrival.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+        assert cfg.greeter_arrival_message == DEFAULT_ARRIVAL_MESSAGE
+
+        _db_set(conn, "greeter_arrival_message", "{member_name} landed", guild_id=42)
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+        assert cfg.greeter_arrival_message == "{member_name} landed"
+
+        # A cleared box stays cleared — it must not fall back to the default,
+        # or "post nothing" would be unreachable from the panel.
+        _db_set(conn, "greeter_arrival_message", "", guild_id=42)
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+        assert cfg.greeter_arrival_message == ""
+
+
+def test_guild_config_load_strict_mode_ignores_legacy(tmp_path):
+    """A non-home guild with no rows must NOT inherit legacy guild_id=0 config."""
+    db_path = tmp_path / "gc3.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        _db_set(conn, "welcome_channel_id", "999", guild_id=0)  # legacy
+        _db_set(conn, "mod_role_ids", "1,2,3", guild_id=0)
+
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+
+    assert cfg.welcome_channel_id == 0
+    assert cfg.mod_role_ids == frozenset()
+
+
+def test_guild_config_load_home_guild_uses_legacy_fallback(tmp_path):
+    """Home guild reads legacy rows when its own rows aren't present."""
+    db_path = tmp_path / "gc4.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        _db_set(conn, "welcome_channel_id", "888", guild_id=0)  # legacy only
+
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=True)
+
+    assert cfg.welcome_channel_id == 888
+
+
+def test_guild_config_carries_the_promotion_review_grant_role(tmp_path):
+    """The XP panel's Promotion Review Grant Role reaches the level-card path
+    through the config snapshot — without it the "Spicy access" field could
+    only ever find a grant literally keyed "nsfw"."""
+    db_path = tmp_path / "gc_promo.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        _db_set(conn, "promotion_review_grant_role_id", "424242", guild_id=42)
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+        bare = GuildConfig.load(conn, guild_id=43, allow_legacy_fallback=False)
+    assert cfg.promotion_review_grant_role_id == 424242
+    assert bare.promotion_review_grant_role_id == 0
+
+
+def test_guild_config_load_join_leave_log_defaults_to_leave_channel(tmp_path):
+    db_path = tmp_path / "gc5.db"
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        _db_set(conn, "leave_channel_id", "55", guild_id=42)
+        cfg = GuildConfig.load(conn, guild_id=42, allow_legacy_fallback=False)
+    assert cfg.join_leave_log_channel_id == 55
+
+
+def test_guild_config_member_is_mod_matches_mod_or_admin_role():
+    cfg = GuildConfig(
+        guild_id=1,
+        welcome_channel_id=0,
+        welcome_message="",
+        welcome_ping_role_id=0,
+        welcome_ping_member=False,
+        welcome_trigger="join",
+        unverified_role_id=0,
+        greeter_role_id=0,
+        greeter_chat_channel_id=0,
+        greeter_arrival_message="",
+        leave_channel_id=0,
+        leave_message="",
+        join_leave_log_channel_id=0,
+        mod_channel_id=0,
+        mod_role_ids=frozenset({10}),
+        admin_role_ids=frozenset({20}),
+        greeting_watch_enabled=False,
+        greeting_watch_channel_ids=frozenset(),
+        greeting_watch_window_minutes=10,
+        greeting_watch_extra_words=(),
+        bypass_role_ids=frozenset(),
+        recorded_bot_user_ids=frozenset(),
+        xp_excluded_channel_ids=frozenset(),
+        xp_grant_allowed_user_ids=frozenset(),
+        level_5_role_id=0,
+        level_5_log_channel_id=0,
+        level_up_log_channel_id=0,
+        xp_settings=DEFAULT_XP_SETTINGS,
+        grant_roles={},
+        auto_role_ids=frozenset(),
+    )
+
+    def _member_with_role_ids(*role_ids: int) -> MagicMock:
+        m = MagicMock()
+        m.roles = [MagicMock(id=rid) for rid in role_ids]
+        return m
+
+    assert cfg.member_is_mod(_member_with_role_ids(10)) is True
+    assert cfg.member_is_mod(_member_with_role_ids(20)) is True  # admin counts
+    assert cfg.member_is_mod(_member_with_role_ids(99)) is False
+    assert cfg.member_is_admin(_member_with_role_ids(20)) is True
+    assert cfg.member_is_admin(_member_with_role_ids(10)) is False  # mod ≠ admin
+
+
+# ── AppContext.member_is_mod ──────────────────────────────────────────
+#
+# The bot's one answer to "is this member staff?". Jail, the inactive sweep,
+# intake cards and promotion-review cards each kept a private copy until
+# 2026-09-26, two of them widened to Manage Roles; tests/
+# test_member_is_mod_contract.py fails if a copy comes back.
+
+
+def _perm_member(role_ids, guild_id=10, **perms) -> MagicMock:
+    m = MagicMock()
+    m.roles = [MagicMock(id=rid) for rid in role_ids]
+    m.guild_permissions = discord.Permissions(**perms)
+    m.guild = MagicMock()
+    m.guild.id = guild_id
+    return m
+
+
+@pytest.mark.parametrize(
+    ("role_ids", "guild_id", "perms", "expected"),
+    [
+        pytest.param([777], 10, {}, True, id="configured-mod-role"),
+        pytest.param([], 10, {"manage_guild": True}, True, id="manage-server-short-circuit"),
+        pytest.param([], 10, {"administrator": True}, True, id="administrator-short-circuit"),
+        pytest.param([123], 10, {}, False, id="unrelated-role"),
+        # Intake and promotion-review cards once let this through; nothing
+        # else in the bot did, so one member was staff on two cards and a
+        # member everywhere else.
+        pytest.param([], 10, {"manage_roles": True}, False, id="manage-roles-alone-is-not-staff"),
+        pytest.param([888], 20, {}, True, id="reads-the-members-own-guild"),
+        pytest.param([777], 20, {}, False, id="home-guild-roles-do-not-leak"),
+    ],
+)
+def test_member_is_mod(tmp_path, role_ids, guild_id, perms, expected):
+    ctx = _make_ctx(tmp_path / "ctx_member_is_mod.db", guild_id=10)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "mod_role_ids", "777", guild_id=10)
+        _db_set(conn, "mod_role_ids", "888", guild_id=20)
+
+    assert ctx.member_is_mod(_perm_member(role_ids, guild_id, **perms)) is expected
+
+
+# ── AppContext.guild_config caching ───────────────────────────────────
+
+
+def test_guild_config_is_cached_per_guild(tmp_path):
+    ctx = _make_ctx(tmp_path / "ctx_cache.db")
+    cfg_a = ctx.guild_config(ctx.guild_id)
+    cfg_a_again = ctx.guild_config(ctx.guild_id)
+    assert cfg_a is cfg_a_again  # same object → DB only read once
+
+
+def test_guild_config_caches_distinct_guilds_independently(tmp_path):
+    ctx = _make_ctx(tmp_path / "ctx_distinct.db", guild_id=10)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "welcome_channel_id", "111", guild_id=10)
+        _db_set(conn, "welcome_channel_id", "222", guild_id=20)
+
+    assert ctx.guild_config(10).welcome_channel_id == 111
+    assert ctx.guild_config(20).welcome_channel_id == 222
+
+
+def test_guild_config_home_vs_non_home_legacy_fallback(tmp_path):
+    """guild_config picks strict mode for non-home guilds, fallback for home."""
+    ctx = _make_ctx(tmp_path / "ctx_strict.db", guild_id=10)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "welcome_channel_id", "777", guild_id=0)  # legacy only
+
+    assert ctx.guild_config(10).welcome_channel_id == 777  # home → fallback used
+    assert ctx.guild_config(20).welcome_channel_id == 0  # other → strict
+
+
+def test_invalidate_guild_config_drops_only_target_guild(tmp_path):
+    ctx = _make_ctx(tmp_path / "ctx_inv.db", guild_id=10)
+    cfg_10 = ctx.guild_config(10)
+    cfg_20 = ctx.guild_config(20)
+
+    ctx.invalidate_guild_config(10)
+
+    # 10 must reload (new instance), 20 must stay cached (same instance).
+    assert ctx.guild_config(10) is not cfg_10
+    assert ctx.guild_config(20) is cfg_20
+
+
+def test_guild_config_mod_roles_scoped_per_guild(tmp_path):
+    """Per-guild snapshots must NOT leak another guild's role IDs."""
+    ctx = _make_ctx(tmp_path / "ctx_reload.db", guild_id=10)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "mod_role_ids", "100,101", guild_id=10)
+        _db_set(conn, "mod_role_ids", "200,201", guild_id=20)
+
+    assert ctx.guild_config(10).mod_role_ids == frozenset({100, 101})
+    assert ctx.guild_config(20).mod_role_ids == frozenset({200, 201})
+
+
+async def test_is_mod_uses_per_guild_config(tmp_path):
+    """is_mod must read mod roles for the interaction's guild, not just home."""
+    ctx = _make_ctx(tmp_path / "ctx_ismod.db", guild_id=10)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "mod_role_ids", "555", guild_id=20)  # other guild only
+
+    # Member with role 555 in guild 20 → is_mod true
+    member = MagicMock()
+    member.roles = [MagicMock(id=555)]
+
+    ix = MagicMock(spec=discord.Interaction)
+    ix.guild_id = 20
+    ix.permissions = MagicMock(manage_guild=False, administrator=False)
+    ix.guild = MagicMock()
+    ix.guild.get_member = MagicMock(return_value=member)
+    ix.user = member
+
+    assert ctx.is_mod(ix) is True
+
+    # Different member with no relevant role → is_mod false
+    other = MagicMock()
+    other.roles = [MagicMock(id=999)]
+    ix.guild.get_member = MagicMock(return_value=other)
+    ix.user = other
+    assert ctx.is_mod(ix) is False
+
+
+async def test_is_mod_returns_false_for_dm_interaction(tmp_path):
+    """No guild_id → can't resolve per-guild config → not a mod."""
+    ctx = _make_ctx(tmp_path / "ctx_dm.db", guild_id=10)
+    member = MagicMock()
+    member.roles = []
+
+    ix = MagicMock(spec=discord.Interaction)
+    ix.guild_id = None
+    ix.permissions = MagicMock(manage_guild=False, administrator=False)
+    ix.guild = None
+    ix.user = member
+
+    assert ctx.is_mod(ix) is False
+    assert ctx.is_admin(ix) is False
+
+
+async def test_setup_hook_skips_sync_for_non_positive_guild_id():
+    bot = Bot(intents=discord.Intents.none(), debug=True, guild_id=0)
+    bot.tree.sync = AsyncMock()
+    with patch("builtins.print") as print_mock:
+        await bot.setup_hook()
+        await bot.close()
+
+    bot.tree.sync.assert_not_called()
+    assert print_mock.called
+    assert "skipping guild command sync" in print_mock.call_args_list[0][0][0].lower()
+
+
+async def test_setup_hook_handles_forbidden_during_debug_guild_sync(tmp_path):
+    bot = Bot(intents=discord.Intents.none(), debug=True, guild_id=123)
+    bot.ctx = MagicMock()
+    bot.ctx.db_path = tmp_path / "test.db"
+    forbidden = discord.Forbidden(
+        MagicMock(status=403, reason="Forbidden"),
+        {"code": 50001, "message": "Missing Access"},
+    )
+    bot.tree.sync = AsyncMock(side_effect=forbidden)
+
+    async def fake_sync_if_changed(tree, _db_path, *, guild):
+        # Mirror real behavior: call tree.sync, propagate Forbidden upward.
+        if guild is None:
+            await tree.sync()
+        else:
+            await tree.sync(guild=guild)
+        return [], True
+
+    with patch(
+        "bot_modules.core.command_sync.sync_if_changed",
+        side_effect=fake_sync_if_changed,
+    ), patch("builtins.print") as print_mock:
+        await bot.setup_hook()
+        await bot.close()
+
+    bot.tree.sync.assert_called_once()
+    printed_text = "\n".join(
+        str(call.args[0]) for call in print_mock.call_args_list if call.args
+    )
+    assert "missing access" in printed_text.lower()
+
+
+async def test_setup_hook_starts_loops_registered_during_cog_load():
+    """Cogs append their loop factories from cog_load — those must still start.
+
+    Regression: the launch loop used to run *before* load_extension(), so every
+    cog-owned background loop (pen pals, jail expiry, birthdays…) was registered
+    into a list nobody ever read and silently never ran in production.
+    """
+    bot = Bot(intents=discord.Intents.none(), debug=False, guild_id=0)
+    bot.ctx = MagicMock()
+    started = asyncio.Event()
+
+    async def cog_loop() -> None:
+        started.set()
+
+    async def fake_load_extension(_name: str) -> None:
+        # Stand in for a cog's cog_load() registering its background loop.
+        bot.startup_task_factories.append(lambda: cog_loop())
+
+    bot.extension_names = ["fake_cog"]
+    with patch.object(bot, "load_extension", side_effect=fake_load_extension), patch(
+        "bot_modules.core.command_sync.sync_if_changed",
+        new=AsyncMock(return_value=([], False)),
+    ), patch("builtins.print"):
+        await bot.setup_hook()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await bot.close()
+
+    assert len(bot.startup_tasks) == 1
+
+
+async def test_setup_hook_starts_loops_registered_before_setup():
+    """Factories the entry point registers up front still start (no regression)."""
+    bot = Bot(intents=discord.Intents.none(), debug=False, guild_id=0)
+    bot.ctx = MagicMock()
+    started = asyncio.Event()
+
+    async def entrypoint_loop() -> None:
+        started.set()
+
+    bot.startup_task_factories.append(lambda: entrypoint_loop())
+    with patch(
+        "bot_modules.core.command_sync.sync_if_changed",
+        new=AsyncMock(return_value=([], False)),
+    ), patch("builtins.print"):
+        await bot.setup_hook()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await bot.close()
+
+    assert len(bot.startup_tasks) == 1
+
+
+# ── /grant per-grant permissions: the allow-list decides, admins excepted ──
+
+
+def _grant_ix(guild_id: int, member, *, administrator: bool = False,
+              manage_guild: bool = False) -> MagicMock:
+    ix = MagicMock(spec=discord.Interaction)
+    ix.guild_id = guild_id
+    ix.permissions = MagicMock(
+        manage_guild=manage_guild, administrator=administrator
+    )
+    ix.guild = MagicMock()
+    ix.guild.get_member = MagicMock(return_value=member)
+    ix.user = member
+    return ix
+
+
+def _member(*role_ids: int, user_id: int = 7) -> MagicMock:
+    m = MagicMock()
+    m.id = user_id
+    m.roles = [MagicMock(id=rid) for rid in role_ids]
+    return m
+
+
+MOD_ROLE = 555
+ADMIN_ROLE = 556
+KEEPER_ROLE = 557
+
+
+def _grant_ctx(db_path, guild_id: int = 20):
+    from bot_modules.core.db_utils import upsert_grant_role
+
+    ctx = _make_ctx(db_path, guild_id=guild_id)
+    with open_db(ctx.db_path) as conn:
+        _db_set(conn, "mod_role_ids", str(MOD_ROLE), guild_id=guild_id)
+        _db_set(conn, "admin_role_ids", str(ADMIN_ROLE), guild_id=guild_id)
+        upsert_grant_role(
+            conn, guild_id, "goldengirl", label="Golden Girl", role_id=900,
+            log_channel_id=0, announce_channel_id=0, grant_message="",
+        )
+    return ctx
+
+
+def test_a_moderator_no_longer_bypasses_the_per_grant_list(tmp_path):
+    """The regression this shipped for: is_mod let every mod use every grant.
+
+    With the old ``is_mod`` short-circuit the allow-list could only ever add
+    people, so "this grant belongs to one keeper" was unexpressable.
+    """
+    ctx = _grant_ctx(tmp_path / "grant_mod.db")
+    ix = _grant_ix(20, _member(MOD_ROLE))
+    assert ctx.can_use_grant_role(ix, "goldengirl") is False
+    assert ctx.can_grant_any_role(ix) is False
+
+
+def test_an_administrator_still_bypasses_every_grant(tmp_path):
+    """Admins keep the bypass so a guild can't lock itself out."""
+    ctx = _grant_ctx(tmp_path / "grant_admin.db")
+    by_perm = _grant_ix(20, _member(), administrator=True)
+    assert ctx.can_use_grant_role(by_perm, "goldengirl") is True
+    assert ctx.can_grant_any_role(by_perm) is True
+
+    by_role = _grant_ix(20, _member(ADMIN_ROLE))
+    assert ctx.can_use_grant_role(by_role, "goldengirl") is True
+
+
+def test_manage_guild_alone_does_not_bypass(tmp_path):
+    """is_admin, unlike is_mod, does not honour bare manage_guild."""
+    ctx = _grant_ctx(tmp_path / "grant_mg.db")
+    ix = _grant_ix(20, _member(), manage_guild=True)
+    assert ctx.can_use_grant_role(ix, "goldengirl") is False
+
+
+def test_a_listed_role_or_user_can_use_only_its_own_grant(tmp_path):
+    """A keeper listed on one grant gets that grant and no other."""
+    from bot_modules.core.db_utils import add_grant_permission, upsert_grant_role
+
+    ctx = _grant_ctx(tmp_path / "grant_keeper.db")
+    with open_db(ctx.db_path) as conn:
+        upsert_grant_role(
+            conn, 20, "veteran", label="Veteran", role_id=901,
+            log_channel_id=0, announce_channel_id=0, grant_message="",
+        )
+        add_grant_permission(conn, 20, "goldengirl", "role", KEEPER_ROLE)
+        add_grant_permission(conn, 20, "goldengirl", "user", 4242)
+
+    by_role = _grant_ix(20, _member(KEEPER_ROLE))
+    assert ctx.can_use_grant_role(by_role, "goldengirl") is True
+    assert ctx.can_use_grant_role(by_role, "veteran") is False
+    assert ctx.can_grant_any_role(by_role) is True
+
+    by_user = _grant_ix(20, _member(user_id=4242))
+    assert ctx.can_use_grant_role(by_user, "goldengirl") is True
+    assert ctx.can_use_grant_role(by_user, "veteran") is False
+
+
+def test_a_moderator_listed_on_a_grant_can_use_it(tmp_path):
+    """Seeding mods onto a grant restores their access — what migration 144 does."""
+    from bot_modules.core.db_utils import add_grant_permission
+
+    ctx = _grant_ctx(tmp_path / "grant_seeded.db")
+    with open_db(ctx.db_path) as conn:
+        add_grant_permission(conn, 20, "goldengirl", "role", MOD_ROLE)
+
+    ix = _grant_ix(20, _member(MOD_ROLE))
+    assert ctx.can_use_grant_role(ix, "goldengirl") is True
+
+
+# ── the restart supervisor ────────────────────────────────────────────
+
+
+async def coin_drops_loop() -> None:
+    raise RuntimeError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_a_loop_the_supervisor_gives_up_on_is_recorded(monkeypatch, caplog):
+    """The give-up reaches the dashboard under the coroutine's name — the
+    factory is a lambda, and "<lambda> gave up" named nothing."""
+    from bot_modules.core import background
+
+    monkeypatch.setattr(background, "_GAVE_UP", {})
+    with caplog.at_level(logging.ERROR, logger="dungeonkeeper.tasks"):
+        await Bot._resilient_task(
+            lambda: coin_drops_loop(), restart_delay=0, max_restarts=2
+        )
+    [record] = background.gave_up()
+    assert (record.name, record.crashes) == ("coin_drops_loop", 3)
+    assert record.error == "RuntimeError: database is locked"
+    assert "coin_drops_loop exceeded max restarts" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_loop_that_recovers_is_not_recorded(monkeypatch):
+    from bot_modules.core import background
+
+    monkeypatch.setattr(background, "_GAVE_UP", {})
+    attempts = iter([RuntimeError("once"), None])
+
+    async def flaky() -> None:
+        exc = next(attempts)
+        if exc:
+            raise exc
+
+    await Bot._resilient_task(lambda: flaky(), restart_delay=0, max_restarts=2)
+    assert background.gave_up() == []

@@ -1,0 +1,137 @@
+# Lavalink v4 + LavaSrc (Spotify) configuration.
+#
+# - Listens on 127.0.0.1 only — never expose Lavalink to the internet.
+# - Secrets resolved from env: LAVALINK_PASSWORD, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET.
+# - Pin specific LavaSrc release in scripts/setup_lavalink.py and verify the
+#   filename of the jar dropped into ./plugins matches the version below.
+#
+# Bump versions in lockstep with setup_lavalink.py.
+server:
+  port: ${LAVALINK_PORT:2333}
+  address: 127.0.0.1
+
+lavalink:
+  plugins:
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
+      repository: "https://maven.lavalink.dev/releases"
+    # Built-in YouTube source breaks whenever YouTube changes player JS.
+    # The youtube-source plugin from lavalink-devs is actively maintained
+    # against those changes -- use it instead.
+    # Pinned to a main-branch SNAPSHOT, not a release: 1.18.2 (the latest
+    # release) can't play through the signed-in TV client ("The page needs to
+    # be reloaded", upstream issue #226), fixed in b33460b but unreleased.
+    # Move back to a release once one ships past f45bbb7. Lavalink downloads
+    # the declared version itself and deletes other versions from ./plugins.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3"
+      snapshot: true
+  server:
+    password: ${LAVALINK_PASSWORD}
+    sources:
+      # Disable built-in YouTube; youtube-source plugin handles it.
+      youtube: false
+      bandcamp: false
+      # SoundCloud is the fallback source when YouTube refuses a track
+      # (rights-holder blocks) -- the cog's scsearch recovery needs it.
+      soundcloud: true
+      twitch: false
+      vimeo: false
+      http: false
+      local: true
+    # Koe's UDP send buffer. 400 (the default) leaves almost no headroom for a
+    # GC pause or a network hiccup, both of which surface as audible stutter.
+    # Cost of raising it is a slower reaction to skip/seek, not quality.
+    bufferDurationMs: 1000
+    # How much audio is pre-buffered from the source. Guards against YouTube
+    # throttling mid-track. Costs heap per player, which is why LAVALINK_HEAP_MB
+    # went to 2048 in the same change.
+    frameBufferDurationMs: 10000
+    opusEncodingQuality: 10
+    # Only reachable because Opus passthrough is off: the cog connects at
+    # volume 20 (music_cog.py:_DEFAULT_VOLUME), and any volume != 100 forces a
+    # decode/resample/re-encode instead of forwarding the source's Opus frames.
+    # While we're paying for that re-encode, do it well. If the volume default
+    # ever goes back to 100, passthrough returns and this setting stops mattering.
+    resamplingQuality: HIGH
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    # Client list rotates as YouTube blocks specific clients. The plugin's
+    # README is the source of truth for the current recommended set.
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - WEB
+      - WEBEMBEDDED
+      # The only client that uses the OAuth sign-in below; it rescues videos
+      # the others refuse with "This video requires login".
+      - TV
+    # Signed in with a dedicated (non-primary) Google account. The refresh
+    # token lives in .env; if it is ever revoked, remove this line, restart,
+    # and approve the google.com/device code the boot log prints.
+    oauth:
+      enabled: true
+      refreshToken: ${YT_REFRESH_TOKEN}
+    # The plugin's built-in signature deciphering is no longer maintained
+    # upstream ("expected to fail", issue #240) -- the WEB client's
+    # "No supported audio streams" was that. kikkia's public yt-cipher
+    # instance does it instead: no password, rate-limited to 10 req/s.
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "dungeon-keeper"
+  lavasrc:
+    providers:
+      # Try ISRC first (LavaSrc substitutes the metadata's ISRC into %ISRC%).
+      - "ytsearch:\"%ISRC%\""
+      # Fall back to title + artist search.
+      - "ytsearch:%QUERY%"
+    sources:
+      spotify: true
+      applemusic: false
+      deezer: false
+      yandexmusic: false
+      flowerytts: false
+      youtube: false
+    spotify:
+      clientId: ${SPOTIFY_CLIENT_ID}
+      clientSecret: ${SPOTIFY_CLIENT_SECRET}
+      countryCode: US
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+
+metrics:
+  prometheus:
+    enabled: false
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
+    # Surface every REST PATCH (player updates, voice state, play commands)
+    # so we can tell whether wavelink is actually reaching Lavalink.
+    lavalink.server.io: DEBUG
+    lavalink.server.player: DEBUG
+    # Prints the YouTube sign-in device code and, once approved, the refresh
+    # token.
+    dev.lavalink.youtube.http.YoutubeOauth2Handler: INFO
+    # Koe is Lavalink's voice library -- it owns the UDP audio stream to
+    # Discord's voice servers. If audio doesn't reach Discord, the failure
+    # shows up here.
+    moe.kyokobot.koe: DEBUG
+  request:
+    enabled: true
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 3

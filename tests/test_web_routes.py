@@ -1,0 +1,911 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from bot_modules.core.db_utils import (
+    add_config_id,
+    add_grant_permission,
+    get_config_id_set,
+    get_config_value,
+    get_grant_permissions,
+    get_grant_roles,
+    get_tz_offset_hours,
+    init_grant_role_tables,
+    open_db,
+    set_config_value,
+    upsert_grant_role,
+)
+from bot_modules.auto_delete.service import init_auto_delete_tables, upsert_auto_delete_rule
+from bot_modules.confessions.service import init_db as init_confessions_db
+from bot_modules.inactive.prune_service import init_inactivity_prune_tables
+from bot_modules.shared.message_store import (
+    init_known_channels_table,
+    init_known_users_table,
+    upsert_known_channel,
+    upsert_known_user,
+)
+from web_server.auth import DiscordOAuthAuth, OpenAuth, SESSION_COOKIE
+from web_server.deps import invalidate_report_cache, store_report_result
+from web_server.server import create_app
+
+
+class _TestCtx:
+    def __init__(self, db_path: Path, guild_id: int = 123):
+        self.db_path = db_path
+        self.guild_id = guild_id
+        self.bot: Any = None
+        self._guild_config_cache: dict = {}
+
+    def open_db(self):
+        return open_db(self.db_path)
+
+    def guild_config(self, guild_id: int):
+        from bot_modules.core.app_context import GuildConfig
+
+        cfg = self._guild_config_cache.get(guild_id)
+        if cfg is None:
+            with self.open_db() as conn:
+                cfg = GuildConfig.load(
+                    conn, guild_id, allow_legacy_fallback=(guild_id == self.guild_id)
+                )
+            self._guild_config_cache[guild_id] = cfg
+        return cfg
+
+    def invalidate_guild_config(self, guild_id: int) -> None:
+        self._guild_config_cache.pop(guild_id, None)
+
+    # The real definition of staff, not a copy: it reads only guild_config,
+    # and a stub here is how this double fell out of step when the sweep
+    # moved onto it.
+    from bot_modules.core.app_context import AppContext
+
+    member_is_mod = AppContext.member_is_mod
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def ctx(tmp_path):
+    from tests.db_template import migrated_db
+
+    db_path = tmp_path / "test.db"
+    # GET /api/config now aggregates sections (needle, auto-react, bump
+    # tracker, ...) that query their tables directly, so build the full
+    # canonical schema instead of hand-picking table-init helpers.
+    migrated_db(db_path)
+    with open_db(db_path) as conn:
+        init_grant_role_tables(conn)
+        init_inactivity_prune_tables(conn)
+        init_known_users_table(conn)
+        init_known_channels_table(conn)
+        init_auto_delete_tables(conn)
+    init_confessions_db(db_path)
+    return _TestCtx(db_path)
+
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    invalidate_report_cache()
+    yield
+    invalidate_report_cache()
+
+
+@pytest.fixture
+def make_client(ctx):
+    clients = []
+
+    def _make(*, auth_mode: str = "open", active_guild_id: int | None = None, permission_bits: int = 0x8) -> TestClient:
+        if auth_mode == "open":
+            auth = OpenAuth()
+        else:
+            auth = DiscordOAuthAuth("test-secret", ctx.guild_id)
+
+        app = create_app(ctx, auth=auth)
+        client = TestClient(app)
+        clients.append(client)
+
+        if auth_mode == "discord":
+            guild_id = active_guild_id if active_guild_id is not None else ctx.guild_id
+            cookie = auth.create_session_cookie(  # type: ignore[union-attr]
+                user_id=1,
+                username="tester",
+                access_token="token",
+                permission_bits=permission_bits,
+                guild_id=guild_id,
+                guilds=[{"id": guild_id, "name": f"Guild {guild_id}", "icon": None}],
+            )
+            client.cookies.set(SESSION_COOKIE, cookie)
+
+        return client
+
+    yield _make
+
+    for c in clients:
+        c.close()
+
+
+# ── Tests ─────────────────────────────────────────────────────────────
+
+
+def test_get_config_returns_active_guild_scoped_values(ctx, make_client):
+    secondary_guild_id = 999
+    with open_db(ctx.db_path) as conn:
+        set_config_value(conn, "guild_id", str(ctx.guild_id), ctx.guild_id)
+        set_config_value(conn, "mod_channel_id", "111", ctx.guild_id)
+        set_config_value(conn, "welcome_message", "Primary welcome", ctx.guild_id)
+
+        set_config_value(conn, "guild_id", str(secondary_guild_id), secondary_guild_id)
+        set_config_value(conn, "tz_offset_hours", "5.5", secondary_guild_id)
+        set_config_value(conn, "mod_channel_id", "222", secondary_guild_id)
+        set_config_value(conn, "booster_swatch_dir", "C:/secondary/swatches", secondary_guild_id)
+        set_config_value(conn, "welcome_channel_id", "333", secondary_guild_id)
+        set_config_value(conn, "welcome_message", "Secondary welcome", secondary_guild_id)
+        set_config_value(conn, "join_leave_log_channel_id", "334", secondary_guild_id)
+        set_config_value(conn, "xp_level_5_role_id", "444", secondary_guild_id)
+        set_config_value(conn, "warning_threshold", "7", secondary_guild_id)
+        add_config_id(conn, "bypass_role_ids", 42, secondary_guild_id)
+        add_config_id(conn, "recorded_bot_user_ids", 77, secondary_guild_id)
+        add_config_id(conn, "xp_grant_allowed_user_ids", 88, secondary_guild_id)
+        add_config_id(conn, "xp_excluded_channel_ids", 99, secondary_guild_id)
+        conn.execute(
+            "INSERT INTO inactivity_prune_rules (guild_id, role_id, inactivity_days) VALUES (?, ?, ?)",
+            (secondary_guild_id, 555, 30),
+        )
+        conn.execute(
+            "INSERT INTO inactivity_prune_exceptions (guild_id, user_id) VALUES (?, ?)",
+            (secondary_guild_id, 888),
+        )
+        upsert_known_user(
+            conn,
+            guild_id=secondary_guild_id,
+            user_id=888,
+            username="fallback-user",
+            display_name="Fallback User",
+            ts=1.0,
+        )
+        upsert_grant_role(
+            conn,
+            secondary_guild_id,
+            "denizen",
+            label="Denizen",
+            role_id=901,
+            log_channel_id=902,
+            announce_channel_id=903,
+            grant_message="Granted!",
+        )
+        add_grant_permission(conn, secondary_guild_id, "denizen", "user", 777)
+    upsert_auto_delete_rule(ctx.db_path, secondary_guild_id, 600, 3600, 7200)
+
+    client = make_client(auth_mode="discord", active_guild_id=secondary_guild_id)
+    response = client.get("/api/config")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["global"]["guild_id"] == secondary_guild_id
+    assert data["global"]["tz_offset_hours"] == 5.5
+    assert data["global"]["mod_channel_id"] == "222"
+    assert data["global"]["bypass_role_ids"] == ["42"]
+    assert data["global"]["recorded_bot_user_ids"] == ["77"]
+    assert data["global"]["booster_swatch_dir"] == "C:/secondary/swatches"
+    assert data["welcome"]["welcome_channel_id"] == "333"
+    assert data["welcome"]["welcome_message"] == "Secondary welcome"
+    assert data["welcome"]["join_leave_log_channel_id"] == "334"
+    assert data["xp"]["level_5_role_id"] == "444"
+    assert data["xp"]["xp_grant_allowed_user_ids"] == ["88"]
+    assert data["xp"]["xp_excluded_channel_ids"] == ["99"]
+    assert data["prune"]["role_id"] == "555"
+    assert data["prune"]["inactivity_days"] == 30
+    assert data["prune"]["exemptions"] == [{"id": "888", "name": "Fallback User"}]
+    assert data["moderation"]["warning_threshold"] == 7
+    assert data["roles"]["denizen"]["role_id"] == "901"
+    assert data["roles"]["denizen"]["permissions"] == [{"entity_type": "user", "entity_id": "777"}]
+    assert data["auto_delete"][0]["channel_id"] == "600"
+
+
+def test_update_global_persists_fields_and_updates_context(ctx, make_client):
+    client = make_client()
+
+    response = client.put(
+        "/api/config/global",
+        json={
+            "tz_offset_hours": -4.5,
+            "mod_channel_id": "111",
+            "bypass_role_ids": ["2", "1"],
+            "recorded_bot_user_ids": ["9"],
+            "booster_swatch_dir": "C:/swatches",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    with open_db(ctx.db_path) as conn:
+        assert get_config_value(conn, "tz_offset_hours", "", ctx.guild_id) == "-4.5"
+        assert get_config_value(conn, "mod_channel_id", "", ctx.guild_id) == "111"
+        assert get_config_value(conn, "booster_swatch_dir", "", ctx.guild_id) == "C:/swatches"
+        assert get_config_id_set(conn, "bypass_role_ids", ctx.guild_id) == {1, 2}
+        assert get_config_id_set(conn, "recorded_bot_user_ids", ctx.guild_id) == {9}
+        assert get_tz_offset_hours(conn, ctx.guild_id) == -4.5
+    cfg = ctx.guild_config(ctx.guild_id)
+    assert cfg.mod_channel_id == 111
+    assert cfg.bypass_role_ids == {1, 2}
+    assert cfg.recorded_bot_user_ids == {9}
+
+
+@pytest.mark.parametrize("field,key,predicate", [
+    (
+        "behavioural_retention_enabled",
+        "BEHAVIOURAL_RETENTION_CONFIG_KEY",
+        "behavioural_retention_enabled",
+    ),
+])
+def test_retention_dial_round_trips_and_arms_the_sweep(
+    ctx, make_client, field, key, predicate
+):
+    """Ticking a box must be what arms that arm, and unticking must disarm it.
+
+    Each dial gates a destructive sweep, and the stored polarity has already
+    been inverted once during development (a single ``data_retention_disabled``
+    where absent meant *on*). A flip the panel and the service disagreed about
+    would either delete for a guild that opted out or never run for one that
+    opted in, and nothing else proves which way round it is wired.
+    """
+    from bot_modules.privacy import retention_service
+
+    config_key = getattr(retention_service, key)
+    is_on = getattr(retention_service, predicate)
+    client = make_client()
+
+    with open_db(ctx.db_path) as conn:
+        assert is_on(conn, ctx.guild_id) is False
+
+    assert client.put("/api/config/privacy", json={field: "1"}).status_code == 200
+    with open_db(ctx.db_path) as conn:
+        assert get_config_value(conn, config_key, "", ctx.guild_id) == "1"
+        assert is_on(conn, ctx.guild_id) is True
+
+    assert client.put("/api/config/privacy", json={field: "0"}).status_code == 200
+    with open_db(ctx.db_path) as conn:
+        assert is_on(conn, ctx.guild_id) is False
+
+    assert client.get("/api/config").json()["privacy"][field] == "0"
+
+
+def test_privacy_route_no_longer_writes_a_storage_level(ctx, make_client):
+    """The message-text storage dial was removed on 2026-09-13.
+
+    A stale dashboard tab still posting it must change nothing. Since body
+    models refuse undeclared fields (a5a97a94) the save is a 422 rather than a
+    silent ignore; either way no ``message_storage_level`` row is written for a
+    reader that no longer exists.
+    """
+    client = make_client()
+    response = client.put(
+        "/api/config/privacy", json={"message_storage_level": "all"}
+    )
+
+    assert response.status_code == 422
+    with open_db(ctx.db_path) as conn:
+        assert (
+            get_config_value(conn, "message_storage_level", "", ctx.guild_id)
+            == ""
+        )
+    assert "message_storage_level" not in client.get("/api/config").json()["privacy"]
+
+
+def test_update_welcome_persists_and_updates_live_context(ctx, make_client):
+    client = make_client()
+
+    response = client.put(
+        "/api/config/welcome",
+        json={
+            "welcome_channel_id": "500",
+            "welcome_message": "Hello there",
+            "welcome_ping_role_id": "501",
+            "leave_channel_id": "502",
+            "leave_message": "Goodbye",
+            "greeter_role_id": "503",
+            "greeter_chat_channel_id": "504",
+            "join_leave_log_channel_id": "505",
+        },
+    )
+
+    assert response.status_code == 200
+    with open_db(ctx.db_path) as conn:
+        assert get_config_value(conn, "welcome_message", "", ctx.guild_id) == "Hello there"
+        assert get_config_value(conn, "greeter_role_id", "", ctx.guild_id) == "503"
+        assert get_config_value(conn, "greeter_chat_channel_id", "", ctx.guild_id) == "504"
+        assert get_config_value(conn, "join_leave_log_channel_id", "", ctx.guild_id) == "505"
+    cfg = ctx.guild_config(ctx.guild_id)
+    assert cfg.welcome_channel_id == 500
+    assert cfg.welcome_message == "Hello there"
+    assert cfg.welcome_ping_role_id == 501
+    assert cfg.leave_channel_id == 502
+    assert cfg.leave_message == "Goodbye"
+    assert cfg.greeter_role_id == 503
+    assert cfg.greeter_chat_channel_id == 504
+    assert cfg.join_leave_log_channel_id == 505
+
+
+def test_update_xp_persists_coefficients_and_reloads_context(ctx, make_client):
+    client = make_client()
+
+    response = client.put(
+        "/api/config/xp",
+        json={
+            "level_5_role_id": "10",
+            "level_5_log_channel_id": "11",
+            "level_up_log_channel_id": "12",
+            "xp_grant_allowed_user_ids": ["13", "14"],
+            "xp_excluded_channel_ids": ["15"],
+            "message_word_xp": 1.5,
+            "cooldown_thresholds_seconds": "10,20",
+            "voice_interval_seconds": 600,
+        },
+    )
+
+    assert response.status_code == 200
+    with open_db(ctx.db_path) as conn:
+        assert get_config_value(conn, "xp_level_5_role_id", "", ctx.guild_id) == "10"
+        assert get_config_value(conn, "xp_level_5_log_channel_id", "", ctx.guild_id) == "11"
+        assert get_config_value(conn, "xp_level_up_log_channel_id", "", ctx.guild_id) == "12"
+        assert get_config_id_set(conn, "xp_grant_allowed_user_ids", ctx.guild_id) == {13, 14}
+        assert get_config_id_set(conn, "xp_excluded_channel_ids", ctx.guild_id) == {15}
+        assert get_config_value(conn, "xp_coeff_message_word_xp", "", ctx.guild_id) == "1.5"
+        assert get_config_value(conn, "xp_coeff_cooldown_thresholds_seconds", "", ctx.guild_id) == "10,20"
+        assert get_config_value(conn, "xp_coeff_voice_interval_seconds", "", ctx.guild_id) == "600"
+    cfg = ctx.guild_config(ctx.guild_id)
+    assert cfg.level_5_role_id == 10
+    assert cfg.level_5_log_channel_id == 11
+    assert cfg.level_up_log_channel_id == 12
+    assert cfg.xp_grant_allowed_user_ids == {13, 14}
+    assert cfg.xp_excluded_channel_ids == {15}
+    assert cfg.xp_settings.message_word_xp == 1.5
+
+
+def test_update_role_grant_creates_row_and_permissions(ctx, make_client):
+    client = make_client()
+
+    response = client.put(
+        "/api/config/roles/nightwatch",
+        json={
+            "label": "Night Watch",
+            "role_id": "701",
+            "log_channel_id": "702",
+            "announce_channel_id": "703",
+            "grant_message": "Stay sharp.",
+            "permissions": [
+                {"entity_type": "role", "entity_id": "704"},
+                {"entity_type": "user", "entity_id": "705"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    with open_db(ctx.db_path) as conn:
+        grant = get_grant_roles(conn, ctx.guild_id)["nightwatch"]
+        permissions = set(get_grant_permissions(conn, ctx.guild_id, "nightwatch"))
+    assert grant["label"] == "Night Watch"
+    assert grant["role_id"] == 701
+    assert grant["log_channel_id"] == 702
+    assert grant["announce_channel_id"] == 703
+    assert grant["grant_message"] == "Stay sharp."
+    assert permissions == {("role", 704), ("user", 705)}
+
+
+def test_config_edits_work_for_non_primary_guild(ctx, make_client):
+    # All config editing is now per-guild — a non-primary guild can edit its own
+    # config (no more primary-guild gating). Writes are scoped to the active guild.
+    client = make_client(auth_mode="discord", active_guild_id=999)
+
+    response = client.put(
+        "/api/config/prune", json={"role_id": "1", "inactivity_days": 30}
+    )
+
+    assert response.status_code == 200
+
+
+def test_reports_cache_clear_endpoint_scopes_to_active_guild(ctx, make_client):
+    store_report_result("xp-leaderboard", 999, {"days": None}, {"ok": 1})
+    store_report_result("channel-comparison", 999, {"days": 30}, {"ok": 2})
+    store_report_result("xp-leaderboard", 123, {"days": None}, {"ok": 3})
+    client = make_client(auth_mode="discord", active_guild_id=999)
+
+    response = client.post("/api/reports/cache/clear")
+
+    assert response.status_code == 200
+    assert response.json() == {"cleared": 2}
+    assert invalidate_report_cache() == 1
+
+
+def test_channel_comparison_resolves_names_from_guild_and_db(ctx, make_client):
+    with open_db(ctx.db_path) as conn:
+        upsert_known_channel(
+            conn,
+            guild_id=ctx.guild_id,
+            channel_id=222,
+            channel_name="archived-channel",
+            ts=1.0,
+        )
+
+    live_channel = SimpleNamespace(id=111, name="live-channel")
+    guild = SimpleNamespace(
+        get_channel=lambda channel_id: live_channel if channel_id == 111 else None
+    )
+    ctx.bot = SimpleNamespace(
+        get_guild=lambda guild_id: guild if guild_id == ctx.guild_id else None
+    )
+    client = make_client()
+    payload = {
+        "channels": [
+            {
+                "channel_id": "111",
+                "channel_name": "",
+                "message_count": 50,
+                "unique_authors": 10,
+                "recent_count": 30,
+                "prev_count": 20,
+                "trend_pct": 50.0,
+                "total_xp": 0.0,
+                "gini": 0.0,
+                "avg_sentiment": None,
+            },
+            {
+                "channel_id": "222",
+                "channel_name": "",
+                "message_count": 15,
+                "unique_authors": 5,
+                "recent_count": 8,
+                "prev_count": 7,
+                "trend_pct": 14.3,
+                "total_xp": 0.0,
+                "gini": 0.0,
+                "avg_sentiment": None,
+            },
+        ]
+    }
+
+    with patch(
+        "web_server.routes.reports.reports_data.get_channel_comparison_data",
+        return_value=payload,
+    ):
+        response = client.get("/api/reports/channel-comparison?days=7")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["channels"][0]["channel_name"] == "live-channel"
+    assert data["channels"][1]["channel_name"] == "archived-channel"
+
+
+def _mk_channel(spec_cls, *, ch_id: int, name: str, category=None, nsfw: bool = False):
+    """Build a MagicMock that passes isinstance(ch, spec_cls)."""
+    import discord
+    from unittest.mock import MagicMock
+
+    ch = MagicMock(spec=spec_cls)
+    ch.id = ch_id
+    ch.name = name
+    ch.category = category
+    if spec_cls is not discord.CategoryChannel:
+        ch.nsfw = nsfw
+    return ch
+
+
+def test_meta_channels_default_returns_text_and_thread_only(ctx, make_client):
+    import discord
+
+    category = _mk_channel(discord.CategoryChannel, ch_id=10, name="General")
+    text_ch = _mk_channel(discord.TextChannel, ch_id=11, name="general", category=category)
+    voice_ch = _mk_channel(discord.VoiceChannel, ch_id=12, name="Lobby", category=category)
+    thread_ch = _mk_channel(discord.Thread, ch_id=13, name="thread-a", category=None)
+
+    guild = SimpleNamespace(channels=[category, text_ch, voice_ch, thread_ch])
+    ctx.bot = SimpleNamespace(
+        get_guild=lambda gid: guild if gid == ctx.guild_id else None
+    )
+    client = make_client()
+
+    response = client.get("/api/meta/channels")
+    assert response.status_code == 200
+    data = response.json()
+    types_returned = sorted(c["type"] for c in data)
+    assert types_returned == ["text", "thread"]
+
+
+def test_meta_channels_includes_voice_and_category_when_requested(ctx, make_client):
+    import discord
+
+    category = _mk_channel(discord.CategoryChannel, ch_id=10, name="General")
+    text_ch = _mk_channel(discord.TextChannel, ch_id=11, name="general", category=category)
+    voice_ch = _mk_channel(discord.VoiceChannel, ch_id=12, name="Lobby", category=category)
+
+    guild = SimpleNamespace(channels=[category, text_ch, voice_ch])
+    ctx.bot = SimpleNamespace(
+        get_guild=lambda gid: guild if gid == ctx.guild_id else None
+    )
+    client = make_client()
+
+    response = client.get("/api/meta/channels?types=text,voice,category")
+    assert response.status_code == 200
+    data = response.json()
+    by_id = {c["id"]: c for c in data}
+    assert by_id["10"]["type"] == "category"
+    assert by_id["11"]["type"] == "text"
+    assert by_id["12"]["type"] == "voice"
+    assert by_id["12"]["name"] == "Lobby"
+
+
+def test_get_config_includes_bot_identity_with_bot(ctx, make_client):
+    from types import SimpleNamespace
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick="DungeonBot",
+            guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    resp = client.get("/api/config")
+    assert resp.status_code == 200
+    bi = resp.json()["bot_identity"]
+    assert bi["nick"] == "DungeonBot"
+    assert bi["avatar_url"] == "https://cdn.discordapp.com/avatars/1/abc.png"
+
+def test_get_config_bot_identity_falls_back_when_no_bot(ctx, make_client):
+    ctx.bot = None
+    client = make_client()
+    resp = client.get("/api/config")
+    assert resp.status_code == 200
+    bi = resp.json()["bot_identity"]
+    assert bi["nick"] == ""
+    assert bi["avatar_url"] == ""
+
+def test_get_config_bot_identity_empty_nick_when_no_guild_nick(ctx, make_client):
+    from types import SimpleNamespace
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick=None,
+            guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    resp = client.get("/api/config")
+    assert resp.status_code == 200
+    assert resp.json()["bot_identity"]["nick"] == ""
+
+
+def test_post_bot_identity_updates_nick(ctx, make_client):
+    from types import SimpleNamespace
+    edit_calls = []
+    async def mock_edit(**kwargs): edit_calls.append(kwargs)
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick="OldName",
+            guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+            edit=mock_edit,
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    resp = client.post("/api/config/bot-identity", data={"nick": "NewName"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert edit_calls == [{"nick": "NewName"}]
+
+def test_post_bot_identity_fetches_avatar_url(ctx, make_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    edit_calls = []
+    async def mock_edit(**kwargs): edit_calls.append(kwargs)
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick=None, guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+            edit=mock_edit,
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    fake_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    # The route streams the body (client.stream is a sync call returning an
+    # async context manager — mocking it as a coroutine breaks `async with`).
+    class _FakeStreamResponse:
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield fake_image
+
+    class _FakeStreamCM:
+        async def __aenter__(self):
+            return _FakeStreamResponse()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    with patch("web_server.routes.config.httpx.AsyncClient") as MockClient:
+        instance = AsyncMock()
+        instance.stream = MagicMock(return_value=_FakeStreamCM())
+        instance.__aenter__ = AsyncMock(return_value=instance)
+        instance.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = instance
+        resp = client.post("/api/config/bot-identity", data={"avatar_url": "https://example.com/image.png"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert edit_calls[0]["avatar"] == fake_image
+
+def test_post_bot_identity_file_takes_priority_over_url(ctx, make_client):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+    edit_calls = []
+    async def mock_edit(**kwargs): edit_calls.append(kwargs)
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick=None, guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+            edit=mock_edit,
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    file_bytes = b"\x89PNG\r\n\x1a\nFILE"
+    with patch("web_server.routes.config.httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__ = AsyncMock()
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = client.post(
+            "/api/config/bot-identity",
+            data={"avatar_url": "https://example.com/image.png"},
+            files={"avatar_file": ("avatar.png", BytesIO(file_bytes), "image/png")},
+        )
+    assert resp.status_code == 200
+    MockClient.return_value.__aenter__.assert_not_called()
+    assert edit_calls[0]["avatar"] == file_bytes
+
+def test_post_bot_identity_503_when_no_bot(ctx, make_client):
+    ctx.bot = None
+    client = make_client()
+    resp = client.post("/api/config/bot-identity", data={"nick": "NewName"})
+    assert resp.status_code == 503
+
+def test_post_bot_identity_503_when_no_guild(ctx, make_client):
+    from types import SimpleNamespace
+    ctx.bot = SimpleNamespace(get_guild=lambda _: None)
+    client = make_client()
+    resp = client.post("/api/config/bot-identity", data={"nick": "X"})
+    assert resp.status_code == 503
+
+def test_post_bot_identity_400_on_bad_avatar_url(ctx, make_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+    import httpx as _httpx
+    async def mock_edit(**_): pass
+    guild = SimpleNamespace(
+        me=SimpleNamespace(
+            nick=None, guild_avatar=None,
+            display_avatar=SimpleNamespace(url="https://cdn.discordapp.com/avatars/1/abc.png"),
+            edit=mock_edit,
+        )
+    )
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+    with patch("web_server.routes.config.httpx.AsyncClient") as MockClient:
+        instance = AsyncMock()
+        instance.get = AsyncMock(side_effect=_httpx.RequestError("connection failed"))
+        instance.__aenter__ = AsyncMock(return_value=instance)
+        instance.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = instance
+        resp = client.post("/api/config/bot-identity", data={"avatar_url": "https://bad.example.com/img.png"})
+    assert resp.status_code == 400
+
+
+# ── Inactive-sweep dry-run preview + exemptions ───────────────────────────────
+#
+# The preview exists so an admin can see the cost of switching the auto-sweep on
+# before switching it on. It is only worth anything if it agrees with the sweep,
+# so these pin the parts the route itself owns: the 503 when member state isn't
+# available, string-safe snowflakes, the hierarchy split, and the unsaved
+# threshold override.
+
+
+def _sweep_role(role_id: int, name: str, *, managed: bool = False, position: int = 1):
+    return SimpleNamespace(id=role_id, name=name, managed=managed, position=position)
+
+
+def _sweep_member(member_id: int, roles, *, joined_days_ago=400):
+    import datetime as _dt
+
+    return SimpleNamespace(
+        id=member_id,
+        bot=False,
+        display_name=f"member{member_id}",
+        roles=roles,
+        joined_at=_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=joined_days_ago),
+        guild_permissions=SimpleNamespace(administrator=False, manage_guild=False),
+    )
+
+
+def _sweep_guild(ctx, members, *, bot_top_position: int = 10):
+    everyone = _sweep_role(0, "@everyone", position=0)
+    by_id = {m.id: m for m in members}
+    guild = SimpleNamespace(
+        id=ctx.guild_id,
+        owner_id=1,
+        members=members,
+        default_role=everyone,
+        me=SimpleNamespace(top_role=SimpleNamespace(position=bot_top_position)),
+        get_member=lambda uid: by_id.get(int(uid)),
+    )
+    for m in members:
+        m.guild = guild  # a real Member knows its guild; member_is_mod reads it
+    return guild
+
+
+def test_inactive_preview_requires_a_connected_bot(ctx, make_client):
+    # Member and role state is gateway state — without it there is nothing
+    # truthful to show, so the route refuses rather than rendering an empty list.
+    ctx.bot = None
+    client = make_client()
+    resp = client.post("/api/config/inactive/preview", json={"threshold_days": 30})
+    assert resp.status_code == 503
+
+
+def test_inactive_preview_lists_members_and_what_they_would_lose(ctx, make_client):
+    big_id = 1234567890123456789  # > 2^53: must survive as a string
+    member = _sweep_member(
+        big_id,
+        [
+            _sweep_role(0, "@everyone", position=0),
+            _sweep_role(11, "Member"),
+            _sweep_role(12, "Server Booster", managed=True),
+        ],
+    )
+    guild = _sweep_guild(ctx, [member])
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    resp = client.post("/api/config/inactive/preview", json={"threshold_days": 30})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["eligible_count"] == 1
+    assert data["blocked_count"] == 0
+    row = data["members"][0]
+    assert row["user_id"] == str(big_id)  # never a bare JSON number
+    assert str(big_id) in resp.text and str(big_id + 1) not in resp.text
+    # @everyone is not strippable and the managed role can't be restored, so
+    # neither is promised — only the real role is listed as lost.
+    assert row["removed_role_names"] == ["Member"]
+    assert row["kept_managed_role_names"] == ["Server Booster"]
+    assert row["removed_role_count"] == 1
+    assert row["has_tracked_messages"] is False  # aged from join date alone
+    assert data["sweep_cap"] == 25
+    assert data["inactive_channel_configured"] is False
+
+
+def test_inactive_preview_separates_members_the_bot_cannot_strip(ctx, make_client):
+    ok = _sweep_member(5, [_sweep_role(11, "Member", position=1)])
+    outranking = _sweep_member(6, [_sweep_role(12, "Staff", position=99)])
+    guild = _sweep_guild(ctx, [ok, outranking], bot_top_position=10)
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    data = client.post("/api/config/inactive/preview", json={"threshold_days": 30}).json()
+
+    assert [r["user_id"] for r in data["members"]] == ["5"]
+    assert [r["user_id"] for r in data["blocked"]] == ["6"]
+    # The headline count excludes the member the sweep would fail on.
+    assert data["eligible_count"] == 1
+    assert data["blocked_count"] == 1
+
+
+def test_inactive_preview_refuses_when_the_bot_member_is_uncached(ctx, make_client):
+    """No `guild.me` means no role position to compare against.
+
+    Defaulting it would file every candidate under "the bot can't strip them"
+    and report nobody as sweepable — a confidently wrong answer.
+    """
+    guild = _sweep_guild(ctx, [_sweep_member(5, [_sweep_role(11, "Member")])])
+    guild.me = None
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    resp = client.post("/api/config/inactive/preview", json={"threshold_days": 30})
+    assert resp.status_code == 503
+
+
+def test_inactive_preview_note_uses_the_cap_on_screen(ctx, make_client):
+    """The panel sends the typed cap so its note can't contradict the field."""
+    guild = _sweep_guild(ctx, [_sweep_member(5, [_sweep_role(11, "Member")])])
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    typed = client.post(
+        "/api/config/inactive/preview", json={"threshold_days": 30, "sweep_cap": 5}
+    ).json()
+    saved = client.post("/api/config/inactive/preview", json={"threshold_days": 30}).json()
+
+    assert typed["sweep_cap"] == 5
+    assert saved["sweep_cap"] == 25  # falls back to the stored setting
+
+
+def test_inactive_preview_uses_the_unsaved_threshold(ctx, make_client):
+    member = _sweep_member(5, [_sweep_role(11, "Member")], joined_days_ago=45)
+    guild = _sweep_guild(ctx, [member])
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    strict = client.post("/api/config/inactive/preview", json={"threshold_days": 90}).json()
+    loose = client.post("/api/config/inactive/preview", json={"threshold_days": 10}).json()
+
+    assert strict["eligible_count"] == 0
+    assert strict["threshold_days"] == 90
+    assert loose["eligible_count"] == 1
+
+
+def test_inactive_preview_skips_exempt_members(ctx, make_client):
+    spared = _sweep_member(5, [_sweep_role(11, "Member")])
+    other = _sweep_member(6, [_sweep_role(11, "Member")])
+    guild = _sweep_guild(ctx, [spared, other])
+    ctx.bot = SimpleNamespace(get_guild=lambda gid: guild if gid == ctx.guild_id else None)
+    client = make_client()
+
+    assert client.put("/api/config/inactive/exemptions/5").status_code == 200
+    data = client.post("/api/config/inactive/preview", json={"threshold_days": 30}).json()
+
+    assert [r["user_id"] for r in data["members"]] == ["6"]
+
+
+def test_inactive_exemptions_round_trip_through_config(ctx, make_client):
+    big_id = 1234567890123456789
+    client = make_client()
+
+    assert client.put(f"/api/config/inactive/exemptions/{big_id}").status_code == 200
+    section = client.get("/api/config").json()["inactive"]
+    assert [e["id"] for e in section["exemptions"]] == [str(big_id)]
+
+    assert client.delete(f"/api/config/inactive/exemptions/{big_id}").status_code == 200
+    assert client.get("/api/config").json()["inactive"]["exemptions"] == []
+
+
+# ── auth backend selection fails closed (deep-review #5) ──────────────────────
+
+from web_server.server import _auto_detect_auth  # noqa: E402
+
+
+def test_auto_detect_auth_uses_oauth_when_configured(monkeypatch):
+    monkeypatch.setenv("DISCORD_CLIENT_ID", "cid")
+    # Must clear the session-secret strength floor _auto_detect_auth enforces;
+    # the floor itself is covered by the session-secret tests.
+    monkeypatch.setenv("SESSION_SECRET", "x7Qp2vLm9RtWzB4nKcJdF6sYhE3aUgN8")
+    monkeypatch.delenv("DASHBOARD_OPEN_AUTH", raising=False)
+    assert isinstance(_auto_detect_auth(123), DiscordOAuthAuth)
+
+
+def test_auto_detect_auth_open_only_with_explicit_optin(monkeypatch):
+    monkeypatch.delenv("DISCORD_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
+    monkeypatch.setenv("DASHBOARD_OPEN_AUTH", "1")
+    assert isinstance(_auto_detect_auth(123), OpenAuth)
+
+
+def test_auto_detect_auth_fails_closed_when_unconfigured(monkeypatch):
+    # A dropped OAuth secret must NOT silently serve admin-to-everyone.
+    monkeypatch.delenv("DISCORD_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
+    monkeypatch.delenv("DASHBOARD_OPEN_AUTH", raising=False)
+    with pytest.raises(RuntimeError, match="Refusing to start"):
+        _auto_detect_auth(123)

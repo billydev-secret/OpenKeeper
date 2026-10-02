@@ -1,0 +1,657 @@
+"""Per-asker server context for the AI advisor.
+
+The advisor's static grounding is the user manual (``advisor_service``). This
+module adds *live, per-server* grounding — server docs, recent announcements,
+and channel names/topics — plus a summary of what the asker can **do** (their
+roles/permissions), so answers are tailored to them.
+
+Three hard rules, all enforced here and covered by tests:
+
+- **See:** a channel's topic is only ever included if the asker can view that
+  channel (``permissions_for(viewer).view_channel``), and age-gated channels
+  are never included — the channel's own flag or its category's. ``/ask`` is
+  open to everyone, so this is the gate that stops a member extracting
+  mod-only content.
+- **Do:** the capability summary reflects the asker's real permissions, so
+  the advisor only suggests actions they can actually perform.
+- **Nothing about a person:** no member-written message, no stored per-member
+  data, and no member's name — the asker's included. Everything assembled here
+  is server-level: channel structure, staff-authored docs and announcements,
+  and the asker's permissions. See the note above
+  :func:`build_asker_context` before adding a source, and record the change in
+  ``docs/data_register.md``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib
+import logging
+import re
+import sqlite3
+from collections.abc import Callable
+
+import discord
+
+from bot_modules.core.db_utils import get_config_value, open_db
+from bot_modules.docs.db import list_docs
+from bot_modules.announcements.service import list_announcements
+from bot_modules.shared.age_gate import is_age_gated_channel
+from bot_modules.core.settings_registry import FEATURES as REGISTRY_FEATURES
+
+log = logging.getLogger(__name__)
+
+# Caps — keep the live block small so the cached manual stays the bulk of the
+# prompt and per-ask cost stays bounded.
+MAX_CHANNELS = 60
+MAX_TOPIC_CHARS = 300
+MAX_DOCS = 12
+MAX_DOC_CHARS = 900
+MAX_ANNOUNCEMENTS = 6
+MAX_ANNOUNCEMENT_CHARS = 500
+MAX_CONTEXT_CHARS = 12000  # hard ceiling on the whole assembled block
+
+
+# ---------------------------------------------------------------------------
+# Trust boundary
+# ---------------------------------------------------------------------------
+
+# Everything this module gathers except the config summary is text a human
+# typed — a channel topic, a doc, an announcement, a role name. It goes into a
+# *system* block, so without neutralizing the delimiters the prompt itself uses,
+# a channel topic could close the context section and open something that reads
+# like instructions. Strip the fence tags and any run of '=' that could forge a
+# "=== SECTION ===" header.
+_FENCE_RE = re.compile(r"</?untrusted[^>]*>|={3,}", re.I)
+
+
+def _untrusted(text: str | None) -> str:
+    """Neutralize prompt delimiters in one piece of member-written text.
+
+    Takes ``None`` because several callers pass a nullable DB column straight
+    in; the point is that no path can skip this by forgetting a coalesce.
+    """
+    return _FENCE_RE.sub(" ", str(text or ""))
+
+
+def _fenced(header: str, body: str) -> str:
+    """One context section, explicitly marked as member-written data.
+
+    The tags are what the system instructions' TRUST BOUNDARY rule points at
+    (``advisor_service._SYSTEM_INSTRUCTIONS_TEMPLATE``); changing them here
+    means changing them there.
+    """
+    return f"{header}\n<untrusted>\n{body}\n</untrusted>"
+
+
+# ---------------------------------------------------------------------------
+# Visibility gate
+# ---------------------------------------------------------------------------
+
+
+def can_view(channel, viewer) -> bool:
+    """True if ``viewer`` may see ``channel`` and it isn't an NSFW channel.
+
+    ``viewer`` is a Member (the asker) or a Role (``guild.default_role`` as the
+    public fallback). Any error resolving permissions fails closed (excluded),
+    and so does an age gate we can't establish — hence ``default=True``, which
+    reads as "assume age-gated, leave it out". The shared helper's own default
+    is the opposite because its other callers permit content rather than
+    withhold it; this is an exclusion, so it wants the other direction.
+
+    An age-restricted **category** excludes the channels inside it, the same
+    as the channel's own flag.
+    """
+    try:
+        if is_age_gated_channel(channel, default=True):
+            return False
+        return bool(channel.permissions_for(viewer).view_channel)
+    except Exception:  # noqa: BLE001 — fails closed by design (see docstring): any error resolving permissions must exclude the channel, not raise past the advisor context builder
+        return False
+
+
+def visible_text_channels(guild, viewer) -> list:
+    """Text channels ``viewer`` may see (``viewer=None`` → public @everyone).
+
+    Shared by the context builder and the web surface (which uses it to label
+    ``<#id>`` mentions), so both agree on exactly what the asker can see.
+    """
+    vis = viewer if viewer is not None else getattr(guild, "default_role", None)
+    if vis is None:
+        return []
+    return [ch for ch in getattr(guild, "text_channels", []) if can_view(ch, vis)]
+
+
+def is_private_room(channel, me=None) -> bool:
+    """True if a *specific member* was granted view — a per-member private room.
+
+    Jail channels, tickets, Pen Pals rooms and the bios wizard all create a
+    channel and hand view access to one or two named members; staff channels
+    gate on a role instead. That difference is the only reliable signal we have
+    without hard-coding four category ids, and it fails closed: an unreadable
+    overwrite map counts as private, and over-excluding costs context quality,
+    never confidentiality.
+
+    ``me`` is the bot's own member, whose overwrite these features also set and
+    which must not make every one of them look private.
+
+    These rooms are **named after the members in them** — ``penpals-alice-bob``,
+    ``jail-alice-1723``, ``bio-<user id>`` — so to a staff asker, who can see
+    them all, the channel list alone would hand the AI a roster of who is in
+    jail and who is talking to whom. That is why this gate now sits on the
+    channel list itself; it used to guard only the pin snapshot, which left the
+    names flowing regardless.
+    """
+    try:
+        overwrites = getattr(channel, "overwrites", None) or {}
+        my_id = getattr(me, "id", None)
+        for target, perms in overwrites.items():
+            if isinstance(target, discord.Role):
+                continue
+            if my_id is not None and getattr(target, "id", None) == my_id:
+                continue
+            if perms.view_channel:
+                return True
+    except Exception:  # noqa: BLE001 — fails closed by design (see docstring): an unreadable overwrite map counts as private, over-excluding costs context quality, never confidentiality
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Capability summary (what the asker can *do*)
+# ---------------------------------------------------------------------------
+
+
+def _can_see_config(member: discord.Member | None) -> bool:
+    """Config is admin-accessible, so only admins/manage-server get the summary."""
+    if member is None:
+        return False
+    p = member.guild_permissions
+    return bool(p.administrator or p.manage_guild)
+
+
+def is_server_admin(member: discord.Member | None) -> bool:
+    """Full ``administrator`` — stricter than :func:`_can_see_config`.
+
+    Gates the registry's ``admin_only`` settings (access roles, the jailed
+    role, who may mark Q&A answers). Manage Server is enough to *see* settings
+    and change ordinary ones; handing out access is a step above that.
+    """
+    if member is None:
+        return False
+    return bool(member.guild_permissions.administrator)
+
+
+def is_staff(member: discord.Member | None) -> bool:
+    """Whether the asker is a mod or admin — anyone with a staff-ish power.
+
+    Deliberately wider than :func:`_can_see_config` (admin/manage-server only):
+    this drives *answer quality* (which model handles the ask), not access to
+    settings, so a message-moderating mod counts even though they can't see
+    config.
+    """
+    if member is None:
+        return False
+    p = member.guild_permissions
+    return bool(
+        p.administrator
+        or p.manage_guild
+        or p.manage_messages
+        or p.moderate_members
+        or p.kick_members
+        or p.ban_members
+    )
+
+
+def can_post_public(member: discord.Member | None) -> bool:
+    """Whether this asker may push an ``/ask`` answer into the channel.
+
+    Staff-only, and for a different reason than :func:`is_staff`'s usual one:
+    a public post is the bot speaking to the whole room in a channel the asker
+    chose, so it is a moderation-shaped act, not a self-service one. Any mod
+    power is enough — the answer itself is stripped to what @everyone can see
+    (``build_asker_context(viewer=None)``) regardless of who asked, so a
+    higher bar would buy no extra safety.
+    """
+    return is_staff(member)
+
+
+# Never surface these — the config KV table holds at least one secret
+# (spotify_bot_refresh_token), and future *_token/*_secret keys must stay hidden.
+_SECRET_KEY_RE = re.compile(
+    r"token|secret|refresh|password|passwd|api[_-]?key|webhook|oauth|credential",
+    re.I,
+)
+_CONFIG_VALUE_MAXLEN = 200
+_CONFIG_MAX_LINES = 80  # per feature section
+_CONFIG_MAX_CHARS = 9000  # whole settings block
+
+
+def _fmt_value(guild, key: str, val):
+    """Render one setting value readably: ids → names, flags → on/off, else str."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return "on" if val else "off"
+    low = key.lower()
+    ival: int | None = None
+    if isinstance(val, int):
+        ival = val
+    elif isinstance(val, str) and val.strip().lstrip("-").isdigit():
+        ival = int(val.strip())
+    if ival is not None and ival != 0:
+        try:
+            if low.endswith(("channel_id", "channel")):
+                ch = guild.get_channel(ival)
+                return f"#{ch.name}" if ch else f"channel {ival}"
+            if low.endswith(("role_id", "role")):
+                r = guild.get_role(ival)
+                return f"@{r.name}" if r else f"role {ival}"
+        except (TypeError, AttributeError):
+            pass
+    if isinstance(val, str):
+        s = val.strip()
+        if s == "1":
+            return "on"
+        if s == "0":
+            return "off"
+        return s[:_CONFIG_VALUE_MAXLEN] or None
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, (list, tuple, set, frozenset)):
+        return f"{len(val)} configured" if val else None
+    if isinstance(val, dict):
+        return f"{len(val)} configured" if val else None
+    return str(val)[:_CONFIG_VALUE_MAXLEN]
+
+
+def _to_flat_dict(obj) -> dict | None:
+    """Coerce a loader's return (dataclass / Row / dict / list) to a flat dict."""
+    if obj is None:
+        return None
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    if isinstance(obj, sqlite3.Row):
+        return dict(obj)
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, (list, tuple)):
+        return {"entries": len(obj)} if obj else None
+    d = getattr(obj, "__dict__", None)
+    return dict(d) if d else None
+
+
+def _feature_section(guild, label: str, obj) -> str:
+    """One `[Label]` block of `key = value` lines for a feature's settings."""
+    d = _to_flat_dict(obj)
+    if not d:
+        return ""
+    lines: list[str] = []
+    for key, val in d.items():
+        skey = str(key)
+        if _SECRET_KEY_RE.search(skey):
+            continue
+        fv = _fmt_value(guild, skey, val)
+        if fv is None:
+            continue
+        lines.append(f"{skey} = {fv}")
+        if len(lines) >= _CONFIG_MAX_LINES:
+            break
+    return f"[{label}]\n" + "\n".join(lines) if lines else ""
+
+
+def _registry_feature_section(conn, guild, feature) -> str:
+    """One registry feature's KV-backed settings as a `[Label]` block.
+
+    Same shape as :func:`_feature_section`; unset keys are skipped so an
+    unconfigured feature yields "" and the caller's pointer-to-the-panel
+    message. The registry never lists secret-shaped keys (asserted at its
+    import), so no extra filtering is needed here.
+    """
+    lines: list[str] = []
+    for s in feature.settings:
+        raw = (get_config_value(conn, s.key, "", guild.id) or "").strip()
+        if not raw:
+            continue
+        # Channels/roles use "0" for "not configured" — skip rather than
+        # letting _fmt_value render the 0 as "off".
+        if s.kind in ("channel", "role") and raw in ("0", "-1"):
+            continue
+        fv = _fmt_value(guild, s.key, raw)
+        if fv is None:
+            continue
+        lines.append(f"{s.key} = {fv}")
+    if not lines:
+        return ""
+    if feature.extra_panel_only:
+        lines.append(
+            "(dashboard-only, not shown here: "
+            + ", ".join(feature.extra_panel_only) + ")"
+        )
+    return f"[{feature.label}]\n" + "\n".join(lines)
+
+
+def _mk_getter(module: str, func: str, kind: str) -> Callable:
+    """Lazily import a loader and adapt its call shape ('conn' vs 'dbpath')."""
+    def _get(conn, guild_id, db_path):
+        loader = getattr(importlib.import_module(module), func)
+        return loader(db_path, guild_id) if kind == "dbpath" else loader(conn, guild_id)
+    # Exposed for the test that imports every loader: a renamed or moved module
+    # otherwise only drops its section quietly at run time.
+    _get.target = (module, func)  # type: ignore[attr-defined]
+    return _get
+
+
+# Feature settings that live in their own tables (not the shared config KV).
+# Each getter is (conn, guild_id, db_path) -> dataclass|Row|dict|list|None.
+# Failures are isolated per feature, so a bad loader just drops that section.
+# (slug, display label, getter). The slug is a **stable key**, not a derived
+# one: it has to match ``settings_registry.Feature.slug`` for the union in
+# :func:`fetch_feature_settings` to hold, while the label is member-visible copy
+# that gets renamed. Deriving the slug from the label meant a copy edit could
+# split the union silently — renaming "Voice Master" to "Voice Control" on
+# 2026-07-27 moved this loader's key to ``voice_control`` while the registry
+# stayed on ``voice_master``, so neither name returned both sections.
+_FEATURE_LOADERS: list[tuple[str, str, Callable]] = [
+    ("economy", "Economy", _mk_getter("bot_modules.economy.service", "load_econ_settings", "conn")),
+    ("xp", "XP", _mk_getter("bot_modules.core.xp_system", "load_xp_settings", "conn")),
+    ("qa_rewards", "QA rewards", _mk_getter("bot_modules.qa.service", "load_qa_settings", "conn")),
+    ("voice_master", "Voice Control", _mk_getter("bot_modules.voice.master.service", "load_voice_master_config", "conn")),
+    ("wellness", "Wellness", _mk_getter("bot_modules.wellness.service", "get_wellness_config", "conn")),
+    ("chat_revive", "Chat Revive", _mk_getter("bot_modules.chat_revive.service", "get_guild_config", "conn")),
+    ("starboard", "Starboard", _mk_getter("bot_modules.starboard.service", "get_starboard_config", "conn")),
+    ("dm_permissions", "DM permissions", _mk_getter("bot_modules.dm.perms.service", "get_dms_config_with_conn", "conn")),
+    ("whisper", "Whisper", _mk_getter("bot_modules.whisper.repo", "get_whisper_config", "conn")),
+    ("guess", "Guess", _mk_getter("bot_modules.games.guess.repo", "get_guess_config", "conn")),
+    ("confessions", "Confessions", _mk_getter("bot_modules.confessions.service", "get_config_conn", "conn")),
+    ("grant_roles", "Grant roles", _mk_getter("bot_modules.core.db_utils", "get_grant_roles", "conn")),
+    ("color_palette", "Color palette", _mk_getter("bot_modules.economy.color_catalog_service", "list_catalog", "conn")),
+    ("auto_delete", "Auto-delete", _mk_getter("bot_modules.auto_delete.service", "list_auto_delete_rules_for_guild_with_conn", "conn")),
+    ("auto_react", "Auto-react", _mk_getter("bot_modules.auto_react.service", "list_auto_react_rules_for_guild_with_conn", "conn")),
+    ("voice_transcription", "Voice transcription", _mk_getter("bot_modules.voice.transcription.service", "get_config", "conn")),
+    ("inactivity_prune", "Inactivity prune", _mk_getter("bot_modules.inactive.prune_service", "get_prune_rule", "dbpath")),
+]
+
+
+def _slugify(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+
+_FEATURES_BY_SLUG: dict[str, tuple[str, Callable]] = {
+    slug: (label, getter) for slug, label, getter in _FEATURE_LOADERS
+}
+
+# The model sees display labels in the summary but has to call the tool with a
+# slug, so accept what a label slugifies to as well. Keeps "voice_control"
+# working now that the label and the key intentionally disagree.
+_SLUG_ALIASES: dict[str, str] = {
+    _slugify(label): slug
+    for slug, label, _ in _FEATURE_LOADERS
+    if _slugify(label) != slug
+}
+
+# KV-backed features described in the settings registry (greeting watch,
+# intake, welcome, …). Their keys live in the shared config table, but burying
+# them behind "general" made the model conclude it couldn't see them — so each
+# registry feature is fetchable by its own slug, same as the own-table ones.
+_REGISTRY_BY_SLUG = {f.slug: f for f in REGISTRY_FEATURES}
+
+# "general" is the shared config KV table (welcome, moderation, spoiler, …).
+FEATURE_KEYS: list[str] = [
+    "general", *dict.fromkeys((*_FEATURES_BY_SLUG, *_REGISTRY_BY_SLUG))
+]
+
+can_see_config = _can_see_config  # public alias for surface wiring
+
+
+def fetch_feature_settings(
+    guild, member: discord.Member | None, db_path, feature: str
+) -> str:
+    """One feature's settings on demand — the handler behind the advisor's
+    ``get_server_settings`` tool.
+
+    Same formatting, secret filtering, and admin gate as the inline summary,
+    but fetched per question instead of dumped into every prompt. Returns
+    human/model-readable text in every case (errors included) — the tool
+    result goes straight back to the model.
+    """
+    if not _can_see_config(member):
+        return "Not available: only server admins can view server settings."
+    slug = _slugify(feature or "")
+    slug = _SLUG_ALIASES.get(slug, slug)
+    try:
+        with open_db(db_path) as conn:
+            if slug == "general":
+                sec = _kv_config_section(conn, guild)
+            elif slug in _FEATURES_BY_SLUG or slug in _REGISTRY_BY_SLUG:
+                # A slug can be both (e.g. voice_master: own-table settings
+                # plus KV keys) — show every section that has values.
+                parts: list[str] = []
+                if slug in _FEATURES_BY_SLUG:
+                    label, getter = _FEATURES_BY_SLUG[slug]
+                    parts.append(
+                        _feature_section(guild, label, getter(conn, guild.id, db_path))
+                    )
+                if slug in _REGISTRY_BY_SLUG:
+                    parts.append(
+                        _registry_feature_section(conn, guild, _REGISTRY_BY_SLUG[slug])
+                    )
+                sec = "\n\n".join(p for p in parts if p)
+            else:
+                return (
+                    f"Unknown feature '{feature}'. "
+                    f"Available: {', '.join(FEATURE_KEYS)}."
+                )
+    except Exception:
+        log.exception("advisor settings fetch failed: %s / %s", getattr(guild, "id", "?"), slug)
+        return "Couldn't read those settings just now — suggest the dashboard panel instead."
+    return sec or (
+        f"No saved settings for '{slug}' — the feature may be unconfigured. "
+        "Point the admin to its dashboard panel."
+    )
+
+
+def _kv_config_section(conn, guild) -> str:
+    """The shared config KV table (welcome, moderation, spoiler, …), secret-filtered."""
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM config WHERE guild_id = ? ORDER BY key",
+            (guild.id,),
+        ).fetchall()
+    except Exception:
+        log.exception("advisor KV config read failed for guild %s", getattr(guild, "id", "?"))
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        key = row["key"]
+        if _SECRET_KEY_RE.search(key):
+            continue
+        raw = row["value"]
+        if raw is None or len(str(raw)) > _CONFIG_VALUE_MAXLEN:
+            continue  # skip long blobs (prompts / JSON)
+        fv = _fmt_value(guild, key, raw)
+        if fv is None:
+            continue
+        lines.append(f"{key} = {fv}")
+        if len(lines) >= _CONFIG_MAX_LINES:
+            break
+    return "[General]\n" + "\n".join(lines) if lines else ""
+
+
+def build_config_summary(conn, guild, member: discord.Member | None, db_path=None) -> str:
+    """A secret-filtered, name-resolved view of the guild's settings across features.
+
+    Only returned to admins. Combines the shared `config` KV table with each
+    feature's own settings loader (economy, wellness, voice control, …). Values
+    are shown as raw `field = value` lines so the model reads them directly.
+    """
+    if not _can_see_config(member):
+        return ""
+
+    sections: list[str] = []
+    kv = _kv_config_section(conn, guild)
+    if kv:
+        sections.append(kv)
+
+    total = len(kv)
+    for _slug, label, getter in _FEATURE_LOADERS:
+        if total > _CONFIG_MAX_CHARS:
+            break
+        try:
+            sec = _feature_section(guild, label, getter(conn, guild.id, db_path))
+        except Exception:  # noqa: BLE001 — one feature's loader failing drops its section, not the summary; debug-level on purpose, a broken loader isn't an operator alert
+            log.debug("advisor config loader %s failed", label, exc_info=True)
+            continue
+        if sec:
+            sections.append(sec)
+            total += len(sec)
+
+    if not sections:
+        return ""
+    header = (
+        "Server settings — the asker is an admin, so you can see these. Only "
+        "what's listed here is visible to you; if a setting or feature isn't "
+        "here, say you can't see it and point to its dashboard panel. Values are "
+        "raw field names (e.g. welcome_channel_id = #welcome); read them sensibly.\n\n"
+    )
+    return (header + "\n\n".join(sections))[: _CONFIG_MAX_CHARS + 500]
+
+
+def capability_summary(member: discord.Member | None) -> str:
+    """One line describing the asker's powers, for answer tailoring.
+
+    Deliberately nameless. The asker's nickname used to open this line, and it
+    bought nothing — the answers turn on what the asker *can do*, not on who
+    they are — so it went with the pins (todo #100). Role names stay: they are
+    admin-set server structure, and "you'd need @Denizen for that" is the
+    permission-tailoring the whole feature rests on.
+    """
+    if member is None:
+        return "The person asking is a regular member (no special permissions)."
+
+    p = member.guild_permissions
+    # Role names are admin-set text going into a system block; the sentence
+    # around them is ours, the values are not.
+    if p.administrator:
+        powers = "is a server administrator (full control)"
+    else:
+        parts: list[str] = []
+        if p.manage_guild:
+            parts.append("manage server settings")
+        if p.manage_roles:
+            parts.append("manage roles")
+        if p.manage_channels:
+            parts.append("manage channels")
+        if p.manage_messages:
+            parts.append("moderate messages (pin/delete/purge)")
+        if p.moderate_members or p.kick_members or p.ban_members:
+            parts.append("take moderator actions on members")
+        powers = "can " + ", ".join(parts) if parts else "is a regular member with no moderator or admin powers"
+
+    roles = [_untrusted(r.name) for r in getattr(member, "roles", []) if getattr(r, "name", "") not in ("@everyone", "")]
+    role_note = f" Roles: {', '.join(roles)}." if roles else ""
+    return f"The person asking {powers}.{role_note}"
+
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+#
+# No member-written *messages* reach this module. A background loop used to
+# snapshot every shared channel's pins and feed them in as context — up to five
+# per channel, taking an embed's title+description when a message had no
+# content. That put arbitrary member-authored text (and anything posted as an
+# embed, which is the shape a bio takes) in front of the AI, which is a wider
+# reach than a help assistant needs. Removed 2026-08-16 (todo #100) along with
+# the asker's own display name and the per-member private rooms whose *names*
+# identify their occupants. What stays is server-level material — shared
+# channel names and topics, staff-authored docs and announcements, and the
+# asker's permissions, which the answers have to be tailored to. Don't add a
+# message, transcript, or profile source back without a decision recorded in
+# docs/data_register.md.
+
+
+def build_asker_context(
+    guild: discord.Guild,
+    viewer: discord.Member | None,
+    db_path,
+    *,
+    include_config: bool = True,
+) -> str:
+    """Assemble the live, visibility-scoped server context block for one asker.
+
+    ``viewer`` is the asking Member when known; when it's ``None`` (e.g. a
+    dashboard user we couldn't resolve to a guild member) we fall back to the
+    guild's public (@everyone) visibility.
+
+    ``include_config=False`` skips the inline admin settings dump — used when
+    the caller gives the advisor the ``get_server_settings`` tool instead, so
+    settings are fetched on demand rather than paid for on every ask.
+    """
+    # Per-member rooms are dropped even from a staff asker's list: they are
+    # named after their occupants, so listing them tells the AI who is in jail
+    # and who is paired with whom (see :func:`is_private_room`).
+    me = getattr(guild, "me", None)
+    visible = [
+        ch for ch in visible_text_channels(guild, viewer) if not is_private_room(ch, me)
+    ]
+    visible_ids = {ch.id for ch in visible}
+
+    sections: list[str] = [capability_summary(viewer)]
+
+    # Channels the asker can see (name + <#id> mention + topic).
+    topic_lines = [
+        f"#{_untrusted(ch.name)} (<#{ch.id}>) — "
+        f"{_untrusted(ch.topic.strip()[:MAX_TOPIC_CHARS])}"
+        for ch in visible
+        if getattr(ch, "topic", None)
+    ]
+    if topic_lines:
+        sections.append(_fenced("Channels you can see:", "\n".join(topic_lines)))
+
+    # Server docs, announcements, and (for admins) core settings come from the DB.
+    config_text = ""
+    try:
+        with open_db(db_path) as conn:
+            docs = list_docs(conn, guild.id)
+            anns = list_announcements(conn, guild.id)
+            if include_config:
+                config_text = build_config_summary(conn, guild, viewer, db_path)
+    except Exception:
+        log.exception("advisor context DB read failed for guild %s", getattr(guild, "id", "?"))
+        docs, anns = [], []
+
+    # High-signal for admins — place right after the "who's asking" line.
+    if config_text:
+        sections.insert(1, config_text)
+
+    doc_lines = []
+    for d in docs[:MAX_DOCS]:
+        body = (d.get("body_md") or "").strip()[:MAX_DOC_CHARS]
+        if body:
+            title = _untrusted(d.get("title") or d.get("doc_key"))
+            doc_lines.append(f"## {title}\n{_untrusted(body)}")
+    if doc_lines:
+        sections.append(_fenced("Server docs:", "\n\n".join(doc_lines)))
+
+    # Recent *sent* announcements whose target channel the asker can see.
+    ann_lines = []
+    for row in anns:
+        if row["status"] != "sent":
+            continue
+        ch_id = row["sent_channel_id"] or row["channel_id"]
+        if ch_id and ch_id not in visible_ids:
+            continue
+        title = _untrusted((row["title"] or "").strip())
+        body = _untrusted((row["body"] or "").strip()[:MAX_ANNOUNCEMENT_CHARS])
+        entry = (f"**{title}** — " if title.strip() else "") + body
+        if entry.strip():
+            ann_lines.append(entry.strip())
+        if len(ann_lines) >= MAX_ANNOUNCEMENTS:
+            break
+    if ann_lines:
+        sections.append(
+            _fenced("Recent announcements:", "\n".join(f"- {a}" for a in ann_lines))
+        )
+
+    return "\n\n".join(sections)[:MAX_CONTEXT_CHARS]

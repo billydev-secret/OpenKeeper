@@ -1,0 +1,39 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: gate-scoped
+        name: gate (ruff + scoped tests)
+        # gate.py locates the repo venv itself, so this works on Linux and
+        # Windows with whatever `python` is on PATH. --scoped runs only the
+        # tests mapped to the staged diff; a shared-file change (core, deps,
+        # conftest) falls back to the full suite, so a commit can occasionally
+        # take longer. Use `git commit --no-verify` to bypass in a pinch.
+        entry: python scripts/gate.py --scoped
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: no-attribution-trailers
+        name: no attribution trailers
+        # CLAUDE.md § Commits forbids Co-Authored-By / Claude-Session lines.
+        # A commit message is the one artefact that cannot be fixed after the
+        # fact without rewriting history, so the check belongs here rather
+        # than at review time. pre-commit passes the message file as the
+        # single filename argument on this stage.
+        #
+        # THIS ENTRY IS INERT UNTIL SOMEONE INSTALLS THE HOOK. git only runs
+        # commit-msg if .git/hooks/commit-msg exists, and nothing here creates
+        # it — `pre-commit install --hook-type commit-msg` does, writing into
+        # the git common dir that every worktree shares. One install therefore
+        # arms this for all five sessions at once, which is why it is a
+        # deliberate press and not a side effect of merging.
+        #
+        # Until then the backstop still runs on every full suite and in CI:
+        # tests/contracts/test_commit_trailer_contract.py scans history since the
+        # grandfather cutoff, and tests/tooling/test_check_commit_msg.py covers this
+        # script's own behaviour.
+        entry: python scripts/check_commit_msg.py
+        language: system
+        stages: [commit-msg]

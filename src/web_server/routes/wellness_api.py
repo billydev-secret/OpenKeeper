@@ -1,0 +1,876 @@
+"""Wellness Guardian JSON API — read + write endpoints for the dashboard SPA,
+mounted under ``/api/wellness/`` (the admin half is ``wellness_admin``, under
+``/api/wellness/admin/``).
+
+Each endpoint reads the shared `dk_session` cookie via `require_user`,
+mutates/reads state via `bot_modules.wellness.service`, and returns JSON.
+Write endpoints return `{ok: true, ...}` or `{ok: false, error: "..."}`.
+Read endpoints return the data directly.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
+
+from bot_modules.core.utils import format_user_for_log
+from bot_modules.wellness.service import (
+    AWAY_MESSAGE_MAX_LEN,
+    BLACKOUT_TEMPLATES,
+    CAP_SCOPES,
+    CAP_WINDOWS,
+    ENFORCEMENT_LEVELS,
+    NOTIFICATION_PREFS,
+    add_blackout,
+    add_cap,
+    ensure_streak,
+    find_blackout_by_name,
+    find_cap_by_label,
+    get_cap,
+    get_wellness_config,
+    get_wellness_user,
+    list_blackouts,
+    list_caps,
+    list_weekly_reports,
+    next_milestone,
+    opt_out_user,
+    pause_user,
+    remove_blackout,
+    remove_cap,
+    resume_user,
+    toggle_blackout,
+    update_away_message,
+    update_cap_bucket_limits,
+    update_cap_limit,
+    update_user_settings,
+    user_now,
+)
+from web_server.auth import AuthenticatedUser
+from web_server.deps import run_query
+from web_server.routes.wellness_deps import get_ctx, get_guild_id, require_user
+
+log = logging.getLogger("dungeonkeeper.wellness.web.api")
+
+router = APIRouter()
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+_DAY_LETTERS = ["M", "T", "W", "T", "F", "S", "S"]
+
+
+def _blackout_to_dict(b) -> dict:
+    days_str = "".join(_DAY_LETTERS[i] for i in range(7) if b.days_mask & (1 << i))
+    return {
+        "id": b.id,
+        "name": b.name,
+        "enabled": b.enabled,
+        "start_str": f"{b.start_minute // 60:02d}:{b.start_minute % 60:02d}",
+        "end_str": f"{b.end_minute // 60:02d}:{b.end_minute % 60:02d}",
+        "start_minute": b.start_minute,
+        "end_minute": b.end_minute,
+        "days_mask": b.days_mask,
+        "days_str": days_str or "—",
+    }
+
+
+def _cap_to_dict(c) -> dict:
+    d = {
+        "id": c.id,
+        "label": c.label,
+        "scope": c.scope,
+        # Snowflake-as-string: a channel/category id exceeds 2^53 and would
+        # lose its low digits once JSON.parse turns it into a JS number. The
+        # write side accepts either form (`int(...)` on the payload).
+        "scope_target_id": str(c.scope_target_id),
+        "window": c.window,
+        "limit": c.cap_limit,
+        "exclude_exempt": c.exclude_exempt,
+    }
+    if c.bucket_limits is not None:
+        d["bucket_limits"] = c.bucket_limits
+    return d
+
+
+# ── Read (GET) endpoints ──────────────────────────────────────────────
+
+
+@router.get("/me")
+async def wellness_me(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    """Current user's wellness overview — streak, counts, settings."""
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            wuser = get_wellness_user(conn, guild_id, user_id)
+            if wuser is None or not wuser.is_active:
+                return None  # sentinel: not opted in
+            now_local = user_now(wuser.timezone)
+            today_iso = now_local.date().isoformat()
+            streak = ensure_streak(conn, guild_id, user_id, today_iso)
+            caps = list_caps(conn, guild_id, user_id)
+            blackouts = list_blackouts(conn, guild_id, user_id)
+            return wuser, streak, caps, blackouts
+
+    _result = await run_query(_q)
+    if _result is None:
+        return {"opted_in": False}
+    wuser, streak, caps, blackouts = _result
+
+    nxt = next_milestone(streak.current_days)
+    next_text = (
+        f"{nxt[1]} {nxt[0]} days ({nxt[0] - streak.current_days} to go)"
+        if nxt
+        else "Top tier"
+    )
+
+    return {
+        "opted_in": True,
+        "timezone": wuser.timezone,
+        "enforcement_level": wuser.enforcement_level,
+        "notifications_pref": wuser.notifications_pref,
+        "public_commitment": wuser.public_commitment,
+        "daily_reset_hour": wuser.daily_reset_hour,
+        "slow_mode_rate_seconds": wuser.slow_mode_rate_seconds,
+        "away_enabled": wuser.away_enabled,
+        "away_message": wuser.away_message,
+        "paused_until": wuser.paused_until,
+        "streak": {
+            "current_days": streak.current_days,
+            "personal_best": streak.personal_best,
+            "badge": streak.current_badge,
+            "start_date": streak.streak_start_date,
+        },
+        "next_milestone_text": next_text,
+        "caps_count": len(caps),
+        "blackouts_count": len([b for b in blackouts if b.enabled]),
+        "enforcement_levels": ENFORCEMENT_LEVELS,
+        "notification_prefs": NOTIFICATION_PREFS,
+    }
+
+
+@router.get("/caps")
+async def get_caps(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            return list_caps(conn, guild_id, user_id)
+
+    caps = await run_query(_q)
+    return {
+        "caps": [_cap_to_dict(c) for c in caps],
+        "scopes": CAP_SCOPES,
+        "windows": CAP_WINDOWS,
+    }
+
+
+_HOUR_LABELS = [
+    "12am",
+    "1am",
+    "2am",
+    "3am",
+    "4am",
+    "5am",
+    "6am",
+    "7am",
+    "8am",
+    "9am",
+    "10am",
+    "11am",
+    "12pm",
+    "1pm",
+    "2pm",
+    "3pm",
+    "4pm",
+    "5pm",
+    "6pm",
+    "7pm",
+    "8pm",
+    "9pm",
+    "10pm",
+    "11pm",
+]
+_DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@router.get("/activity-histogram")
+async def activity_histogram(
+    mode: str = Query("daily"),
+    days: int = Query(30),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    """Average messages posted per hour-of-day (daily) or day-of-week (weekly).
+
+    Enforcement counts *messages*, so the caps panel's sliders must be seeded
+    in messages too. Message-shaped xp_events (source text/reply — one row
+    per message that earned XP) are the proxy; averaging their per-message XP
+    *amount* instead (as this endpoint originally did) produced limits several
+    times tighter than real behavior, e.g. 1-message-per-hour caps.
+    """
+    if mode not in ("daily", "weekly"):
+        return _err("mode must be 'daily' or 'weekly'")
+    days = max(7, min(days, 180))
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            wuser = get_wellness_user(conn, guild_id, user_id)
+            tz_name = wuser.timezone if wuser and wuser.timezone else "UTC"
+            try:
+                tz = ZoneInfo(tz_name)
+            except (ValueError, ZoneInfoNotFoundError):
+                tz = ZoneInfo("UTC")
+            cutoff = time.time() - days * 86400
+            rows = conn.execute(
+                "SELECT created_at FROM xp_events "
+                "WHERE guild_id = ? AND user_id = ? AND created_at >= ? "
+                "AND source IN ('text', 'reply') ORDER BY created_at",
+                (guild_id, user_id, cutoff),
+            ).fetchall()
+            return tz, rows
+
+    tz, rows = await run_query(_q)
+
+    n_buckets = 24 if mode == "daily" else 7
+    labels = _HOUR_LABELS if mode == "daily" else _DAY_LABELS
+    counts = [0] * n_buckets
+
+    for row in rows:
+        dt = datetime.fromtimestamp(float(row["created_at"]), tz=tz)
+        idx = dt.hour if mode == "daily" else dt.weekday()
+        counts[idx] += 1
+
+    # Compute number of distinct days/weeks covered for averaging
+    if mode == "daily":
+        distinct_periods = max(1, days)
+    else:
+        distinct_periods = max(1, days // 7)
+
+    buckets = [
+        {
+            "index": i,
+            "label": labels[i],
+            "avg_messages": round(counts[i] / distinct_periods, 1),
+            "count": counts[i],
+        }
+        for i in range(n_buckets)
+    ]
+
+    return {
+        "mode": mode,
+        "days_covered": days,
+        "total_events": len(rows),
+        "buckets": buckets,
+    }
+
+
+@router.get("/blackouts")
+async def get_blackouts(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            return list_blackouts(conn, guild_id, user_id)
+
+    blackouts = await run_query(_q)
+    return {
+        "blackouts": [_blackout_to_dict(b) for b in blackouts],
+        "templates": list(BLACKOUT_TEMPLATES.keys()),
+    }
+
+
+@router.get("/away")
+async def get_away(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            return get_wellness_user(conn, guild_id, user_id)
+
+    wuser = await run_query(_q)
+    if wuser is None or not wuser.is_active:
+        return {"opted_in": False}
+    return {
+        "opted_in": True,
+        "enabled": wuser.away_enabled,
+        "message": wuser.away_message,
+        "max_len": AWAY_MESSAGE_MAX_LEN,
+    }
+
+
+@router.get("/history")
+async def get_history(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+):
+    user_id = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            return list_weekly_reports(conn, guild_id, user_id, limit=12)
+
+    rows = await run_query(_q)
+
+    reports = []
+    for r in rows:
+        try:
+            report_data = json.loads(r["report_json"])
+        except (ValueError, TypeError):
+            report_data = {}
+        reports.append(
+            {
+                "iso_year": int(r["iso_year"]),
+                "iso_week": int(r["iso_week"]),
+                "week_start": str(r["week_start"]),
+                "ai_text": str(r["ai_text"]),
+                "summary": report_data,
+            }
+        )
+    return {"reports": reports}
+
+
+def _ok(**extra: Any) -> JSONResponse:
+    return JSONResponse({"ok": True, **extra})
+
+
+def _err(message: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status)
+
+
+async def _require_active(ctx, guild_id: int, user_id: int):
+    """Returns the WellnessUser if active, otherwise raises HTTPException 403."""
+    def _q():
+        with ctx.open_db() as conn:
+            return get_wellness_user(conn, guild_id, user_id)
+
+    wuser = await run_query(_q)
+    if wuser is None or not wuser.is_active:
+        raise HTTPException(
+            status_code=403, detail="You must opt in to wellness first."
+        )
+    return wuser
+
+
+# ── Settings ────────────────────────────────────────────────────────────
+
+
+@router.post("/settings")
+async def update_settings(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+
+    timezone = payload.get("timezone")
+    enforcement_level = payload.get("enforcement_level")
+    notifications_pref = payload.get("notifications_pref")
+    public_commitment = payload.get("public_commitment")
+    daily_reset_hour = payload.get("daily_reset_hour")
+    slow_mode_rate_seconds = payload.get("slow_mode_rate_seconds")
+
+    if enforcement_level is not None and enforcement_level not in ENFORCEMENT_LEVELS:
+        return _err("Invalid enforcement_level")
+    if notifications_pref is not None and notifications_pref not in NOTIFICATION_PREFS:
+        return _err("Invalid notifications_pref")
+    if daily_reset_hour is not None:
+        try:
+            daily_reset_hour = int(daily_reset_hour)
+        except (TypeError, ValueError):
+            return _err("daily_reset_hour must be an integer 0-23")
+        if not (0 <= daily_reset_hour < 24):
+            return _err("daily_reset_hour must be between 0 and 23")
+    if slow_mode_rate_seconds is not None:
+        try:
+            slow_mode_rate_seconds = int(slow_mode_rate_seconds)
+        except (TypeError, ValueError):
+            return _err("slow_mode_rate_seconds must be an integer")
+        if slow_mode_rate_seconds < 1:
+            return _err("slow_mode_rate_seconds must be ≥ 1")
+
+    tz_value = timezone if isinstance(timezone, str) and timezone else None
+    pub_value = bool(public_commitment) if public_commitment is not None else None
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            update_user_settings(
+                conn,
+                guild_id,
+                user_id,
+                timezone=tz_value,
+                enforcement_level=enforcement_level,
+                notifications_pref=notifications_pref,
+                public_commitment=pub_value,
+                daily_reset_hour=daily_reset_hour,
+                slow_mode_rate_seconds=slow_mode_rate_seconds,
+            )
+
+    await run_query(_write)
+    return _ok()
+
+
+@router.post("/pause")
+async def pause(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    try:
+        minutes = int(payload.get("minutes", 0))
+    except (TypeError, ValueError):
+        return _err("minutes must be an integer")
+    if minutes < 1 or minutes > 7 * 24 * 60:
+        return _err("minutes must be between 1 and 10080 (7 days)")
+    until = time.time() + minutes * 60
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            pause_user(conn, guild_id, user_id, until)
+
+    await run_query(_write)
+    return _ok(paused_until=until)
+
+
+@router.post("/resume")
+async def resume(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            resume_user(conn, guild_id, user_id)
+
+    await run_query(_write)
+    return _ok()
+
+
+@router.post("/optout")
+async def optout(
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    """Leave the program. A boundary tool must always have an exit.
+
+    opt_out_user() deactivates tracking, lifts slow mode, and clears pause /
+    cooldown / blackout markers; settings are retained 30 days (nightly sweep)
+    so a re-opt-in within that window restores the member's configuration.
+    """
+    await _require_active(ctx, guild_id, user.user_id)
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            opt_out_user(conn, guild_id, user_id)
+            return get_wellness_config(conn, guild_id)
+
+    cfg = await run_query(_write)
+
+    # Best-effort: take the wellness role off so the member also leaves the
+    # wellness channels. Failure never blocks the opt-out itself.
+    bot = getattr(ctx, "bot", None)
+    if bot and cfg and cfg.role_id:
+        guild = bot.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+        role = guild.get_role(cfg.role_id) if guild else None
+        if member and role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Wellness Guardian opt-out")
+            except Exception as e:  # noqa: BLE001 — the opt-out is already saved; a failed role removal is logged, never a failed request
+                log.warning(
+                    "Could not remove wellness role from %s on opt-out: %s",
+                    format_user_for_log(member, user_id),
+                    e,
+                )
+    return _ok()
+
+
+# ── Caps ────────────────────────────────────────────────────────────────
+
+
+@router.post("/caps")
+async def create_cap(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+
+    label = str(payload.get("label", "")).strip()
+    scope = str(payload.get("scope", "")).strip()
+    window = str(payload.get("window", "")).strip()
+    try:
+        cap_limit = int(payload.get("limit", 0))
+    except (TypeError, ValueError):
+        return _err("limit must be an integer")
+    try:
+        scope_target_id = int(payload.get("scope_target_id", 0))
+    except (TypeError, ValueError):
+        scope_target_id = 0
+    exclude_exempt = bool(payload.get("exclude_exempt", True))
+
+    if not label:
+        return _err("label is required")
+    if scope not in CAP_SCOPES:
+        return _err(f"scope must be one of {','.join(CAP_SCOPES)}")
+    if window not in CAP_WINDOWS:
+        return _err(f"window must be one of {','.join(CAP_WINDOWS)}")
+    if cap_limit < 1:
+        return _err("limit must be ≥ 1")
+    # Channel/category caps need a picker (not yet built) to supply
+    # scope_target_id; without one they persist target 0, which enforcement
+    # can never match (and for category would apply to every uncategorized
+    # channel). Reject them — and voice — until the picker lands rather than
+    # ship a scope that isn't enforced.
+    if scope in ("channel", "category") and scope_target_id <= 0:
+        return _err(f"{scope} scope requires a target (coming soon)")
+    if scope == "voice":
+        return _err("voice scope is coming soon")
+
+    # Optional per-bucket limits (list of ints)
+    bucket_limits = payload.get("bucket_limits")
+    if bucket_limits is not None:
+        if not isinstance(bucket_limits, list) or not all(
+            isinstance(v, int) and v >= 1 for v in bucket_limits
+        ):
+            return _err("bucket_limits must be a list of positive integers")
+        expected_len = 24 if window == "daily" else 7 if window == "weekly" else 0
+        if expected_len and len(bucket_limits) != expected_len:
+            return _err(
+                f"bucket_limits must have {expected_len} entries for {window} window"
+            )
+        cap_limit = max(bucket_limits)
+
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            if find_cap_by_label(conn, guild_id, user_id, label):
+                return None  # sentinel: label already exists
+            return add_cap(
+                conn,
+                guild_id,
+                user_id,
+                label=label,
+                scope=scope,
+                scope_target_id=scope_target_id,
+                window=window,
+                cap_limit=cap_limit,
+                exclude_exempt=exclude_exempt,
+                bucket_limits=bucket_limits,
+            )
+
+    cap_id = await run_query(_write)
+    if cap_id is None:
+        return _err(f"a cap named '{label}' already exists")
+    return _ok(id=cap_id)
+
+
+@router.put("/caps/{cap_id}")
+async def edit_cap(
+    cap_id: int,
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    user_id = user.user_id
+
+    bucket_limits = payload.get("bucket_limits")
+    if bucket_limits is not None:
+        if not isinstance(bucket_limits, list) or not all(
+            isinstance(v, int) and v >= 1 for v in bucket_limits
+        ):
+            return _err("bucket_limits must be a list of positive integers")
+        bucket_limits_snap = bucket_limits
+
+        def _write_buckets():
+            with ctx.open_db() as conn:
+                cap = get_cap(conn, cap_id)
+                if cap is None or cap.user_id != user_id or cap.guild_id != guild_id:
+                    return {"_err": "cap not found", "_status": 404}
+                expected_len = (
+                    24 if cap.window == "daily" else 7 if cap.window == "weekly" else 0
+                )
+                if expected_len and len(bucket_limits_snap) != expected_len:
+                    return {
+                        "_err": f"bucket_limits must have {expected_len} entries for {cap.window} window",
+                        "_status": 400,
+                    }
+                update_cap_bucket_limits(conn, cap_id, bucket_limits_snap)
+                return None  # success
+
+        _res = await run_query(_write_buckets)
+        if _res is not None:
+            return _err(_res["_err"], status=_res["_status"])
+        return _ok()
+
+    try:
+        new_limit = int(payload.get("limit", 0))
+    except (TypeError, ValueError):
+        return _err("limit must be an integer")
+    if new_limit < 1:
+        return _err("limit must be ≥ 1")
+
+    def _write_limit():
+        with ctx.open_db() as conn:
+            cap = get_cap(conn, cap_id)
+            if cap is None or cap.user_id != user_id or cap.guild_id != guild_id:
+                return {"_err": "cap not found", "_status": 404}
+            update_cap_limit(conn, cap_id, new_limit)
+            return None  # success
+
+    _res = await run_query(_write_limit)
+    if _res is not None:
+        return _err(_res["_err"], status=_res["_status"])
+    return _ok()
+
+
+@router.delete("/caps/{cap_id}")
+async def delete_cap(
+    cap_id: int,
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            cap = get_cap(conn, cap_id)
+            if cap is None or cap.user_id != user_id or cap.guild_id != guild_id:
+                return {"_err": "cap not found", "_status": 404}
+            remove_cap(conn, cap_id)
+            return None  # success
+
+    _res = await run_query(_write)
+    if _res is not None:
+        return _err(_res["_err"], status=_res["_status"])
+    return _ok()
+
+
+# ── Blackouts ───────────────────────────────────────────────────────────
+
+_DAY_NAME_TO_BIT = {
+    "mon": 1,
+    "tue": 2,
+    "wed": 4,
+    "thu": 8,
+    "fri": 16,
+    "sat": 32,
+    "sun": 64,
+}
+
+
+def _parse_days_mask(value: Any) -> int:
+    """Accept either an int days_mask, or a list of day names like ['mon', 'tue']."""
+    if isinstance(value, int):
+        return value & 0x7F
+    if isinstance(value, list):
+        mask = 0
+        for d in value:
+            mask |= _DAY_NAME_TO_BIT.get(str(d).lower()[:3], 0)
+        return mask
+    return 0
+
+
+def _parse_minute(value: Any) -> int | None:
+    """Accept either an int (minutes from midnight) or 'HH:MM' string."""
+    if isinstance(value, int):
+        return value if 0 <= value < 24 * 60 else None
+    if isinstance(value, str) and ":" in value:
+        try:
+            h, m = value.split(":", 1)
+            mins = int(h) * 60 + int(m)
+            return mins if 0 <= mins < 24 * 60 else None
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+@router.post("/blackouts")
+async def create_blackout(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+
+    template_key = str(payload.get("template", "")).strip()
+    start_minute: int | None
+    end_minute: int | None
+    if template_key:
+        tpl = BLACKOUT_TEMPLATES.get(template_key)
+        if not tpl:
+            return _err(f"unknown template '{template_key}'")
+        name = str(tpl["name"])
+        start_minute = int(tpl["start_minute"])
+        end_minute = int(tpl["end_minute"])
+        days_mask = int(tpl["days_mask"])
+    else:
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return _err("name is required")
+        start_minute = _parse_minute(payload.get("start"))
+        end_minute = _parse_minute(payload.get("end"))
+        if start_minute is None or end_minute is None:
+            return _err("start/end must be 'HH:MM' or minutes-since-midnight")
+        if start_minute == end_minute:
+            return _err("start and end cannot be identical")
+        days_mask = _parse_days_mask(payload.get("days"))
+        if days_mask == 0:
+            return _err("at least one day must be selected")
+
+    user_id = user.user_id
+    start_min = start_minute
+    end_min = end_minute
+
+    def _write():
+        with ctx.open_db() as conn:
+            if find_blackout_by_name(conn, guild_id, user_id, name):
+                return None  # sentinel: already exists
+            return add_blackout(
+                conn,
+                guild_id,
+                user_id,
+                name=name,
+                start_minute=start_min,
+                end_minute=end_min,
+                days_mask=days_mask,
+            )
+
+    blackout_id = await run_query(_write)
+    if blackout_id is None:
+        return _err(f"a blackout named '{name}' already exists")
+    return _ok(id=blackout_id)
+
+
+@router.put("/blackouts/{blackout_id}/toggle")
+async def toggle_blackout_endpoint(
+    blackout_id: int,
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    enabled = bool(payload.get("enabled", False))
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            row = conn.execute(
+                "SELECT user_id, guild_id FROM wellness_blackouts WHERE id = ?",
+                (blackout_id,),
+            ).fetchone()
+            if (
+                row is None
+                or int(row["user_id"]) != user_id
+                or int(row["guild_id"]) != guild_id
+            ):
+                return {"_err": "blackout not found", "_status": 404}
+            toggle_blackout(conn, blackout_id, enabled)
+            return None  # success
+
+    _res = await run_query(_write)
+    if _res is not None:
+        return _err(_res["_err"], status=_res["_status"])
+    return _ok(enabled=enabled)
+
+
+@router.delete("/blackouts/{blackout_id}")
+async def delete_blackout(
+    blackout_id: int,
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            row = conn.execute(
+                "SELECT user_id, guild_id FROM wellness_blackouts WHERE id = ?",
+                (blackout_id,),
+            ).fetchone()
+            if (
+                row is None
+                or int(row["user_id"]) != user_id
+                or int(row["guild_id"]) != guild_id
+            ):
+                return {"_err": "blackout not found", "_status": 404}
+            remove_blackout(conn, blackout_id)
+            return None  # success
+
+    _res = await run_query(_write)
+    if _res is not None:
+        return _err(_res["_err"], status=_res["_status"])
+    return _ok()
+
+
+# ── Away message ────────────────────────────────────────────────────────
+
+
+@router.post("/away")
+async def update_away(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(require_user),
+    ctx=Depends(get_ctx),
+    guild_id: int = Depends(get_guild_id),
+) -> JSONResponse:
+    await _require_active(ctx, guild_id, user.user_id)
+    enabled = bool(payload.get("enabled", False))
+    message = payload.get("message")
+    if message is not None:
+        message = str(message)
+        if len(message) > AWAY_MESSAGE_MAX_LEN:
+            return _err(f"message must be ≤ {AWAY_MESSAGE_MAX_LEN} characters")
+    user_id = user.user_id
+
+    def _write():
+        with ctx.open_db() as conn:
+            update_away_message(conn, guild_id, user_id, enabled=enabled, message=message)
+
+    await run_query(_write)
+    return _ok()

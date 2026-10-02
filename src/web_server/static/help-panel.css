@@ -1,0 +1,355 @@
+/* ═══════════════════════════════════════════════════════════════
+   Help-panel re-skin — renders manual content using the dashboard's
+   own primitives (.card, .section-label, .chip, .w-table aesthetics)
+   so help pages feel native. All selectors scoped under .dk-help.
+   ═══════════════════════════════════════════════════════════════ */
+
+.dk-help {
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--t-3);
+  line-height: 1.55;
+  max-width: 920px;
+}
+
+/* Hide the section h2 — the panel header already shows the title */
+.dk-help > h2:first-child { display: none; }
+
+/* Any other h2 (rare, only inside Quick Reference area) styled as small */
+.dk-help h2 {
+  margin: var(--s-5) 0 var(--s-3);
+  font-size: var(--t-4);
+  font-family: var(--display);
+  font-stretch: 106%;
+  font-weight: 700;
+  color: var(--ink-bright);
+}
+.dk-help h2 .section-num { display: none; }
+
+/* h3 → mirror .section-label exactly (uppercase + trailing rule) */
+.dk-help h3 {
+  font-size: var(--t-1);
+  font-family: var(--display);
+  font-stretch: 96%;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-mute);
+  margin: var(--s-5) 0 var(--s-3);
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.dk-help h3::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--rule-soft);
+}
+.dk-help > h3:first-child,
+.dk-help > p:first-child + h3,
+.dk-help > p:first-of-type + h3 { margin-top: 0; }
+
+/* h4 → sub-topic inside a section. The section's own h3 is dropped by the
+   panel (the header already shows the title), so an h4 is the first heading a
+   reader actually sees: it reads as body-scale and bright rather than as
+   another small uppercase label competing with the header. */
+.dk-help h4 {
+  font-size: var(--t-3);
+  font-family: var(--display);
+  font-stretch: 106%;
+  font-weight: 600;
+  color: var(--ink-bright);
+  margin: var(--s-4) 0 var(--s-2);
+}
+.dk-help h4:first-child { margin-top: 0; }
+
+/* Body text */
+.dk-help p { margin: 0 0 var(--s-3); color: var(--ink); }
+.dk-help p:last-child { margin-bottom: 0; }
+
+/* --blurple-text, not --blurple: the saturated tier is 2.74:1 on --bg, and
+   every guide link failed WCAG 1.4.3 (the axe sweep's 158 of 163 contrast
+   findings). Every link is underlined too — at 1.47:1 against --ink, colour
+   alone can't mark one out in running text (WCAG 1.4.1), and the guide's
+   text lives in callouts, command cells and bold runs as much as in <p>. */
+.dk-help a:not(.btn) { color: var(--blurple-text); text-decoration: underline; text-underline-offset: 2px; }
+
+.dk-help strong { color: var(--ink-bright); font-weight: 600; }
+.dk-help em { font-style: italic; color: var(--ink-dim); }
+
+/* Inline code */
+.dk-help code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--bg-rail);
+  padding: 1px var(--s-2);
+  border-radius: var(--r-sm);
+  color: var(--gold-solid);
+  border: 1px solid var(--rule-soft);
+}
+
+/* ── Command blocks → .card with .stat-style left accent ─────── */
+.dk-help .cmd-block {
+  background: var(--bg-card);
+  border: 1px solid var(--rule-soft);
+  border-left: 3px solid var(--blurple);
+  border-radius: var(--r);
+  padding: var(--s-3) var(--s-4);
+  margin: var(--s-3) 0;
+  font-family: var(--sans);
+  font-size: var(--t-2);
+}
+.dk-help .cmd-block + .cmd-block { margin-top: var(--s-2); }
+.dk-help .cmd-block .cmd-name {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--ink-bright);
+  display: block;
+  margin-bottom: var(--s-2);
+  word-break: break-word;
+  font-size: var(--t-2);
+}
+.dk-help .cmd-block .cmd-perm {
+  font-size: var(--t-1);
+  color: var(--ink-mute);
+  display: block;
+  margin-bottom: var(--s-2);
+}
+.dk-help .cmd-block .cmd-desc {
+  color: var(--ink);
+  font-size: var(--t-2);
+  display: block;
+  line-height: 1.5;
+}
+.dk-help .cmd-block .cmd-params {
+  margin-top: var(--s-2);
+  padding-top: var(--s-2);
+  border-top: 1px solid var(--rule-soft);
+  font-size: var(--t-2);
+  color: var(--ink-dim);
+  line-height: 1.55;
+}
+.dk-help .cmd-block code {
+  background: var(--bg-rail);
+  border-color: var(--rule);
+  color: var(--ink-bright);
+}
+
+/* ── Permission badges → .chip pill aesthetic ────────────────── */
+.dk-help .perm {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--s-0) var(--s-2);
+  border-radius: 999px;
+  font-size: var(--t-1);
+  font-family: var(--display);
+  font-stretch: 94%;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  background: var(--rule-soft);
+  color: var(--ink-dim);
+  vertical-align: middle;
+}
+.dk-help .perm-all   { background: var(--green-soft);            color: var(--green-text); }
+.dk-help .perm-mod   { background: var(--blurple-soft);          color: var(--blurple-text); }
+.dk-help .perm-admin { background: var(--red-soft);              color: var(--red-text); }
+.dk-help .perm-owner { background: var(--gold-soft);             color: var(--gold-solid); }
+
+/* ── Callouts → tighter, dashboard-restrained ───────────────── */
+.dk-help .callout {
+  border-radius: var(--r);
+  padding: var(--s-3) var(--s-4);
+  margin: var(--s-4) 0;
+  display: flex;
+  gap: var(--s-3);
+  align-items: flex-start;
+  background: var(--bg-card);
+  border: 1px solid var(--rule-soft);
+  border-left: 3px solid var(--rule);
+}
+.dk-help .callout-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; opacity: 0.9; }
+.dk-help .callout-body { flex: 1; min-width: 0; }
+.dk-help .callout-body strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: var(--t-2);
+  font-weight: 600;
+  color: var(--ink-bright);
+}
+.dk-help .callout-body p { margin: 0; font-size: var(--t-2); line-height: 1.5; }
+.dk-help .callout-body p + p { margin-top: var(--s-2); }
+.dk-help .callout-body table { margin: var(--s-2) 0 0; }
+.dk-help .callout-tip   { border-left-color: var(--blurple); }
+.dk-help .callout-warn  { border-left-color: var(--gold-solid); }
+.dk-help .callout-info  { border-left-color: var(--green); }
+
+/* ── Tables → mirror .w-table conventions ───────────────────── */
+.dk-help table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--t-2);
+  margin: var(--s-3) 0 var(--s-4);
+}
+.dk-help th {
+  text-align: left;
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-dim);
+  font-size: var(--t-1);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: transparent;
+}
+.dk-help td {
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top;
+  color: var(--ink);
+}
+.dk-help tr:last-child td { border-bottom: none; }
+
+/* On a phone, a three-column command table cannot fit and must not push the
+   page sideways with it — the house rule is that wide content scrolls inside
+   its own container while the body never scrolls horizontally. `display:
+   block` turns the table into that container. Scoped to narrow widths so the
+   table keeps filling its column everywhere else. */
+@media (max-width: 700px) {
+  .dk-help table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+.dk-help tr:hover td { background: var(--bg-card-hover); }
+.dk-help td code,
+.dk-help td a code { color: var(--gold-solid); }
+.dk-help td:first-child code { font-size: var(--t-2); }
+
+/* ── Lists ─────────────────────────────────────────────────── */
+.dk-help ul, .dk-help ol { padding-left: var(--s-5); margin: 0 0 var(--s-3); }
+.dk-help li { margin-bottom: var(--s-1); }
+
+.dk-help .steps { list-style: none; padding: 0; counter-reset: steps; }
+/* The badge is positioned, not a flex sibling. A step's body is prose with
+   inline links in it, and under `display: flex` each inline child becomes its
+   own flex item competing for the row's width — with min-width:0 on the
+   children, a link like "Guess Who" was squeezed to 13px and rendered as a
+   vertical stack of letters. Indenting past an absolutely-positioned badge
+   keeps the body as one normal inline flow, so links wrap like text. */
+.dk-help .steps li {
+  counter-increment: steps;
+  position: relative;
+  padding-left: 32px;   /* 20px badge + the 12px gap it used to get from flex */
+  margin-bottom: var(--s-3);
+}
+.dk-help .steps li::before {
+  content: counter(steps);
+  position: absolute;
+  left: 0;
+  top: 1px;
+  background: var(--blurple);
+  color: #fff;
+  font-size: var(--t-1);
+  font-weight: 700;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── Quick-Reference table-section dividers ─────────────────── */
+.dk-help .qr-table .qr-section td {
+  background: var(--bg-rail);
+  font-weight: 700;
+  font-size: var(--t-1);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--rule);
+}
+/* This column used to be `white-space: nowrap`, which pushed the Quick
+   Reference table to 1503px and scrolled the whole page sideways — at every
+   width, desktop included, not just on a phone. The column holds command
+   flows, not short labels, so it was never a nowrap candidate. Letting it
+   wrap takes the standalone guide's horizontal overflow to zero on desktop
+   and tablet, and the panel gets the same fix for free. */
+.dk-help .qr-table td:nth-child(2) { white-space: normal; }
+
+/* Hide print bar (it's a standalone-page concern) */
+.dk-help .print-bar { display: none; }
+
+/* ── Guide search (input lives in the panel header) ──────────── */
+.dk-help-search {
+  background: var(--bg-rail);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--t-2);
+  padding: var(--s-1) var(--s-3);
+  width: 200px;
+}
+.dk-help-search:focus {
+  outline: none;
+  border-color: var(--blurple);
+}
+
+.dk-help-results-count {
+  color: var(--ink-dim);
+  font-size: var(--t-2);
+  margin: 0 0 var(--s-3);
+}
+.dk-help-result {
+  display: block;
+  background: var(--bg-card);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r);
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-2);
+  text-decoration: none;
+}
+.dk-help-result:hover {
+  border-color: var(--blurple);
+  text-decoration: none;
+}
+.dk-help-result-title {
+  color: var(--ink-bright);
+  font-size: var(--t-2);
+  font-family: var(--display);
+  font-stretch: 104%;
+  font-weight: 600;
+  margin-bottom: var(--s-1);
+}
+.dk-help-result-snippet {
+  color: var(--ink-dim);
+  font-size: var(--t-2);
+  line-height: 1.5;
+}
+.dk-help-result-snippet mark {
+  background: var(--gold-soft);
+  color: var(--gold-solid);
+  border-radius: 2px;
+  padding: 0 var(--s-0);
+}
+
+/* Search-result deep-link landing flash */
+.dk-help .dk-help-focus {
+  animation: dk-help-flash 2.5s ease-out;
+}
+@keyframes dk-help-flash {
+  0%, 40% { background: var(--gold-soft); }
+  100%    { background: transparent; }
+}
+
+/* Long tokens in a step (a command name, a URL) break rather than push the row
+   past the panel — the phone sweep caught 15px on the Getting Started
+   checklist. The flex-specific props that used to live here (min-width:0 on the
+   li and its children, flex-shrink on the badge) are gone with the flex layout
+   above; it was min-width:0 on the children that let a link shrink to 13px. */
+.dk-help .steps li { overflow-wrap: break-word; }

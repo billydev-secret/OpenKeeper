@@ -1,0 +1,1138 @@
+import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import Bot  # noqa: F401
+
+import discord
+
+from bot_modules.core.branding_service import PanelArt
+from bot_modules.core.layout import V2_EDIT, bind_present, card
+from bot_modules.core.sticky import StickyPanel
+from bot_modules.shared.name_resolver import build_name_fn
+from bot_modules.no_contact.service import is_no_contact
+from bot_modules.games.start_ping_service import (
+    extract_start_epoch,
+)
+from bot_modules.core.utils import allow_pings
+from discord.ext import commands
+from discord import app_commands
+from bot_modules.games.constants import HOW_TO_PLAY, play_description
+from bot_modules.games.command_groups import play
+from bot_modules.games.utils.game_manager import (
+    ConfirmCloseView,
+    finish_launch_response,
+    create_game,
+    get_active_game_by_id,
+    update_game_message,
+    update_game_payload,
+    update_game_state,
+    modify_payload,
+    get_game_payload,
+    end_game,
+    update_session,
+    is_game_expired,
+    channel_name,
+)
+from bot_modules.games.utils.send_retry import retry_transient
+from bot_modules.games.utils.host_panel import (
+    GAME_ENDED_REPLY,
+    GameHostPanel,
+    hand_over,
+    reply as host_reply,
+    send_panel,
+)
+from bot_modules.games.utils.launch_guard import refuse_launch
+from bot_modules.games.utils.lobby_art import NO_ART, read_lobby_art
+from bot_modules.games.utils.names import build_names, cached_names, host_display, plain_name
+from bot_modules.shared.name_resolver import GuildNames
+from bot_modules.games.board_sticky_service import (
+    LiveBoards,
+    redraw_board,
+    redraw_embed_era_board,
+    redraw_embed_era_lobby,
+)
+from bot_modules.games.utils.question_source import (
+    get_mlt_prompt,
+    channel_allows_nsfw,
+)
+from bot_modules.games.utils.round_pacing import (
+    CONTROL_DENIED,
+    END_DENIED,
+    REASON_EXPIRED,
+    REASON_HOST_ENDED,
+    REASON_ROUND_CAP,
+    RoundPacing,
+    advance_check,
+    is_scheduled_launch,
+    may_control,
+    launch_pacing,
+    round_cap_reached,
+    seconds_left,
+)
+from bot_modules.games.mlt.layouts import (
+    HELP_ID,
+    HOST_END_ID,
+    HOST_NEXT_ID,
+    HOST_START_ID,
+    JOIN_ID,
+    LEAVE_ID,
+    LOBBY_HELP_ID,
+    NEXT_ID,
+    POSE_ID,
+    POSE_LABEL,
+    TITLE,
+    VOTE_SELECT_ID,
+    build_final_standings_layout,
+    build_host_panel_layout,
+    build_lobby_layout,
+    build_results_layout,
+    build_round_layout,
+)
+from bot_modules.games.mlt.logic import (
+    MAX_PLAYERS,
+    MIN_PLAYERS,
+    add_player,
+    clamp_player_limits,
+    bump_crowns,
+    can_start,
+    encode_round_votes,
+    find_round_winners,
+    is_eligible_voter,
+    lobby_is_full,
+    pop_next_prompt,
+    queue_prompt,
+    record_vote,
+    remove_player,
+    tally_votes,
+)
+
+log = logging.getLogger(__name__)
+
+# Cap the player-submitted prompt queue to prevent flooding.
+_MAX_QUEUED_PROMPTS = 15
+
+# After a restart, a timed round that already ran out still gets a moment
+# for the room to see the board before it auto-advances.
+_RECOVERY_GRACE_SECONDS = 5.0
+
+REASON_TOO_FEW_PLAYERS = "too_few_players"
+
+
+NOT_STARTED_REPLY = "The game hasn't started yet — press Start once the pool is in."
+ALREADY_STARTED_REPLY = "The game has already started."
+
+
+class MLTJoinView(discord.ui.LayoutView):
+    """The lobby. **Paradigm 8 — live board**: rebuilt and re-edited in place
+    on every Join/Leave. ``mlt_join`` / ``mlt_leave`` / ``mlt_htp`` are
+    frozen custom ids — ``recover_game`` re-registers this view against the
+    lobby message after a restart. Start is not here: the host panel calls
+    :meth:`start_game`.
+    """
+
+    def __init__(
+        self, game_id: str, host_id: int, db, bot, cog,
+        *,
+        guild: "discord.Guild | None" = None,
+        host_name: str = "Host",
+        players: list[int] | None = None,
+        start_at: int | None = None,
+        art: PanelArt = NO_ART,
+    ):
+        super().__init__(timeout=None)
+        self.game_id = game_id
+        self.host_id = host_id
+        self.db = db
+        self.bot = bot
+        self.cog = cog
+        self.guild = guild
+        self.host_name = host_name
+        self.players: list[int] = list(players or [])
+        self.names: GuildNames = cached_names(guild)
+        self.start_at = start_at
+        # The guild's lobby art, read once at launch/recovery and reused on
+        # every redraw — never re-read per join/leave click.
+        self.art = art
+        self._msg: discord.Message | None = None
+        self._closed = False
+        self._rebuild()
+
+    async def refresh_names(self) -> None:
+        """Re-resolve the roster (live cache, then ``known_users``) before a
+        redraw; ``_rebuild`` stays synchronous."""
+        self.names = await build_names(self.bot, self.guild, self.players)
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        for item in build_lobby_layout(
+            self.host_name,
+            [plain_name(self.names, uid) for uid in self.players],
+            self.start_at,
+            closed=self._closed,
+            header_url=self.art.header,
+            footer_url=self.art.footer,
+            title_in_header=self.art.title_in_header,
+        ):
+            self.add_item(item)
+        bind_present(self, {JOIN_ID: self.join, LEAVE_ID: self.leave, LOBBY_HELP_ID: self.how_to_play})
+
+    async def _redraw(self, interaction: discord.Interaction, payload: dict) -> None:
+        self.players = [int(p) for p in payload.get("players", [])]
+        # Re-read from the payload, not the view: the countdown must
+        # survive a restart that rebuilt this view from the DB.
+        self.start_at = extract_start_epoch(payload)
+        self.guild = interaction.guild or self.guild
+        await self.refresh_names()
+        self._rebuild()
+        await interaction.response.edit_message(view=self, **V2_EDIT)
+
+    async def join(self, interaction: discord.Interaction) -> None:
+        log.info("%s pressed 'Join' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        log.info("%s joined game %s in #%s", interaction.user.display_name, self.game_id, channel_name(interaction.channel))
+        payload = await get_game_payload(self.db, self.game_id)
+        players = payload.setdefault("players", [])
+        limit = int(payload.get("max_players") or MAX_PLAYERS)
+        if interaction.user.id not in players and lobby_is_full(players, limit):
+            await interaction.response.send_message(
+                f"❌ This lobby is full — this game is set to take up to "
+                f"{limit} players.",
+                ephemeral=True,
+            )
+            return
+        add_player(players, interaction.user.id, limit)
+        await update_game_payload(self.db, self.game_id, payload)
+        await self._redraw(interaction, payload)
+        await interaction.followup.send("✅ You've joined the pool!", ephemeral=True)
+
+    async def leave(self, interaction: discord.Interaction) -> None:
+        log.info("%s pressed 'Leave' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        log.info("%s left game %s in #%s", interaction.user.display_name, self.game_id, channel_name(interaction.channel))
+        payload = await get_game_payload(self.db, self.game_id)
+        players = payload.setdefault("players", [])
+        remove_player(players, interaction.user.id)
+        await update_game_payload(self.db, self.game_id, payload)
+        await self._redraw(interaction, payload)
+        await interaction.followup.send("✅ You've left the pool.", ephemeral=True)
+
+    async def start_game(self, interaction: discord.Interaction) -> None:
+        """Start — the host panel's button lands here."""
+        log.info("%s pressed 'Start' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        # The same gate the host panel opened on (``may_control``: host, mod
+        # or a Game Host), not the narrower ``is_host_or_mod`` — a Game Host
+        # could open the panel and then had Start refused (ship review,
+        # 2026-10-01).
+        if not await may_control(interaction, self.host_id, self.db):
+            await interaction.response.send_message(CONTROL_DENIED, ephemeral=True)
+            return
+        payload = await get_game_payload(self.db, self.game_id)
+        players = payload.get("players", [])
+        floor = int(payload.get("min_players") or MIN_PLAYERS)
+        if not can_start(players, floor):
+            await interaction.response.send_message(
+                f"❌ Need at least {floor} players to start!", ephemeral=True
+            )
+            return
+        # Two presses can both get this far (a second panel, or a mod's);
+        # the first to arrive owns the start.
+        if self._closed:
+            await interaction.response.send_message(ALREADY_STARTED_REPLY, ephemeral=True)
+            return
+        self._closed = True
+        await interaction.response.defer()
+        self.stop()
+        # Close the lobby: no Join, no Leave.
+        await self.refresh_names()
+        self._rebuild()
+        if self._msg is not None:
+            try:
+                await self._msg.edit(view=self, **V2_EDIT)
+            except discord.HTTPException:
+                pass
+
+        channel = self._msg.channel if self._msg is not None else interaction.channel
+        # Ping joined players — a plain message with its own allow-list; it
+        # has to notify, and it deletes itself.
+        if interaction.guild:
+            mentions = [
+                member.mention
+                for uid in players
+                if (member := interaction.guild.get_member(uid)) is not None
+            ]
+            if mentions:
+                assert isinstance(channel, discord.abc.Messageable)
+                await channel.send(
+                    f"👑 **Most Likely To is starting!** {' '.join(mentions)} — get ready!",
+                    delete_after=15,
+                    allowed_mentions=allow_pings(users=players),
+                )
+
+        # The row must stop reading as an open lobby — the start-ping sweep
+        # polls state='joining' and a game outlives its countdown.
+        await update_game_state(self.db, self.game_id, "playing")
+
+        await self.cog._run_round(
+            interaction=interaction,
+            game_id=self.game_id,
+            host_id=self.host_id,
+            host_name=interaction.user.display_name,
+            round_num=1,
+            players=players,
+            channel=channel,
+            custom_prompt=payload.get("opening_prompt"),
+        )
+
+    async def press_next(self, interaction: discord.Interaction) -> None:
+        """Next on the panel while the lobby is still open."""
+        await interaction.response.send_message(NOT_STARTED_REPLY, ephemeral=True)
+
+    press_end = press_next
+
+    async def how_to_play(self, interaction: discord.Interaction) -> None:
+        log.info("%s pressed 'Help' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        await interaction.response.send_message(HOW_TO_PLAY["mlt"], ephemeral=True)
+
+
+class PoseMLTModal(discord.ui.Modal, title="Pose a Prompt"):
+    prompt = discord.ui.TextInput(
+        label="Most likely to…",
+        placeholder="e.g. win a staring contest",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+    )
+
+    def __init__(self, view, message: discord.Message):
+        super().__init__()
+        self._view = view
+        self._message = message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        log.info("%s submitted '%s' modal in #%s", interaction.user.display_name, "Pose a Prompt", channel_name(interaction.channel))
+        if self._view._closed:
+            await interaction.response.send_message("This round already ended.", ephemeral=True)
+            return
+        text = self.prompt.value.strip()
+        if not text:
+            await interaction.response.send_message("A prompt is required.", ephemeral=True)
+            return
+        if self._view.waiting:
+            # The bank had nothing to serve, so this prompt *is* the round.
+            await self._view.begin_round(text, self._message)
+            await interaction.response.send_message("✅ Your prompt opened the round!", ephemeral=True)
+            return
+        if len(self._view.queued_prompts) >= _MAX_QUEUED_PROMPTS:
+            await interaction.response.send_message(
+                f"The prompt queue is full ({_MAX_QUEUED_PROMPTS}). Let some play first!",
+                ephemeral=True,
+            )
+            return
+        queue_prompt(self._view.queued_prompts, text)
+        # The card's subtext carries the queue count; redrawn through the
+        # board seam, since a restick may have moved the board.
+        try:
+            await redraw_board(self._view, self._message)
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message("✅ Your prompt has been queued!", ephemeral=True)
+
+
+class MLTVoteView(discord.ui.LayoutView):
+    """One round's card and its dropdown — a ``LiveBoardLayoutView``
+    (``game_id``, ``guild``, ``_panel``, ``_board_retired``, ``_rebuild``),
+    so ``LiveBoards`` opens, redraws and retires it.
+
+    The card carries what any member may press. ⏭️ Next is on it only for a
+    scheduled game, where a voter may press it; on a hosted game Next and
+    🏁 End Game are on the ephemeral host panel, which calls
+    :meth:`press_next` and :meth:`press_end` here.
+    """
+
+    def __init__(
+        self,
+        game_id: str,
+        host_id: int,
+        prompt: str,
+        round_num: int,
+        players: list[int],
+        db,
+        bot,
+        host_name: str,
+        guild,
+        advance_callback,
+        *,
+        pacing: RoundPacing | None = None,
+        finish_callback=None,
+    ):
+        super().__init__(timeout=None)
+        self.game_id = game_id
+        self.host_id = host_id
+        self.prompt = prompt
+        self.round_num = round_num
+        self.players = players
+        self.names: GuildNames = cached_names(guild)
+        self.db = db
+        self.bot = bot
+        self.host_name = host_name
+        self.guild = guild
+        self.advance_callback = advance_callback
+        self.finish_callback = finish_callback
+        self.votes: dict[int, int] = {}
+        self._closed = False
+        self.queued_prompts: list[str] = []
+        self.pacing = pacing or RoundPacing()
+        # Set when the guild turns on the "keep the board at the bottom"
+        # dial (Games Global Config → Live Game Boards): the StickyPanel
+        # that owns reposting this round's board, and the flag the cog sets
+        # once the round is over — the panel's ``build`` checks that flag,
+        # never ``_closed``, which is set one legitimate render *earlier*
+        # (the closed final frame, which still has to go out). Both stay
+        # None/False for the life of the round when the dial is off.
+        self._panel: "StickyPanel | None" = None
+        self._board_retired: bool = False
+        # force_end_active_game pokes this alias to wake a timed round.
+        self._advanced_event = self.pacing.advanced
+        self.message: discord.Message | None = None
+        # No prompt yet (the bank had nothing to serve): only Pose and Help
+        # are on the card until someone poses one (vote-games-50).
+        self.waiting = not prompt
+        self._rebuild()
+
+    async def refresh_names(self) -> None:
+        """Re-resolve the players once (the roster is fixed for the round)
+        for the vote dropdown; ``_rebuild`` stays synchronous."""
+        self.names = await build_names(self.bot, self.guild, self.players)
+
+    def _rebuild(self) -> None:
+        """Clear and re-add the card from current state, then bind whatever
+        controls that state shows — a rebuild adds a brand-new dropdown and
+        buttons with nothing wired to them."""
+        self.clear_items()
+        for item in build_round_layout(
+            self.prompt,
+            self.round_num,
+            len(self.votes),
+            [(plain_name(self.names, uid), str(uid)) for uid in self.players],
+            closed=self._closed,
+            waiting=self.waiting,
+            advance_at=self.pacing.advance_at(),
+            queued=len(self.queued_prompts),
+            scheduled=self.pacing.scheduled,
+        ):
+            self.add_item(item)
+        bind_present(self, {
+            VOTE_SELECT_ID: self._vote_select_callback,
+            POSE_ID: self.pose_prompt,
+            NEXT_ID: self.press_next,
+            HELP_ID: self.how_to_play,
+        })
+
+    async def begin_round(self, prompt: str, message: discord.Message) -> None:
+        """A posed prompt starts a round that was waiting for one."""
+        self.prompt = prompt
+        self.waiting = False
+        opened = self.pacing.open()
+
+        def _save(payload):
+            rd = payload.setdefault("rounds", {}).setdefault(str(self.round_num), {})
+            rd["prompt"] = prompt
+            rd["opened_at"] = opened
+
+        await modify_payload(self.db, self.game_id, _save)
+        self.message = message
+        self.pacing.start_timer(lambda: self.advance_callback(message))
+        await redraw_board(self, message)
+
+    async def _vote_select_callback(self, interaction: discord.Interaction):
+        log.info("%s voted in game %s in #%s", interaction.user.display_name, self.game_id, channel_name(interaction.channel))
+        if self._closed or self.waiting:
+            await interaction.response.send_message("This round is over." if self._closed else "No prompt yet — pose one first!", ephemeral=True)
+            return
+        if not is_eligible_voter(interaction.user.id, self.players):
+            await interaction.response.send_message("You're not in the player pool.", ephemeral=True)
+            return
+        values = (interaction.data or {}).get("values") or []
+        target_id = int(values[0])
+        voter_id = interaction.user.id
+        guild_id = interaction.guild_id or 0
+
+        # The no-contact gate: a blocked pair's pick is dropped, and the ack
+        # below is sent exactly as for a counted vote (docs/specs/no_contact_spec.md).
+        blocked = await asyncio.to_thread(
+            is_no_contact, self.bot.ctx.db_path, guild_id, voter_id, target_id
+        )
+        counted, changed = record_vote(self.votes, voter_id, target_id, blocked=blocked)
+
+        if counted:
+            # Persist live votes so a crash mid-round doesn't lose them.
+            def _save(payload):
+                rounds = payload.setdefault("rounds", {})
+                rd = rounds.setdefault(str(self.round_num), {})
+                rd["votes"] = encode_round_votes(self.votes)
+
+            await modify_payload(self.db, self.game_id, _save)
+
+        name = discord.utils.escape_markdown(plain_name(self.names, target_id))
+        msg = f"✅ Voted for **{name}**{' (changed)' if changed else ''}"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    async def pose_prompt(self, interaction: discord.Interaction) -> None:
+        log.info("%s pressed '%s' in #%s", interaction.user.display_name, POSE_LABEL, channel_name(interaction.channel))
+        if self._closed:
+            await interaction.response.send_message("This round is over.", ephemeral=True)
+            return
+        assert interaction.message
+        await interaction.response.send_modal(PoseMLTModal(self, interaction.message))
+
+    async def press_next(self, interaction: discord.Interaction) -> None:
+        """⏭️ Next — from the host panel, or from the card of a scheduled
+        game. Advances the *board's* message, not the one the press came
+        from: a panel press arrives on the ephemeral panel."""
+        log.info("%s pressed 'Next' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        refusal = await advance_check(
+            interaction, host_id=self.host_id, db=self.db, pacing=self.pacing,
+            has_voted=interaction.user.id in self.votes,
+        )
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
+        if self._closed:
+            await interaction.response.send_message("This round is already over.", ephemeral=True)
+            return
+        if self.waiting:
+            await interaction.response.send_message("No prompt yet — pose one first!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.advance_callback(self.message or interaction.message)
+
+    async def press_end(self, interaction: discord.Interaction) -> None:
+        """🏁 End Game, from the host panel: close the game with its final
+        standings and pay the room (vote-games-52)."""
+        log.info("%s pressed 'End Game' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        if not await may_control(interaction, self.host_id, self.db):
+            await interaction.response.send_message(END_DENIED, ephemeral=True)
+            return
+        if self._closed:
+            await interaction.response.send_message("This game already ended.", ephemeral=True)
+            return
+
+        async def _confirmed(_confirm_interaction: discord.Interaction) -> None:
+            if self.finish_callback is not None:
+                await self.finish_callback(self.message, REASON_HOST_ENDED)
+
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to end this game?", view=ConfirmCloseView(_confirmed), ephemeral=True,
+        )
+
+    async def start_game(self, interaction: discord.Interaction) -> None:
+        """Start on the panel once the game is under way."""
+        await interaction.response.send_message(ALREADY_STARTED_REPLY, ephemeral=True)
+
+    async def how_to_play(self, interaction: discord.Interaction) -> None:
+        log.info("%s pressed 'Help' in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        await interaction.response.send_message(HOW_TO_PLAY["mlt"], ephemeral=True)
+
+
+class MLTCog(commands.Cog):
+    def __init__(self, bot: "Bot"):
+        self.bot = bot
+        # Every live round board this cog owns (Games Global Config → Live
+        # Game Boards). Keyed by game_id, so the board a round opens is the
+        # board that round retires — one guild can run several Most Likely
+        # To games in different channels at once. The lobby is not on the
+        # dial; only the in-play board is.
+        self.live_boards = LiveBoards(bot, self.db, "mlt board")
+
+    @property
+    def db(self):
+        return self.bot.games_db
+
+    async def cog_unload(self) -> None:
+        # A reload mid-round must not leave a debounced restick armed
+        # against a cog that's gone.
+        self.live_boards.unload()
+
+    @commands.Cog.listener("on_message")
+    async def _restick_boards(self, message: discord.Message) -> None:
+        await self.live_boards.on_message(message)
+
+    @commands.Cog.listener("on_guild_channel_delete")
+    async def _forget_deleted_board_channel(
+        self, channel: discord.abc.GuildChannel
+    ) -> None:
+        await self.live_boards.on_channel_delete(channel)
+
+    @app_commands.command(name="mlt", description=play_description("mlt"))
+    @app_commands.describe(
+        question="Opening prompt (e.g. 'win a staring contest') — defaults to question bank",
+        tags="Comma-separated tags to filter the question bank",
+        start_in="Countdown before the game starts, in minutes",
+    )
+    async def mlt(
+        self,
+        interaction: discord.Interaction,
+        question: str = "",
+        tags: str = "",
+        start_in: app_commands.Range[int, 1, 60] | None = None,
+    ):
+        # These moved to the dashboard. Passing None is exactly what an
+        # omitted option always meant, so the per-guild dial applies.
+        round_seconds = rounds = None
+        log.info("%s used /games play mlt in #%s", interaction.user.display_name, channel_name(interaction.channel))
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        # The one launch guard every door shares: allowed channel, enabled
+        # dial, no game already running here, and a bank with something to
+        # serve unless the host brought their own prompt (platform-27: a bare
+        # /mlt used to fill a lobby and die at Start on an empty bank).
+        refusal = await refuse_launch(
+            self.db, interaction, "mlt",
+            tags=tag_list, host_supplied=bool(question.strip()),
+        )
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        game_id = await self.launch(
+            channel=interaction.channel,
+            host_id=interaction.user.id,
+            host_name=interaction.user.display_name,
+            guild_id=interaction.guild_id or 0,
+            options={
+                "question": question, "tags": tag_list, "start_in": start_in,
+                "round_seconds": round_seconds, "max_rounds": rounds,
+            },
+        )
+        await finish_launch_response(interaction, game_id)
+        # Start, Next and End Game aren't on the cards, so hand the host
+        # their controls now rather than make them go find ``/games host``.
+        await hand_over(self.bot, interaction, self.open_host_panel, game_id)
+
+    async def open_host_panel(self, interaction: discord.Interaction, game_id: str) -> None:
+        """``/games host`` for a Most Likely To game: Start, ⏭️ Next and 🏁
+        End Game on one panel for the whole game. Open to whoever the
+        controls accept — the host, a mod, or a Game Host (``may_control``)."""
+        view = self.bot.active_views.get(game_id)
+        if not isinstance(view, (MLTJoinView, MLTVoteView)):
+            await host_reply(interaction, GAME_ENDED_REPLY)
+            return
+        if not await may_control(interaction, view.host_id, self.db):
+            await host_reply(interaction, CONTROL_DENIED)
+            return
+        panel = GameHostPanel(
+            self.bot, game_id, build_host_panel_layout(),
+            {HOST_START_ID: "start_game", HOST_NEXT_ID: "press_next", HOST_END_ID: "press_end"},
+            view_type=(MLTJoinView, MLTVoteView),
+        )
+        await send_panel(interaction, panel, label="mlt host panel")
+
+    async def launch(
+        self,
+        *,
+        channel,
+        host_id: int,
+        host_name: str,
+        guild_id: int,
+        options: dict,
+    ) -> str | None:
+        """Interaction-free launch (slash command + scheduler). Returns game_id, or None."""
+        question = options.get("question", "")
+        # One read of the dial row covers the pacing and the roster limits.
+        pacing = await launch_pacing(self.db, "mlt", guild_id, options)
+        game_opts = pacing.game_opts
+        # The two dials this game actually has somewhere to enforce: it is one
+        # of only two with a join phase. Clamped on the way in so a value saved
+        # before the dashboard bounded them cannot outgrow the vote Select.
+        min_players, max_players = clamp_player_limits(
+            options.get("min_players", game_opts.get("min_players", MIN_PLAYERS)),
+            options.get("max_players", game_opts.get("max_players", MAX_PLAYERS)),
+        )
+        start_epoch = pacing.start_epoch
+        payload = pacing.stamp({
+            "opening_prompt": question.strip() or None, "rounds": {}, "crowns": {}, "players": [],
+            "tags": options.get("tags") or [],
+            "min_players": min_players, "max_players": max_players,
+            "round_seconds": pacing.round_seconds, "max_rounds": pacing.max_rounds,
+            "scheduled": is_scheduled_launch(options, host_id),
+        })
+        game_id = await create_game(
+            self.db,
+            channel.id,
+            host_id,
+            "mlt",
+            state="joining",
+            payload=payload,
+            guild_id=guild_id,
+        )
+
+        log.info("Game %s (mlt) created by host %s in #%s", game_id, host_id, getattr(channel, "name", channel.id))
+        view = MLTJoinView(
+            game_id, host_id, self.db, self.bot, self,
+            guild=getattr(channel, "guild", None), host_name=host_name,
+            start_at=start_epoch, art=await read_lobby_art(self.bot, channel, TITLE),
+        )
+        self.bot.active_views[game_id] = view
+
+        try:
+            msg = await retry_transient(lambda: channel.send(view=view), label="mlt launch")
+        except (discord.Forbidden, discord.DiscordServerError):
+            await end_game(self.db, game_id)
+            self.bot.active_views.pop(game_id, None)
+            log.warning("mlt launch lacked send perms in channel %s", channel.id)
+            return None
+        view._msg = msg
+        await update_game_message(self.db, game_id, msg.id)
+        await update_session(self.db, channel.id, game_id, [host_id])
+        return game_id
+
+    @staticmethod
+    def _voter_roster_from(payload: dict) -> list[int]:
+        """Everyone who cast a vote in any round — the real participant set
+        for economy payouts (survivors-only ``players`` would drop members who
+        voted for several rounds then left)."""
+        return sorted({
+            int(v)
+            for rd in payload.get("rounds", {}).values()
+            for v in (rd.get("votes") or {})
+        })
+
+    async def _voter_roster(self, game_id: str) -> list[int]:
+        return self._voter_roster_from(await get_game_payload(self.db, game_id))
+
+    @staticmethod
+    def _pacing_from_payload(payload: dict, opened_at: float | None) -> RoundPacing:
+        return RoundPacing(
+            round_seconds=payload.get("round_seconds", 0),
+            max_rounds=payload.get("max_rounds"),
+            scheduled=bool(payload.get("scheduled")),
+            opened_at=opened_at,
+        )
+
+    async def _run_round(
+        self,
+        interaction,
+        game_id: str,
+        host_id: int,
+        host_name: str,
+        round_num: int,
+        players: list[int],
+        channel,
+        custom_prompt: str | None = None,
+        carry_over_queue: list[str] | None = None,
+    ):
+        payload = await get_game_payload(self.db, game_id)
+        if custom_prompt:
+            prompt = custom_prompt
+        else:
+            tags = payload.get("tags") or None
+            prompt = await get_mlt_prompt(
+                self.db, tags=tags, allow_nsfw=channel_allows_nsfw(channel)
+            ) or ""
+        # Nothing to serve: the round opens *waiting* for a posed prompt
+        # rather than ending the game (vote-games-50).
+        waiting = not prompt
+
+        pacing = self._pacing_from_payload(payload, None)
+        if not waiting:
+            pacing.open()
+        rounds_data = payload.setdefault("rounds", {})
+        rounds_data[str(round_num)] = {"votes": {}, "prompt": prompt, "opened_at": pacing.opened_at}
+        await update_game_payload(self.db, game_id, payload)
+
+        view = self._build_vote_view(
+            game_id=game_id,
+            host_id=host_id,
+            host_name=host_name,
+            round_num=round_num,
+            players=players,
+            channel=channel,
+            prompt=prompt,
+            interaction=interaction,
+            pacing=pacing,
+        )
+        await view.refresh_names()
+        if carry_over_queue:
+            view.queued_prompts = carry_over_queue
+        view._rebuild()
+        self.bot.active_views[game_id] = view
+
+        # Post this round's board — sticky (reposting to the bottom of the
+        # channel as chat buries it) for the length of the round when the
+        # guild's dial is on, a plain send otherwise. No ``msg`` to hand
+        # over: each round posts a *fresh* board and leaves the round that
+        # just closed on screen as its record, so the panel has nothing of
+        # its own to move yet.
+        try:
+            msg = await self.live_boards.open(
+                game_id,
+                view,
+                channel,
+                getattr(channel, "guild", None),
+                suffix=f" round {round_num}",
+            )
+        except discord.Forbidden:
+            await end_game(self.db, game_id)
+            if game_id in self.bot.active_views:
+                del self.bot.active_views[game_id]
+            await self._tell_host(
+                interaction,
+                "❌ I don't have permission to send messages in that channel. "
+                "Please grant me **Send Messages** and **Embed Links** permissions.",
+            )
+            return
+        except Exception:
+            # Any other send failure (e.g. a 400 from an oversized select or
+            # embed) would otherwise leave the view registered and the game
+            # row un-ended, so recover_game re-registers the dead lobby every
+            # restart. Tear the game down cleanly and tell the host.
+            log.exception("mlt: failed to send round message for game %s", game_id)
+            await end_game(self.db, game_id, reason="crash")
+            if game_id in self.bot.active_views:
+                del self.bot.active_views[game_id]
+            await self._tell_host(
+                interaction,
+                "❌ Something went wrong starting that round, so the game "
+                "was ended. Please start a new one.",
+            )
+            return
+        view.message = msg
+        if not waiting:
+            view.pacing.start_timer(lambda: view.advance_callback(msg))
+
+    @staticmethod
+    async def _tell_host(interaction, text: str) -> None:
+        """Ephemeral follow-up to whoever pressed Start, when there is one —
+        a timer-driven round has no interaction to answer."""
+        if interaction is None:
+            return
+        try:
+            await interaction.followup.send(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    def _build_vote_view(
+        self,
+        *,
+        game_id: str,
+        host_id: int,
+        host_name: str,
+        round_num: int,
+        players: list[int],
+        channel,
+        prompt: str,
+        interaction=None,
+        pacing: RoundPacing | None = None,
+    ) -> "MLTVoteView":
+        """Construct a vote-round view with its advance and finish callbacks wired.
+
+        Shared by _run_round (fresh round) and recover_game (post-restart) so
+        round-to-round advancement behaves identically after a crash.
+        """
+        guild = getattr(channel, "guild", None)
+
+        async def close_round(message: discord.Message | None) -> dict[int, int]:
+            """Close the board and, when anyone voted, post the round's
+            results and bank its crowns. Returns the tally."""
+            # Retire first: that cancels any pending restick, so nothing
+            # can repost the round *over* its own closing frame, and it
+            # hands back wherever the board actually ended up — ``message``
+            # was captured when the round opened and a restick may have
+            # moved the board since. ``None`` back means the dial was off,
+            # in which case ``message`` is still right.
+            target = self.live_boards.retire(view, channel) or message
+            view._closed = True
+            # Wakes a timed round's wait (and never cancels it — the timer
+            # task may be the caller).
+            view.pacing.advanced.set()
+            # The closed frame is the round's record: the prompt, how many
+            # voted, and no controls, so nothing on it can be pressed.
+            view._rebuild()
+            if target is not None:
+                try:
+                    await target.edit(view=view, **V2_EDIT)
+                except discord.HTTPException:
+                    pass
+            if view.waiting:
+                return {}
+            tally = tally_votes(view.votes, players)
+            # Decide the crowns before showing them: a tie at the top is
+            # broken without self-votes, and the board must crown exactly
+            # what gets banked (vote-games-62).
+            winners = find_round_winners(tally, view.votes)
+            name_fn = await build_name_fn(
+                guild=guild,
+                db_path=self.bot.ctx.db_path,
+                guild_id=getattr(guild, "id", 0),
+                user_ids=list(tally),
+            )
+            try:
+                await channel.send(view=card(build_results_layout(
+                    view.prompt, view.round_num, tally, name_fn=name_fn, winners=winners,
+                )))
+            except discord.HTTPException:
+                pass
+            votes = encode_round_votes(view.votes)
+
+            def _save(payload):
+                bump_crowns(payload.setdefault("crowns", {}), winners)
+                payload.setdefault("rounds", {}).setdefault(str(round_num), {})["votes"] = votes
+
+            await modify_payload(self.db, game_id, _save)
+            return tally
+
+        async def finish(message: discord.Message | None, reason: str = REASON_HOST_ENDED) -> None:
+            """End with the final standings through the paying path — the
+            host's End Game, the round cap, an expired game at Next, and
+            /games end."""
+            if not view._closed:
+                await close_round(message)
+            await self._finish_game(game_id, channel, reason=reason)
+
+        async def advance(message: discord.Message) -> None:
+            if view._closed:
+                return
+            await close_round(message)
+
+            if await is_game_expired(self.db, game_id):
+                # Past the 24h line: end with the standings and pay the room
+                # (vote-games-59 — this used to be a bare, guild-0 end).
+                await self._finish_game(game_id, channel, reason=REASON_EXPIRED)
+                return
+
+            if round_cap_reached(round_num, view.pacing.max_rounds):
+                await self._finish_game(game_id, channel, reason=REASON_ROUND_CAP)
+                return
+
+            # Re-read the roster so /games join and /games leave take effect next
+            # round. NOTE: keep this round's `players` (used above by tally_votes)
+            # untouched — only the next round runs with the updated roster.
+            payload = await get_game_payload(self.db, game_id)
+            next_players = [int(p) for p in payload.get("players", players)]
+
+            # Mid-game leaves can drop the roster below a playable size — end
+            # cleanly rather than trying to build a vote with < 2 candidates.
+            if len(next_players) < 2:
+                try:
+                    await channel.send("🎲 Not enough players left — ending the game.")
+                except discord.HTTPException:
+                    pass
+                await self._finish_game(game_id, channel, reason=REASON_TOO_FEW_PLAYERS)
+                return
+
+            next_custom, remaining = pop_next_prompt(view.queued_prompts)
+            try:
+                await self._run_round(
+                    interaction=interaction,
+                    game_id=game_id,
+                    host_id=host_id,
+                    host_name=host_name,
+                    round_num=round_num + 1,
+                    players=next_players,
+                    channel=channel,
+                    custom_prompt=next_custom,
+                    carry_over_queue=remaining if remaining else None,
+                )
+            except Exception:
+                log.exception("Error advancing MLT game %s to round %d", game_id, round_num + 1)
+                await end_game(self.db, game_id, reason="crash")
+                self.bot.active_views.pop(game_id, None)
+                try:
+                    await channel.send("❌ Something went wrong advancing the round. Game ended.")
+                except discord.HTTPException:
+                    pass
+
+        view = MLTVoteView(
+            game_id=game_id,
+            host_id=host_id,
+            prompt=prompt,
+            round_num=round_num,
+            players=players,
+            db=self.db,
+            bot=self.bot,
+            host_name=host_name,
+            guild=guild,
+            # pyright reports a circular inference here (advance captures
+            # `view`, whose initializer takes `advance`); the closure itself
+            # is fully annotated above.
+            advance_callback=advance,  # pyright: ignore[reportGeneralTypeIssues]
+            pacing=pacing,
+            finish_callback=finish,
+        )
+        return view
+
+    async def _finish_game(self, game_id: str, channel, *, reason: str) -> bool:
+        """Post the final crown standings and end through the paying path.
+
+        Returns False when the game had already been ended by another path
+        (``end_game``'s DELETE claim makes the payout exactly-once either way).
+        """
+        row = await get_active_game_by_id(self.db, game_id)
+        if row is None:
+            self.bot.active_views.pop(game_id, None)
+            return False
+        payload = await get_game_payload(self.db, game_id)
+        crowns = payload.get("crowns") or {}
+        roster = self._voter_roster_from(payload)
+        guild = getattr(channel, "guild", None)
+        try:
+            name_fn = await build_name_fn(
+                guild=guild,
+                db_path=self.bot.ctx.db_path,
+                guild_id=getattr(guild, "id", 0),
+                user_ids=[int(uid) for uid in crowns],
+            )
+            payout_line = None
+            if guild:
+                from bot_modules.economy.game_rewards import payout_footer_line
+                payout_line = await payout_footer_line(self.bot, guild.id, "mlt")
+            await channel.send(view=card(build_final_standings_layout(
+                crowns, name_fn=name_fn, reason=reason, payout_line=payout_line,
+            )))
+        except Exception:
+            log.exception("MLT: failed to post final standings for %s", game_id)
+        rounds = payload.get("rounds", {})
+        played = sum(1 for rd in rounds.values() if isinstance(rd, dict) and rd.get("prompt"))
+        ended = await end_game(
+            self.db, game_id,
+            player_count=len(roster), round_count=played, payload=payload,
+            bot=self.bot, player_ids=roster, reason=reason,
+        )
+        self.bot.active_views.pop(game_id, None)
+        return ended is not None
+
+    async def end_with_recap(self, channel, game_id: str) -> bool:
+        """``/games end`` on a started Most Likely To game: the same standings
+        ending as the host's 🏁 End Game, instead of the red Force-Closed card.
+        A lobby that never started has nothing to recap and answers False."""
+        view = self.bot.active_views.get(game_id)
+        if isinstance(view, MLTVoteView) and view.finish_callback is not None:
+            await view.finish_callback(view.message, REASON_HOST_ENDED)
+            return True
+        payload = await get_game_payload(self.db, game_id)
+        if not payload.get("rounds"):
+            return False
+        return await self._finish_game(game_id, channel, reason=REASON_HOST_ENDED)
+
+    async def recover_game(self, row, payload, channel, message) -> bool:
+        """Rebuild the current phase's view after a restart.
+
+        Join lobby -> MLTJoinView; a started game -> the current vote round's
+        view with its live votes restored.
+
+
+        A recovered round is deliberately **not** re-stuck when the guild's
+        Live Game Boards dial is on: the view is re-registered against the
+        message that is already on screen, and the board starts following the
+        channel bottom again from the next round.
+        """
+        game_id = row["game_id"]
+        host_id = int(row["host_id"])
+        rounds = payload.get("rounds", {})
+
+        guild = getattr(channel, "guild", None)
+        if not rounds:
+            view = MLTJoinView(
+                game_id, host_id, self.db, self.bot, self,
+                guild=guild, host_name=await host_display(self.bot, guild, host_id),
+                players=[int(p) for p in payload.get("players", [])],
+                start_at=extract_start_epoch(payload),
+                art=await read_lobby_art(self.bot, channel, TITLE),
+            )
+            view._msg = message
+            self.bot.active_views[game_id] = view
+            self.bot.add_view(view, message_id=message.id)
+            await redraw_embed_era_lobby(view, message)
+            log.info("Recovered mlt game %s (join phase) in #%s", game_id, getattr(channel, "name", channel.id))
+            return True
+
+        cur = max(rounds, key=lambda k: int(k))
+        rd = rounds.get(cur, {})
+        prompt = rd.get("prompt", "") or ""
+        players = [int(p) for p in payload.get("players", [])]
+        host_name = await host_display(self.bot, guild, host_id)
+
+        pacing = self._pacing_from_payload(payload, rd.get("opened_at"))
+        view = self._build_vote_view(
+            game_id=game_id,
+            host_id=host_id,
+            host_name=host_name,
+            round_num=int(cur),
+            players=players,
+            channel=channel,
+            prompt=prompt,
+            interaction=None,
+            pacing=pacing,
+        )
+        view.votes = {int(k): int(v) for k, v in (rd.get("votes") or {}).items()}
+        await view.refresh_names()
+        view._rebuild()
+        view.message = message
+        self.bot.active_views[game_id] = view
+        self.bot.add_view(view, message_id=message.id)
+        await redraw_embed_era_board(view, message)
+        if not view.waiting:
+            left = seconds_left(pacing.opened_at, pacing.round_seconds)
+            if left is not None:
+                view.pacing.start_timer(
+                    lambda: view.advance_callback(message),
+                    seconds=max(left, _RECOVERY_GRACE_SECONDS),
+                )
+        log.info("Recovered mlt game %s (round %s) in #%s", game_id, cur, getattr(channel, "name", channel.id))
+        return True
+
+
+    async def mid_game_join(self, channel, game_id: str, member):
+        """Add *member* to a running game; they're in from the next round."""
+        uid = member.id
+        state: dict = {}
+        # games_config_cog sends the success arm publicly in-channel
+        # (`ephemeral=not ok`), so the bot's ** is the bot's and the name
+        # inside it is not. Same shape as clapback's twin handler.
+        name = discord.utils.escape_markdown(member.display_name)
+
+        def _add(payload):
+            players = payload.setdefault("players", [])
+            state["limit"] = int(payload.get("max_players") or MAX_PLAYERS)
+            state["already_in"] = uid in players
+            state["full"] = lobby_is_full(players, state["limit"])
+            state["added"] = add_player(players, uid, state["limit"])
+
+        await modify_payload(self.db, game_id, _add)
+        if not state.get("added"):
+            if state.get("already_in"):
+                return False, f"**{name}** is already in this game."
+            if state.get("full"):
+                return (
+                    False,
+                    f"This game is full — it is set to take up to "
+                    f"{state.get('limit', MAX_PLAYERS)} players.",
+                )
+            return False, f"**{name}** is already in this game."
+        return True, f"🎲 **{name}** joined Most Likely To — in from the next round!"
+
+    async def mid_game_leave(self, channel, game_id: str, member):
+        """Remove *member* from a running game. Their crowns stay on the board."""
+        uid = member.id
+        state: dict = {}
+        # Escaped for the same reason as mid_game_join above.
+        name = discord.utils.escape_markdown(member.display_name)
+
+        def _remove(payload):
+            players = payload.setdefault("players", [])
+            state["removed"] = remove_player(players, uid)
+
+        await modify_payload(self.db, game_id, _remove)
+        if not state.get("removed"):
+            return False, f"**{name}** isn't in this game."
+        return True, f"🎲 **{name}** left Most Likely To — their crowns stay on the board."
+
+
+async def setup(bot: "Bot"):
+    cog = MLTCog(bot)
+    await bot.add_cog(cog)
+    bot.tree.remove_command("mlt")
+    play.add_command(cog.mlt, override=True)
+    bot.game_launchers["mlt"] = cog.launch
+    bot.game_recoverers["mlt"] = cog.recover_game
+    bot.game_joiners["mlt"] = cog.mid_game_join
+    bot.game_leavers["mlt"] = cog.mid_game_leave

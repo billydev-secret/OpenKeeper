@@ -1,0 +1,381 @@
+import asyncio
+import logging
+from collections.abc import Iterable
+from pathlib import Path
+
+import discord
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.shared.message_store import get_known_user_names_bulk
+from bot_modules.shared.name_resolver import (
+    NameFn,
+    mention as _mention,
+    resolve_name_from,
+)
+from . import state as app_state
+from .logic import PayoffDials, unasked_questioners
+from .models import PendingQuestionState, PostedQuestionState, PromptKind, RiskyRollState
+
+log = logging.getLogger(__name__)
+
+
+def make_name_resolver(guild: "discord.Guild | None") -> NameFn:
+    """Return a resolver that prints display names as plain text.
+
+    Delegates to the shared chain in ``services.name_resolver``: the live
+    member cache first (complete and nickname-fresh, since ``intents.members``
+    is on), then ``app_state.display_names``, then a ``<@id>`` mention.
+
+    ``app_state.display_names`` is an in-memory dict that empties on restart,
+    which used to make the "a restored round still shows names" promise false
+    for anyone who had since left the guild — the member cache can't recover
+    them either. ``seed_display_names_from_db`` now refills it from the
+    persistent ``known_users`` table when rounds are restored, so a departed
+    player still renders by name rather than as a bare id.
+    """
+    def resolve(uid: int) -> str:
+        # Memoise live-cache hits: if this player leaves mid-round, the name we
+        # saw while they were present is the only one left to print. The live
+        # rung is handled here, so the shared chain is asked for the table and
+        # mention rungs only (guild=None) rather than repeating the lookup.
+        member = guild.get_member(uid) if guild is not None else None
+        if member is not None:
+            name = (member.display_name or "").strip()
+            if name:
+                app_state.display_names[uid] = name
+        return resolve_name_from(
+            uid, guild=None, table_names=app_state.display_names
+        )
+
+    return resolve
+
+
+async def seed_display_names_from_db(
+    db_path: "Path", states: "Iterable[RiskyRollState]"
+) -> int:
+    """Prime ``app_state.display_names`` from ``known_users`` for restored rounds.
+
+    Called once at cog load, after active rounds come back from the store. Only
+    ids the in-memory dict doesn't already hold are looked up, and existing
+    entries are never overwritten. Returns the number of names seeded.
+
+    Never raises: a failed lookup only means the roster falls back to mentions,
+    which must not stop the cog from loading.
+    """
+    by_guild: dict[int, set[int]] = {}
+    for state in states:
+        wanted = set(state.rolls) | {state.opener_id}
+        missing = {uid for uid in wanted if uid not in app_state.display_names}
+        if missing:
+            by_guild.setdefault(state.guild_id, set()).update(missing)
+    if not by_guild:
+        return 0
+
+    def _lookup() -> dict[int, str]:
+        found: dict[int, str] = {}
+        with open_db(db_path) as conn:
+            for guild_id, uids in by_guild.items():
+                found.update(get_known_user_names_bulk(conn, guild_id, sorted(uids)))
+        return found
+
+    try:
+        found = await asyncio.to_thread(_lookup)
+    except Exception:  # noqa: BLE001 — never raises by design (see docstring): a failed lookup must not stop the cog from loading
+        log.warning("risky_roll: display-name seeding failed", exc_info=True)
+        return 0
+
+    for uid, name in found.items():
+        app_state.display_names.setdefault(uid, name)
+    return len(found)
+
+
+def format_user_mentions(user_ids: set[int]) -> str:
+    return " ".join(f"<@{uid}>" for uid in sorted(user_ids))
+
+
+def format_lowest_rolloff_note(
+    tied_user_ids: set[int],
+    selected_user_id: int | None,
+    name_fn: NameFn = _mention,
+) -> str:
+    if selected_user_id is None or len(tied_user_ids) < 2:
+        return ""
+    tied = ", ".join(name_fn(uid) for uid in sorted(tied_user_ids))
+    return f"{tied} → {name_fn(selected_user_id)}"
+
+
+def _roll_prefix(user_id: int, roll: int, state: RiskyRollState) -> str:
+    if roll == 69:
+        return "🔥"
+    if not state.is_open:
+        if user_id == state.highest_user:
+            return "⭐" if roll == 100 else "🥇"
+        if user_id == state.lowest_user:
+            return "☠️" if roll == 1 else "💀"
+    return "🎲"
+
+
+def _questioner_mentions(state: PendingQuestionState, *, asked: bool) -> str:
+    return " and ".join(
+        f"<@{uid}>"
+        for uid in [state.winner_id, state.extra_questioner_id]
+        if uid is not None and (uid in state.questioners_asked) == asked
+    )
+
+
+def build_pending_prompt_content(state: PendingQuestionState) -> str:
+    if state.prompt_kind == PromptKind.TWO_QUESTIONERS:
+        target_mentions = format_user_mentions(state.participant_user_ids)
+        lines = [
+            f"☠️ Someone rolled a **1**! {_questioner_mentions(state, asked=False)} "
+            f"can each fire a question at {target_mentions}."
+        ]
+        if state.questioners_asked:
+            lines.append(f"{_questioner_mentions(state, asked=True)} already asked.")
+        lines.append("Click **Ask Question** to send yours.")
+        return "\n".join(lines)
+
+    if state.prompt_kind == PromptKind.DIRECT:
+        selected_user_id = next(iter(sorted(state.participant_user_ids)), None)
+        lowest_rolloff_note = format_lowest_rolloff_note(state.lowest_tie_user_ids, selected_user_id)
+        target_mentions = format_user_mentions(state.participant_user_ids)
+        lines = [f"🥇 <@{state.winner_id}> wins the round."]
+        if lowest_rolloff_note:
+            lines.append(lowest_rolloff_note)
+        if len(state.participant_user_ids) > 1:
+            lines.append(f"They rolled **100** — click **Ask Question** to send your question to {target_mentions}.")
+        else:
+            lines.append(f"Click **Ask Question** to send your question to {target_mentions}.")
+        return "\n".join(lines)
+
+    return (
+        f"🔥 <@{state.winner_id}> rolled **69** — they ask the room.\n"
+        "Click **Ask Question** to post your question in a thread."
+    )
+
+
+def build_pending_question_summary(
+    state: PendingQuestionState,
+    question_text: str,
+    asker_id: int | None = None,
+    *,
+    from_bank: bool = False,
+) -> str:
+    """The text the disabled Ask Question prompt is left showing.
+
+    ``from_bank`` is the fallback dial: the winner never asked, so the bot
+    drew the question for them, and the summary says so rather than putting
+    the bank's words in the winner's mouth.
+    """
+    question_text = discord.utils.escape_markdown(question_text)
+    if state.prompt_kind == PromptKind.TWO_QUESTIONERS:
+        uid = asker_id if asker_id is not None else state.winner_id
+        target_mentions = format_user_mentions(state.participant_user_ids)
+        if from_bank:
+            return f"<@{uid}> ran out of time — the deck asked {target_mentions} for them:\n> {question_text}"
+        return f"<@{uid}> asked {target_mentions}:\n> {question_text}"
+
+    if state.prompt_kind == PromptKind.DIRECT:
+        target_mentions = format_user_mentions(state.participant_user_ids)
+        if from_bank:
+            return (
+                f"<@{state.winner_id}> ran out of time — the deck asked {target_mentions} for them:\n"
+                f"> {question_text}"
+            )
+        return f"<@{state.winner_id}> asked {target_mentions}:\n> {question_text}"
+
+    if from_bank:
+        return f"<@{state.winner_id}> rolled 69 but never asked — the deck asked the room:\n> {question_text}"
+    return f"<@{state.winner_id}> rolled 69 and asked:\n> {question_text}"
+
+
+def build_pending_chase_content(state: PendingQuestionState, dials: PayoffDials) -> str:
+    """The one re-ping of whoever still owes the round a question.
+
+    Message content, not an embed, so the ``<@id>`` mentions resolve. Names
+    the fallback window when that dial is on, so the winner knows the deck
+    will ask for them if they don't.
+    """
+    owed = format_user_mentions(set(unasked_questioners(state)))
+    line = f"⏰ {owed} — your Risky Rolls question is still waiting. Press **Ask Question** above to send it."
+    if dials.fallback_hours > 0:
+        line += f" If it's still unasked after {_hours(dials.fallback_hours)}, the deck asks one for you."
+    return line
+
+
+def build_posted_chase_content(state: PostedQuestionState) -> str:
+    """The one re-ping of the answerer(s) once a question has been posted."""
+    targets = format_user_mentions(state.allowed_replier_ids)
+    whose = "the deck's" if state.from_bank else f"<@{state.asker_id}>'s"
+    return f"⏰ {targets} — {whose} question is still waiting for your reply. Press **Reply** above to answer it."
+
+
+def build_fallback_question_content(
+    state: PendingQuestionState,
+    asker_id: int,
+    question_text: str,
+    pinged_user_ids: set[int],
+) -> str:
+    """The question the bot posts for a winner who ran out of time.
+
+    Same shape as the winner's own question message (targets, then the
+    asker line, then the question) so the Reply flow and the reply render
+    read the same; the asker line just says who really wrote it.
+    """
+    pings = format_user_mentions(pinged_user_ids)
+    if state.prompt_kind == PromptKind.ROOM:
+        return (
+            f"{pings}\n🔥 <@{asker_id}> rolled 69 but never asked, so the deck asks the room:\n"
+            f"{question_text}"
+        )
+    return f"{pings}\n<@{asker_id}> ran out of time, so the deck asks for them:\n{question_text}"
+
+
+def _hours(hours: int) -> str:
+    return f"{hours} hour{'s' if hours != 1 else ''}"
+
+
+def auto_close_text(state: RiskyRollState) -> str | None:
+    """"Auto-closes at N players or after M minutes" for an open round, else
+    ``None``."""
+    if not state.is_open or not (state.auto_close_players or state.auto_close_minutes):
+        return None
+    parts = []
+    if state.auto_close_players:
+        parts.append(f"at {state.auto_close_players} players")
+    if state.auto_close_minutes:
+        parts.append(f"after {state.auto_close_minutes} minute{'s' if state.auto_close_minutes != 1 else ''}")
+    return f"Auto-closes {' or '.join(parts)}"
+
+
+def roll_lines(state: RiskyRollState, name: NameFn) -> list[str]:
+    """One line per roll, highest first, each led by its glyph."""
+    sorted_rolls = sorted(state.rolls.items(), key=lambda item: item[1], reverse=True)
+    return [
+        f"{_roll_prefix(uid, roll, state)} **{roll}** — {name(uid)}"
+        for uid, roll in sorted_rolls
+    ]
+
+
+def result_text(state: RiskyRollState, name: NameFn) -> str | None:
+    """Who asks and who answers, once a closed round has a winner.
+
+    ``None`` while the round is open or when nobody won. Shared by the embed
+    and the Components V2 board so the two can't word a result differently.
+    """
+    if state.is_open or not state.highest_user:
+        return None
+    high_mention = name(state.highest_user)
+    if state.lowest_user is None:
+        result = f"**Asks:** {high_mention}\n**Answers:** the room"
+        highest_rolloff_note = format_lowest_rolloff_note(state.highest_tie_user_ids, state.highest_user, name)
+        if highest_rolloff_note:
+            result += f"\n{highest_rolloff_note}"
+    else:
+        low_mention = name(state.lowest_user)
+        winner_rolled_100 = state.rolls.get(state.highest_user) == 100
+        loser_rolled_1 = state.rolls.get(state.lowest_user) == 1
+
+        if winner_rolled_100 and state.second_lowest_user is not None:
+            result = f"**Asks:** {high_mention} ⭐\n**Answers:** {low_mention} and {name(state.second_lowest_user)}"
+        elif loser_rolled_1 and state.second_highest_user is not None:
+            result = f"**Asks:** {high_mention} and {name(state.second_highest_user)}\n**Answers:** {low_mention} ☠️"
+        else:
+            result = f"**Asks:** {high_mention}\n**Answers:** {low_mention}"
+
+        highest_rolloff_note = format_lowest_rolloff_note(state.highest_tie_user_ids, state.highest_user, name)
+        if highest_rolloff_note:
+            result += f"\n{highest_rolloff_note}"
+        lowest_rolloff_note = format_lowest_rolloff_note(state.lowest_tie_user_ids, state.lowest_user, name)
+        if lowest_rolloff_note:
+            result += f"\n{lowest_rolloff_note}"
+        second_lowest_note = format_lowest_rolloff_note(state.second_lowest_tie_user_ids, state.second_lowest_user, name)
+        if second_lowest_note:
+            result += f"\n{second_lowest_note}"
+        second_highest_note = format_lowest_rolloff_note(state.second_highest_tie_user_ids, state.second_highest_user, name)
+        if second_highest_note:
+            result += f"\n{second_highest_note}"
+
+        if winner_rolled_100 and loser_rolled_1:
+            result += "\n*Both the 100 and 1 rules apply.*"
+
+    return result
+
+
+def build_question_reply_content(
+    state: PostedQuestionState,
+    replier_id: int,
+    reply_text: str,
+) -> str:
+    target_mentions = format_user_mentions(state.allowed_replier_ids)
+    asks = (
+        f"the deck asks for <@{state.asker_id}>:" if state.from_bank
+        else f"<@{state.asker_id}> asks:"
+    )
+    question_text = discord.utils.escape_markdown(state.question_text)
+    reply_text = discord.utils.escape_markdown(reply_text)
+    return f"{target_mentions}\n{asks}\n{question_text}\n\n<@{replier_id}>: {reply_text}"
+
+
+def how_to_play_parts(
+    dials: PayoffDials | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """The rules as ``(basics, special rolls, after the round)`` line groups.
+
+    The question line promises only what the game enforces — the loser is
+    *asked* to reply; nothing makes them. With a payoff dial on, the card
+    names the window so the promise matches what actually happens.
+    """
+    dials = dials or PayoffDials()
+    basics = [
+        "**Roll** — Each player presses **Roll** once. You roll a number from **1** to **100**.",
+        "**Win** — Highest unique roll wins the round; lowest roll is the loser.",
+        "**Ties for highest** — Tied players auto-reroll until one wins.",
+        "**Question** — The winner asks the loser a question, and the loser is asked to reply.",
+    ]
+    specials = [
+        "🔥 **Rolled 69** — The winner asks the whole room (in a thread).",
+        "⭐ **Rolled 100** — The winner asks the bottom 2 players.",
+        "☠️ **Rolled 1** — The top 2 players each ask the loser.",
+    ]
+    after: list[str] = []
+    if dials.chase_hours > 0:
+        after.append(
+            f"⏰ **Reminders** — An unasked question, or an unanswered one, gets one nudge after "
+            f"{_hours(dials.chase_hours)}."
+        )
+    if dials.fallback_hours > 0:
+        after.append(
+            f"🃏 **The deck** — If the winner hasn't asked after {_hours(dials.fallback_hours)}, "
+            "the deck asks a question for them and the loser still answers."
+        )
+    after.append("**Close** — Only the round opener (or an admin) can close early.")
+    return basics, specials, after
+
+
+async def get_text_channel(
+    client: discord.Client,
+    channel_id: int,
+) -> discord.TextChannel | discord.Thread | None:
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.NotFound:
+            log.warning("get_text_channel: channel %s not found.", channel_id)
+            return None
+        except discord.Forbidden:
+            log.warning("get_text_channel: forbidden fetching channel %s.", channel_id)
+            return None
+        except discord.HTTPException:
+            log.warning("get_text_channel: HTTP error fetching channel %s.", channel_id, exc_info=True)
+            return None
+
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return channel
+
+    log.warning(
+        "get_text_channel: channel %s is type %s, not a TextChannel or Thread.",
+        channel_id, type(channel).__name__,
+    )
+    return None

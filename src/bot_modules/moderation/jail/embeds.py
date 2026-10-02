@@ -1,0 +1,780 @@
+"""Embed builders for the jail / ticket / policy / warnings subsystem.
+
+These functions take plain Python values (ints, strings, lists of dicts)
+and return ``discord.Embed`` objects. They make no network calls and run
+no queries — every field is computed from the arguments, so the cog can
+gather data once and these can render it without touching state.
+
+Why factor it out:
+  - The cog used to build embeds inline from DB rows; tests couldn't reach
+    the formatting without a fake interaction. Now each builder takes plain
+    data and the cog's job shrinks to "fetch rows → call builder → send".
+  - The same policy-vote embed shape is rebuilt three times across the cog
+    and ``moderation/jail/jail_commands.py``. Centralizing here means one place to
+    fix when (e.g.) the "+N more" overflow rule changes.
+  - ``discord.Embed.timestamp`` requires a real ``datetime``; pass one in
+    and the builder uses ``datetime.now(timezone.utc)`` only as a default
+    so tests can pin the value for snapshot comparisons.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+from typing import Any
+
+import discord
+
+from bot_modules.shared.name_resolver import NameFn, mention
+from bot_modules.shared.embeds import (
+    MOD_INFO,
+    MOD_JAIL,
+    MOD_POLICY,
+    MOD_SUCCESS,
+    MOD_TICKET,
+    MOD_WARNING,
+    xp_breakdown_parts,
+)
+from bot_modules.core.branding import (
+    EMBED_TITLE_LIMIT,
+    FIELD_NAME_LIMIT,
+    FIELD_VALUE_LIMIT,
+    apply_section_spacing,
+    escape_to_fit,
+    trim_escaped,
+)
+from bot_modules.moderation.jail.logic import policy_visibility_status
+
+
+
+# Defaults that mirror the cog's existing knobs. Kept here so tests can
+# assert behavior changes when (e.g.) the page size moves without finding
+# the constant baked into the cog.
+DEFAULT_POLICIES_PAGE_SIZE = 25
+DEFAULT_POLICY_DESC_PREVIEW = 100
+
+#: How much of one mod-typed reason ``/modinfo`` shows per line. The summary
+#: stacks up to three warning reasons plus a jail reason and a release reason
+#: into two 1024-char fields, and none of those reasons is capped where it is
+#: written — a slash-command string parameter accepts far more than a field
+#: holds, and escaping can double whatever arrives. A per-line budget keeps
+#: one long reason from crowding out the four beside it; the whole-field trim
+#: below it is the backstop that makes the send provably safe.
+_REASON_PREVIEW = 200
+
+# The escape-then-fit helper started life here, as ``_escaped_name``, when this
+# was the only file known to need it. The cap sweep found the same defect in
+# eight more modules, so it moved to ``core.branding.escape_to_fit`` — where
+# ``FIELD_VALUE_LIMIT`` and the rest of the Discord ceilings already live —
+# rather than being copied per subsystem.
+
+
+# ``MOD_JAIL`` is ``0xE74C3C`` — the same bright red used in the original
+# ``moderation/jail/jail_commands.py`` for rejected-vote and timeout audit embeds.
+# Reusing the named constant keeps every "rejected" indicator in sync.
+_REJECTED_COLOR_INT = MOD_JAIL
+
+
+# ── Mention helpers ────────────────────────────────────────────────────
+
+
+#: Character budget for one voter-list field. Leaves room under Discord's
+#: 1024-char field ceiling for the "+N more" tail and the separators.
+DEFAULT_BALLOT_NAMES_BUDGET = 900
+
+
+def _format_names(
+    ids: Sequence[int],
+    name_fn: "NameFn | None" = None,
+    *,
+    budget: int = DEFAULT_BALLOT_NAMES_BUDGET,
+) -> str:
+    """Render ids as a comma-separated list of resolved names, or ``"—"``.
+
+    Truncates on accumulated *characters* and appends ``"+N more"``, so the
+    field fits whatever mix of short and long display names turns up.
+
+    Names alone, on both cards. The mod vote used to append ``(`id`)`` under
+    the copyable-id rule, on the premise that only mods would ever read it.
+    Neither half holds: nothing in the policy flow takes a user id (the vote
+    buttons carry a *policy* id), and a policy ticket is run privately among
+    mods **or** opened to the general public, proposal by proposal — so this
+    builder cannot know whether a member is reading, and renders as if one
+    is. See docs/embed_style_guide.md, "Naming members in embeds".
+    """
+    resolve = name_fn or mention
+    shown: list[str] = []
+    used = 0
+    for index, uid in enumerate(ids):
+        name = resolve(uid)
+        cost = len(name) + (2 if shown else 0)
+        if used + cost > budget:
+            return f"{', '.join(shown) or '—'} *+{len(ids) - index} more*"
+        shown.append(name)
+        used += cost
+    return ", ".join(shown) or "—"
+
+
+# ── Policy vote ────────────────────────────────────────────────────────
+
+
+def build_policy_vote_initial_embed(
+    *,
+    channel_name: str,
+    vote_text: str,
+    eligible_ids: Sequence[int],
+    name_fn: "NameFn | None" = None,
+) -> discord.Embed:
+    """Build the very first embed posted when a policy vote opens.
+
+    All counts are zero / "—"; only the eligible-voter "awaiting" list is
+    populated, truncated with a ``"+N more"`` tail so the field stays under
+    Discord's 1024-character ceiling.
+
+    Names, not mentions. This card lives in a private mod channel, so a
+    ``<@id>`` mostly resolved and the violation was invisible — but it was
+    still a violation, and "mostly" is doing real work in that sentence: a
+    mod who has never seen a colleague, or a voter who has since left the
+    guild, rendered as a bare number. Every id goes through ``name_fn``
+    (``services/name_resolver.build_name_fn``), which also escapes markdown.
+    """
+    # `vote_text` is the mod's raw modal text and `channel_name` is derived
+    # from the admin's policy title — `sanitize_channel_name` strips everything
+    # but `[a-z0-9_-]`, and an underscore still italicises. Both are escaped
+    # and fitted here rather than by the caller, so the update card below can
+    # state the same contract.
+    title_prefix = "🗳️ Policy Vote: "
+    embed = discord.Embed(
+        title=title_prefix
+        + escape_to_fit(channel_name, EMBED_TITLE_LIMIT - len(title_prefix)),
+        color=MOD_POLICY,
+    )
+    embed.add_field(
+        name="📜 Policy Text",
+        value=escape_to_fit(vote_text, FIELD_VALUE_LIMIT),
+        inline=False,
+    )
+    embed.add_field(
+        name="Votes Cast", value=f"0/{len(list(eligible_ids))}", inline=True
+    )
+    embed.add_field(name="Status", value="🗳️ Voting", inline=True)
+    embed.add_field(name="✅ Yes", value="—", inline=False)
+    embed.add_field(name="❌ No", value="—", inline=False)
+    embed.add_field(name="➖ Abstain", value="—", inline=False)
+    embed.add_field(
+        name="⏳ Awaiting",
+        value=_format_names(eligible_ids, name_fn),
+        inline=False,
+    )
+    apply_section_spacing(embed)
+    return embed
+
+
+def build_policy_vote_update_embed(
+    *,
+    policy_title: str,
+    vote_text: str,
+    yes_ids: Sequence[int],
+    no_ids: Sequence[int],
+    abstain_ids: Sequence[int],
+    awaiting_ids: Sequence[int],
+    outcome: str | None = None,
+    name_fn: "NameFn | None" = None,
+) -> discord.Embed:
+    """Build the running-tally embed shown after each vote is cast.
+
+    ``outcome`` is one of:
+      - ``None``     — voting still open, "🗳️ Voting" status.
+      - ``"adopted"`` — green check, "✅ Adopted" status.
+      - ``"rejected"`` — red x, "❌ Rejected" status.
+
+    Mirrors the field order used in ``_handle_policy_vote`` so embed
+    updates land cleanly via ``set_field_at``.
+    """
+    eligible_count = (
+        len(list(yes_ids)) + len(list(no_ids))
+        + len(list(abstain_ids)) + len(list(awaiting_ids))
+    )
+    voted_count = eligible_count - len(list(awaiting_ids))
+
+    if outcome == "adopted":
+        color = MOD_SUCCESS
+        status = "✅ Adopted"
+    elif outcome == "rejected":
+        color = _REJECTED_COLOR_INT
+        status = "❌ Rejected"
+    else:
+        color = MOD_POLICY
+        status = "🗳️ Voting"
+
+    # Same contract as the initial card: both halves are human-typed and both
+    # arrive raw, here straight off the `policy_tickets` row rather than from
+    # a modal. The title is the trap — `policy_title` is capped at 200 when
+    # it is written, which fits 256 only while it is unescaped.
+    title_prefix = "🗳️ Policy Vote: "
+    embed = discord.Embed(
+        title=title_prefix
+        + escape_to_fit(policy_title, EMBED_TITLE_LIMIT - len(title_prefix)),
+        color=color,
+    )
+    embed.add_field(
+        name="📜 Policy Text",
+        value=escape_to_fit(vote_text, FIELD_VALUE_LIMIT) or "(no text)",
+        inline=False,
+    )
+    embed.add_field(
+        name="Votes Cast", value=f"{voted_count}/{eligible_count}", inline=True
+    )
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(
+        name="✅ Yes",
+        value=_format_names(yes_ids, name_fn),
+        inline=False,
+    )
+    embed.add_field(
+        name="❌ No",
+        value=_format_names(no_ids, name_fn),
+        inline=False,
+    )
+    embed.add_field(
+        name="➖ Abstain",
+        value=_format_names(abstain_ids, name_fn),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏳ Awaiting",
+        value=_format_names(awaiting_ids, name_fn),
+        inline=False,
+    )
+    apply_section_spacing(embed)
+    return embed
+
+
+# ── Community ballot ───────────────────────────────────────────────────
+#
+# The members' counterpart to the mod vote above, and rendered by different
+# rules for one reason: this card is posted in a channel ordinary members read.
+#
+#  * **Names, not mentions.** A ``<@id>`` in an embed is resolved by the
+#    *reading* client from its own cache, so it degrades to a bare number for
+#    anyone who has not seen that member — in a public roster that is most
+#    readers. Every id here goes through a ``name_fn``
+#    (``services/name_resolver.build_name_fn``), which also escapes markdown.
+#  * **The voter lists are capped by characters, not entries.** Embed fields
+#    stop at 1024 characters and display names vary wildly in length, so the
+#    fixed 25-entry rule the mod vote used to use does not transfer: 25 long
+#    nicknames would silently lose the whole field. The mod vote was converted
+#    to the same character budget on 2026-09-03, and that entry cap is gone.
+
+def build_policy_ballot_embed(
+    *,
+    question: str,
+    yes_ids: Sequence[int] = (),
+    no_ids: Sequence[int] = (),
+    abstain_ids: Sequence[int] = (),
+    name_fn: "NameFn | None" = None,
+    closes_at: float | None = None,
+    outcome: str | None = None,
+    color: "discord.Color | None" = None,
+) -> discord.Embed:
+    """The community ballot card: the question, the tally, and who voted how.
+
+    ``outcome`` is ``None`` while the ballot is open, then one of ``passed`` /
+    ``failed`` / ``cancelled``. ``closes_at`` is a unix timestamp rendered as a
+    relative Discord timestamp while open, and dropped once it has closed.
+
+    The card takes **only** the question a moderator typed. It is never handed
+    the proposal's description, a transcript, or anything else from a private
+    channel: the string in the modal is the entire seam between mod
+    deliberation and the public room, and keeping it that way is what makes
+    "widen the vote" not mean "widen the discussion".
+    """
+    if color is None:
+        color = discord.Color(MOD_POLICY)
+    if outcome == "passed":
+        color = discord.Color(MOD_SUCCESS)
+        status = "✅ Passed"
+    elif outcome == "failed":
+        color = discord.Color(_REJECTED_COLOR_INT)
+        status = "❌ Failed"
+    elif outcome == "cancelled":
+        status = "🚫 Cancelled"
+    else:
+        status = "🗳️ Open"
+
+    yes, no, abstain = list(yes_ids), list(no_ids), list(abstain_ids)
+    embed = discord.Embed(title="🗳️ Community Ballot", color=color)
+    # Escaped *here*, not at the caller. The opening card and every re-render
+    # after a vote press are two different call sites — the cog holds the
+    # modal text, `_render_ballot_embed` reads the same string back out of
+    # `policy_ballots.question` — and escaping at the cog left every render
+    # but the first one raw, in a public thread, on a card that is edited on
+    # every button press. Escaping at the one place both paths pass through is
+    # what makes the two agree. The modal allows 1000 characters, which is
+    # under the 1024 field cap only until it is escaped.
+    embed.add_field(
+        name="📜 The Question",
+        value=escape_to_fit(question, FIELD_VALUE_LIMIT) or "(no question)",
+        inline=False,
+    )
+    embed.add_field(name="Votes Cast", value=str(len(yes) + len(no) + len(abstain)), inline=True)
+    embed.add_field(name="Status", value=status, inline=True)
+    if outcome is None and closes_at:
+        embed.add_field(name="Closes", value=f"<t:{int(closes_at)}:R>", inline=True)
+    embed.add_field(
+        name=f"✅ Yes ({len(yes)})", value=_format_names(yes, name_fn), inline=False
+    )
+    embed.add_field(
+        name=f"❌ No ({len(no)})", value=_format_names(no, name_fn), inline=False
+    )
+    embed.add_field(
+        name=f"➖ Abstain ({len(abstain)})",
+        value=_format_names(abstain, name_fn),
+        inline=False,
+    )
+    embed.set_footer(
+        text="Anyone who can see this thread may vote • Abstaining counts "
+        "toward neither side • Ties fail • Your vote is public"
+    )
+    apply_section_spacing(embed)
+    return embed
+
+
+# ── Policy list ────────────────────────────────────────────────────────
+
+
+def build_policy_list_embed(
+    policies: Sequence[Mapping[str, Any]],
+    *,
+    page_size: int = DEFAULT_POLICIES_PAGE_SIZE,
+    desc_preview: int = DEFAULT_POLICY_DESC_PREVIEW,
+) -> discord.Embed:
+    """Build the ``/policy list`` embed.
+
+    Each policy row is rendered as one embed field showing its ID, title,
+    a description preview (with an ellipsis if truncated), and the
+    ``<t:…:d>`` adoption timestamp. When the list is longer than
+    ``page_size`` rows, a footer reports the truncation count.
+
+    Pass ``page_size=0`` to disable pagination (used by tests that want to
+    snapshot the full list).
+    """
+    embed = discord.Embed(title="📋 Passed Policies", color=MOD_POLICY)
+    effective_size = page_size if page_size > 0 else len(policies)
+    for p in policies[:effective_size]:
+        passed_ts = f"<t:{int(p['passed_at'])}:d>"
+        # Title and description are both member-authored. Escape before the
+        # preview slice so the cut measures what actually renders — the
+        # ellipsis then reports truncation of the escaped text, which is the
+        # string that really got trimmed. ``escape_to_fit`` also keeps the cut
+        # off an escape pair, which a bare ``[:desc_preview]`` did not.
+        preview = escape_to_fit(p.get("description") or "", desc_preview)
+        # The "#12 — " prefix is the bot's own and eats into the same 256, so
+        # the title is fitted to what is left rather than to the full cap.
+        prefix = f"#{p['id']} — "
+        embed.add_field(
+            name=prefix + escape_to_fit(p["title"], FIELD_NAME_LIMIT - len(prefix)),
+            value=f"{preview}\nPassed: {passed_ts}",
+            inline=False,
+        )
+    if page_size > 0 and len(policies) > page_size:
+        embed.set_footer(
+            text=f"Showing {page_size} of {len(policies)} policies."
+        )
+    return embed
+
+
+# ── Ticket panel ───────────────────────────────────────────────────────
+
+
+def build_ticket_panel_embed(
+    *,
+    color: "discord.Color | None" = None,
+) -> discord.Embed:
+    """The static "📩 Support Tickets" embed for ``/ticket panel``."""
+    if color is None:
+        color = discord.Color(MOD_TICKET)
+    return discord.Embed(
+        title="📩 Support Tickets",
+        description=(
+            "Need help from the mod team? Click the button below to open a "
+            "private ticket.\n\n"
+            "A moderator will respond as soon as possible."
+        ),
+        color=color,
+    )
+
+
+def build_ticket_open_embed(
+    *,
+    ticket_id: int,
+    description: str,
+    opener_name: str,
+    now: datetime | None = None,
+    color: "discord.Color | None" = None,
+) -> discord.Embed:
+    """Build the welcome embed posted inside a freshly-opened ticket.
+
+    ``opener_name`` is a resolved display name — the ticket channel is read by
+    the member who opened it, never by a client guaranteed to have them cached.
+    """
+    if color is None:
+        color = discord.Color(MOD_TICKET)
+    embed = discord.Embed(
+        title=f"🎫 Ticket #{ticket_id}",
+        description=description,
+        color=color,
+        timestamp=now or datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Opened by", value=opener_name, inline=True)
+    embed.add_field(name="Status", value="🟢 Open", inline=True)
+    # Up-front consent notice — users should know their words will be archived.
+    embed.set_footer(
+        text=(
+            "When this ticket is closed, the conversation is archived to "
+            "the moderator transcript channel."
+        )
+    )
+    apply_section_spacing(embed)
+    return embed
+
+
+# ── Mod info ──────────────────────────────────────────────────────────
+
+
+def build_modinfo_embed(
+    *,
+    user_label: str,
+    user_avatar_url: str | None,
+    account_created: datetime,
+    account_age_days: int,
+    joined_at: datetime | None,
+    xp_row: Mapping[str, Any] | None,
+    xp_by_source: Mapping[str, float] | None = None,
+    watcher_count: int,
+    active_jail: Mapping[str, Any] | None,
+    jail_history: Sequence[Mapping[str, Any]],
+    warns: Sequence[Mapping[str, Any]],
+    tickets: Sequence[Mapping[str, Any]],
+    last_seen_ts: float | None,
+    top_channels: Sequence[Mapping[str, Any]],
+    msgs_30d_total: int,
+    ts_formatter=None,
+    color: "discord.Color | None" = None,
+) -> discord.Embed:
+    """Assemble the ``/modinfo`` summary embed.
+
+    All inputs are plain values — the cog does the DB lookups and Discord
+    member resolution, then passes results in. This is the largest single
+    win for cog testability: the field-by-field formatting used to live
+    inline in the slash-command handler.
+
+    ``ts_formatter`` is an optional ``Callable[[float | None], str]`` — if not
+    given, falls back to Discord's ``<t:…:f>`` form. Pass an identity formatter
+    in tests for stable snapshots.
+    """
+    formatter = ts_formatter or (lambda ts: f"<t:{int(ts)}:f>" if ts else "N/A")
+
+    if color is None:
+        color = discord.Color(MOD_INFO)
+    embed = discord.Embed(title=f"ℹ️ Mod Info — {user_label}", color=color)
+    if user_avatar_url:
+        embed.set_thumbnail(url=user_avatar_url)
+
+    # ── Account ──────────────────────────────────────────────────────
+    created_ts = int(account_created.timestamp())
+    acct_lines = f"Created: <t:{created_ts}:D> ({account_age_days}d ago)"
+    if joined_at is not None:
+        # Relative, as on /info — the client keeps it current and shows the
+        # date on hover.
+        acct_lines += f"\nJoined: <t:{int(joined_at.timestamp())}:R>"
+    embed.add_field(name="👤 Account", value=acct_lines, inline=True)
+
+    # ── XP / Level ───────────────────────────────────────────────────
+    if xp_row is not None:
+        xp_text = f"Level **{xp_row['level']}** · {xp_row['total_xp']:,.0f} XP"
+        parts = xp_breakdown_parts(dict(xp_by_source) if xp_by_source else None)
+        if parts:
+            xp_text += "\n" + " · ".join(parts)
+    else:
+        xp_text = "No XP recorded"
+    embed.add_field(name="⭐ Level", value=xp_text, inline=True)
+
+    # ── Watch list ───────────────────────────────────────────────────
+    if watcher_count:
+        suffix = "s" if watcher_count != 1 else ""
+        watch_text = f"👁 **{watcher_count} mod{suffix} watching**"
+    else:
+        watch_text = "Not watched"
+    embed.add_field(name="🔍 Watch List", value=watch_text, inline=True)
+
+    # ── Jail ─────────────────────────────────────────────────────────
+    #
+    # The reason columns below are mod-typed free text read back out of the
+    # DB, and they land in field *values*, which render markdown. The audit
+    # embeds further down this file escape the same columns; leaving these
+    # raw made the file disagree with itself, so a `**` in a jail reason
+    # bolded part of a card that reads as the bot's own summary. Each reason
+    # is escaped and previewed, and the assembled block is trimmed as a
+    # backstop — `trim_escaped`, not a slice, because the block now contains
+    # escape pairs a bare cut could split.
+    if active_jail is not None:
+        jail_text = f"**Currently jailed** since {formatter(active_jail['created_at'])}"
+        if active_jail.get("expires_at"):
+            jail_text += f"\nExpires: {formatter(active_jail['expires_at'])}"
+        if active_jail.get("reason"):
+            reason = escape_to_fit(active_jail["reason"], _REASON_PREVIEW)
+            jail_text += f"\nReason: {reason}"
+    else:
+        jail_text = "Not currently jailed"
+    if len(jail_history) > 1 or (len(jail_history) == 1 and active_jail is None):
+        past = [j for j in jail_history if j["status"] != "active"]
+        jail_text += f"\n**Past jails:** {len(past)}"
+        if past:
+            recent = past[0]
+            release = escape_to_fit(recent.get("release_reason") or "", _REASON_PREVIEW)
+            jail_text += f"\n  Most recent: {formatter(recent['created_at'])} — {release}"
+    embed.add_field(
+        name="🔒 Jail", value=trim_escaped(jail_text, FIELD_VALUE_LIMIT), inline=False
+    )
+
+    # ── Warnings ─────────────────────────────────────────────────────
+    active_warns = [w for w in warns if not w["revoked"]]
+    warn_text = f"**Active:** {len(active_warns)} / **Total:** {len(warns)}"
+    for w in active_warns[:3]:
+        warn_reason = escape_to_fit(w["reason"] or "", _REASON_PREVIEW) or "no reason"
+        warn_text += (
+            f"\n  #{w['id']} — {formatter(w['created_at'])} — {warn_reason}"
+        )
+    embed.add_field(
+        name="⚠️ Warnings",
+        value=trim_escaped(warn_text, FIELD_VALUE_LIMIT),
+        inline=False,
+    )
+
+    # ── Tickets ──────────────────────────────────────────────────────
+    open_t = sum(1 for t in tickets if t["status"] == "open")
+    closed_t = sum(1 for t in tickets if t["status"] in ("closed", "deleted"))
+    ticket_text = f"**Open:** {open_t} / **Closed:** {closed_t}"
+    if tickets:
+        recent_ticket = tickets[0]
+        ticket_text += (
+            f"\n  Most recent: #{recent_ticket['id']} — "
+            f"{recent_ticket['status']} — {formatter(recent_ticket['created_at'])}"
+        )
+    embed.add_field(name="📩 Tickets", value=ticket_text, inline=False)
+
+    # ── Activity ─────────────────────────────────────────────────────
+    last_seen = formatter(last_seen_ts) if last_seen_ts else "Never"
+    ch_lines = "\n".join(
+        f"<#{row['channel_id']}> — {row['cnt']} msgs" for row in top_channels
+    ) or "No activity"
+    embed.add_field(
+        name=f"💬 Activity — {msgs_30d_total} msgs (30d)",
+        value=f"Last seen: {last_seen}\n{ch_lines}",
+        inline=False,
+    )
+
+    embed.set_image(url="attachment://modinfo_activity.png")
+    apply_section_spacing(embed)
+    return embed
+
+
+# ── Jail and warning audit ────────────────────────────────────────────
+#
+# Every member here is a **resolved display name** (``build_name_fn``), never a
+# ``<@id>``: until 2026-09-14 these took ``*_mention`` strings, which rendered
+# as a bare number for any mod who hadn't cached the member, and always for
+# one who had left. ``tests/contracts/test_embed_mention_guard.py`` rejects the old
+# parameter shape.
+
+
+def build_jail_audit_embed(
+    *,
+    target_name: str,
+    moderator_name: str,
+    duration_text: str,
+    reason: str = "",
+) -> discord.Embed:
+    """Audit-log embed posted after a ``/jail``."""
+    description = (
+        f"{target_name} jailed by {moderator_name}\n"
+        f"**Duration:** {duration_text}"
+    )
+    if reason:
+        description += f"\n**Reason:** {discord.utils.escape_markdown(reason)}"
+    return discord.Embed(
+        title="🔒 Member Jailed", description=description, color=MOD_JAIL,
+    )
+
+
+def build_warning_audit_embed(
+    *,
+    target_name: str,
+    moderator_name: str,
+    active_count: int,
+    reason: str = "",
+    notes: str = "",
+    source_jump_url: str | None = None,
+) -> discord.Embed:
+    """Build the "⚠️ Warning Issued" audit embed.
+
+    ``source_jump_url`` is supplied by the message-context-menu path so the
+    audit row can link back to the offending message; the slash-command
+    path passes ``None``.
+    """
+    parts = [f"{target_name} warned by {moderator_name}"]
+    if reason:
+        parts.append(f"**Reason:** {discord.utils.escape_markdown(reason)}")
+    if notes:
+        # Escaped for the same reason ``reason`` two lines up is, even though
+        # nothing in ``src/`` passes ``notes=`` today. An unescaped parameter
+        # sitting beside an escaped sibling is a trap for whoever wires the
+        # first caller: it reads as a considered exception rather than a gap.
+        parts.append(f"**Notes:** {discord.utils.escape_markdown(notes)}")
+    parts.append(f"**Active warnings:** {active_count}")
+    if source_jump_url:
+        parts.append(f"[Jump to source message]({source_jump_url})")
+    return discord.Embed(
+        title="⚠️ Warning Issued",
+        description="\n".join(parts),
+        color=MOD_WARNING,
+    )
+
+
+def build_warning_threshold_embed(
+    *,
+    target_name: str,
+    active_count: int,
+) -> discord.Embed:
+    """Posted when a warning pushes a member to or past the threshold.
+
+    The admin ping is **not** in here. A mention inside an embed is resolved by
+    the reading client and notifies nobody, so the roles ride in the message
+    ``content=`` instead — see ``warning_threshold_ping`` and ``_post_audit``.
+    """
+    return discord.Embed(
+        title="🚨 Warning Threshold Reached",
+        description=(
+            f"{target_name} has reached **{active_count}** active warnings."
+        ),
+        color=MOD_JAIL,
+    )
+
+
+def warning_threshold_ping(admin_role_ids: Sequence[int]) -> str:
+    """The ``content=`` line that actually reaches the admins."""
+    return " ".join(f"<@&{rid}>" for rid in admin_role_ids)
+
+
+def build_warning_revoke_audit_embed(
+    *,
+    warning_id: int,
+    target_name: str,
+    moderator_name: str,
+    active_count: int,
+    reason: str = "",
+) -> discord.Embed:
+    """Audit-log embed posted after a ``/revokewarn``."""
+    parts = [f"#{warning_id} for {target_name} revoked by {moderator_name}"]
+    if reason:
+        parts.append(f"**Reason:** {discord.utils.escape_markdown(reason)}")
+    parts.append(f"**Active warnings:** {active_count}")
+    return discord.Embed(
+        title="✅ Warning Revoked",
+        description="\n".join(parts),
+        color=MOD_SUCCESS,
+    )
+
+
+# ── Policy proposal ───────────────────────────────────────────────────
+
+
+def build_policy_proposal_embed(
+    *,
+    policy_id: int,
+    title: str,
+    description: str,
+    proposer: str,
+    visibility: object = None,
+    now: datetime | None = None,
+) -> discord.Embed:
+    """Build the policy-proposal embed posted when ``/policy open`` runs.
+
+    The Visibility field states who can see the channel, because the card's
+    own toggle can change it mid-discussion and a mod scrolling back needs
+    the answer without checking the channel settings. It reads as the state
+    ("🔒 Mods only"); the button next to it reads as the action ("Open to
+    Members"), so the two are never mistaken for each other.
+
+    ``proposer`` is a **resolved display name**, not a ``<@id>``. It used to
+    be a mention, which was survivable while only mods read this card — and
+    stopped being survivable the moment that same card could be opened to
+    every member, since an embed mention is resolved by the *reading* client
+    from its own cache. Callers pass ``build_name_fn(...)(creator_id)``.
+    """
+    # Escaped here rather than by each caller: this builder has two call
+    # sites (the cog's /policy open, and the visibility-toggle re-render in
+    # moderation/jail/jail_commands.py), both passing the admin's raw typed text.
+    #
+    # The title is fitted, not just escaped. `jail_cog` caps the raw title at
+    # 200 with a comment saying it does so to keep this "#N: " prefix under
+    # Discord's 256 — a budget that was correct until the escape landed and
+    # made 200 markdown characters into 400. The prefix is the bot's own and
+    # spends the same 256, so what is left is what the title gets.
+    prefix = f"📋 Policy Proposal #{policy_id}: "
+    embed = discord.Embed(
+        title=prefix + escape_to_fit(title, EMBED_TITLE_LIMIT - len(prefix)),
+        description=discord.utils.escape_markdown(description),
+        color=MOD_POLICY,
+        timestamp=now or datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Proposed by", value=proposer, inline=True)
+    embed.add_field(name="Status", value="💬 Open for Discussion", inline=True)
+    embed.add_field(
+        name="Visibility", value=policy_visibility_status(visibility), inline=True
+    )
+    embed.set_footer(text="Use /policy vote to start the formal vote when ready.")
+    apply_section_spacing(embed)
+    return embed
+
+
+def build_policy_close_embed(
+    *,
+    title: str,
+    moderator_name: str,
+    reason: str = "",
+    color: "discord.Color | None" = None,
+) -> discord.Embed:
+    """Embed posted when an admin closes a policy proposal without voting."""
+    if color is None:
+        color = discord.Color(MOD_INFO)
+    embed = discord.Embed(
+        title="📋 Policy Proposal Closed",
+        description=f"**{discord.utils.escape_markdown(title)}** was closed by {moderator_name}.",
+        color=color,
+    )
+    if reason:
+        embed.add_field(
+            name="Reason", value=discord.utils.escape_markdown(reason), inline=False
+        )
+    return embed
+
+
+def build_adopted_policies_embed(
+    adopted: Sequence[Mapping[str, Any]],
+) -> discord.Embed:
+    """Embed listing all policies that were adopted from a parent proposal."""
+    embed = discord.Embed(title="📜 Adopted Policies from This Proposal", color=MOD_SUCCESS)
+    for p in adopted:
+        # Both halves are member-authored (a proposal's title and body) and this
+        # card is posted to the policy channel, not ephemerally. Escape before
+        # the 1024 cap, not after: a backslash is a character like any other, so
+        # escaping an already-trimmed value can push it back over the field
+        # limit and 400 the whole embed.
+        embed.add_field(
+            name=escape_to_fit(p["title"], FIELD_NAME_LIMIT),
+            value=escape_to_fit(p.get("description") or "", FIELD_VALUE_LIMIT),
+            inline=False,
+        )
+    return embed

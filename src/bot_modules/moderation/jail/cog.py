@@ -1,0 +1,2109 @@
+"""Jail & Ticket moderation commands."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import time
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from bot_modules.core.branding import safe_resolve_accent
+from bot_modules.core.utils import allow_pings
+from bot_modules.moderation.jail.policy_ballot_service import (
+    TICKET_STATUS_BALLOT,
+    attach_ballot_message,
+    get_open_ballot_for_thread,
+    open_ballot,
+)
+from bot_modules.moderation.jail.embeds import (
+    build_adopted_policies_embed,
+    build_policy_ballot_embed,
+    build_modinfo_embed,
+    build_policy_close_embed,
+    build_policy_list_embed,
+    build_policy_proposal_embed,
+    build_policy_vote_initial_embed,
+    build_ticket_open_embed,
+    build_ticket_panel_embed,
+    build_warning_audit_embed,
+    build_warning_revoke_audit_embed,
+    build_warning_threshold_embed,
+    warning_threshold_ping,
+)
+from bot_modules.moderation.settings import staff_ping_service
+from bot_modules.shared.name_resolver import build_name_fn
+from bot_modules.moderation.jail.logic import POLICY_VISIBILITY_MODS, sanitize_channel_name
+
+from bot_modules.moderation.jail.jail_commands import (
+    CLR_JAIL,
+    CLR_POLICY,
+    PolicyBallotAbstainButton,
+    PolicyBallotCloseButton,
+    PolicyBallotNoButton,
+    PolicyBallotYesButton,
+    PolicyVisibilityButton,
+    PolicyVoteAbstainButton,
+    PolicyVoteNoButton,
+    PolicyVoteYesButton,
+    BALLOT_THREAD_AUTO_ARCHIVE_MINUTES,
+    _ballot_view,
+    _policy_visibility_view,
+    _policy_vote_timeout_seconds,
+    finalize_ballot,
+    TICKET_STATUS_CLOSED,
+    TICKET_STATUS_ESCALATED,
+    TICKET_STATUS_OPEN,
+    TicketCloseButton,
+    TicketDeleteButton,
+    TicketPanelButton,
+    TicketReopenButton,
+    _JailModal,
+    _TicketFromMessageModal,
+    _apply_ticket_status,
+    _collect_and_post_transcript,
+    _dm_user,
+    _do_jail,
+    _do_unjail,
+    _finalize_ticket_delete,
+    _get_admin_role_ids,
+    _get_mod_role_ids,
+    guild_eligible_voters,
+    _is_admin,
+    _post_audit,
+    _ts_str,
+    jail_channel_deny_sweep,
+    jail_expiry_loop,
+    jail_rejoin_reconcile_sweep,
+    policy_vote_timeout_loop,
+    retire_departed_jail_channel,
+    stamp_channel_jail_deny,
+    ticket_autodelete_loop,
+)
+from bot_modules.moderation.service import (
+    add_ticket_participant,
+    claim_ticket,
+    close_policy_ticket,
+    close_ticket,
+    create_policy_ticket,
+    create_ticket,
+    create_warning,
+    escalate_ticket,
+    get_active_jail,
+    get_active_warning_count,
+    get_jail_by_channel,
+    get_jail_history,
+    get_policies,
+    get_policies_by_ticket_id,
+    get_policy_ticket_by_channel,
+    get_ticket_by_channel,
+    get_ticket_history,
+    get_warnings,
+    remove_ticket_participant,
+    reopen_ticket,
+    revoke_warning,
+    start_policy_vote,
+    write_audit,
+)
+from bot_modules.core.db_utils import get_config_value, get_tz_offset_hours
+from bot_modules.core.sticky import PanelContent
+from bot_modules.core.xp_system import get_user_xp_by_source
+from bot_modules.analytics.activity_graphs import (
+    query_message_activity,
+    query_xp_activity_with_breakdown,
+    render_activity_chart,
+)
+from bot_modules.shared.replies import NO_PERMISSION
+
+
+# Discord caps the embed *title* at 256 chars; we trim our policy titles
+# below that so the "Policy Proposal #N: …" prefix still fits.
+_POLICY_TITLE_MAX = 200
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import AppContext, Bot
+
+log = logging.getLogger("dungeonkeeper.jail_commands")
+
+
+def _read_warning_threshold(ctx: "AppContext", guild_id: int) -> int:
+    """Read the guild-scoped warning-count threshold (default 3).
+
+    The dashboard writes ``warning_threshold`` per-guild, so the read must pass
+    ``guild_id`` — a bare ``guild_id=0`` read never sees the configured row and
+    the default always wins.
+    """
+    with ctx.open_db() as conn:
+        return int(get_config_value(conn, "warning_threshold", "3", guild_id))
+
+
+def _modinfo_user_label(user: "discord.abc.User") -> str:
+    """The ``/modinfo`` embed title's user label.
+
+    ``str(user)`` is the account's global username (plus a legacy
+    ``#discriminator`` for an account that hasn't migrated), and it lands
+    straight in the embed TITLE. A current, migrated username is charset-
+    restricted (lowercase letters, digits, underscore, period), but a
+    pre-migration legacy username can still hold Discord's older, broader
+    charset — escape defensively rather than rely on that distinction.
+    """
+    return discord.utils.escape_markdown(str(user))
+
+
+class _PolicyBallotModal(discord.ui.Modal, title="Open a Community Ballot"):
+    """Takes the one string that becomes a public ballot.
+
+    Only the question crosses into the room. Nothing from a private policy
+    channel — no description, no transcript, no "as discussed" quote — is
+    copied here, which is what keeps "let members vote" from also meaning "let
+    members read the mod team's deliberation".
+    """
+
+    question: discord.ui.TextInput = discord.ui.TextInput(  # type: ignore[assignment]
+        label="The question members vote on",
+        style=discord.TextStyle.paragraph,
+        placeholder="Should we add quiet hours to the voice rooms?",
+        required=True,
+        max_length=1000,
+    )
+
+    def __init__(self, ctx: AppContext) -> None:
+        super().__init__()
+        self._ctx = ctx
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        ctx = self._ctx
+        guild = interaction.guild
+        member = interaction.user
+        channel = interaction.channel
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        # Re-checked on submit, not just before the modal opened: a modal can be
+        # left sitting open, and `/policy`'s permission decorators are inert
+        # (discord.py only emits default_member_permissions for top-level
+        # commands), so a runtime check is the only gate there is.
+        if not _is_admin(member, ctx):
+            await interaction.response.send_message(
+                "❌ Only admins can open a community ballot.", ephemeral=True
+            )
+            return
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Run this in a normal text channel — a ballot opens a thread, "
+                "and threads and forum posts can't hold one.",
+                ephemeral=True,
+            )
+            return
+
+        question_text = self.question.value.strip()
+        await interaction.response.defer(ephemeral=True)
+
+        hours = _policy_vote_timeout_seconds(ctx, guild.id) / 3600.0
+        closes_at = time.time() + hours * 3600.0 if hours > 0 else 0.0
+
+        try:
+            thread = await channel.create_thread(
+                name=f"ballot-{sanitize_channel_name(question_text[:40], fallback='vote')}"[:100],
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=BALLOT_THREAD_AUTO_ARCHIVE_MINUTES,
+                reason=f"Community ballot opened by {member}",
+            )
+        except discord.HTTPException:
+            log.exception("Could not open a ballot thread in %s", channel.id)
+            await interaction.followup.send(
+                "❌ I couldn't open a thread here — check I have Create Public "
+                "Threads and Send Messages in Threads in this channel.",
+                ephemeral=True,
+            )
+            return
+
+        pb_guild_id = guild.id
+        pb_member_id = member.id
+        pb_channel_id = channel.id
+
+        def _create_ballot():
+            with ctx.open_db() as conn:
+                policy_id = create_policy_ticket(
+                    conn,
+                    guild_id=pb_guild_id,
+                    creator_id=pb_member_id,
+                    channel_id=thread.id,
+                    title=question_text[:_POLICY_TITLE_MAX],
+                    description="",
+                )
+                # 'ballot', deliberately outside the ('open','voting') pair
+                # `get_policy_ticket_by_channel` matches: a mod running
+                # `/policy vote` inside a ballot thread must not be able to
+                # start the mod team's unanimity vote on it, because that
+                # vote's finalizer archives and deletes the channel it runs in.
+                conn.execute(
+                    "UPDATE policy_tickets SET status = ? WHERE id = ?",
+                    (TICKET_STATUS_BALLOT, policy_id),
+                )
+                bid = open_ballot(
+                    conn,
+                    guild_id=pb_guild_id,
+                    policy_id=policy_id,
+                    channel_id=pb_channel_id,
+                    question=question_text,
+                    opened_by=pb_member_id,
+                    closes_at=closes_at,
+                )
+                # The thread id lands with the row, before the card is posted.
+                # If that send then fails, the ballot is still findable by
+                # thread (so `/policy close` can cancel it) and still closable
+                # by the sweep — a row nobody could reach would sit open until
+                # somebody noticed.
+                attach_ballot_message(
+                    conn, bid, thread_id=thread.id, message_id=0
+                )
+                write_audit(
+                    conn,
+                    guild_id=pb_guild_id,
+                    action="policy_ballot_opened",
+                    actor_id=pb_member_id,
+                    extra={
+                        "ballot_id": bid,
+                        "policy_id": policy_id,
+                        "question": question_text,
+                        "channel_id": pb_channel_id,
+                        "thread_id": thread.id,
+                    },
+                )
+                return bid, policy_id
+
+        ballot_id, _policy_id = await asyncio.to_thread(_create_ballot)
+
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+        embed = build_policy_ballot_embed(
+            question=question_text,
+            closes_at=closes_at or None,
+            color=accent,
+        )
+        # No ping and no mention, ever — not on the card, not in the opening
+        # line. A ballot is a broadcast to a room, and a role ping to every
+        # member who can see the channel is a mass ping; a member mention would
+        # be a contact edge the no-contact list would have to be consulted for.
+        try:
+            message = await thread.send(
+                embed=embed,
+                view=_ballot_view(ballot_id),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            log.exception("Could not post the ballot card for ballot %s", ballot_id)
+            await interaction.followup.send(
+                "❌ I opened the thread but couldn't post the ballot card — check "
+                "I have Send Messages in Threads and Embed Links here. Run "
+                "`/policy close` in the thread to cancel this ballot.",
+                ephemeral=True,
+            )
+            return
+
+        def _attach():
+            with ctx.open_db() as conn:
+                attach_ballot_message(
+                    conn, ballot_id, thread_id=thread.id, message_id=message.id
+                )
+
+        await asyncio.to_thread(_attach)
+
+        await interaction.followup.send(
+            f"Ballot opened → {thread.mention}", ephemeral=True
+        )
+
+        audit_embed = discord.Embed(
+            title="🗳️ Community Ballot Opened",
+            description=(
+                # A resolved name, not a `<@id>`: an embed mention is resolved
+                # by the reading client from its own cache, so it degrades to a
+                # bare number for anyone who hasn't seen that member. The
+                # channel mention is fine — those always resolve.
+                f"**{discord.utils.escape_markdown(question_text)}**\n"
+                f"Opened by {discord.utils.escape_markdown(member.display_name)} "
+                f"in {channel.mention}"  # embed-mention-ok: channel
+            ),
+            color=accent,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+
+class _PolicyVoteModal(discord.ui.Modal, title="Start Policy Vote"):
+    vote_text: discord.ui.TextInput = discord.ui.TextInput(  # type: ignore[assignment]
+        label="Exact policy text to vote on",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type the exact wording of the policy being voted on…",
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, policy_id: int, ctx: AppContext) -> None:
+        super().__init__()
+        self.policy_id = policy_id
+        self._ctx = ctx
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        ctx = self._ctx
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return
+
+        vote_text_val = self.vote_text.value.strip()
+        pv_guild_id = guild.id
+        pv_policy_id = self.policy_id
+        pv_member_id = member.id
+
+        def _start_vote():
+            with ctx.open_db() as conn:
+                start_policy_vote(conn, pv_policy_id, vote_text=vote_text_val)
+                write_audit(
+                    conn,
+                    guild_id=pv_guild_id,
+                    action="policy_vote_started",
+                    actor_id=pv_member_id,
+                    extra={"policy_id": pv_policy_id, "vote_text": vote_text_val},
+                )
+
+        await asyncio.to_thread(_start_vote)
+
+        mod_role_ids = _get_mod_role_ids(ctx, guild.id)
+        admin_role_ids = _get_admin_role_ids(ctx, guild.id)
+        all_role_ids = mod_role_ids | admin_role_ids
+        eligible = guild_eligible_voters(ctx, guild)
+
+        embed = build_policy_vote_initial_embed(
+            channel_name=interaction.channel.name,  # type: ignore[union-attr]
+            vote_text=vote_text_val,
+            eligible_ids=sorted(eligible),
+            # Resolved names, never <@id>: an embed mention is resolved by the
+            # reading client's own cache, so a mod who has not seen a
+            # colleague sees a bare number.
+            name_fn=await build_name_fn(
+                guild=guild,
+                db_path=ctx.db_path,
+                guild_id=guild.id,
+                user_ids=sorted(eligible),
+            ),
+        )
+
+        view = discord.ui.View(timeout=None)
+        view.add_item(PolicyVoteYesButton(self.policy_id))
+        view.add_item(PolicyVoteNoButton(self.policy_id))
+        view.add_item(PolicyVoteAbstainButton(self.policy_id))
+
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "🗳️ **Voting has begun!** All mods and admins must vote.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await channel.send(embed=embed, view=view)
+            # The call-out is the one send here that *should* notify: it tells
+            # every mod and admin to go and vote. The bot suppresses mentions
+            # by default, so the send names the roles it may ping — the ones
+            # that resolved, which is exactly the list the text mentions.
+            # sorted(): all_role_ids is a set union, so the unsorted order
+            # varies run to run and the call-out listed the same two roles in
+            # a different order each time.
+            ping_roles = [
+                role
+                for role in (guild.get_role(rid) for rid in sorted(all_role_ids))
+                if role
+            ]
+            if ping_roles:
+                await channel.send(
+                    "🗳️ Vote now! "
+                    + " ".join(role.mention for role in ping_roles),
+                    allowed_mentions=allow_pings(roles=ping_roles),
+                )
+
+
+class JailCog(commands.Cog):
+    ticket = app_commands.Group(name="ticket", description="Ticket management commands.")
+    policy = app_commands.Group(
+        name="policy", description="Policy proposal and voting commands."
+    )
+
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        super().__init__()
+
+    async def cog_load(self) -> None:
+        bot = self.bot
+        ctx = self.bot.ctx
+
+        # Register persistent dynamic items
+        bot.add_dynamic_items(TicketPanelButton)
+        bot.add_dynamic_items(TicketCloseButton)
+        bot.add_dynamic_items(TicketReopenButton)
+        bot.add_dynamic_items(TicketDeleteButton)
+        bot.add_dynamic_items(PolicyVoteYesButton)
+        bot.add_dynamic_items(PolicyVoteNoButton)
+        bot.add_dynamic_items(PolicyVoteAbstainButton)
+        # The visibility toggle sits on a proposal card that lives for the
+        # length of a discussion, so it has to survive restarts too. Its
+        # prefix is `policy_visibility:`, distinct from both `policy_vote:`
+        # and `policy_ballot:`.
+        bot.add_dynamic_items(PolicyVisibilityButton)
+        # A ballot runs for days in a public thread and has to survive every
+        # restart in between. Its custom-id prefix is `policy_ballot:`, which
+        # cannot collide with `policy_vote:` above.
+        bot.add_dynamic_items(PolicyBallotYesButton)
+        bot.add_dynamic_items(PolicyBallotNoButton)
+        bot.add_dynamic_items(PolicyBallotAbstainButton)
+        bot.add_dynamic_items(PolicyBallotCloseButton)
+
+        # Context menus — add to tree; stored for removal in cog_unload
+        async def _jail_ctx_cb(
+            interaction: discord.Interaction, user: discord.Member
+        ) -> None:
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+                await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_JailModal(user, ctx))
+
+        jail_ctx_menu = app_commands.ContextMenu(name="Jail User", callback=_jail_ctx_cb)
+        jail_ctx_menu.default_permissions = discord.Permissions(moderate_members=True)
+        bot.tree.add_command(jail_ctx_menu)
+        self._jail_context_menu = jail_ctx_menu
+
+        async def ticket_message_context(
+            interaction: discord.Interaction, message: discord.Message
+        ) -> None:
+            await interaction.response.send_modal(_TicketFromMessageModal(message))
+
+        ticket_ctx_menu = app_commands.ContextMenu(
+            name="Open Ticket About This Message", callback=ticket_message_context
+        )
+        bot.tree.add_command(ticket_ctx_menu)
+        self._ticket_context_menu = ticket_ctx_menu
+
+        # Start jail expiry background task
+        bot.startup_task_factories.append(lambda: jail_expiry_loop(bot, ctx))
+        # Resolve policy votes whose 72h (or configured) window has passed.
+        bot.startup_task_factories.append(
+            lambda: policy_vote_timeout_loop(bot, ctx)
+        )
+        # Permanently delete tickets left closed for 24h (archives first).
+        bot.startup_task_factories.append(
+            lambda: ticket_autodelete_loop(bot, ctx)
+        )
+        # Backfill the @Jailed view-deny on any channel that leaked (created
+        # while offline, or before this backstop shipped). The listener below
+        # covers channels created while the bot is running.
+        bot.startup_task_factories.append(
+            lambda: jail_channel_deny_sweep(bot, ctx)
+        )
+        # Re-apply holds for members who rejoined while the bot was offline —
+        # on_member_join never fired for them, so nothing else notices.
+        bot.startup_task_factories.append(
+            lambda: jail_rejoin_reconcile_sweep(bot, ctx)
+        )
+
+    async def cog_unload(self) -> None:
+        if hasattr(self, "_jail_context_menu"):
+            self.bot.tree.remove_command(
+                "Jail User", type=discord.AppCommandType.user
+            )
+        if hasattr(self, "_ticket_context_menu"):
+            self.bot.tree.remove_command(
+                "Open Ticket About This Message", type=discord.AppCommandType.message
+            )
+
+    # ── Record a jailed member walking out ───────────────────────────────
+    @commands.Cog.listener("on_member_remove")
+    async def _note_jailed_member_left(self, member: discord.Member) -> None:
+        """Log it when someone leaves mid-hold, archive and delete their channel.
+
+        Leaving is not an escape: the ``jails`` row survives and
+        ``check_jail_rejoin`` re-applies the hold if they come back. But nothing
+        used to *say* so, which left mods to discover a departure only when
+        ``/unjail`` failed on them.
+
+        The jail channel used to be kept on the reasoning that deleting it would
+        strand a returning member in a server they can't see with nowhere to
+        appeal. ``check_jail_rejoin`` now rebuilds a missing channel on rejoin,
+        which closes that gap, so the channel goes (2026-09-16, Billy's call) —
+        after its transcript is saved, and for bans and kicks alike.
+        """
+        ctx = self.bot.ctx
+        guild = member.guild
+        if guild is None or guild.id != ctx.guild_id:
+            return
+
+        def _fetch():
+            with ctx.open_db() as conn:
+                return get_active_jail(conn, guild.id, member.id)
+
+        try:
+            jail = await asyncio.to_thread(_fetch)
+        except Exception:
+            log.exception("jail leave-check failed for %s", member.id)
+            return
+        if not jail:
+            return
+
+        jail_id = jail["id"]
+
+        # on_member_remove fires for kicks and bans too. Promising "they'll be
+        # re-jailed if they rejoin" is false for a ban, so check the ban list
+        # before choosing the wording — one API call, and only ever on the rare
+        # occasion that a *jailed* member leaves.
+        banned = False
+        try:
+            await guild.fetch_ban(member)
+            banned = True
+        except discord.NotFound:
+            pass  # genuinely left, or was kicked
+        except discord.HTTPException:
+            # No Ban Members permission, or the API is unhappy. Fall back to the
+            # neutral wording rather than asserting either way.
+            log.debug("Could not check ban list for %s", member.id, exc_info=True)
+
+        # They have already left, so the member cache can't name them — but the
+        # Member object still carries the display name they left with.
+        name = discord.utils.escape_markdown(member.display_name)
+        if banned:
+            channel_note = (
+                f"🔨 {member.mention} was banned. The hold no longer applies."
+            )
+        else:
+            channel_note = (
+                f"🚪 {member.mention} left the server. The hold is still "
+                "active — rejoining re-applies it."
+            )
+
+        channel_deleted = await retire_departed_jail_channel(
+            ctx, guild, member, jail, banned=banned, note=channel_note
+        )
+
+        def _audit():
+            with ctx.open_db() as conn:
+                write_audit(
+                    conn,
+                    guild_id=guild.id,
+                    action="jail_member_left",
+                    actor_id=0,
+                    target_id=member.id,
+                    extra={
+                        "jail_id": jail_id,
+                        "banned": banned,
+                        "channel_deleted": channel_deleted,
+                    },
+                )
+
+        await asyncio.to_thread(_audit)
+
+        if banned:
+            title = "🔨 Jailed member banned"
+            body = (
+                f"{name} was banned while jailed (jail #{jail_id}).\n"
+                "The hold is now moot — they can't return. Use `/unjail` with "
+                f"their ID (`{member.id}`) to close the record out."
+            )
+        else:
+            title = "🚪 Jailed member left"
+            body = (
+                f"{name} left while jailed (jail #{jail_id}).\n"
+                "The hold stays active — they'll be re-jailed automatically if "
+                f"they rejoin. Use `/unjail` with their ID (`{member.id}`) to "
+                "close it out instead; their stored roles won't survive that."
+            )
+        if channel_deleted:
+            body += (
+                "\nTheir jail channel was saved as a transcript and deleted"
+                + ("." if banned else "; rejoining builds them a new one.")
+            )
+
+        await _post_audit(
+            ctx,
+            guild,
+            discord.Embed(title=title, description=body, color=CLR_JAIL),
+        )
+
+    # ── Keep jailed members out of newly-created channels ────────────────
+    @commands.Cog.listener("on_guild_channel_create")
+    async def _deny_jailed_on_new_channel(
+        self, channel: discord.abc.GuildChannel
+    ) -> None:
+        """Stamp the @Jailed view-deny on any channel/category as it's created.
+
+        Jailed members keep @everyone, so a channel without an explicit
+        ``@Jailed → view_channel=False`` overwrite is visible to them. Categories
+        fire this event too, so a channel created inside a freshly-stamped
+        category inherits the deny by syncing. Best-effort: a channel we lack
+        permission on is logged and skipped, exactly like the initial sweep.
+        """
+        ctx = self.bot.ctx
+        guild = channel.guild
+        if guild is None or guild.id != ctx.guild_id:
+            return
+        jailed_role_id = ctx.guild_config(guild.id).jailed_role_id
+        if not jailed_role_id:
+            return
+        role = guild.get_role(jailed_role_id)
+        if role is None:
+            return
+        await stamp_channel_jail_deny(channel, role)
+
+    # ── /jail ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="jail", description="Place a member in a private jail channel.")
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(
+        user="Member to jail",
+        duration="How long (e.g. 24h, 7d). Leave blank for indefinite.",
+        reason="Reason for jailing",
+    )
+    async def jail_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        duration: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+            await interaction.response.send_message(
+                NO_PERMISSION, ephemeral=True
+            )
+            return
+        await _do_jail(
+            interaction, ctx, user, duration_str=duration or "", reason=reason or ""
+        )
+
+    # ── /unjail ───────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="unjail", description="Release a jailed member and restore their roles."
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(
+        user="Member to release (paste a user ID if they've left the server)",
+        reason="Release reason",
+    )
+    async def unjail_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        reason: str | None = None,
+    ) -> None:
+        """Release a hold, whether or not the subject is still in the server.
+
+        Typed as ``discord.User`` rather than ``discord.Member`` on purpose: a
+        member who leaves while jailed keeps their active row (they're re-jailed
+        on return), and a Member-typed option can't resolve them at all, which
+        left departed users unreleasable from Discord entirely. Resolving the
+        member here keeps full role restoration for anyone still present.
+        """
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message(
+                NO_PERMISSION, ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        target: discord.Member | discord.User = guild.get_member(user.id) or user
+        result = await _do_unjail(ctx, guild, target, reason=reason or "", actor=member)
+        await interaction.followup.send(result, ephemeral=True)
+
+    # ── /ticket ───────────────────────────────────────────────────────────
+
+    async def build_ticket_panel(self, guild: discord.Guild) -> PanelContent:
+        """The panel as it should look now — what a post sends and what the
+        panel refresher edits a recorded copy to (``panel_registry.render``)."""
+        accent = await safe_resolve_accent(self.bot.ctx, guild, log_label="jail")
+        view = discord.ui.View(timeout=None)
+        view.add_item(TicketPanelButton())
+        return PanelContent(embed=build_ticket_panel_embed(color=accent), view=view)
+
+    async def post_ticket_panel(self, guild, channel):
+        """Post the Open Ticket button into ``channel``.
+
+        Entry point for the dashboard's panel poster (``panel_registry``);
+        replaced /ticket panel on 2026-07-28. Unlike the StickyPanel-backed
+        panels this never deletes an older copy: the route records each post
+        in ``posted_panels`` and moves the copy already in the chosen channel
+        (new copy up, old one deleted), but a panel in another channel keeps working until someone deletes it —
+        the button is stateless, and silently killing a panel members may have
+        bookmarked would be worse than leaving two live.
+
+        Returns the new message, or None if Discord refused the post.
+        """
+        content = await self.build_ticket_panel(guild)
+        try:
+            return await channel.send(**content.send_kwargs())
+        except discord.HTTPException:
+            return None
+
+    @ticket.command(
+        name="open", description="Open a private support ticket with the mod team."
+    )
+    @app_commands.describe(description="Brief description of your issue")
+    async def ticket_open(
+        self, interaction: discord.Interaction, description: str | None = None
+    ) -> None:
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        user = interaction.user
+        if guild is None or not isinstance(user, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+
+        cat_id = ctx.guild_config(guild.id).ticket_category_id
+        category = guild.get_channel(cat_id) if cat_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(
+                "❌ Ticket category not configured. Ask an admin to set one on the dashboard (Config → Moderation).",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+        desc_text = description or "(no description)"
+        ts = datetime.now(timezone.utc).strftime("%m%d-%H%M")
+        name = f"ticket-{sanitize_channel_name(user.name)[:16]}-{ts}"
+        mod_role_ids = _get_mod_role_ids(ctx, guild.id)
+
+        overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+            ),
+        }
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                manage_messages=True,
+                read_message_history=True,
+            )
+        for rid in mod_role_ids:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                )
+
+        channel = await guild.create_text_channel(
+            name, category=category, overwrites=overwrites  # type: ignore[arg-type]
+        )
+
+        to_guild_id = guild.id
+
+        def _create_ticket():
+            with ctx.open_db() as conn:
+                tid = create_ticket(
+                    conn,
+                    guild_id=to_guild_id,
+                    user_id=user.id,
+                    channel_id=channel.id,
+                    description=desc_text,
+                )
+                write_audit(
+                    conn,
+                    guild_id=to_guild_id,
+                    action="ticket_open",
+                    actor_id=user.id,
+                    extra={"ticket_id": tid, "description": desc_text},
+                )
+            return tid
+
+        ticket_id = await asyncio.to_thread(_create_ticket)
+
+        opener = (await build_name_fn(
+            guild=guild, db_path=ctx.db_path, guild_id=guild.id, user_ids=[user.id]
+        ))(user.id)
+        embed = build_ticket_open_embed(
+            ticket_id=ticket_id,
+            description=discord.utils.escape_markdown(desc_text),
+            opener_name=opener,
+            color=accent,
+        )
+        view = discord.ui.View(timeout=None)
+        view.add_item(TicketCloseButton(ticket_id))
+        await channel.send(embed=embed, view=view)
+        await interaction.followup.send(
+            f"Ticket created → {channel.mention}", ephemeral=True
+        )
+
+        await _dm_user(
+            user,
+            db_path=ctx.db_path,
+            guild=guild,
+            embed=discord.Embed(
+                description=f"Your ticket has been created → [Go to ticket]({channel.jump_url})",
+                color=accent,
+            ),
+        )
+        await staff_ping_service.ping_ticket_opened(
+            ctx, guild, ticket_id=ticket_id, channel_id=channel.id
+        )
+
+        audit_embed = discord.Embed(
+            title="📩 Ticket Opened",
+            description=f"**Ticket #{ticket_id}** by {opener} in {channel.mention}",  # embed-mention-ok: channel
+            color=accent,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+    @ticket.command(name="close", description="Close the current ticket.")
+    @app_commands.describe(reason="Reason for closing")
+    async def ticket_close_cmd(
+        self, interaction: discord.Interaction, reason: str | None = None
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+            await interaction.response.send_message(
+                "❌ Only moderators can close tickets.", ephemeral=True
+            )
+            return
+        def _fetch_close_ticket():
+            with ctx.open_db() as conn:
+                return get_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        ticket = await asyncio.to_thread(_fetch_close_ticket)
+        if not ticket or ticket["status"] != "open":
+            await interaction.response.send_message(
+                "❌ This is not an open ticket channel.", ephemeral=True
+            )
+            return
+        tid = ticket["id"]
+        reason_text = reason or ""
+        guild = interaction.guild
+        if not guild:
+            return
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+        tc_guild_id = guild.id
+        tc_ticket_user_id = ticket["user_id"]
+
+        def _close_ticket():
+            with ctx.open_db() as conn:
+                close_ticket(conn, tid, closed_by=member.id, reason=reason_text)
+                write_audit(
+                    conn,
+                    guild_id=tc_guild_id,
+                    action="ticket_close",
+                    actor_id=member.id,
+                    target_id=tc_ticket_user_id,
+                    extra={"ticket_id": tid, "reason": reason_text},
+                )
+
+        await asyncio.to_thread(_close_ticket)
+
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            creator = guild.get_member(ticket["user_id"])
+            if creator:
+                await channel.set_permissions(
+                    creator, view_channel=True, send_messages=False, read_message_history=True
+                )
+
+            view = discord.ui.View(timeout=None)
+            view.add_item(TicketReopenButton(tid))
+            view.add_item(TicketDeleteButton(tid))
+
+            close_msg = f"🔒 Ticket closed by {member.mention}."
+            if reason_text:
+                close_msg += (
+                    f"\n**Reason:** {discord.utils.escape_markdown(reason_text)}"
+                )
+
+            await interaction.response.send_message(
+                close_msg, allowed_mentions=discord.AllowedMentions.none()
+            )
+
+            async for msg in channel.history(limit=5, oldest_first=True):
+                if msg.author == guild.me and msg.embeds:
+                    await msg.edit(
+                        embed=_apply_ticket_status(
+                            msg.embeds[0], TICKET_STATUS_CLOSED
+                        ),
+                        view=view,
+                    )
+                    break
+
+            if creator:
+                await _dm_user(
+                    creator,
+                    db_path=ctx.db_path,
+                    guild=guild,
+                    embed=discord.Embed(
+                        description=f"Your ticket in **{guild.name}** has been closed."
+                        + (
+                            f"\n**Reason:** {discord.utils.escape_markdown(reason_text)}"
+                            if reason_text
+                            else ""
+                        )
+                        + "\nYou can still view the channel.",
+                        color=accent,
+                    ),
+                    fallback_channel=channel,
+                )
+
+    @ticket.command(name="reopen", description="Reopen a closed ticket.")
+    async def ticket_reopen_cmd(self, interaction: discord.Interaction) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+            await interaction.response.send_message(
+                "❌ Only moderators can reopen tickets.", ephemeral=True
+            )
+            return
+        def _fetch_reopen_ticket():
+            with ctx.open_db() as conn:
+                return get_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        ticket = await asyncio.to_thread(_fetch_reopen_ticket)
+        if not ticket or ticket["status"] != "closed":
+            await interaction.response.send_message(
+                "❌ This is not a closed ticket channel.", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if not guild:
+            return
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+        tid = ticket["id"]
+        tr_guild_id = guild.id
+
+        def _reopen_ticket():
+            with ctx.open_db() as conn:
+                reopen_ticket(conn, tid)
+                write_audit(
+                    conn,
+                    guild_id=tr_guild_id,
+                    action="ticket_reopen",
+                    actor_id=member.id,
+                    extra={"ticket_id": tid},
+                )
+
+        await asyncio.to_thread(_reopen_ticket)
+
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            # Answer first: the overwrite, the history walk and the embed edit
+            # are three REST calls, and Discord drops a reply that misses its
+            # 3 s window. The ticket is already reopened in the database.
+            await interaction.response.send_message(
+                f"🔓 Ticket reopened by {member.mention}.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            creator = guild.get_member(ticket["user_id"])
+            if creator:
+                await channel.set_permissions(
+                    creator,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                )
+            view = discord.ui.View(timeout=None)
+            view.add_item(TicketCloseButton(tid))
+            # Restore the Status field — keep the ⚠️ marker if the ticket was
+            # escalated (that flag survives reopen), else back to 🟢 Open.
+            reopen_status = (
+                TICKET_STATUS_ESCALATED
+                if ticket.get("escalated")
+                else TICKET_STATUS_OPEN
+            )
+            async for msg in channel.history(limit=5, oldest_first=True):
+                if msg.author == guild.me and msg.embeds:
+                    await msg.edit(
+                        embed=_apply_ticket_status(msg.embeds[0], reopen_status),
+                        view=view,
+                    )
+                    break
+            if creator:
+                await _dm_user(
+                    creator,
+                    db_path=ctx.db_path,
+                    guild=guild,
+                    embed=discord.Embed(
+                        description=f"Your ticket in **{guild.name}** has been reopened.",
+                        color=accent,
+                    ),
+                )
+
+    @ticket.command(
+        name="delete",
+        description="Permanently delete a closed ticket. A transcript is saved first.",
+    )
+    async def ticket_delete_cmd(self, interaction: discord.Interaction) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+            await interaction.response.send_message(
+                "❌ Only moderators can delete tickets.", ephemeral=True
+            )
+            return
+        def _fetch_delete_ticket():
+            with ctx.open_db() as conn:
+                return get_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        ticket = await asyncio.to_thread(_fetch_delete_ticket)
+        if not ticket or ticket["status"] != "closed":
+            await interaction.response.send_message(
+                "❌ Ticket must be closed before deleting.", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        channel = interaction.channel
+        if not guild or not isinstance(channel, discord.TextChannel):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await _finalize_ticket_delete(ctx, channel, ticket, actor_id=member.id)
+
+    @ticket.command(
+        name="claim",
+        description="Mark yourself as handling this ticket. You'll get DM pings on new activity.",
+    )
+    async def ticket_claim_cmd(self, interaction: discord.Interaction) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not ctx.member_is_mod(member):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+        def _fetch_claim_ticket():
+            with ctx.open_db() as conn:
+                return get_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        ticket = await asyncio.to_thread(_fetch_claim_ticket)
+        if not ticket:
+            await interaction.response.send_message("❌ Not a ticket channel.", ephemeral=True)
+            return
+        claim_ticket_id = ticket["id"]
+
+        def _claim_ticket():
+            with ctx.open_db() as conn:
+                claim_ticket(conn, claim_ticket_id, member.id)
+                write_audit(
+                    conn,
+                    guild_id=interaction.guild_id or 0,
+                    action="ticket_claim",
+                    actor_id=member.id,
+                    extra={"ticket_id": claim_ticket_id},
+                )
+
+        await asyncio.to_thread(_claim_ticket)
+        await interaction.response.send_message(
+            f"✅ {member.mention} claimed this ticket. You'll get DM notifications for new activity.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @ticket.command(
+        name="escalate", description="Bring admin roles into this ticket and ping them."
+    )
+    @app_commands.describe(reason="Reason for escalation")
+    async def ticket_escalate_cmd(
+        self, interaction: discord.Interaction, reason: str | None = None
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+        def _fetch_esc_ticket():
+            with ctx.open_db() as conn:
+                return get_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        ticket = await asyncio.to_thread(_fetch_esc_ticket)
+        if not ticket:
+            await interaction.response.send_message("❌ Not a ticket channel.", ephemeral=True)
+            return
+        if ticket["escalated"]:
+            await interaction.response.send_message(
+                "❌ This ticket is already escalated.", ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        # One overwrite per admin role is a REST call each, and they have to
+        # land before the ping does — Discord only notifies a role member who
+        # can see the channel when the message arrives. So defer now, and post
+        # the announcement as its own channel message once the roles are in.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        admin_ids = _get_admin_role_ids(ctx, guild.id)
+        pings: list[str] = []
+        for rid in admin_ids:
+            role = guild.get_role(rid)
+            if role:
+                await channel.set_permissions(
+                    role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                )
+                pings.append(role.mention)
+
+        esc_guild_id = guild.id
+        esc_ticket_id = ticket["id"]
+
+        def _escalate_ticket():
+            with ctx.open_db() as conn:
+                escalate_ticket(conn, esc_ticket_id)
+                write_audit(
+                    conn,
+                    guild_id=esc_guild_id,
+                    action="ticket_escalate",
+                    actor_id=member.id,
+                    extra={"ticket_id": esc_ticket_id, "reason": reason or ""},
+                )
+
+        await asyncio.to_thread(_escalate_ticket)
+
+        msg = f"⚠️ **Ticket escalated** by {member.mention}."
+        if reason:
+            msg += f"\n**Reason:** {discord.utils.escape_markdown(reason)}"
+        if pings:
+            msg += f"\n{' '.join(pings)}"
+        try:
+            await channel.send(
+                msg, allowed_mentions=allow_pings(users=[member], roles=admin_ids)
+            )
+        except discord.HTTPException:
+            log.warning("ticket escalate: announcement failed", exc_info=True)
+            await interaction.followup.send(
+                "⚠️ Escalated and admins added, but the ping couldn't be posted.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send("⚠️ Ticket escalated.", ephemeral=True)
+
+        # Flip the ticket embed's Status field to Escalated. The embed carries
+        # no view change, so edit only the embed and leave the existing
+        # buttons intact.
+        async for hist_msg in channel.history(limit=5, oldest_first=True):
+            if hist_msg.author == guild.me and hist_msg.embeds:
+                await hist_msg.edit(
+                    embed=_apply_ticket_status(
+                        hist_msg.embeds[0], TICKET_STATUS_ESCALATED
+                    )
+                )
+                break
+
+    # ── /policy ───────────────────────────────────────────────────────────
+
+    @policy.command(
+        name="open", description="Open a new policy proposal for discussion."
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        title="Short title for the policy",
+        description="Detailed description of the proposed policy",
+    )
+    async def policy_open(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str | None = None,
+    ) -> None:
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        user = interaction.user
+        if guild is None or not isinstance(user, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        if not _is_admin(user, ctx):
+            await interaction.response.send_message(
+                "❌ Only admins can open policy proposals.", ephemeral=True
+            )
+            return
+
+        cat_id = ctx.guild_config(guild.id).ticket_category_id
+        category = guild.get_channel(cat_id) if cat_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(
+                "❌ Ticket category not configured. Ask an admin to set one on the dashboard (Config → Moderation).",
+                ephemeral=True,
+            )
+            return
+
+        # Cap the title so the resulting embed-title (which prefixes "Policy
+        # Proposal #N: ") stays under Discord's 256-char embed-title limit.
+        if len(title) > _POLICY_TITLE_MAX:
+            title = title[:_POLICY_TITLE_MAX].rstrip() + "…"
+
+        await interaction.response.defer(ephemeral=True)
+
+        desc_text = description or "(no description)"
+        ts = datetime.now(timezone.utc).strftime("%m%d-%H%M")
+        safe_title = sanitize_channel_name(title[:20])
+        name = f"policy-{safe_title}-{ts}"
+
+        mod_role_ids = _get_mod_role_ids(ctx, guild.id)
+        admin_role_ids = _get_admin_role_ids(ctx, guild.id)
+        all_role_ids = mod_role_ids | admin_role_ids
+
+        overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                manage_messages=True,
+                read_message_history=True,
+            )
+        for rid in all_role_ids:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                )
+
+        channel = await guild.create_text_channel(
+            name, category=category, overwrites=overwrites  # type: ignore[arg-type]
+        )
+
+        po_guild_id = guild.id
+
+        def _create_policy():
+            with ctx.open_db() as conn:
+                pid = create_policy_ticket(
+                    conn,
+                    guild_id=po_guild_id,
+                    creator_id=user.id,
+                    channel_id=channel.id,
+                    title=title,
+                    description=desc_text,
+                )
+                write_audit(
+                    conn,
+                    guild_id=po_guild_id,
+                    action="policy_open",
+                    actor_id=user.id,
+                    extra={"policy_id": pid, "title": title},
+                )
+            return pid
+
+        policy_id = await asyncio.to_thread(_create_policy)
+
+        # A resolved name, not a mention: this card starts mod-only but can be
+        # opened to every member from its own button, and an embed mention
+        # renders as a bare number to any client that hasn't cached the user.
+        name_fn = await build_name_fn(
+            guild=guild, db_path=ctx.db_path, guild_id=guild.id, user_ids=[user.id]
+        )
+        embed = build_policy_proposal_embed(
+            policy_id=policy_id,
+            title=title,
+            description=desc_text,
+            proposer=name_fn(user.id),
+            visibility=POLICY_VISIBILITY_MODS,
+        )
+        # The toggle rides on the card, so the decision to open a proposal
+        # lives where the proposal is being discussed.
+        await channel.send(
+            embed=embed, view=_policy_visibility_view(policy_id, POLICY_VISIBILITY_MODS)
+        )
+
+        role_mentions = []
+        for rid in all_role_ids:
+            role = guild.get_role(rid)
+            if role:
+                role_mentions.append(role.mention)
+        if role_mentions:
+            await channel.send(
+                f"📋 New policy proposal from {user.mention}: "
+                f"**{discord.utils.escape_markdown(title)}**\n"
+                f"Attention: {' '.join(role_mentions)}",
+                allowed_mentions=allow_pings(users=[user], roles=all_role_ids),
+            )
+
+        await interaction.followup.send(
+            f"Policy proposal created → {channel.mention}", ephemeral=True
+        )
+
+        audit_embed = discord.Embed(
+            title="📋 Policy Proposal Opened",
+            description=(
+                f"**{discord.utils.escape_markdown(title)}** by {name_fn(user.id)} "
+                f"in {channel.mention}"  # embed-mention-ok: channel
+            ),
+            color=CLR_POLICY,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+    @policy.command(
+        name="vote", description="Start the formal vote on this policy proposal."
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    async def policy_vote_cmd(self, interaction: discord.Interaction) -> None:
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        if not (ctx.member_is_mod(member) or _is_admin(member, ctx)):
+            await interaction.response.send_message(
+                "❌ Only mods and admins can start a policy vote.", ephemeral=True
+            )
+            return
+
+        def _fetch_vote_policy():
+            with ctx.open_db() as conn:
+                return get_policy_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        policy = await asyncio.to_thread(_fetch_vote_policy)
+        if not policy:
+            await interaction.response.send_message(
+                "❌ This is not an active policy proposal channel.", ephemeral=True
+            )
+            return
+        if policy["status"] != "open":
+            await interaction.response.send_message(
+                f"❌ This policy is already in '{policy['status']}' state.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(_PolicyVoteModal(policy["id"], ctx))
+
+    @policy.command(
+        name="ballot",
+        description="Open a community ballot in this channel (admin only).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def policy_ballot_cmd(self, interaction: discord.Interaction) -> None:
+        """Put a question to everyone who can see this channel.
+
+        Admin-only, matching ``/policy open``, and enforced **here at runtime**:
+        the ``default_permissions`` decorator above is inert on a subcommand
+        (discord.py emits ``default_member_permissions`` only when
+        ``self.parent is None``, and the ``/policy`` group carries none), so
+        every member already sees this command in the picker. It is decoration
+        for the day the group gains its own gate, never the gate itself.
+        """
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        if not _is_admin(member, ctx):
+            await interaction.response.send_message(
+                "❌ Only admins can open a community ballot.", ephemeral=True
+            )
+            return
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Run this in a normal text channel — a ballot opens a thread, "
+                "and threads and forum posts can't hold one.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(_PolicyBallotModal(ctx))
+
+    @policy.command(
+        name="close",
+        description="Close a policy proposal without voting (admin only).",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(reason="Reason for closing without a vote")
+    async def policy_close_cmd(
+        self, interaction: discord.Interaction, reason: str | None = None
+    ) -> None:
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        if not _is_admin(member, ctx):
+            await interaction.response.send_message(
+                "❌ Only admins can close policy proposals.", ephemeral=True
+            )
+            return
+
+        # Run inside a community ballot's thread, this cancels the ballot: the
+        # counts are frozen so the record says what the room had said, but no
+        # result is claimed from a vote that was stopped early. It is the only
+        # way to call one off without recording a pass or a fail, and it is
+        # here rather than on a fourth button because calling off a ballot
+        # should be a deliberate act, not a neighbour of the Close everyone can
+        # see. A ballot's own ticket wears status 'ballot', so the proposal
+        # lookup below can never reach it.
+        def _fetch_thread_ballot():
+            with ctx.open_db() as conn:
+                return get_open_ballot_for_thread(conn, interaction.channel_id or 0)
+
+        thread_ballot = await asyncio.to_thread(_fetch_thread_ballot)
+        if thread_ballot is not None:
+            await interaction.response.defer(ephemeral=True)
+            closed = await finalize_ballot(
+                ctx, guild, thread_ballot["id"], closed_by=member.id, cancelled=True
+            )
+            await interaction.followup.send(
+                "Ballot cancelled — the votes cast so far are recorded, but no "
+                "result was declared."
+                if closed is not None
+                else "❌ That ballot has already closed.",
+                ephemeral=True,
+            )
+            return
+
+        def _fetch_close_policy():
+            with ctx.open_db() as conn:
+                return get_policy_ticket_by_channel(conn, interaction.channel_id or 0)
+
+        policy = await asyncio.to_thread(_fetch_close_policy)
+        if not policy:
+            await interaction.response.send_message(
+                "❌ This is not an active policy proposal channel.", ephemeral=True
+            )
+            return
+
+        policy_id = policy["id"]
+        reason_text = reason or "Closed without vote"
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+        pc_guild_id = guild.id
+
+        def _close_policy():
+            with ctx.open_db() as conn:
+                close_policy_ticket(conn, policy_id)
+                write_audit(
+                    conn,
+                    guild_id=pc_guild_id,
+                    action="policy_closed",
+                    actor_id=member.id,
+                    extra={"policy_id": policy_id, "reason": reason_text},
+                )
+
+        await asyncio.to_thread(_close_policy)
+        closer = (await build_name_fn(
+            guild=guild, db_path=ctx.db_path, guild_id=guild.id, user_ids=[member.id]
+        ))(member.id)
+
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            close_embed = build_policy_close_embed(
+                title=policy["title"],
+                moderator_name=closer,
+                reason=reason_text,
+                color=accent,
+            )
+            await interaction.response.send_message(embed=close_embed)
+
+            def _get_adopted_policies():
+                with ctx.open_db() as conn:
+                    return get_policies_by_ticket_id(conn, policy_id)
+
+            adopted_policies = await asyncio.to_thread(_get_adopted_policies)
+            if adopted_policies:
+                adopted_embed = build_adopted_policies_embed(adopted_policies)
+                await channel.send(embed=adopted_embed)
+
+            creator = guild.get_member(policy["creator_id"]) or member
+            try:
+                await _collect_and_post_transcript(
+                    ctx,
+                    channel,
+                    record_type="policy_ticket",
+                    record_id=policy_id,
+                    user=creator,
+                    extra_meta={
+                        "resolution": "closed",
+                        "reason": reason_text,
+                        "policy_title": policy["title"],
+                        "adopted_policies": [
+                            {"id": p["id"], "title": p["title"], "description": p["description"]}
+                            for p in adopted_policies
+                        ],
+                    },
+                )
+            except Exception:
+                # Don't delete the channel if we couldn't archive the
+                # discussion — losing both the transcript and the source is
+                # the worst possible outcome here.
+                log.exception(
+                    "Policy transcript save failed for policy %s; "
+                    "leaving channel %s intact.",
+                    policy_id, channel.id,
+                )
+                await channel.send(
+                    "⚠️ Failed to archive this policy's transcript. "
+                    "The channel has been **kept** so the discussion isn't lost. "
+                    "An admin can retry by running `/policy close` again, "
+                    "or delete the channel manually once a transcript is saved."
+                )
+                return
+            await channel.delete(reason=f"Policy #{policy_id} closed by {member}")
+
+        audit_embed = discord.Embed(
+            title="📋 Policy Proposal Closed",
+            # Same title build_policy_close_embed rendered a few lines above
+            # (which escapes it internally) — this second, literal embed
+            # must match, not re-open the raw policy title to the mod log.
+            description=f"**{discord.utils.escape_markdown(policy['title'])}** closed by {closer}"
+            + (
+                f"\nReason: {discord.utils.escape_markdown(reason_text)}"
+                if reason_text
+                else ""
+            ),
+            color=accent,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+    # The dashboard's Policy Tickets panel covers the *proposal* workflow
+    # (policy_tickets: open / voting / closed). Adopted policies live in a
+    # separate `policies` table that no web route reads, so this stays the only
+    # way to see what actually passed — checked during the 2026-07-28 command
+    # surface audit and deliberately kept.
+    @policy.command(name="list", description="List all passed policies.")
+    @app_commands.default_permissions(moderate_members=True)
+    async def policy_list_cmd(self, interaction: discord.Interaction) -> None:
+        ctx = self.bot.ctx
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+            return
+        if not (ctx.member_is_mod(member) or _is_admin(member, ctx)):
+            await interaction.response.send_message(
+                "❌ Only mods and admins can view policies.", ephemeral=True
+            )
+            return
+
+        pl_guild_id = guild.id
+
+        def _get_policies():
+            with ctx.open_db() as conn:
+                return get_policies(conn, pl_guild_id)
+
+        policies_list = await asyncio.to_thread(_get_policies)
+
+        if not policies_list:
+            await interaction.response.send_message(
+                "No passed policies yet.", ephemeral=True
+            )
+            return
+
+        embed = build_policy_list_embed(policies_list)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /pull ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="pull", description="Bring someone into this jail or ticket channel."
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(user="User to add to the channel")
+    async def pull_cmd(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        channel = interaction.channel
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ Use this inside a jail or ticket channel.", ephemeral=True
+            )
+            return
+
+        pull_ch_id = channel.id
+
+        def _fetch_pull_records():
+            with ctx.open_db() as conn:
+                return (
+                    get_jail_by_channel(conn, pull_ch_id),
+                    get_ticket_by_channel(conn, pull_ch_id),
+                )
+
+        jail, ticket = await asyncio.to_thread(_fetch_pull_records)
+        if not jail and not ticket:
+            await interaction.response.send_message(
+                "❌ This is not a jail or ticket channel.", ephemeral=True
+            )
+            return
+
+        await channel.set_permissions(
+            user,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+        )
+
+        record_type = "jail" if jail else "ticket"
+        record_id = jail["id"] if jail else ticket["id"]  # type: ignore[index]
+        if ticket:
+            pull_ticket_id = ticket["id"]
+
+            def _add_participant():
+                with ctx.open_db() as conn:
+                    add_ticket_participant(conn, pull_ticket_id, user.id, member.id)
+
+            await asyncio.to_thread(_add_participant)
+
+        pull_guild_id = guild.id
+
+        def _audit_pull():
+            with ctx.open_db() as conn:
+                write_audit(
+                    conn,
+                    guild_id=pull_guild_id,
+                    action="channel_pull",
+                    actor_id=member.id,
+                    target_id=user.id,
+                    extra={"channel_type": record_type, "record_id": record_id},
+                )
+
+        await asyncio.to_thread(_audit_pull)
+
+        await interaction.response.send_message(
+            f"{user.mention} has been added by {member.mention}.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ── /remove ───────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="remove",
+        description="Remove someone you pulled into this jail or ticket channel.",
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(user="User to remove from the channel")
+    async def remove_cmd(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        channel = interaction.channel
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        rm_ch_id = channel.id
+
+        def _fetch_rm_records():
+            with ctx.open_db() as conn:
+                return (
+                    get_jail_by_channel(conn, rm_ch_id),
+                    get_ticket_by_channel(conn, rm_ch_id),
+                )
+
+        jail, ticket = await asyncio.to_thread(_fetch_rm_records)
+        if not jail and not ticket:
+            await interaction.response.send_message(
+                "❌ Not a jail or ticket channel.", ephemeral=True
+            )
+            return
+
+        primary_id = jail["user_id"] if jail else ticket["user_id"]  # type: ignore[index]
+        if user.id == primary_id:
+            await interaction.response.send_message(
+                "❌ Cannot remove the primary user from their own channel.", ephemeral=True
+            )
+            return
+
+        await channel.set_permissions(user, overwrite=None)
+
+        record_type = "jail" if jail else "ticket"
+        record_id = jail["id"] if jail else ticket["id"]  # type: ignore[index]
+        if ticket:
+            rm_ticket_id = ticket["id"]
+
+            def _rm_participant():
+                with ctx.open_db() as conn:
+                    remove_ticket_participant(conn, rm_ticket_id, user.id)
+
+            await asyncio.to_thread(_rm_participant)
+
+        rm_guild_id = guild.id
+
+        def _audit_rm():
+            with ctx.open_db() as conn:
+                write_audit(
+                    conn,
+                    guild_id=rm_guild_id,
+                    action="channel_remove",
+                    actor_id=member.id,
+                    target_id=user.id,
+                    extra={"channel_type": record_type, "record_id": record_id},
+                )
+
+        await asyncio.to_thread(_audit_rm)
+
+        await interaction.response.send_message(
+            f"{user.mention} has been removed by {member.mention}.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ── /warn ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="warn",
+        description="Issue a formal warning. The action is logged (user is not notified).",
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(user="Member to warn", reason="Reason for warning")
+    async def warn_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        reason: str | None = None,
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+
+        reason_text = reason or ""
+        warn_guild_id = guild.id
+
+        def _issue_warn():
+            with ctx.open_db() as conn:
+                wid = create_warning(
+                    conn,
+                    guild_id=warn_guild_id,
+                    user_id=user.id,
+                    moderator_id=member.id,
+                    reason=reason_text,
+                )
+                cnt = get_active_warning_count(conn, warn_guild_id, user.id)
+                write_audit(
+                    conn,
+                    guild_id=warn_guild_id,
+                    action="warning_issue",
+                    actor_id=member.id,
+                    target_id=user.id,
+                    extra={"warning_id": wid, "reason": reason_text, "count": cnt},
+                )
+            return wid, cnt
+
+        warning_id, count = await asyncio.to_thread(_issue_warn)
+
+        await interaction.response.send_message(
+            f"⚠️ Warning issued to {user.mention}. They now have **{count}** active warning(s).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        name_fn = await build_name_fn(
+            guild=guild, db_path=ctx.db_path, guild_id=guild.id,
+            user_ids=[user.id, member.id],
+        )
+        audit_embed = build_warning_audit_embed(
+            target_name=name_fn(user.id),
+            moderator_name=name_fn(member.id),
+            active_count=count,
+            reason=reason_text,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+        threshold = await asyncio.to_thread(
+            _read_warning_threshold, ctx, guild.id
+        )
+        # Fire the threshold alert when this warning is the one that crosses
+        # the line — i.e. count was below threshold before, and is at or
+        # above it now. Equality-only comparison would miss bulk additions.
+        if count >= threshold and (count - 1) < threshold:
+            admin_ids = sorted(_get_admin_role_ids(ctx, guild.id))
+            alert = build_warning_threshold_embed(
+                target_name=name_fn(user.id),
+                active_count=count,
+            )
+            await _post_audit(
+                ctx,
+                guild,
+                alert,
+                content=warning_threshold_ping(admin_ids) or None,
+                ping_role_ids=admin_ids,
+            )
+
+    # ── /revokewarn ───────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="revokewarn",
+        description="Revoke a warning by ID. Stays in history but stops counting.",
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(
+        user="Member the warning belongs to",
+        warning_id="The warning's numeric ID (see the dashboard's Warnings page).",
+        reason="Why this warning is being revoked.",
+    )
+    async def revokewarn_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        warning_id: int,
+        reason: str | None = None,
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+
+        reason_text = reason or ""
+        rw_guild_id = guild.id
+        rw_member_id = member.id
+
+        def _revoke() -> tuple[str, int]:
+            # Verify the warning belongs to this user in this guild before
+            # touching the row — services.revoke_warning looks up by id only.
+            with ctx.open_db() as conn:
+                warns = get_warnings(conn, rw_guild_id, user.id)
+                match = next((w for w in warns if w["id"] == warning_id), None)
+                if match is None:
+                    return ("not_found", 0)
+                if match["revoked"]:
+                    return ("already_revoked", 0)
+                revoked = revoke_warning(
+                    conn, warning_id, revoked_by=rw_member_id, reason=reason_text
+                )
+                if not revoked:
+                    return ("race", 0)
+                count = get_active_warning_count(conn, rw_guild_id, user.id)
+                write_audit(
+                    conn,
+                    guild_id=rw_guild_id,
+                    action="warning_revoke",
+                    actor_id=rw_member_id,
+                    target_id=user.id,
+                    extra={
+                        "warning_id": warning_id,
+                        "reason": reason_text,
+                        "count": count,
+                    },
+                )
+            return ("ok", count)
+
+        rw_status, count = await asyncio.to_thread(_revoke)
+        if rw_status == "not_found":
+            await interaction.response.send_message(
+                f"❌ Warning #{warning_id} doesn't belong to {user.mention} "
+                f"in this server.",
+                ephemeral=True,
+            )
+            return
+        if rw_status == "already_revoked":
+            await interaction.response.send_message(
+                f"❌ Warning #{warning_id} is already revoked.", ephemeral=True
+            )
+            return
+        if rw_status == "race":
+            await interaction.response.send_message(
+                "❌ Couldn't revoke that warning — it may have just been "
+                "revoked by someone else.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Warning #{warning_id} revoked. {user.mention} now has "
+            f"**{count}** active warning(s).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        name_fn = await build_name_fn(
+            guild=guild, db_path=ctx.db_path, guild_id=guild.id,
+            user_ids=[user.id, member.id],
+        )
+        audit_embed = build_warning_revoke_audit_embed(
+            warning_id=warning_id,
+            target_name=name_fn(user.id),
+            moderator_name=name_fn(member.id),
+            active_count=count,
+            reason=reason_text,
+        )
+        await _post_audit(ctx, guild, audit_embed)
+
+    # ── /modinfo ──────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="modinfo",
+        description="Full mod profile — jail history, warnings, and tickets for a member.",
+    )
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(user="Member to inspect")
+    async def modinfo_cmd(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        ctx = self.bot.ctx
+        member = interaction.user
+        guild = interaction.guild
+        if (
+            not isinstance(member, discord.Member)
+            or guild is None
+            or not ctx.member_is_mod(member)
+        ):
+            await interaction.response.send_message("❌ Mod only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        accent = await safe_resolve_accent(ctx, guild, log_label="jail")
+
+        since_30d = datetime.now(timezone.utc).timestamp() - 30 * 86400
+
+        def _fetch():
+            with ctx.open_db() as conn:
+                active_jail = get_active_jail(conn, guild.id, user.id)
+                jail_hist = get_jail_history(conn, guild.id, user.id)
+                warns = get_warnings(conn, guild.id, user.id)
+                tickets = get_ticket_history(conn, guild.id, user.id)
+
+                xp_row = conn.execute(
+                    "SELECT total_xp, level FROM member_xp WHERE guild_id = ? AND user_id = ?",
+                    (guild.id, user.id),
+                ).fetchone()
+
+                # All-time XP split by source (reconciles with total_xp above).
+                xp_by_source = get_user_xp_by_source(conn, guild.id, user.id)
+
+                watcher_count = conn.execute(
+                    "SELECT COUNT(*) FROM watched_users WHERE guild_id = ? AND watched_user_id = ?",
+                    (guild.id, user.id),
+                ).fetchone()[0]
+
+                last_ts = conn.execute(
+                    "SELECT MAX(created_at) FROM processed_messages WHERE guild_id = ? AND user_id = ?",
+                    (guild.id, user.id),
+                ).fetchone()[0]
+
+                top_channels = conn.execute(
+                    """
+                    SELECT channel_id, COUNT(*) AS cnt
+                    FROM processed_messages
+                    WHERE guild_id = ? AND user_id = ? AND created_at >= ?
+                    GROUP BY channel_id ORDER BY cnt DESC LIMIT 3
+                    """,
+                    (guild.id, user.id, since_30d),
+                ).fetchall()
+
+                tz_off = get_tz_offset_hours(conn, guild.id)
+                # Message total (drives the "N msgs (30d)" header) — counts only.
+                _, msg_counts, _ = query_message_activity(
+                    conn, guild.id, "day", user_id=user.id,
+                    utc_offset_hours=tz_off,
+                )
+                # 30-day XP split by source for the stacked-bar chart.
+                xp_labels, xp_totals, _, xp_series = (
+                    query_xp_activity_with_breakdown(
+                        conn, guild.id, "day", user_id=user.id,
+                        utc_offset_hours=tz_off,
+                    )
+                )
+
+            return (
+                active_jail, jail_hist, warns, tickets,
+                xp_row, xp_by_source, watcher_count, last_ts, top_channels,
+                msg_counts, xp_labels, xp_totals, xp_series,
+            )
+
+        (
+            active_jail, jail_hist, warns, tickets,
+            xp_row, xp_by_source, watcher_count, last_ts, top_channels,
+            msg_counts, xp_labels, xp_totals, xp_series,
+        ) = await asyncio.to_thread(_fetch)
+
+        chart_bytes = await asyncio.to_thread(
+            render_activity_chart,
+            xp_labels,
+            xp_totals,
+            [],
+            f"{user.display_name} — 30-Day XP by Source",
+            "day",
+            show_members=False,
+            y_label="XP",
+            bar_label="XP",
+            by_source=xp_series,
+        )
+
+        embed = build_modinfo_embed(
+            user_label=_modinfo_user_label(user),
+            user_avatar_url=user.display_avatar.url if user.display_avatar else None,
+            account_created=user.created_at,
+            account_age_days=(datetime.now(timezone.utc) - user.created_at).days,
+            joined_at=user.joined_at,
+            xp_row=xp_row,
+            xp_by_source=xp_by_source,
+            watcher_count=watcher_count,
+            active_jail=active_jail,
+            jail_history=jail_hist,
+            warns=warns,
+            tickets=tickets,
+            last_seen_ts=last_ts,
+            top_channels=top_channels,
+            msgs_30d_total=sum(msg_counts),
+            ts_formatter=_ts_str,
+            color=accent,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(io.BytesIO(chart_bytes), filename="modinfo_activity.png"),
+            ephemeral=True,
+        )
+
+
+async def setup(bot: Bot) -> None:
+    await bot.add_cog(JailCog(bot))

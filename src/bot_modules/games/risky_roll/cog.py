@@ -1,0 +1,589 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from bot_modules.core.role_provision import ensure_config_role
+from bot_modules.games.utils.game_manager import check_game_enabled, sign_off_game_chore
+from bot_modules.games.utils.host_panel import CallbackHostPanel, send_panel
+from bot_modules.games.utils.host_panel import reply as host_reply
+from bot_modules.games.utils.send_retry import retry_transient
+from bot_modules.shared.feature_roles import RISKY_PING
+from bot_modules.games.risky_roll import state as rr_state
+from bot_modules.core.layout import card
+from bot_modules.games.risky_roll.formatters import make_name_resolver, seed_display_names_from_db
+from bot_modules.games.risky_roll.layouts import (
+    ICON,
+    TITLE,
+    board_mentions,
+    build_host_panel_layout,
+    host_close_id,
+)
+from bot_modules.games.risky_roll.logic import (
+    collect_channel_state_ids,
+    may_close_round,
+    normalize_auto_close_options,
+)
+from bot_modules.games.risky_roll.models import RiskyRollState
+from bot_modules.games.risky_roll.store import MAX_GAMES_PER_CHANNEL, StateStore
+from bot_modules.games.risky_roll.views import (
+    QuestionReplyView,
+    RiskyRollView,
+    SixtyNineQuestionView,
+    auto_close_round,
+    board_view,
+    close_round,
+    disable_pending_question_message,
+    disable_round_message,
+    schedule_auto_close,
+)
+from bot_modules.event_echo import service as event_echo_service
+from bot_modules.shared.replies import NO_PERMISSION
+
+if TYPE_CHECKING:
+    from bot_modules.core.app_context import Bot
+
+log = logging.getLogger("dungeonkeeper.risky_roll")
+
+NOT_OPENER_REPLY = "❌ Only the round opener or an admin can use the round controls."
+
+
+async def _echo_round(bot, guild, state, *, channel, host_id: int) -> None:
+    """Mirror a freshly opened round into the Event Echo channel, best effort.
+
+    Wrapped rather than called inline because both entry points reach it from
+    inside their channel lock, and a round that opened fine must not be undone
+    by an echo that didn't. ``echo_event`` already swallows its own send
+    failures; this catches the rest (an unreachable channel, a db hiccup) so
+    the caller never sees them.
+
+    Note the argument order this hands on: the *round's* channel, not the echo
+    destination — Event Echo resolves that itself from guild config, and is a
+    no-op when no destination is set.
+    """
+    if guild is None or channel is None or not state.message_id:
+        return
+    try:
+        await event_echo_service.echo_risky_round(
+            bot,
+            guild=guild,
+            game_id=state.game_id,
+            channel=channel,
+            message_id=state.message_id,
+            host_id=host_id,
+        )
+    except Exception:
+        log.exception("risky_roll: event echo failed for round %s", state.game_id)
+
+
+class RiskyRollCog(commands.Cog):
+    risky = app_commands.Group(name="risky", description="Risky Rolls game commands")
+
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        super().__init__()
+
+    @property
+    def db(self):
+        return self.bot.games_db
+
+    async def cog_load(self) -> None:
+        rr_state.store = StateStore(self.bot.ctx.db_path)
+        rr_state.db_path = self.bot.ctx.db_path
+
+        swept = await rr_state.store.sweep_old_posted_questions()
+        if swept:
+            log.info("Swept %d old posted questions.", swept)
+
+        swept_pending = await rr_state.store.sweep_old_pending_questions()
+        if swept_pending:
+            log.info("Swept %d old pending questions.", swept_pending)
+
+        ping_roles, min_times, max_games, active_rounds, pending_questions, posted_questions = await asyncio.gather(
+            rr_state.store.load_ping_roles(),
+            rr_state.store.load_min_game_times(),
+            rr_state.store.load_max_games_per_channel(),
+            rr_state.store.load_active_rounds(),
+            rr_state.store.load_pending_questions(),
+            rr_state.store.load_posted_questions(),
+        )
+        rr_state.ping_roles.update(ping_roles)
+        rr_state.min_game_seconds.update(min_times)
+        rr_state.max_games_per_channel.update(max_games)
+
+        # The roster embed prints names from an in-memory dict that empties on
+        # restart. Refill it from known_users before any restored round renders,
+        # so players who have since left the guild — whom the member cache can
+        # no longer resolve — still show a name instead of a raw id.
+        seeded = await seed_display_names_from_db(self.bot.ctx.db_path, active_rounds)
+        if seeded:
+            log.info("Seeded %d risky-roll display names from known_users.", seeded)
+
+        now = time.time()
+        for state in active_rounds:
+            rr_state.active_games[state.game_id] = state
+            if state.message_id is not None:
+                self.bot.add_view(RiskyRollView(state.game_id), message_id=state.message_id)
+            if state.auto_close_minutes and state.auto_close_minutes > 0:
+                elapsed = now - state.created_at
+                delay = max(0.0, state.auto_close_minutes * 60 - elapsed)
+                rr_state.auto_close_tasks[state.game_id] = asyncio.create_task(
+                    schedule_auto_close(self.bot, state.game_id, delay)
+                )
+
+        for pq in pending_questions:
+            rr_state.pending_questions[pq.game_id] = pq
+            if pq.prompt_message_id is not None:
+                self.bot.add_view(SixtyNineQuestionView(pq.game_id), message_id=pq.prompt_message_id)
+
+        for posted in posted_questions:
+            rr_state.posted_questions[posted.message_id] = posted
+            self.bot.add_view(QuestionReplyView(), message_id=posted.message_id)
+
+        log.info(
+            "Risky Rolls loaded: %d active, %d pending, %d posted",
+            len(active_rounds), len(pending_questions), len(posted_questions),
+        )
+
+    async def cog_unload(self) -> None:
+        tasks = list(rr_state.auto_close_tasks.values())
+        rr_state.auto_close_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        rr_state.active_games.clear()
+        rr_state.pending_questions.clear()
+        rr_state.posted_questions.clear()
+        rr_state.ping_roles.clear()
+        rr_state.min_game_seconds.clear()
+        rr_state.max_games_per_channel.clear()
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        if isinstance(error, app_commands.MissingPermissions):
+            msg = NO_PERMISSION
+        else:
+            log.exception("Unhandled risky command error", exc_info=error)
+            msg = "❌ The command failed. Check the bot logs for details."
+
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # Game commands
+    # ------------------------------------------------------------------
+
+    # `ping` replaced the separate /risky start_no_ping command (2026-07-28):
+    # the two callbacks were identical but for this flag. A quiet round also
+    # skips the minimum game time — the two always moved together, because the
+    # minimum exists to give pinged members time to arrive.
+    @risky.command(name="start", description="Open a new Risky Rolls round in this channel")
+    @app_commands.describe(
+        auto_close_players="Auto-close when this many players have rolled (default 25)",
+        auto_close_minutes="Auto-close after this many minutes (default 120)",
+        ping="Ping the round role and hold a minimum game time (default yes)",
+    )
+    async def risky_start(
+        self,
+        interaction: discord.Interaction,
+        auto_close_players: int | None = 25,
+        auto_close_minutes: int | None = 120,
+        ping: bool = True,
+    ) -> None:
+        await self._start_game(
+            interaction,
+            auto_close_players=auto_close_players,
+            auto_close_minutes=auto_close_minutes,
+            ping=ping,
+            skip_min_game_time=not ping,
+        )
+
+    async def _start_game(
+        self,
+        interaction: discord.Interaction,
+        auto_close_players: int | None,
+        auto_close_minutes: int | None,
+        ping: bool,
+        skip_min_game_time: bool,
+    ) -> None:
+        if interaction.guild is None or interaction.channel is None:
+            await interaction.response.send_message(
+                "❌ This command can only be used in a server channel.", ephemeral=True
+            )
+            return
+
+        # The Games Global Config availability list promises that switching a
+        # game off refuses its command as well as skipping its scheduled
+        # rounds. risky_roll is in that list, so honour it here rather than
+        # letting the switch mean something narrower for this one game.
+        if not await check_game_enabled(self.db, "risky_roll", interaction.guild.id):
+            await interaction.response.send_message(
+                "Risky Rolls is currently disabled on this server.", ephemeral=True
+            )
+            return
+
+        me = interaction.guild.me
+        perms = interaction.channel.permissions_for(me)
+        missing = [
+            name for allowed, name in [
+                (perms.send_messages, "Send Messages"),
+                (perms.embed_links, "Embed Links"),
+            ]
+            if not allowed
+        ]
+        if missing:
+            await interaction.response.send_message(
+                f"❌ I'm missing permissions in this channel: {', '.join(missing)}. "
+                "Please fix my permissions before starting a round.",
+                ephemeral=True,
+            )
+            return
+
+        #: Set once the round is really posted, so the chore sign-off happens
+        #: outside the channel lock and outside the teardown handler below.
+        opened: tuple[int, int] | None = None
+        async with rr_state.get_channel_lock(interaction.channel.id):
+            active_in_channel = sum(
+                1 for s in rr_state.active_games.values()
+                if s.channel_id == interaction.channel.id
+            )
+            max_games = rr_state.max_games_per_channel.get(
+                interaction.guild.id, MAX_GAMES_PER_CHANNEL
+            )
+            if active_in_channel >= max_games:
+                await interaction.response.send_message(
+                    f"❌ This channel already has {max_games} active games. "
+                    "Close one before starting another.",
+                    ephemeral=True,
+                )
+                return
+
+            normalized_players, normalized_minutes = normalize_auto_close_options(
+                auto_close_players, auto_close_minutes
+            )
+            state = RiskyRollState(
+                channel_id=interaction.channel.id,
+                guild_id=interaction.guild.id,
+                opener_id=interaction.user.id,
+                auto_close_players=normalized_players,
+                auto_close_minutes=normalized_minutes,
+                skip_min_game_time=skip_min_game_time,
+            )
+            rr_state.active_games[state.game_id] = state
+
+            if ping:
+                # Provisions @Risky Rolls on a guild that never set a ping
+                # role; a stored "(none)" returns None and the round posts
+                # silent. The in-memory cache is refreshed so the next round
+                # skips the lookup.
+                role = await ensure_config_role(
+                    self.bot.ctx, interaction.guild,
+                    RISKY_PING.key, RISKY_PING.spec, feature=RISKY_PING.feature,
+            allow_legacy_fallback=RISKY_PING.legacy_fallback,
+                )
+                if role is not None:
+                    rr_state.ping_roles[interaction.guild.id] = role.id
+                    # The board draws the role's line and allow-lists
+                    # exactly this role (layouts.board_mentions).
+                    state.ping_role_id = role.id
+
+            try:
+                view = await board_view(self.bot, state, interaction.channel)
+                await interaction.response.send_message(
+                    view=view, allowed_mentions=board_mentions(state)
+                )
+                message = await interaction.original_response()
+                state.message_id = message.id
+                if rr_state.store is not None:
+                    await rr_state.store.save_round(state)
+
+                if state.auto_close_minutes:
+                    rr_state.auto_close_tasks[state.game_id] = asyncio.create_task(
+                        schedule_auto_close(interaction.client, state.game_id, state.auto_close_minutes * 60)
+                    )
+
+                opened = (interaction.guild.id, interaction.user.id)
+            except Exception:
+                rr_state.active_games.pop(state.game_id, None)
+                if rr_state.store is not None:
+                    await rr_state.store.delete_round(state.game_id)
+                state.is_open = False
+
+                if interaction.response.is_done():
+                    try:
+                        message = await interaction.original_response()
+                    except (discord.NotFound, discord.HTTPException):
+                        pass
+                    else:
+                        failed = card([discord.ui.TextDisplay(
+                            f"## {ICON} {TITLE}\n"
+                            "Risky Rolls could not finish setup. Start a new round."
+                        )])
+                        try:
+                            await message.edit(
+                                view=failed,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
+                raise
+
+        # Two best-effort side effects, both deliberately out here rather than
+        # beside the send: neither may hold the channel lock, and neither may
+        # sit inside the try whose handler tears a live round down.
+
+        # Event Echo. A push, not a sweep — Risky Rolls keeps its rounds in
+        # memory and never writes games_active_games, so nothing polls them.
+        # After the auto-close timer is armed on purpose: this writes to the
+        # database and sends to a *different* channel, so a rate limit on the
+        # echo destination would otherwise stall a concurrent /risky start and
+        # delay the round's own auto-close by however long the bucket slept.
+        # First of the two because it is the time-sensitive one — it says
+        # "come and join this", and a todo-board repaint must not delay it.
+        await _echo_round(
+            self.bot, interaction.guild, state,
+            channel=interaction.channel, host_id=interaction.user.id,
+        )
+
+        # Risky Rolls does not go through the party games' shared
+        # finish_launch_response, so it carries the seam itself — otherwise a
+        # mod opening a round by hand would still be marked as not having run a
+        # game. This is the interactive path only: the scheduler's daily rounds
+        # come in through launch(), which deliberately reaches nothing here.
+        if opened is not None:
+            await sign_off_game_chore(self.bot, *opened)
+
+    async def open_channel_host_panel(self, interaction: discord.Interaction) -> bool:
+        """``/games host`` in a channel with a Risky Rolls round: Close Round
+        on one ephemeral panel. Rounds are not rows in ``games_active_games``
+        (``host_panel.CHANNEL_HOST_PANEL_COGS``), so they are found in
+        ``risky_roll.state``. Returns False for a channel with no open round.
+        Only a round's opener or an admin is offered its Close Round
+        (``logic.may_close_round``, the same gate the press re-checks)."""
+        rounds = [
+            s for s in rr_state.active_games.values()
+            if s.channel_id == interaction.channel_id and s.is_open
+        ]
+        if not rounds:
+            return False
+        is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
+        mine = [s for s in rounds if may_close_round(s, interaction.user.id, is_admin=is_admin)]
+        if not mine:
+            await host_reply(interaction, NOT_OPENER_REPLY)
+            return True
+        panel = CallbackHostPanel(
+            build_host_panel_layout(mine, make_name_resolver(interaction.guild)),
+            {
+                host_close_id(s.game_id): (lambda i, p, gid=s.game_id: close_round(i, gid, p))
+                for s in mine
+            },
+        )
+        await send_panel(interaction, panel, label="risky host panel")
+        return True
+
+    async def channel_has_active_round(self, channel_id: int) -> bool:
+        """Scheduler busy-check: True if an in-memory round is live in this channel.
+
+        Risky Rolls tracks rounds in ``rr_state.active_games`` (not the shared
+        games_active_games table), so the scheduler can't see them without this.
+        Registered as ``bot.game_busy_checks['risky_roll']`` so a scheduled run skips
+        instead of pinging "starting now!" and then refusing to start a duplicate.
+        """
+        return any(
+            s.channel_id == channel_id for s in rr_state.active_games.values()
+        )
+
+    async def close_channel_rounds(self, channel_id: int) -> bool:
+        """Resolve every open round in this channel now. Returns whether any did.
+
+        The counterpart to :meth:`channel_has_active_round`, registered as
+        ``bot.game_channel_closers['risky_roll']`` so the feature rotation can
+        end this room's game when the room stops being the featured one —
+        rounds live in ``rr_state.active_games``, so the rotation's
+        games_active_games lookup cannot see them.
+
+        Deliberately routed through ``auto_close_round`` rather than dropping
+        the state: that is the round's real resolution, so the winner is picked,
+        the no-contact gate is consulted before anything is settled, and the
+        question prompts go out. Closing early is the same event as the timer
+        running out, just sooner.
+        """
+        game_ids = [
+            gid for gid, s in rr_state.active_games.items()
+            if s.channel_id == channel_id and s.is_open
+        ]
+        closed = False
+        for game_id in game_ids:
+            task = rr_state.auto_close_tasks.pop(game_id, None)
+            if task is not None:
+                task.cancel()
+            try:
+                await auto_close_round(self.bot, game_id)
+            except Exception:
+                log.exception("Risky Rolls: failed to close round %s early", game_id)
+                continue
+            closed = True
+        return closed
+
+    async def launch(
+        self,
+        *,
+        channel,
+        host_id: int,
+        host_name: str,
+        guild_id: int,
+        options: dict,
+    ) -> str | None:
+        """Interaction-free launch for the scheduler. Returns game_id, or None."""
+        me = channel.guild.me
+        perms = channel.permissions_for(me)
+        if not (perms.send_messages and perms.embed_links):
+            log.warning("risky_roll launch: missing perms in channel %s", channel.id)
+            return None
+
+        auto_close_players = options.get("auto_close_players", 25)
+        auto_close_minutes = options.get("auto_close_minutes", 120)
+
+        async with rr_state.get_channel_lock(channel.id):
+            active_in_channel = sum(
+                1 for s in rr_state.active_games.values()
+                if s.channel_id == channel.id
+            )
+            if active_in_channel >= 1:
+                log.warning(
+                    "risky_roll launch: channel %s already has an active round", channel.id
+                )
+                return None
+
+            normalized_players, normalized_minutes = normalize_auto_close_options(
+                auto_close_players, auto_close_minutes
+            )
+            state = RiskyRollState(
+                channel_id=channel.id,
+                guild_id=guild_id,
+                opener_id=host_id,
+                auto_close_players=normalized_players,
+                auto_close_minutes=normalized_minutes,
+                skip_min_game_time=True,
+            )
+            rr_state.active_games[state.game_id] = state
+
+            view = await board_view(self.bot, state, channel)
+            try:
+                msg = await retry_transient(
+                    lambda: channel.send(
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    ),
+                    label="risky roll launch",
+                )
+            except discord.Forbidden:
+                rr_state.active_games.pop(state.game_id, None)
+                log.warning("risky_roll launch: Forbidden in channel %s", channel.id)
+                return None
+            except Exception:
+                rr_state.active_games.pop(state.game_id, None)
+                log.exception("risky_roll launch: failed to send in channel %s", channel.id)
+                return None
+
+            state.message_id = msg.id
+            if rr_state.store is not None:
+                await rr_state.store.save_round(state)
+
+            if state.auto_close_minutes:
+                rr_state.auto_close_tasks[state.game_id] = asyncio.create_task(
+                    schedule_auto_close(self.bot, state.game_id, state.auto_close_minutes * 60)
+                )
+
+        # Scheduled and rotation rounds echo too (Ben, 2026-09-02) — they are
+        # exactly the ones nobody is in the room to notice. Rotation launches
+        # carry no author line (host_id=0); a *scheduled* one is footed with
+        # the member who set the schedule up, which is what every scheduled
+        # party game already does — see `_round_host_name`. Outside the lock
+        # for the reason `_start_game` gives.
+        await _echo_round(
+            self.bot, channel.guild, state, channel=channel, host_id=host_id,
+        )
+
+        return state.game_id
+
+    # ------------------------------------------------------------------
+    # Admin commands
+    # ------------------------------------------------------------------
+
+    @risky.command(
+        name="reset_state",
+        description="Clear all active rounds and pending prompts in this channel",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def risky_reset_state(self, interaction: discord.Interaction) -> None:
+        if interaction.channel is None:
+            await interaction.response.send_message(
+                "❌ This command can only be used in a server channel.", ephemeral=True
+            )
+            return
+
+        async with rr_state.get_channel_lock(interaction.channel.id):
+            channel_id = interaction.channel.id
+
+            game_ids, question_ids, posted_message_ids = collect_channel_state_ids(
+                rr_state.active_games,
+                rr_state.pending_questions,
+                rr_state.posted_questions,
+                channel_id,
+            )
+
+            if not game_ids and not question_ids and not posted_message_ids:
+                await interaction.response.send_message(
+                    "❌ No active or pending Risky Rolls state was found in this channel.",
+                    ephemeral=True,
+                )
+                return
+
+            for game_id in game_ids:
+                task = rr_state.auto_close_tasks.pop(game_id, None)
+                if task:
+                    task.cancel()
+                state = rr_state.active_games.pop(game_id, None)
+                if state is not None:
+                    state.is_open = False
+                    await disable_round_message(state, interaction.channel, interaction.client)
+                if rr_state.store is not None:
+                    await rr_state.store.delete_round(game_id)
+
+            for game_id in question_ids:
+                pending_state = rr_state.pending_questions.pop(game_id, None)
+                if pending_state is not None:
+                    await disable_pending_question_message(
+                        interaction.client,
+                        pending_state,
+                        "The pending question prompt was cleared by an administrator.",
+                    )
+                if rr_state.store is not None:
+                    await rr_state.store.delete_pending_question(game_id)
+
+            for message_id in posted_message_ids:
+                rr_state.posted_questions.pop(message_id, None)
+                if rr_state.store is not None:
+                    await rr_state.store.delete_posted_question(message_id)
+
+            await interaction.response.send_message(
+                "Reset the Risky Rolls state for this channel.", ephemeral=True
+            )
+
+
+async def setup(bot: Bot) -> None:
+    cog = RiskyRollCog(bot)
+    await bot.add_cog(cog)
+    bot.game_launchers["risky_roll"] = cog.launch
+    bot.game_busy_checks["risky_roll"] = cog.channel_has_active_round
+    bot.game_channel_closers["risky_roll"] = cog.close_channel_rounds

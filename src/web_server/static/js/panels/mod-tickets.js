@@ -1,0 +1,781 @@
+import { api, apiPost, esc, fmtTs, fmtAge } from "../api.js";
+import { showTranscript } from "../transcript-modal.js";
+import { toast, promptDialog, confirmDialog, bindRowActivation } from "../ui.js";
+import { makeFilterStrip } from "../tab-strip.js";
+import { renderLoading, renderEmpty, renderError } from "../states.js";
+import { syncHash, updatedStampText } from "../report-helpers.js";
+import { mountPanelPoster } from "../panel-post.js";
+
+// The queue is a live workspace, so it re-fetches itself while you have it
+// open. Long enough not to hammer the API, short enough that a ticket raised
+// mid-shift shows up without a manual reload.
+const POLL_MS = 45000;
+
+const AVATAR_COLORS = ["#c07aa1", "#5865f2", "#23a55a", "#e6b84c", "#f23f43", "#7F8F3A"];
+
+function avatarColor(key) {
+  const s = String(key || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+function initial(name) {
+  const s = String(name || "?").trim();
+  return (s[0] || "?").toUpperCase();
+}
+
+function fmtJoinDate(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function memberForLabel(ts) {
+  if (!ts) return "";
+  const now = Date.now() / 1000;
+  const months = Math.max(1, Math.round((now - ts) / (30 * 86400)));
+  if (months < 12) return `${months} month${months === 1 ? "" : "s"}`;
+  const years = Math.floor(months / 12);
+  const rem = months % 12;
+  if (!rem) return `${years} year${years === 1 ? "" : "s"}`;
+  return `${years}y ${rem}m`;
+}
+
+function fmtShortDate(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+}
+
+function priorityClass(t) {
+  if (t.escalated) return "high";
+  if (t.status === "open" && !t.claimer_id) return "med";
+  return "low";
+}
+
+function statusChip(t) {
+  if (t.status === "closed" || t.status === "deleted") return '<span class="t-chip closed">Closed</span>';
+  if (t.claimer_id) return '<span class="t-chip claimed">Claimed</span>';
+  return '<span class="t-chip open">Open</span>';
+}
+
+function ticketSubject(t) {
+  const desc = (t.description || "").trim();
+  if (desc) return desc.length > 80 ? desc.slice(0, 77) + "…" : desc;
+  return `Ticket #${t.id}`;
+}
+
+// Build a lowercased blob of every searchable field — the visible text
+// (description, names, channel) plus metadata that never renders (raw IDs,
+// status, reasons) so a query can match on either.
+function ticketHaystack(t) {
+  return [
+    t.id,
+    `#${t.id}`,
+    t.description,
+    t.user_name,
+    t.user_id,
+    t.claimer_name,
+    t.claimer_id,
+    t.closer_name,
+    t.closed_by,
+    t.close_reason,
+    t.channel_name,
+    t.channel_id,
+    t.status,
+    t.escalated ? "escalated" : "",
+  ]
+    .filter((v) => v != null && v !== "")
+    .join(" ")
+    .toLowerCase();
+}
+
+// Every whitespace-separated term must appear somewhere in the haystack, so
+// "escalated #42" or "alice spam" narrow instead of widen.
+function matchesSearch(t, query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const hay = ticketHaystack(t);
+  return terms.every((term) => hay.includes(term));
+}
+
+function renderList(tickets, activeId, searching) {
+  if (!tickets.length) {
+    return renderEmpty(searching
+      ? "No tickets match your search. Try fewer words, or clear the search box to see the whole queue."
+      : "Nothing in this queue. Reports, flagged messages, and auto-mod hits land here as they come in.");
+  }
+  return tickets.map((t) => {
+    const cls = priorityClass(t) + (t.id === activeId ? " active" : "");
+    const reporter = t.user_name || t.user_id || "unknown";
+    const who = t.claimer_name
+      ? `claimed by <b style="color:var(--ink-dim)">${esc(t.claimer_name)}</b>`
+      : `by <b style="color:var(--ink-dim)">${esc(reporter)}</b>`;
+    const age = t.status === "open"
+      ? fmtAge(Date.now() / 1000 - t.created_at) + " ago"
+      : fmtAge(Date.now() / 1000 - (t.closed_at || t.created_at));
+    const channelChip = t.channel_name
+      ? `<span class="ch">#${esc(t.channel_name)}</span><span class="dot">·</span>`
+      : "";
+    const escalatedChip = t.escalated
+      ? '<span class="t-chip" style="background:var(--gold-soft);color:var(--gold-solid)">Escalated</span>'
+      : "";
+    return `
+      <div class="ticket-item ${cls}" data-ticket-id="${esc(t.id)}"
+           tabindex="0" role="button" aria-current="${t.id === activeId ? "true" : "false"}">
+        <div class="pri"></div>
+        <div class="body">
+          <div class="subj">${esc(ticketSubject(t))}</div>
+          <div class="row">
+            ${channelChip}
+            ${escalatedChip}
+            <span>${who}</span>
+            ${statusChip(t)}
+          </div>
+        </div>
+        <div class="right">
+          <span class="id">#${esc(t.id)}</span>
+          <span class="age">${esc(age)}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+const ICON_WARN = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1L13 12H1L7 1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M7 6V8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="7" cy="10.5" r="0.75" fill="currentColor"/></svg>`;
+const ICON_JAIL = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="2" y="3" width="10" height="9" stroke="currentColor" stroke-width="1.5" rx="1"/><path d="M5 3V12M9 3V12" stroke="currentColor" stroke-width="1.5"/><path d="M4.5 3V1.5a2.5 2.5 0 015 0V3" stroke="currentColor" stroke-width="1.5"/></svg>`;
+const ICON_CHEV = `<svg class="chev" width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 4L5 7L8 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+const ICON_NOTE = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 11V3a1 1 0 011-1h6l4 4v5a1 1 0 01-1 1H2a1 1 0 01-1-1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 2v4h4" stroke="currentColor" stroke-width="1.5"/></svg>`;
+const ICON_X = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 2L8 8M8 2L2 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+const ICON_DOC = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 11V3a1 1 0 011-1h6l4 4v5a1 1 0 01-1 1H2a1 1 0 01-1-1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 2v4h4" stroke="currentColor" stroke-width="1.5"/></svg>`;
+
+/**
+ * The action row, split by *what each action acts on*.
+ *
+ * These seven controls operate on two different objects: some change the
+ * ticket's state, and some write a permanent moderation record against a
+ * member. Presented as one flat row of equal-weight buttons that distinction
+ * was invisible, and the most visually prominent control on the page was the
+ * solid-red Jail button — the destructive one. Grouping them under two labels
+ * makes the difference legible, and the destructive styling moves to the
+ * confirm dialog, which is where the decision actually happens.
+ *
+ * The primary action is state-dependent, because "the obvious next thing"
+ * genuinely changes: an unclaimed ticket wants Claim, one you already hold
+ * wants Close Ticket. Previously every button looked equally likely.
+ */
+function memberLabel(t) {
+  // Matches the SUBJECT card exactly — the API derives subject.user_id from
+  // the ticket's own user_id, so the two can never disagree about *who*. The
+  // unresolved fallback has to match too: this said "this member" while the
+  // three `reporter` sites say "unknown", so one ticket showed both names for
+  // the same person.
+  return esc(String((t && (t.user_name || t.user_id)) || "unknown"));
+}
+
+function renderActions(t) {
+  if (t && (t.status === "closed" || t.status === "deleted")) {
+    return `
+      <div class="td-act-groups">
+        <div class="td-act-group">
+          <div class="section-label">This ticket</div>
+          <div class="td-actions">
+            <button class="act-btn primary" data-action="reopen">Reopen Ticket</button>
+            <span class="act-spacer"></span>
+            <button class="act-btn ghost" data-action="transcript" title="View transcript">${ICON_DOC}Transcript</button>
+          </div>
+        </div>
+        <div class="td-act-group">
+          <div class="section-label">This member <span class="td-act-who">${memberLabel(t)}</span></div>
+          <div class="td-actions">
+            <button class="act-btn" data-action="note">${ICON_NOTE}Add Note</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  const me = window.__dk_user;
+  const claimedByMe = t && t.claimer_id && me && String(t.claimer_id) === String(me.user_id);
+  // Claimed by you ⇒ closing is the next step and the Claim button is noise
+  // (the header already states who holds it). Claimed by someone else ⇒ the
+  // meaningful move is taking it over.
+  const primary = !t || !t.claimer_id
+    ? { action: "claim", label: "Claim" }
+    : claimedByMe
+      ? { action: "close", label: "Close Ticket" }
+      : { action: "claim", label: "Reassign to me" };
+  const closeBtn = primary.action === "close"
+    ? ""
+    : `<button class="act-btn" data-action="close">Close Ticket${ICON_X}</button>`;
+  return `
+    <div class="td-act-groups">
+      <div class="td-act-group">
+        <div class="section-label">This ticket</div>
+        <div class="td-actions">
+          <button class="act-btn primary" data-action="${primary.action}">${esc(primary.label)}</button>
+          ${closeBtn}
+          <button class="act-btn" data-action="dismiss">Dismiss</button>
+          <span class="act-spacer"></span>
+          <button class="act-btn ghost" data-action="transcript" title="View transcript">${ICON_DOC}Transcript</button>
+        </div>
+      </div>
+      <div class="td-act-group">
+        <div class="section-label">This member <span class="td-act-who">${memberLabel(t)}</span></div>
+        <div class="td-actions">
+          <button class="act-btn" data-action="warn">${ICON_WARN}Warn</button>
+          <div class="split-btn">
+            <button class="act-btn danger" data-action="jail">${ICON_JAIL}Jail · 24h</button>
+            <button class="act-btn danger" data-action="jail-custom" aria-label="Change duration">${ICON_CHEV}</button>
+          </div>
+          <button class="act-btn" data-action="note">${ICON_NOTE}Add Note</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHistory(history) {
+  if (!history.length) {
+    return `<div class="empty" style="padding:8px 0;color:var(--ink-mute);font-size:12px">No warnings, jails, or notes on this member yet.</div>`;
+  }
+  return `<div class="history">${history.map((h) => {
+    const dLabel = fmtShortDate(h.date);
+    const kindLabel = h.kind ? h.kind[0].toUpperCase() + h.kind.slice(1) : "";
+    const actorSuffix = h.actor_name ? ` — ${esc(h.actor_name)}` : "";
+    return `
+      <div class="history-row">
+        <span class="h-kind ${esc(h.kind)}">${esc(kindLabel)}</span>
+        <span class="h-body">${esc(h.body || "")}${actorSuffix}</span>
+        <span class="h-time">${esc(dLabel)}</span>
+      </div>
+    `;
+  }).join("")}</div>`;
+}
+
+function renderSubjectCard(t, detail) {
+  const reporter = t.user_name || t.user_id || "unknown";
+  const color = avatarColor(t.user_id || t.user_name);
+  const init = initial(t.user_name || t.user_id);
+
+  let metaLine = "—";
+  let warnCount = "—";
+  let jailCount = "—";
+  if (detail) {
+    warnCount = detail.subject.warn_count_active;
+    jailCount = detail.subject.jail_count_total;
+    if (detail.subject.joined_at) {
+      const parts = [`Joined ${fmtJoinDate(detail.subject.joined_at)}`];
+      const mf = memberForLabel(detail.subject.joined_at);
+      if (mf) parts.push(`Member for ${mf}`);
+      metaLine = parts.join(" · ");
+    }
+  }
+
+  const idSuffix = t.user_id
+    ? `<span style="color:var(--ink-mute);font-weight:500;font-family:var(--mono);font-size:11px">· ${esc(t.user_id)}</span>`
+    : "";
+
+  return `
+    <div class="user-card">
+      <div class="av" style="background:${color}">${esc(init)}</div>
+      <div class="info">
+        <div class="n">${esc(reporter)} ${idSuffix}</div>
+        <div class="m">${esc(metaLine)}</div>
+      </div>
+      <div class="counts">
+        <div><b>${esc(warnCount)}</b>warns</div>
+        <div><b>${esc(jailCount)}</b>jails</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDetail(t, detail) {
+  if (!t) {
+    return '<div class="empty">Select a ticket from the queue to view details.</div>';
+  }
+
+  const reporter = t.user_name || t.user_id || "unknown";
+  const when = t.status === "open"
+    ? `opened ${fmtAge(Date.now() / 1000 - t.created_at)} ago`
+    : `closed ${fmtAge(Date.now() / 1000 - (t.closed_at || t.created_at))} ago`;
+  const crumb = `#T-${esc(t.id)} &nbsp;·&nbsp; ${esc(when)}${t.escalated ? " &nbsp;·&nbsp; escalated" : ""}`;
+
+  const channelName = t.channel_name || (detail && detail.channel_name) || "";
+  const channelPair = channelName
+    ? `<span class="pair"><span class="k">Channel</span><b style="color:var(--gold-solid)">#${esc(channelName)}</b></span>`
+    : "";
+  const claimedPair = t.claimer_name
+    ? `<span class="pair"><span class="k">Claimed by</span><b>${esc(t.claimer_name)}</b></span>`
+    : `<span class="pair"><span class="k">Claimed</span><b style="color:var(--ink-mute)">Unclaimed</b></span>`;
+
+  const desc = (t.description || "").trim() || "(no description)";
+
+  const historyHtml = detail
+    ? renderHistory(detail.history || [])
+    : `<div class="empty" style="padding:8px 0;color:var(--ink-mute);font-size:12px">Loading…</div>`;
+
+  const closeSection = (t.status === "closed" || t.status === "deleted") ? `
+    <div class="td-section">Resolution</div>
+    <div class="user-card" style="background:var(--bg-floor)">
+      <div class="av" style="background:${avatarColor(t.closed_by || "system")}">${esc(initial(t.closer_name || "·"))}</div>
+      <div class="info">
+        <div class="n">Closed by ${esc(t.closer_name || "system")}</div>
+        <div class="m">${esc(fmtTs(t.closed_at))} · ${esc(t.close_reason || "no reason given")}</div>
+      </div>
+    </div>
+  ` : "";
+
+  return `
+    <div class="td-head">
+      <div class="td-crumb">${crumb}</div>
+      <h3 class="td-title">${esc(ticketSubject(t))}</h3>
+      <div class="td-meta">
+        ${channelPair}
+        <span class="pair"><span class="k">Reporter</span><b>${esc(reporter)}</b></span>
+        ${claimedPair}
+        <span class="pair"><span class="k">Status</span>${statusChip(t)}</span>
+      </div>
+    </div>
+
+    <div class="td-body">
+      <div class="td-section">Report</div>
+      <div style="font-size:14px;color:var(--ink);line-height:1.5;white-space:pre-wrap;word-break:break-word;padding:4px 8px 8px">${esc(desc)}</div>
+
+      <div class="td-section">Subject</div>
+      ${renderSubjectCard(t, detail)}
+
+      <div class="td-section">Prior actions</div>
+      ${historyHtml}
+
+      ${closeSection}
+    </div>
+
+    ${renderActions(t)}
+  `;
+}
+
+const FILTERS = {
+  open:   (t) => t.status === "open",
+  mine:   (t) => {
+    if (t.status !== "open" || !t.claimer_id) return false;
+    const me = window.__dk_user;
+    if (!me || !me.user_id) return true;
+    return String(t.claimer_id) === String(me.user_id);
+  },
+  closed: (t) => t.status === "closed" || t.status === "deleted",
+  all:    () => true,
+};
+
+export function mount(container, initialParams = {}) {
+  container.innerHTML = `
+    <div class="panel">
+      <header>
+        <h2>Tickets</h2>
+        <div class="subtitle">Flagged messages, auto-mod hits, and member reports.</div>
+        <div class="queue-freshness" style="display:flex;align-items:center;gap:10px;margin-top:6px;font-size:12px;color:var(--ink-dim);">
+          <span data-updated>Loading…</span>
+          <button class="btn btn-ghost" data-refresh style="padding:2px 10px;font-size:12px;">Refresh</button>
+        </div>
+      </header>
+
+      <div class="mod-stats" data-stats>
+        <div class="mod-stat open"><div class="lbl">Open</div><div class="v">—</div><div class="sub">loading…</div></div>
+        <div class="mod-stat high"><div class="lbl">Unclaimed</div><div class="v">—</div><div class="sub"></div></div>
+        <div class="mod-stat claimed"><div class="lbl">Escalated</div><div class="v">—</div><div class="sub"></div></div>
+        <div class="mod-stat resolved"><div class="lbl">Claimed by me</div><div class="v">—</div><div class="sub"></div></div>
+      </div>
+
+      <section class="mod-split">
+        <div class="ticket-list-wrap">
+          <div class="ticket-list-head">
+            <h3>Queue</h3>
+            <div class="ctrl-group" role="group" aria-label="Filter tickets" data-filter-group>
+              <button class="active" data-filter="open">Open</button>
+              <button data-filter="mine">Mine</button>
+              <button data-filter="closed">Closed</button>
+              <button data-filter="all">All</button>
+            </div>
+          </div>
+          <div class="ticket-search">
+            <input type="search" data-search autocomplete="off"
+              placeholder="Search text, member, channel, ID…"
+              aria-label="Search tickets" />
+          </div>
+          <div class="ticket-list" data-list>
+            ${renderLoading("Loading…")}
+          </div>
+        </div>
+
+        <div class="ticket-detail" data-detail>
+          ${renderLoading("Loading…")}
+        </div>
+      </section>
+
+      <div style="margin-top:20px;" data-poster="ticket-panel"></div>
+    </div>
+  `;
+
+  // Where members enter the queue this page works through. Admin-only, so it
+  // renders locked for the moderators who otherwise live on this page.
+  mountPanelPoster(container.querySelector('[data-poster="ticket-panel"]'), "ticket-panel", {
+    heading: "Post Support Ticket Panel",
+    buttonLabel: "Post Panel",
+  });
+
+  const statsEl = container.querySelector("[data-stats]");
+  const listEl = container.querySelector("[data-list]");
+  const detailEl = container.querySelector("[data-detail]");
+  const filterGroup = container.querySelector("[data-filter-group]");
+  const searchEl = container.querySelector("[data-search]");
+  const updatedEl = container.querySelector("[data-updated]");
+  const refreshBtn = container.querySelector("[data-refresh]");
+
+  const validFilters = Object.keys(FILTERS);
+  const state = {
+    tickets: [],
+    closedTickets: null,
+    filter: validFilters.includes(initialParams.filter) ? initialParams.filter : "open",
+    search: initialParams.q || "",
+    activeId: initialParams.ticket ? Number(initialParams.ticket) : null,
+    detailCache: new Map(),
+    fetchToken: 0,
+  };
+  searchEl.value = state.search;
+  for (const btn of filterGroup.querySelectorAll("[data-filter]")) {
+    const on = btn.dataset.filter === state.filter;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+
+  /** Mirror the queue view into the URL so a tab, search, or open ticket can
+   *  be refreshed into or handed to a colleague as a link (W-D9). */
+  function pushHash() {
+    syncHash("mod-tickets", {
+      filter: state.filter === "open" ? "" : state.filter,
+      q: state.search.trim(),
+      ticket: state.activeId || "",
+    });
+  }
+
+  // ── Freshness stamp ────────────────────────────────────────────────────
+  let lastLoadedAt = 0;
+  let loadFailed = false;
+
+  function renderUpdatedStamp() {
+    updatedEl.textContent = updatedStampText(lastLoadedAt, loadFailed);
+  }
+
+  function currentTicketSource() {
+    return state.filter === "closed" ? (state.closedTickets || []) : state.tickets;
+  }
+
+  // A search spans every ticket regardless of the active tab: merge the default
+  // (open + non-deleted-closed) set with the separately-fetched closed/deleted
+  // history, deduped by id, newest first.
+  function unionTickets() {
+    const map = new Map();
+    for (const t of state.tickets) map.set(t.id, t);
+    for (const t of state.closedTickets || []) if (!map.has(t.id)) map.set(t.id, t);
+    return [...map.values()].sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  }
+
+  function findTicket(id) {
+    return state.tickets.find((t) => t.id === id)
+      || (state.closedTickets || []).find((t) => t.id === id)
+      || null;
+  }
+
+  let closedInFlight = false;
+  // Load the closed/deleted history once, then re-render. Guarded so rapid
+  // typing can't fire overlapping fetches.
+  async function ensureClosed() {
+    if (state.closedTickets !== null || closedInFlight) {
+      render();
+      return;
+    }
+    closedInFlight = true;
+    listEl.innerHTML = renderLoading("Searching…");
+    try {
+      const data = await api("/api/moderation/tickets?status=closed");
+      state.closedTickets = data.tickets || [];
+    } catch (err) {
+      console.error("Failed to load closed tickets for search:", err);
+      state.closedTickets = [];
+    } finally {
+      closedInFlight = false;
+      render();
+    }
+  }
+
+  function setFilterBadge(filter, label, count) {
+    const btn = filterGroup.querySelector(`[data-filter="${filter}"]`);
+    if (!btn) return;
+    btn.textContent = label;
+    if (count) {
+      const badge = document.createElement("span");
+      badge.className = "filter-badge";
+      badge.textContent = String(count);
+      btn.appendChild(badge);
+    }
+  }
+
+  function updateFilterBadges() {
+    const openCount = state.tickets.filter((t) => t.status === "open").length;
+    const mineCount = state.tickets.filter(FILTERS.mine).length;
+    setFilterBadge("open", "Open", openCount);
+    setFilterBadge("mine", "Mine", mineCount);
+  }
+
+  function renderStats() {
+    const open = state.tickets.filter((t) => t.status === "open");
+    const unclaimed = open.filter((t) => !t.claimer_id).length;
+    const escalated = open.filter((t) => t.escalated).length;
+    const me = window.__dk_user;
+    const mine = me ? open.filter((t) => t.claimer_id && String(t.claimer_id) === String(me.user_id)).length : 0;
+    statsEl.innerHTML = `
+      <div class="mod-stat open">
+        <div class="lbl">Open</div>
+        <div class="v">${open.length}</div>
+        <div class="sub">${open.length === 1 ? "ticket" : "tickets"}</div>
+      </div>
+      <div class="mod-stat high">
+        <div class="lbl">Unclaimed</div>
+        <div class="v">${unclaimed}</div>
+        <div class="sub">${unclaimed ? "need attention" : "all claimed"}</div>
+      </div>
+      <div class="mod-stat claimed">
+        <div class="lbl">Escalated</div>
+        <div class="v">${escalated}</div>
+        <div class="sub">${escalated ? "high priority" : "none"}</div>
+      </div>
+      <div class="mod-stat resolved">
+        <div class="lbl">Claimed by me</div>
+        <div class="v">${mine}</div>
+        <div class="sub">${mine ? "in progress" : "none"}</div>
+      </div>`;
+  }
+
+  function render() {
+    const searching = state.search.trim() !== "";
+    const source = searching ? unionTickets() : currentTicketSource();
+    const filtered = searching
+      ? source.filter((t) => matchesSearch(t, state.search))
+      : source.filter(FILTERS[state.filter]);
+    if (!filtered.find((t) => t.id === state.activeId)) {
+      state.activeId = filtered[0]?.id ?? null;
+    }
+    listEl.innerHTML = renderList(filtered, state.activeId, searching);
+    const active = source.find((t) => t.id === state.activeId) || null;
+    const detail = active ? state.detailCache.get(active.id) : null;
+    detailEl.innerHTML = renderDetail(active, detail);
+    if (active && !detail) loadDetail(active.id);
+    updateFilterBadges();
+    renderUpdatedStamp();
+    pushHash();
+  }
+
+  async function loadDetail(id) {
+    const token = ++state.fetchToken;
+    try {
+      const detail = await api(`/api/moderation/tickets/${encodeURIComponent(id)}`);
+      if (token !== state.fetchToken) return;
+      state.detailCache.set(id, detail);
+      if (state.activeId === id) render();
+    } catch (err) {
+      // Show the failure where the detail should have been — a console-only
+      // error left the pane stuck on "Loading…" forever (W-D7).
+      if (token !== state.fetchToken || state.activeId !== id) return;
+      detailEl.innerHTML = renderError(
+        `Couldn't load ticket #${id} — ${err.message}. Pick the ticket again to retry.`
+      );
+    }
+  }
+
+  /** @param {boolean} quiet  background poll: keep the current view on screen
+   *  and never replace it with a spinner or an error. */
+  async function refresh(quiet = false) {
+    try {
+      const data = await api("/api/moderation/tickets");
+      state.tickets = data.tickets || [];
+      state.closedTickets = null;
+      lastLoadedAt = Date.now();
+      loadFailed = false;
+      renderStats();
+      if (state.filter === "closed") {
+        await refreshClosed();
+      } else if (state.search.trim()) {
+        await ensureClosed();
+      } else {
+        render();
+      }
+    } catch (err) {
+      loadFailed = true;
+      renderUpdatedStamp();
+      if (quiet) return; // keep the last good queue on screen
+      listEl.innerHTML = renderError(`Couldn't load tickets — ${err.message}. Press Refresh to try again.`);
+      detailEl.innerHTML = "";
+    }
+  }
+
+  async function refreshClosed() {
+    if (state.closedTickets === null) listEl.innerHTML = renderLoading("Loading closed tickets…");
+    try {
+      const data = await api("/api/moderation/tickets?status=closed");
+      state.closedTickets = data.tickets || [];
+      render();
+    } catch (err) {
+      listEl.innerHTML = renderError(
+        `Couldn't load closed tickets — ${err.message}. Press Refresh to try again.`
+      );
+    }
+  }
+
+  makeFilterStrip(filterGroup, (value) => {
+    state.filter = value;
+    state.activeId = null;
+    if (state.filter === "closed" && state.closedTickets === null) {
+      refreshClosed();
+    } else {
+      render();
+    }
+  });
+
+  searchEl.addEventListener("input", () => {
+    state.search = searchEl.value;
+    state.activeId = null;
+    if (state.search.trim()) {
+      ensureClosed();
+    } else {
+      render();
+    }
+  });
+
+  bindRowActivation(listEl, ".ticket-item", (row) => {
+    state.activeId = Number(row.dataset.ticketId);
+    render();
+  });
+
+  // Runs one ticket action. Returns a success message, or undefined if the
+  // user cancelled (promptDialog/confirmDialog resolve null/false on cancel).
+  async function runAction(action, t) {
+    const id = t.id;
+    const base = `/api/moderation/tickets/${encodeURIComponent(id)}`;
+    if (action === "claim") {
+      if (!(await confirmDialog(`Claim ticket #${id}?`, { confirmLabel: "Claim" }))) return;
+      await apiPost(`${base}/claim`);
+      return "Ticket claimed";
+    }
+    if (action === "reopen") {
+      if (!(await confirmDialog(`Reopen ticket #${id}?`, { confirmLabel: "Reopen" }))) return;
+      await apiPost(`${base}/reopen`);
+      return "Ticket reopened";
+    }
+    if (action === "warn") {
+      const reason = await promptDialog("Reason for warning?", {
+        title: "Warn Member", confirmLabel: "Warn", required: true, danger: true,
+      });
+      if (reason === null) return;
+      await apiPost(`${base}/warn`, { reason });
+      return "Warning issued";
+    }
+    if (action === "jail") {
+      const reason = await promptDialog("Reason for 24h jail? (blank = no reason)", {
+        title: "Jail Member", confirmLabel: "Jail", danger: true,
+      });
+      if (reason === null) return;
+      await apiPost(`${base}/jail`, { duration: "24h", reason });
+      return "Member jailed for 24h";
+    }
+    if (action === "jail-custom") {
+      const duration = await promptDialog("Jail duration? (e.g. 30m, 2h, 7d)", {
+        title: "Jail Member", confirmLabel: "Next", value: "24h", required: true, danger: true,
+      });
+      if (duration === null) return;
+      const reason = await promptDialog("Reason? (blank = no reason)", {
+        title: "Jail Member", confirmLabel: "Jail", danger: true,
+      });
+      if (reason === null) return;
+      await apiPost(`${base}/jail`, { duration, reason });
+      return `Member jailed for ${duration}`;
+    }
+    if (action === "note") {
+      const body = await promptDialog("Note body?", {
+        title: "Add Note", confirmLabel: "Add Note", required: true,
+      });
+      if (body === null) return;
+      await apiPost(`${base}/note`, { body });
+      return "Note added";
+    }
+    if (action === "dismiss") {
+      const reason = await promptDialog("Dismissal reason? (optional)", {
+        title: "Dismiss Ticket", confirmLabel: "Dismiss",
+      });
+      if (reason === null) return;
+      await apiPost(`${base}/dismiss`, { reason });
+      return "Ticket dismissed";
+    }
+    if (action === "close") {
+      const reason = await promptDialog("Reason for closing? (optional)", {
+        title: "Close Ticket", confirmLabel: "Close",
+      });
+      if (reason === null) return;
+      await apiPost(`${base}/close`, { reason });
+      return "Ticket closed";
+    }
+    throw new Error(`Unknown action: ${action}`);
+  }
+
+  detailEl.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".act-btn");
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.action;
+    if (!action) return;
+
+    if (action === "transcript") {
+      if (state.activeId) showTranscript("ticket", state.activeId);
+      return;
+    }
+
+    const t = findTicket(state.activeId);
+    if (!t) return;
+
+    btn.disabled = true;
+    try {
+      const msg = await runAction(action, t);
+      if (msg) {
+        toast(msg);
+        state.detailCache.delete(t.id);
+        await refresh();
+      }
+    } catch (err) {
+      console.error(`Ticket action "${action}" failed:`, err);
+      toast(err.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  refreshBtn.addEventListener("click", () => { refresh(); });
+
+  refresh();
+
+  // Poll while the panel is mounted. Skipped when the tab is hidden or a
+  // dialog is open, so a background refresh can't yank the queue out from
+  // under a confirm/prompt the moderator is answering.
+  const poll = setInterval(() => {
+    if (document.hidden) return;
+    if (document.querySelector(".confirm-overlay")) return;
+    refresh(true);
+  }, POLL_MS);
+  // Re-render the "Updated Xs ago" stamp so it never freezes at "just now".
+  const stampTimer = setInterval(renderUpdatedStamp, 1000);
+
+  return {
+    unmount() {
+      clearInterval(poll);
+      clearInterval(stampTimer);
+    },
+  };
+}

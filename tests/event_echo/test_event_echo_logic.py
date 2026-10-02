@@ -1,0 +1,511 @@
+"""Event Echo's rate limiting — the rules that keep main chat a chat channel.
+
+These are the tests that matter for this feature. Everything else is plumbing;
+this is the part that decides whether the busiest channel in the server gets
+another post, and the failure mode it guards against (a bot flooding a live
+channel) has happened here before.
+"""
+from __future__ import annotations
+
+
+import discord
+import pytest
+
+from bot_modules.core.utils import jump_url
+from bot_modules.event_echo.logic import (
+    CLOSING_LEAD_SECONDS,
+    GLOBAL_COOLDOWN_SECONDS,
+    PER_TYPE_COOLDOWN_SECONDS,
+    SOURCE_AUCTION_CLOSING,
+    SOURCE_BOUNTY,
+    SOURCE_COMMUNITY_TIER,
+    SOURCE_DISCORD_EVENT,
+    SOURCE_PARTY_GAME,
+    SOURCE_POOLS_CLOSING,
+    SOURCE_QUEST_FLIP,
+    SOURCE_RAFFLE_CLOSING,
+    build_echo_embed,
+    closing_due,
+    decide,
+    is_fresh,
+    SOURCE_GUESS_ROUND,
+    SOURCE_RISKY_ROLL,
+    spec_for,
+)
+
+NOW = 1_800_000_000.0
+
+
+@pytest.mark.parametrize(
+    "last_same_type, last_any, allowed, reason",
+    [
+        # Nothing has ever been echoed.
+        pytest.param(None, None, True, "", id="first-ever"),
+        # Both windows long expired.
+        pytest.param(NOW - 7200, NOW - 7200, True, "", id="both-windows-clear"),
+        # The same game type, just inside its hour.
+        pytest.param(
+            NOW - (PER_TYPE_COOLDOWN_SECONDS - 60),
+            NOW - (PER_TYPE_COOLDOWN_SECONDS - 60),
+            False,
+            "per_type",
+            id="same-type-within-hour",
+        ),
+        # Same type exactly at the boundary — the window has elapsed, so post.
+        pytest.param(
+            NOW - PER_TYPE_COOLDOWN_SECONDS,
+            NOW - PER_TYPE_COOLDOWN_SECONDS,
+            True,
+            "",
+            id="same-type-at-boundary",
+        ),
+        # The case per-type alone cannot catch: a *different* game type, well
+        # outside its own window, but seconds after some other echo. Without
+        # the global floor ~20 game types could post ~20 times in a minute and
+        # every one would be within its own limit.
+        pytest.param(None, NOW - 60, False, "global", id="different-type-inside-global"),
+        # Global floor elapsed, this type never echoed.
+        pytest.param(
+            None, NOW - GLOBAL_COOLDOWN_SECONDS, True, "", id="different-type-past-global"
+        ),
+        # Global is checked first: when both would refuse, the reason recorded
+        # is the one that actually stopped it.
+        pytest.param(NOW - 30, NOW - 30, False, "global", id="both-refuse-global-wins"),
+    ],
+)
+def test_decide_applies_both_cooldowns(last_same_type, last_any, allowed, reason):
+    verdict = decide(
+        now=NOW, last_same_type=last_same_type, last_any=last_any, exempt=False
+    )
+    assert verdict.allowed is allowed
+    assert verdict.reason == reason
+
+
+@pytest.mark.parametrize(
+    "last_same_type, last_any, previous_ended, allowed, reason",
+    [
+        # discovery-10: the second Clapback of an evening, 20 minutes after the
+        # first — which has already ended. "Same type at most hourly" was meant
+        # to stop one open game being announced over and over; a *new* game
+        # once the old one is over is a new invitation.
+        pytest.param(NOW - 1200, NOW - 1200, True, True, "", id="previous-ended-lifts-per-type"),
+        pytest.param(NOW - 1200, NOW - 1200, False, False, "per_type", id="previous-still-open-holds"),
+        # The global floor is the real defence and is never lifted.
+        pytest.param(NOW - 60, NOW - 60, True, False, "global", id="global-floor-still-holds"),
+        # Nothing to lift: a type never echoed passes regardless.
+        pytest.param(None, NOW - GLOBAL_COOLDOWN_SECONDS, True, True, "", id="never-echoed"),
+    ],
+)
+def test_decide_lifts_the_per_type_window_once_the_previous_game_ended(
+    last_same_type, last_any, previous_ended, allowed, reason
+):
+    verdict = decide(
+        now=NOW, last_same_type=last_same_type, last_any=last_any, exempt=False,
+        previous_ended=previous_ended,
+    )
+    assert verdict.allowed is allowed
+    assert verdict.reason == reason
+
+
+
+@pytest.mark.parametrize(
+    "opened_at, fresh",
+    [
+        pytest.param(NOW - 10, True, id="just-opened"),
+        pytest.param(NOW - 599, True, id="inside-window"),
+        pytest.param(NOW - 601, False, id="stale"),
+        # A missing timestamp must not silence a game that is demonstrably
+        # live — it is in games_active_games, so it exists.
+        pytest.param(None, True, id="unknown-open-time-counts-as-fresh"),
+    ],
+)
+def test_is_fresh(opened_at, fresh):
+    assert is_fresh(opened_at, NOW) is fresh
+
+
+
+def test_jump_url_includes_the_message_id():
+    """A channel-only link loses the message — the point is landing *on* the lobby."""
+    url = jump_url(111, 222, 333)
+    assert url == "https://discord.com/channels/111/222/333"
+
+
+class TestEchoEmbed:
+    def test_links_and_names_the_origin_channel(self):
+        embed = build_echo_embed(
+            name="Truth or Dare", channel_id=999, url="https://x/1"
+        )
+        assert "Truth or Dare" in (embed.title or "")
+        assert "<#999>" in (embed.description or "")
+        assert "https://x/1" in (embed.description or "")
+
+    def test_a_channel_less_echo_renders_no_mention(self):
+        """External Discord events have a location string and no channel."""
+        embed = build_echo_embed(name="Movie Night", url="https://x/1")
+        assert "<#" not in (embed.description or "")
+        assert "https://x/1" in (embed.description or "")
+
+    def test_a_named_channel_points_at_the_game_not_the_channel(self):
+        """The room is context; every clickable thing lands on the board.
+
+        A bare ``<#id>`` mention drops the reader at the *bottom* of the games
+        channel, where they still have to find the game among whatever else is
+        there. Given the channel's name we render the same words as a masked
+        link at the game message instead (todo #97).
+        """
+        embed = build_echo_embed(
+            name="Truth or Dare",
+            channel_id=999,
+            channel_name="games-2",
+            url="https://x/1",
+        )
+        assert "[#games-2](https://x/1)" in (embed.description or "")
+        assert "<#999>" not in (embed.description or "")
+
+    def test_an_unresolvable_channel_falls_back_to_the_mention(self):
+        """No name (channel left the cache) ⇒ today's behaviour, not a broken link."""
+        embed = build_echo_embed(
+            name="Truth or Dare", channel_id=999, channel_name=None, url="https://x/1"
+        )
+        assert "<#999>" in (embed.description or "")
+
+    def test_a_channel_name_cannot_break_out_of_the_masked_link(self):
+        """Discord permits `_` and `*` in channel names; markdown must not run."""
+        embed = build_echo_embed(
+            name="G", channel_id=9, channel_name="hot_takes*vip*", url="u"
+        )
+        assert r"hot\_takes\*vip\*" in (embed.description or "")
+
+    @pytest.mark.parametrize(
+        "hostile_name",
+        [
+            # escape_markdown escapes a whole [..](..) pair but not a stray
+            # bracket, so a name carrying only the closing half used to end the
+            # masked link early and leave the rest as a live link of its own.
+            pytest.param("x](https://evil.com)", id="closing-bracket"),
+            pytest.param("[x](https://evil.com", id="opening-bracket"),
+            pytest.param("a)(b", id="bare-parens"),
+        ],
+    )
+    def test_a_hostile_channel_name_cannot_inject_a_link(self, hostile_name):
+        """This lands in main chat, and Manage Channels is not trust to publish links.
+
+        Every link target in the embed must be the board's own. A hostile URL
+        surviving as *label* text is inert — Discord doesn't auto-link inside a
+        masked link's label — so the property under test is the structure, not
+        the substring.
+        """
+        board = "https://discord.com/channels/1/2/3"
+        desc = build_echo_embed(
+            name="G", channel_id=9, channel_name=hostile_name, url=board
+        ).description or ""
+        assert "](https://evil.com" not in desc
+        # Every link target is the game's, and no stray bracket pair is left to
+        # start one of its own.
+        assert desc.count("](") == desc.count(f"]({board})")
+
+    def test_the_title_escapes_member_markdown(self):
+        """`name` is member-authored -- a bounty/auction title or a native
+        ScheduledEvent.name -- and the embed title renders markdown, so a
+        member must not be able to forge bold/spoiler formatting in it."""
+        embed = build_echo_embed(name="**URGENT** ||spoiler||", url="u")
+        title = embed.title or ""
+        assert "\\*\\*URGENT\\*\\*" in title
+        assert "\\|\\|spoiler\\|\\|" in title
+        assert "**URGENT**" not in title
+
+    def test_a_markdown_heavy_title_is_escaped_then_fit(self):
+        """escape_markdown can double a string, so fitting to the title cap
+        has to happen *after* escaping -- otherwise a name packed with
+        markdown characters escapes past 256 and Discord 400s the embed."""
+        from bot_modules.core.branding import EMBED_TITLE_LIMIT
+
+        # 200 raw asterisks are only 214 characters once the icon and
+        # headline are added -- already under the cap -- so a length
+        # assertion alone passes on the unescaped code too. It is the
+        # *escape* that pushes this to 414 and makes the fit load-bearing,
+        # so assert both halves: that escaping happened, and that the
+        # result was then fitted.
+        embed = build_echo_embed(name="*" * 200, url="u")
+        title = embed.title or ""
+        assert len(title) <= EMBED_TITLE_LIMIT
+        assert "\\*" in title, "the name was never escaped"
+        assert title.endswith("\u2026"), "escaping overflowed the cap without a trim"
+
+    def test_copy_is_derived_from_the_source(self):
+        """"A game is open" reads as a bug on an event called Movie Night.
+
+        Keyed off `source` rather than passed alongside it, so the copy can't
+        desync from the thing it describes.
+        """
+        game = build_echo_embed(
+            name="Truth or Dare", channel_id=9, url="u", source=SOURCE_PARTY_GAME
+        )
+        event = build_echo_embed(
+            name="Movie Night", channel_id=9, url="u", source=SOURCE_DISCORD_EVENT
+        )
+        game_spec = spec_for(SOURCE_PARTY_GAME)
+        event_spec = spec_for(SOURCE_DISCORD_EVENT)
+        assert game_spec != event_spec
+        assert game_spec.lead in (game.description or "")
+        assert event_spec.lead in (event.description or "")
+        assert (game.title or "").startswith(game_spec.icon)
+        assert (event.title or "").startswith(event_spec.icon)
+
+    def test_an_unknown_source_falls_back_to_game_copy(self):
+        """A new source is one table row; forgetting it must not crash."""
+        assert spec_for("something_new") == spec_for(SOURCE_PARTY_GAME)
+
+    def test_deadline_renders_a_relative_timestamp(self):
+        """Not "in 1 hour" — an auction's soft close moves the deadline.
+
+        A late bid (which this echo exists to cause) extends ends_at, so any
+        fixed phrasing is wrong by the time it's read. Discord's own <t:…:R>
+        at least reflects the deadline as it stood at send time.
+        """
+        embed = build_echo_embed(
+            name="A rare hat", channel_id=9, url="u",
+            source=SOURCE_AUCTION_CLOSING, deadline_epoch=NOW,
+        )
+        assert f"<t:{int(NOW)}:R>" in (embed.description or "")
+
+    def test_no_deadline_renders_no_timestamp(self):
+        embed = build_echo_embed(name="G", channel_id=9, url="u")
+        assert "<t:" not in (embed.description or "")
+
+    @pytest.mark.parametrize(
+        "source, expected_in_title",
+        [
+            pytest.param(SOURCE_PARTY_GAME, "is starting", id="game-starts"),
+            pytest.param(SOURCE_BOUNTY, "New bounty", id="bounty-posted"),
+            # "Auction X is starting" would be actively wrong on a last-call.
+            pytest.param(SOURCE_AUCTION_CLOSING, "Last call", id="auction-closing"),
+            pytest.param(SOURCE_POOLS_CLOSING, "Last call", id="pools-closing"),
+            # The third shape: neither an invitation nor a warning.
+            pytest.param(SOURCE_COMMUNITY_TIER, "Community goal", id="tier-crossed"),
+        ],
+    )
+    def test_headline_matches_what_actually_happened(self, source, expected_in_title):
+        embed = build_echo_embed(name="Thing", url="u", source=source)
+        assert expected_in_title in (embed.title or "")
+        assert "Thing" in (embed.title or "")
+
+    def test_detail_renders_above_the_link(self):
+        """Sources whose news is a number get one line of their own.
+
+        The lead is static per source, so "8 weeklies in the pool" can only
+        live here — and it has to sit above the call to action, or the reader
+        hits the link before the reason to click it.
+        """
+        embed = build_echo_embed(
+            name="This week's quests", url="https://x/1",
+            source=SOURCE_QUEST_FLIP, detail="**8** weeklies in the pool",
+        )
+        desc = embed.description or ""
+        assert "**8** weeklies in the pool" in desc
+        assert desc.index("weeklies") < desc.index("https://x/1")
+
+    def test_detail_is_optional(self):
+        """Every pre-existing source passes none, and must render unchanged."""
+        embed = build_echo_embed(name="G", channel_id=9, url="u")
+        assert (embed.description or "").count("\n") == 1  # lead, then the link
+
+    @pytest.mark.parametrize(
+        "source, cta",
+        [
+            pytest.param(SOURCE_PARTY_GAME, "Jump in", id="game-invites-you-in"),
+            pytest.param(SOURCE_AUCTION_CLOSING, "Jump in", id="deadline-invites-too"),
+            # "Jump in" is an invitation, and there is nothing to join: the
+            # week has begun, the tier is banked.
+            pytest.param(SOURCE_QUEST_FLIP, "See the board", id="flip-points-at-panel"),
+            pytest.param(
+                SOURCE_COMMUNITY_TIER, "See the board", id="tier-points-at-panel"
+            ),
+        ],
+    )
+    def test_call_to_action_matches_the_shape(self, source, cta):
+        embed = build_echo_embed(name="Thing", url="u", source=source)
+        assert f"[{cta} →]" in (embed.description or "")
+
+
+class TestExemptSources:
+    @pytest.mark.parametrize(
+        "source, exempt, retry",
+        [
+            # Start sources: cooled down like everything else, and not retried
+            # (their value expires in minutes).
+            pytest.param(SOURCE_PARTY_GAME, False, False, id="game-start"),
+            pytest.param(SOURCE_BOUNTY, False, False, id="new-bounty"),
+            # Risky Rolls echoes every start, scheduled rounds included, so
+            # the floor it shares with everything else is the only thing
+            # between a busy evening and a stream of posts.
+            pytest.param(SOURCE_RISKY_ROLL, False, False, id="risky-roll"),
+            pytest.param(SOURCE_GUESS_ROUND, False, False, id="guess-round"),
+            # Deadline sources: exempt *and* retried — they are re-offered by
+            # the sweep on every tick inside the window.
+            pytest.param(SOURCE_AUCTION_CLOSING, True, True, id="auction-closing"),
+            pytest.param(SOURCE_POOLS_CLOSING, True, True, id="pools-closing"),
+            pytest.param(SOURCE_RAFFLE_CLOSING, True, True, id="raffle-closing"),
+            # "Just happened" sources: exempt, but never retried — nothing
+            # re-offers a push source, so dropping the claim would only lose
+            # the record that a send was attempted.
+            pytest.param(SOURCE_QUEST_FLIP, True, False, id="quest-flip"),
+            pytest.param(SOURCE_COMMUNITY_TIER, True, False, id="community-tier"),
+        ],
+    )
+    def test_exempt_and_retry_are_independent(self, source, exempt, retry):
+        """One flag used to carry both, and the third shape split them.
+
+        A deadline is exempt *because* it will be re-offered; a boundary the
+        server just crossed is exempt *because* it won't be.
+        """
+        assert spec_for(source).exempt is exempt
+        assert spec_for(source).retry is retry
+
+    @pytest.mark.parametrize(
+        "source, survives",
+        [
+            pytest.param(SOURCE_PARTY_GAME, False, id="game-start-loses"),
+            pytest.param(SOURCE_AUCTION_CLOSING, True, id="deadline-survives"),
+            pytest.param(SOURCE_QUEST_FLIP, True, id="quest-flip-survives"),
+            pytest.param(SOURCE_COMMUNITY_TIER, True, id="tier-survives"),
+        ],
+    )
+    def test_an_exempt_echo_cannot_be_crowded_out(self, source, survives):
+        """The rare valuable echo must not lose to a routine one.
+
+        A game echoed 30s ago would refuse anything else under the global
+        floor. "Auction ends in an hour" has no useful later moment; neither
+        does an ISO week rolling or a tier going down, and for those the
+        dedupe that would have re-offered them (``notified_tier``) has already
+        advanced — so a skip is a permanent loss, not a delay.
+        """
+        verdict = decide(
+            now=NOW, last_same_type=NOW - 30, last_any=NOW - 30,
+            exempt=spec_for(source).exempt,
+        )
+        assert verdict.allowed is survives
+
+
+
+    @pytest.mark.parametrize(
+        "deadline_epoch, due",
+        [
+            pytest.param(NOW + 30 * 60, True, id="half-an-hour-out"),
+            pytest.param(NOW + CLOSING_LEAD_SECONDS, True, id="exactly-at-the-lead"),
+            pytest.param(NOW + CLOSING_LEAD_SECONDS + 1, False, id="too-early"),
+            # No lower bound: a sweep that was down through the ideal moment
+            # should still fire while there is time left to act.
+            pytest.param(NOW + 5, True, id="only-seconds-left-still-fires"),
+            pytest.param(NOW, False, id="deadline-passed"),
+            pytest.param(NOW - 60, False, id="long-gone"),
+            pytest.param(None, False, id="no-deadline"),
+        ],
+    )
+    def test_closing_due(self, deadline_epoch, due):
+        assert closing_due(deadline_epoch, NOW) is due
+
+    def test_host_is_optional(self):
+        assert build_echo_embed(
+            name="G", channel_id=1, url="u"
+        ).footer.text is None
+        assert build_echo_embed(
+            name="G", channel_id=1, url="u", host_name="Ada"
+        ).footer.text == "Hosted by Ada"
+
+    def test_builds_no_mentions(self):
+        """The echo is silent: nothing here may render a ping.
+
+        The sender also passes AllowedMentions.none(), but a mention in the
+        copy would still show as a highlighted @ — belt and braces, since the
+        whole design rests on this post not notifying anyone.
+        """
+        embed = build_echo_embed(
+            name="Truth or Dare", channel_id=999, url="u", host_name="Ada"
+        )
+        blob = f"{embed.title}{embed.description}{embed.footer.text}"
+        assert "@everyone" not in blob
+        assert "@here" not in blob
+        assert "<@" not in blob  # user or role mention
+        assert "<@&" not in blob
+
+    def test_accent_passthrough_and_fallback(self):
+        accent = discord.Color(0x5A32A8)
+        assert build_echo_embed(
+            name="G", channel_id=1, url="u", color=accent
+        ).color == accent
+        assert build_echo_embed(name="G", channel_id=1, url="u").color is not None
+
+
+class TestAgeGatedSourceCopy:
+    """The two sources that can start behind Discord's age gate.
+
+    Their copy leaves the room even when the click doesn't, so what it may
+    carry is a design constraint rather than a wording preference.
+    """
+
+    def test_a_host_name_would_leak_through_the_footer(self):
+        """Why the service must never pass one for Guess Who.
+
+        In Guess Who the submitter IS the answer (`quests.ANON_KINDS`), so a
+        name anywhere in the echo solves the round for everyone who reads it.
+        This pins down *where* the leak would be — `host_name` renders as the
+        footer, not the body, so a test that only checked the description
+        would pass while the name shipped. The guarantee that no name is ever
+        passed lives in test_event_echo_service's TestGuessEcho.
+        """
+        embed = build_echo_embed(
+            name="Guess Who",
+            source=SOURCE_GUESS_ROUND,
+            channel_id=777,
+            channel_name="guess-who",
+            url="https://discord.com/channels/1/2/3",
+            host_name="Sam",
+        )
+        assert "Sam" not in (embed.description or "")
+        assert "Sam" not in (embed.title or "")
+        assert "Sam" in (embed.footer.text or "")
+
+    def test_guess_spec_copy_is_person_free(self):
+        """The static copy itself has no slot a member could land in."""
+        spec = spec_for(SOURCE_GUESS_ROUND)
+        assert "{name}" in spec.headline  # the game, filled in by the caller
+        assert "{" not in spec.lead
+        assert "{" not in spec.cta
+
+    def test_guess_copy_says_nothing_about_the_submission(self):
+        """Neither the confession text nor the crop travels out of the room."""
+        embed = build_echo_embed(
+            name="Guess Who",
+            source=SOURCE_GUESS_ROUND,
+            channel_id=777,
+            channel_name="guess-who",
+            url="https://discord.com/channels/1/2/3",
+        )
+        body = f"{embed.title} {embed.description}"
+        assert "confession" not in body.lower()
+        assert "photo" not in body.lower()
+
+    @pytest.mark.parametrize(
+        "source, name",
+        [
+            pytest.param(SOURCE_RISKY_ROLL, "Risky Rolls", id="risky-roll"),
+            pytest.param(SOURCE_GUESS_ROUND, "Guess Who", id="guess-round"),
+        ],
+    )
+    def test_the_room_renders_as_a_link_for_everyone(self, source, name):
+        """A bare `<#id>` reads as "#deleted-channel" to a member without access.
+
+        Both rooms are usually age-gated, so most readers are that member.
+        Passing the name makes the line render identically for everyone; the
+        link still hits Discord's gate.
+        """
+        embed = build_echo_embed(
+            name=name,
+            source=source,
+            channel_id=777,
+            channel_name="the-room",
+            url="https://discord.com/channels/1/2/3",
+        )
+        assert "[#the-room]" in (embed.description or "")
+        assert "<#777>" not in (embed.description or "")

@@ -1,0 +1,580 @@
+// Help panel — renders sections of /static/manual.html natively in the
+// dashboard's dark theme, plus full-text search across the whole manual.
+// The page→anchor mapping lives in help-sections.js (shared with app.js's
+// nav so the sidebar can't drift from the manual).
+
+import { HELP_PAGES, DEFAULT_ASSISTANT_NAME, assistantHelpLabel } from "./help-sections.js?v=24";
+import { api, apiPost, esc } from "../api.js";
+import { guardedSubmit } from "../config-helpers.js";
+
+// The assistant's name is per-guild branding (Config → Branding); the built-in
+// default (from help-sections.js, shared with the nav label) only shows if the
+// lookup fails.
+let _assistantName = null;
+
+// AUP-required AI/human disclosure ("you are talking to AI, not a person"),
+// shown at the top of the ask box before the member types anything. Resolved
+// from the same /help/advisor/name fetch as the assistant's name — no second
+// request — and cached alongside it. This literal is the fallback shown only
+// until that resolves (or if it fails); it must equal
+// advisor_service.disclosure_line()'s default output exactly —
+// tests/web/test_advisor_disclosure_parity.py pins the two together.
+let _disclosure = null;
+const DEFAULT_DISCLOSURE = "Billy-bot is an AI, not a person. It answers from the server guide and can make mistakes.";
+
+async function assistantName() {
+  if (_assistantName) return _assistantName;
+  try {
+    const res = await api("/api/help/advisor/name");
+    _assistantName = res.assistant_name || DEFAULT_ASSISTANT_NAME;
+    _disclosure = res.disclosure || DEFAULT_DISCLOSURE;
+  } catch {
+    _assistantName = DEFAULT_ASSISTANT_NAME;
+    _disclosure = DEFAULT_DISCLOSURE;
+  }
+  return _assistantName;
+}
+
+// Render the advisor's plaintext answer with a safe markdown-lite pass. `esc`
+// runs first, so the tag substitutions below can only ever produce our own tags.
+// `meta` carries { guild_id, channels } so Discord <#id> mentions and links
+// become clickable (channels is a {id: name} map of the asker's visible channels).
+function renderAnswerHtml(text, meta = {}) {
+  const guildId = meta.guild_id;
+  const channels = meta.channels || {};
+  let html = esc(text);
+  // Linkify plain URLs (e.g. the dashboard). Stop before an escaped entity so a
+  // URL directly followed by a <#id> mention doesn't swallow it.
+  html = html.replace(
+    /(https?:\/\/[^\s<&]+)/g,
+    (u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`,
+  );
+  // Discord channel mentions: <#id> was escaped to &lt;#id&gt;.
+  html = html.replace(/&lt;#(\d+)&gt;/g, (_m, id) => {
+    const label = channels[id] ? `#${esc(channels[id])}` : "#channel";
+    return guildId
+      ? `<a href="https://discord.com/channels/${guildId}/${id}" target="_blank" rel="noopener">${label}</a>`
+      : label;
+  });
+  return html
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+?)`/g, "<code>$1</code>")
+    .replace(/\n/g, "<br>");
+}
+
+// The ask box: a grounded chat over the manual (POST /api/help/advisor). Its
+// labels carry the guild's own name for the assistant once that resolves.
+function buildAskBox() {
+  const box = document.createElement("div");
+  box.className = "dk-help-ask";
+  box.style.cssText =
+    "margin:12px 0 4px;padding:12px;border:1px solid var(--rule);border-radius:var(--r-sm);background:var(--bg-card);";
+
+  // AI/human disclosure, above the form so it's visible before the member
+  // types — the fallback shows until (or unless) the per-guild copy resolves.
+  const disclosure = document.createElement("div");
+  disclosure.className = "field-hint";
+  disclosure.textContent = _disclosure || DEFAULT_DISCLOSURE;
+  assistantName().then(() => {
+    disclosure.textContent = _disclosure || DEFAULT_DISCLOSURE;
+  });
+
+  const form = document.createElement("form");
+  form.style.cssText = "display:flex;gap:8px;align-items:center;";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  const nameSoFar = _assistantName || DEFAULT_ASSISTANT_NAME;
+  input.placeholder = `Ask ${nameSoFar} — e.g. “How do I start a game?”`;
+  input.setAttribute("aria-label", `Ask ${nameSoFar} a question`);
+  assistantName().then((name) => {
+    input.placeholder = `Ask ${name} — e.g. “How do I start a game?”`;
+    input.setAttribute("aria-label", `Ask ${name} a question`);
+  });
+  input.maxLength = 500;
+  input.style.cssText = "flex:1;min-width:0;";
+
+  const btn = document.createElement("button");
+  btn.type = "submit";
+  btn.className = "btn";
+  btn.textContent = "Ask";
+
+  form.append(input, btn);
+
+  const answer = document.createElement("div");
+  answer.className = "dk-help-answer";
+  answer.hidden = true;
+  answer.style.cssText =
+    "margin-top:10px;padding:10px 12px;border-radius:var(--r-sm);background:var(--bg-input);line-height:1.55;white-space:normal;";
+
+  guardedSubmit(form, async () => {
+    const q = input.value.trim();
+    if (!q) return;
+    // guardedSubmit holds the Ask button; the question box is locked on top of
+    // that so the text can't be edited out from under the answer being written
+    // for it. That is this form's own behaviour, not the shared guard's.
+    input.disabled = true;
+    answer.hidden = false;
+    answer.textContent = "Thinking…";
+    try {
+      const res = await apiPost("/api/help/advisor", { question: q });
+      answer.innerHTML = renderAnswerHtml(res.answer || "", res);
+    } catch (err) {
+      answer.textContent =
+        err && /429/.test(String(err.message))
+          ? "You're asking a lot quickly — give it a few seconds and try again."
+          : `Couldn't reach ${_assistantName || DEFAULT_ASSISTANT_NAME} just now — try again in a moment.`;
+    } finally {
+      input.disabled = false;
+      input.focus();
+    }
+  });
+
+  box.append(disclosure, form, answer);
+  return box;
+}
+
+let _manualPromise = null;
+function loadManual() {
+  if (_manualPromise) return _manualPromise;
+  // cache: "no-cache" forces revalidation (ETag/304) so a browser-cached
+  // manual can't go stale against the versioned JS that parses it.
+  // Not an API call: this pulls the manual's own HTML off the static mount and
+  // parses it. api.js expects a JSON envelope and would reject every response.
+  // eslint-disable-next-line no-restricted-syntax
+  _manualPromise = fetch("/static/manual.html", { credentials: "same-origin", cache: "no-cache" })
+    .then((r) => r.text())
+    .then((html) => new DOMParser().parseFromString(html, "text/html"))
+    .catch((err) => {
+      _manualPromise = null;
+      throw err;
+    });
+  return _manualPromise;
+}
+
+function injectStylesheet() {
+  if (document.getElementById("dk-help-panel-css")) return;
+  const link = document.createElement("link");
+  link.id = "dk-help-panel-css";
+  link.rel = "stylesheet";
+  link.href = "/static/help-panel.css?v=24";
+  document.head.appendChild(link);
+}
+
+function currentSection() {
+  const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+  return HELP_PAGES.find((s) => s.page === raw) || HELP_PAGES[0];
+}
+
+function extractSectionContent(doc, anchorId) {
+  const start = doc.getElementById(anchorId);
+  if (!start) return null;
+  let heading;
+  if (start.tagName === "H2" || start.tagName === "H3") {
+    heading = start;
+  } else {
+    heading = start.closest("h2");
+  }
+  if (!heading) return null;
+  const isH3 = heading.tagName === "H3";
+  const frag = document.createDocumentFragment();
+  let node = heading;
+  while (node) {
+    const next = node.nextElementSibling;
+    frag.appendChild(node.cloneNode(true));
+    if (!next) break;
+    if (next.tagName === "H2" || (isH3 && next.tagName === "H3")) break;
+    node = next;
+  }
+  return frag;
+}
+
+// The panel header already renders the section's title, so the manual's own
+// heading (which carries a section number) would show as a second, slightly
+// different title right under it (W-H6). Drop it when it says the same thing
+// as the nav label — but keep an element with the same id in its place so
+// deep links (`?focus=<anchor>`) still have something to scroll to.
+function normalizeTitle(text) {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function dropDuplicateHeading(root, label) {
+  const heading = root.querySelector("h2, h3");
+  if (!heading || heading !== root.firstElementChild) return;
+  const clone = heading.cloneNode(true);
+  // Chrome the heading carries but the nav label never does: the section
+  // number, and the Mod/Admin permission chip on the three audience-gated
+  // subsections. Both land in textContent, and while they did, Word Cloud and
+  // Command & Panel Usage each rendered their title twice.
+  clone.querySelectorAll(".section-num, .perm").forEach((n) => n.remove());
+  if (normalizeTitle(clone.textContent) !== normalizeTitle(label)) return;
+  if (heading.id) {
+    const anchor = document.createElement("div");
+    anchor.id = heading.id;
+    anchor.className = "dk-help-anchor";
+    heading.replaceWith(anchor);
+  } else {
+    heading.remove();
+  }
+}
+
+function rewriteInternalLinks(root) {
+  // Manual uses href="#section-id"; rewrite links whose target is a known
+  // help page (h2 or h3 anchor) to dashboard hash routes. Other intra-section
+  // anchors are left alone (browser scrolls within the rendered fragment if
+  // the target id exists; otherwise it's a no-op).
+  const byAnchor = Object.fromEntries(HELP_PAGES.map((s) => [s.anchor, s.page]));
+  for (const a of root.querySelectorAll('a[href^="#"]')) {
+    const target = a.getAttribute("href").slice(1);
+    const page = byAnchor[target];
+    if (page) a.setAttribute("href", `#/${page}`);
+  }
+}
+
+// ── Getting Started: reshape from a flat scroll into scannable chunks ──
+//
+// The manual nests four h3 subsections under this one h2, and the last —
+// "Ask the AI Assistant" — is a full explainer (4 paragraphs + a callout)
+// that also has its own dedicated nav page (help-ask). Shown in full here
+// too, it was most of what made this page read as a wall of text. This
+// reshapes the *rendered* DOM only — the manual's own text is untouched,
+// so the standalone manual and search snippets still show the complete
+// explainer — into: the intro paragraph, a side-by-side "which am I" card
+// row (member / admin) instead of stacked prose, the dashboard-search tip
+// as a callout so it reads as a tip rather than another paragraph, and a
+// one-line teaser + link standing in for the full AI-assistant explainer.
+function restructureGettingStarted(body) {
+  const byId = (id) => body.querySelector(`#${CSS.escape(id)}`);
+  const memberHeading = byId("start-member");
+  const adminHeading = byId("start-admin");
+  const searchHeading = byId("dashboard-search");
+  const askHeading = byId("ask-guide");
+  // If the manual's shape here ever changes, fall back to the plain
+  // extracted scroll rather than half-transforming an unexpected structure.
+  if (!memberHeading || !adminHeading || !searchHeading || !askHeading) return;
+
+  // Moves (not clones) heading + its following siblings up to the next
+  // h2/h3 — same block boundary extractSectionContent uses — out of `body`
+  // and into a fragment, so ids (and thus focus-scroll / search deep links)
+  // travel with the real nodes instead of being duplicated.
+  const takeBlock = (heading) => {
+    const frag = document.createDocumentFragment();
+    let node = heading;
+    while (node) {
+      const next = node.nextElementSibling;
+      frag.appendChild(node);
+      if (!next || next.tagName === "H2" || next.tagName === "H3") break;
+      node = next;
+    }
+    return frag;
+  };
+
+  const memberBlock = takeBlock(memberHeading);
+  const adminBlock = takeBlock(adminHeading);
+  const searchBlock = takeBlock(searchHeading);
+  takeBlock(askHeading); // full explainer discarded here — it has its own page
+
+  // `.dk-help > h3:first-child` (zero top margin) only matches a direct
+  // child of the section body; nested one level into a card, these would
+  // otherwise carry the normal heading's top margin as leading whitespace.
+  memberHeading.style.marginTop = "0";
+  adminHeading.style.marginTop = "0";
+
+  const paths = document.createElement("div");
+  paths.className = "card-grid";
+  for (const block of [memberBlock, adminBlock]) {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.appendChild(block);
+    paths.appendChild(card);
+  }
+  body.appendChild(paths);
+
+  // "Finding a page" becomes a tip callout (matching the manual's own
+  // callout markup, so the shared .dk-help .callout styling applies)
+  // instead of just another heading-plus-paragraph in the scroll.
+  const tipHeading = searchBlock.firstElementChild;
+  const tip = document.createElement("div");
+  tip.className = "callout callout-tip";
+  tip.innerHTML = `<span class="callout-icon">💡</span><div class="callout-body"></div>`;
+  const tipBody = tip.querySelector(".callout-body");
+  const strong = document.createElement("strong");
+  strong.id = tipHeading.id;
+  strong.textContent = tipHeading.textContent;
+  tipBody.appendChild(strong);
+  Array.from(searchBlock.children).slice(1).forEach((p) => tipBody.appendChild(p));
+  body.appendChild(tip);
+
+  // Teaser card standing in for the discarded explainer, branded the same
+  // way the panel header and ask box are (assistantName() resolves the
+  // guild's own name for the assistant; DEFAULT_ASSISTANT_NAME is the
+  // fallback shown until then).
+  const askTeaser = document.createElement("div");
+  askTeaser.className = "card";
+  askTeaser.id = "ask-guide";
+  const nameNow = _assistantName || DEFAULT_ASSISTANT_NAME;
+  askTeaser.innerHTML = `
+    <h3 style="margin-top:0;">Need a hand?</h3>
+    <p><span data-ask-name>${esc(nameNow)}</span> is a guide-grounded AI that answers from this manual and won't invent commands. Admins get more: live server context, a setup review, and one-press Apply for settings changes.</p>
+    <a class="btn btn-secondary" href="#/help-ask" data-ask-cta>${esc(assistantHelpLabel(nameNow))} →</a>
+  `;
+  body.appendChild(askTeaser);
+  assistantName().then((name) => {
+    const nameSpot = askTeaser.querySelector("[data-ask-name]");
+    const cta = askTeaser.querySelector("[data-ask-cta]");
+    if (nameSpot) nameSpot.textContent = name;
+    if (cta) cta.textContent = `${assistantHelpLabel(name)} →`;
+  });
+}
+
+// ── Full-text search across the manual ─────────────────────────────
+
+let _searchIndex = null;
+
+// One entry per h2/h3 block: { title, path, page, anchor, text }
+function buildSearchIndex(doc) {
+  if (_searchIndex) return _searchIndex;
+  const pageByAnchor = Object.fromEntries(HELP_PAGES.map((s) => [s.anchor, s.page]));
+  const entries = [];
+  let currentH2 = null;
+  let currentH2Page = null;
+
+  const headingTitle = (h) => {
+    const clone = h.cloneNode(true);
+    clone.querySelectorAll(".section-num, .perm").forEach((n) => n.remove());
+    return clone.textContent.trim();
+  };
+
+  for (const h of doc.querySelectorAll("h2[id], h3[id]")) {
+    if (h.tagName === "H2") {
+      currentH2 = headingTitle(h);
+      currentH2Page = pageByAnchor[h.id] || null;
+      if (!currentH2Page) continue; // cover/unmapped section
+      entries.push({ title: currentH2, path: currentH2, page: currentH2Page, anchor: h.id, text: "" });
+    } else {
+      if (!currentH2Page) continue;
+      const title = headingTitle(h);
+      entries.push({
+        title,
+        path: `${currentH2} › ${title}`,
+        // Prefer a dedicated subsection page when one exists (deep link),
+        // otherwise route to the parent section and scroll to the anchor.
+        page: pageByAnchor[h.id] || currentH2Page,
+        anchor: h.id,
+        text: "",
+      });
+    }
+    // Collect the block's text (until the next h2/h3).
+    const entry = entries[entries.length - 1];
+    let node = h.nextElementSibling;
+    const parts = [];
+    while (node && node.tagName !== "H2" && node.tagName !== "H3") {
+      parts.push(node.textContent || "");
+      node = node.nextElementSibling;
+    }
+    entry.text = parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+  _searchIndex = entries;
+  return _searchIndex;
+}
+
+/**
+ * The manual's sections as flat, routable entries:
+ * `{ title, path, page, anchor }`, where `path` reads "Section › Subsection".
+ *
+ * Exported for app.js's command palette, which searches manual headings as a
+ * second result tier. The manual is fetched and indexed once and cached in this
+ * module — the palette imports this file with the same `?v=` specifier the
+ * router uses for the panel, so both share one instance and one parse.
+ */
+export async function manualHeadings() {
+  const doc = await loadManual();
+  return buildSearchIndex(doc).map(({ title, path, page, anchor }) => ({
+    title, path, page, anchor,
+  }));
+}
+
+function searchManual(doc, query) {
+  const q = query.toLowerCase();
+  const results = [];
+  for (const entry of buildSearchIndex(doc)) {
+    const inTitle = entry.title.toLowerCase().includes(q);
+    const idx = entry.text.toLowerCase().indexOf(q);
+    if (!inTitle && idx === -1) continue;
+    let snippet = "";
+    if (idx !== -1) {
+      const start = Math.max(0, idx - 60);
+      const end = Math.min(entry.text.length, idx + q.length + 90);
+      snippet = (start > 0 ? "…" : "") + entry.text.slice(start, end) + (end < entry.text.length ? "…" : "");
+    } else {
+      snippet = entry.text.slice(0, 150) + (entry.text.length > 150 ? "…" : "");
+    }
+    results.push({ ...entry, snippet, rank: inTitle ? 0 : 1 });
+  }
+  results.sort((a, b) => a.rank - b.rank);
+  return results;
+}
+
+function renderSearchResults(body, results, query) {
+  body.replaceChildren();
+  const list = document.createElement("div");
+  list.className = "dk-help-results";
+
+  const count = document.createElement("p");
+  count.className = "dk-help-results-count";
+  count.textContent = results.length
+    ? `${results.length} match${results.length === 1 ? "" : "es"} for “${query}”`
+    : `No matches for “${query}” — try a command name (e.g. “jail”) or a feature word (e.g. “anonymous”).`;
+  list.appendChild(count);
+
+  const q = query.toLowerCase();
+  for (const r of results.slice(0, 30)) {
+    const a = document.createElement("a");
+    a.className = "dk-help-result";
+    a.href = `#/${r.page}?focus=${encodeURIComponent(r.anchor)}`;
+
+    const title = document.createElement("div");
+    title.className = "dk-help-result-title";
+    title.textContent = r.path;
+    a.appendChild(title);
+
+    if (r.snippet) {
+      const snip = document.createElement("div");
+      snip.className = "dk-help-result-snippet";
+      // Highlight the first match inside the snippet.
+      const i = r.snippet.toLowerCase().indexOf(q);
+      if (i === -1) {
+        snip.textContent = r.snippet;
+      } else {
+        snip.append(
+          document.createTextNode(r.snippet.slice(0, i)),
+          Object.assign(document.createElement("mark"), { textContent: r.snippet.slice(i, i + q.length) }),
+          document.createTextNode(r.snippet.slice(i + q.length)),
+        );
+      }
+      a.appendChild(snip);
+    }
+    list.appendChild(a);
+  }
+  body.appendChild(list);
+}
+
+// ── Panel ───────────────────────────────────────────────────────────
+
+export async function mount(container, params = {}) {
+  injectStylesheet();
+  const meta = currentSection();
+
+  container.replaceChildren();
+  const panel = document.createElement("div");
+  panel.className = "panel";
+
+  const header = document.createElement("header");
+  header.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;";
+
+  const titleBox = document.createElement("div");
+  const h2 = document.createElement("h2");
+  h2.textContent = meta.label;
+  // Same per-guild branding the nav applies (IA5): the static label is only a
+  // fallback, so the title picks up this guild's name for the assistant. The
+  // manual's own heading names nobody and so cannot match either one — it is
+  // de-duplicated against the entry's `manualHeading` instead.
+  if (meta.brand === "assistant") {
+    assistantName().then((name) => { h2.textContent = assistantHelpLabel(name); });
+  }
+  const subtitle = document.createElement("div");
+  subtitle.className = "subtitle";
+  subtitle.textContent = "Dungeon Keeper Reference Guide";
+  titleBox.appendChild(h2);
+  titleBox.appendChild(subtitle);
+
+  const tools = document.createElement("div");
+  tools.style.cssText = "display:flex;align-items:center;gap:10px;";
+
+  const search = document.createElement("input");
+  search.type = "search";
+  search.className = "dk-help-search";
+  search.placeholder = "Search the whole guide…";
+  search.setAttribute("aria-label", "Search the reference guide");
+
+  const openLink = document.createElement("a");
+  openLink.href = `/static/manual.html#${meta.anchor}`;
+  openLink.target = "_blank";
+  openLink.rel = "noopener";
+  openLink.textContent = "Standalone ↗";
+  openLink.style.cssText = "color:var(--ink-dim);font-size:12px;white-space:nowrap;text-decoration:none;border:1px solid var(--rule);padding:4px 10px;border-radius:var(--r-sm);";
+  openLink.title = "Open the printable standalone reference in a new tab";
+
+  tools.appendChild(search);
+  tools.appendChild(openLink);
+  header.appendChild(titleBox);
+  header.appendChild(tools);
+  panel.appendChild(header);
+
+  // Only on the assistant's own help page. It used to sit above every one of
+  // the 53 help pages, so the same ask box preceded the content on each of
+  // them; the reference pages are now reference, and the ask box lives on the
+  // page named for it (third in the Help nav).
+  if (meta.brand === "assistant") panel.appendChild(buildAskBox());
+
+  const body = document.createElement("div");
+  body.className = "dk-help";
+  panel.appendChild(body);
+
+  const loading = document.createElement("div");
+  loading.className = "panel-loading";
+  loading.textContent = "Loading…";
+  body.appendChild(loading);
+
+  container.appendChild(panel);
+
+  let sectionFragment = null;
+
+  const showSection = () => {
+    body.replaceChildren();
+    if (sectionFragment) {
+      body.appendChild(sectionFragment.cloneNode(true));
+      dropDuplicateHeading(body, meta.manualHeading || meta.label);
+      rewriteInternalLinks(body);
+      if (meta.page === "help-start") restructureGettingStarted(body);
+    } else {
+      const err = document.createElement("p");
+      err.textContent = `Section "${meta.anchor}" not found in manual.`;
+      body.appendChild(err);
+    }
+  };
+
+  try {
+    const doc = await loadManual();
+    sectionFragment = extractSectionContent(doc, meta.anchor);
+    showSection();
+
+    // Deep link from a search result: scroll to the anchor and flash it.
+    if (params.focus) {
+      const target = body.querySelector(`#${CSS.escape(params.focus)}`);
+      if (target) {
+        target.scrollIntoView({ block: "start" });
+        target.classList.add("dk-help-focus");
+        setTimeout(() => target.classList.remove("dk-help-focus"), 2500);
+      }
+    }
+
+    let debounce = null;
+    search.addEventListener("input", () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        const q = search.value.trim();
+        if (q.length < 2) {
+          showSection();
+          return;
+        }
+        renderSearchResults(body, searchManual(doc, q), q);
+      }, 150);
+    });
+  } catch (err) {
+    body.replaceChildren();
+    const e = document.createElement("p");
+    e.textContent = `Failed to load reference: ${err.message}`;
+    body.appendChild(e);
+  }
+}

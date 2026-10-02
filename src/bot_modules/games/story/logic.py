@@ -1,0 +1,424 @@
+"""Pure decision logic for the Story Builder (Exquisite Corpse) cog.
+
+All functions here take and return plain Python values so they're unit-
+testable without spinning up Discord. The cog calls these from inside
+its button callbacks, slash command, and the ``_run_story`` async loop;
+the Discord glue (sending the message, persisting via ``modify_payload``)
+stays in the cog.
+
+High-leverage pieces:
+
+* :func:`clamp_max_sentences` — bounds the slash command's
+  ``max_sentences`` argument (2..30).
+* :func:`resolve_starter` — supplies the default opening sentence when
+  the host leaves the ``starter`` argument blank.
+* :func:`add_player` / :func:`remove_player` — the join-lobby
+  ``modify_payload`` closures become one-liners that delegate here.
+* :func:`build_turn_order` — shuffles the writers; ``rng`` is injected
+  so tests can pin the order.
+* :func:`pick_current_player` — modular index lookup, so a turn loop
+  that has gone past the last writer wraps back to the first.
+* :func:`build_context` — what the modal shows in the "context" field:
+  the last sentence (``blind`` visibility) or the whole story so far
+  (``full`` visibility).
+* :func:`append_sentence` — pushes a writer's submission onto the
+  payload's ``sentences`` list.
+* :func:`should_end_after_skip` — predicate the run loop checks each
+  time a player is skipped; once every writer in the rotation has
+  skipped, the story ends.
+* :func:`note_turn_outcome` / :func:`should_drop_writer` /
+  :func:`rotation_after_turn` / :func:`writer_may_skip` /
+  :func:`roster_for_payout` — the 2026-09-04 pacing rules (anon-tail-73):
+  a turn is :data:`DEFAULT_TURN_SECONDS`, any writer may Skip a stalled
+  turn after :data:`WRITER_SKIP_AFTER_SECONDS`, a writer who misses
+  :data:`MAX_CONSECUTIVE_MISSES` turns in a row is dropped from the
+  rotation (announced), and Leave works mid-game.
+* :func:`assemble_story_text` — joins all sentence texts into the
+  embed description string, escaping markdown and applying the 4090-char
+  truncation budget (Discord embed description limit).
+* :func:`build_attribution_lines` — one rendered ``**Name:** *text*``
+  line per sentence; ``name_resolver`` maps author uids to display names
+  so the cog can pass its guild-aware closure and tests can pass a dict.
+* :func:`chunk_attribution_lines` — groups the rendered lines into field
+  values bounded by the 1024-char per-field limit; still used nowhere but
+  its own tests since the recap card converted to Components V2 (below) —
+  kept because the shape (grouping under a per-chunk cap) is exactly what
+  a future multi-message spillover would reuse, unlike the trimming
+  :func:`trim_attribution_lines` does for the one-message recap card.
+* :func:`trim_attribution_lines` — the recap card's sibling to
+  ``assemble_story_text``'s truncation: keeps as many whole attribution
+  lines as fit under a char budget and reports how many were dropped,
+  rather than cutting mid-line the way ``chunk_attribution_lines``'
+  per-field grouping never had to.
+"""
+
+from __future__ import annotations
+
+import random
+from collections.abc import Iterable
+from typing import Any, Callable
+
+import discord
+
+DEFAULT_STARTER: str = "Once upon a time, in a place no one quite remembered…"
+
+# Seconds a writer has per turn. Was 300: one AFK writer in a four-writer
+# ten-sentence story cost two five-minute holes in a fifteen-minute game.
+DEFAULT_TURN_SECONDS: int = 120
+
+# Any joined writer (not only the host) may Skip a turn once it has been
+# open this long — halfway through the default turn.
+WRITER_SKIP_AFTER_SECONDS: int = 60
+
+# Missed turns in a row (timed out, dismissed the box, or skipped) before a
+# writer is dropped from the rotation.
+MAX_CONSECUTIVE_MISSES: int = 2
+
+# Discord embed description hard limit is 4096; cog historically uses 4090
+# with a 3-char ellipsis budget (truncates to 4087 + "…").
+_DESCRIPTION_BUDGET: int = 4090
+_DESCRIPTION_TRUNC_TO: int = 4087
+
+# Discord embed field-value hard limit.
+_FIELD_VALUE_LIMIT: int = 1024
+
+# The recap card's two text sections share one 4,000-char Components V2
+# message budget (core.layout.MAX_CHARS) with the card's own heading and
+# "A Community Original" line, which leaves headroom for neither section to
+# assume it owns the whole ceiling the way the old embed pair could (a 4096
+# description *and* up to 25 1024-char fields). Split conservatively rather
+# than dynamically: a fixed split is what a builder test can pin against the
+# fullest real story, and a story that blows both budgets trims both rather
+# than one section silently eating the other's share.
+STORY_TEXT_CARD_BUDGET: int = 2200
+ATTRIBUTION_CARD_BUDGET: int = 1400
+
+
+def clamp_max_sentences(n: int) -> int:
+    """Clamp ``max_sentences`` to the cog's allowed range (2..30).
+
+    Matches ``min(max(n, 2), 30)`` in the slash command body — exposed
+    here so tests can pin the bounds and other entry points (web, /story
+    variants) can reuse the same rule.
+    """
+    return min(max(n, 2), 30)
+
+
+def resolve_starter(starter: str | None) -> str:
+    """Return the opening sentence — host's text, or the default.
+
+    Blank / ``None`` falls back to :data:`DEFAULT_STARTER` so the story
+    always has something to riff off in sentence #2.
+    """
+    if not starter:
+        return DEFAULT_STARTER
+    return starter
+
+
+def format_story_opening(starter: str) -> str:
+    """Announcement line for the opening sentence.
+
+    The starter is host-supplied free text; it is escaped against both
+    mention injection (``escape_mentions`` — so a nickname/role/``@everyone``
+    can't ping) and markdown (``escape_markdown``) before being wrapped in
+    the italic block. The cog still passes ``AllowedMentions.none()`` at the
+    send as defense in depth.
+    """
+    safe = discord.utils.escape_markdown(discord.utils.escape_mentions(starter))
+    return f"📖 **The story begins:**\n> *{safe}*"
+
+
+def format_skip_notice(player_name: str) -> str:
+    """Transient "player was skipped" line, with the display name neutralized.
+
+    ``player_name`` is a member display name; escape mentions so it can't
+    ping on the bot's behalf even though the send also restricts mentions,
+    and escape markdown so a nickname can't forge bold/spoiler formatting
+    in the bot's own announcement (matches :func:`format_story_opening`).
+    """
+    safe = discord.utils.escape_markdown(discord.utils.escape_mentions(player_name))
+    return f"⏩ {safe} was skipped."
+
+
+def add_player(payload: dict[str, Any], user_id: int) -> None:
+    """Append ``user_id`` to the payload's ``players`` list if absent.
+
+    Mutates ``payload`` in place — the cog's join button's
+    ``modify_payload`` closure delegates here.
+    """
+    players: list[int] = payload.setdefault("players", [])
+    if user_id not in players:
+        players.append(user_id)
+
+
+def remove_player(payload: dict[str, Any], user_id: int) -> None:
+    """Remove ``user_id`` from the payload's ``players`` list if present.
+
+    Mutates ``payload`` in place — the cog's leave button's
+    ``modify_payload`` closure delegates here.
+    """
+    players: list[int] = payload.setdefault("players", [])
+    if user_id in players:
+        players.remove(user_id)
+
+
+def build_turn_order(
+    players: list[int], rng: random.Random | None = None
+) -> list[int]:
+    """Return a shuffled copy of ``players`` for the writing rotation.
+
+    ``rng`` is injected so tests can pin the order; defaults to the
+    module ``random`` for production randomness. The returned list is a
+    fresh object so mutating it doesn't perturb the caller's input.
+    """
+    chooser = rng if rng is not None else random
+    order = list(players)
+    chooser.shuffle(order)
+    return order
+
+
+def pick_current_player(turn_order: list[int], turn_index: int) -> int:
+    """Look up the writer whose turn it is, wrapping modulo the rotation.
+
+    The ``_run_story`` loop increments ``turn_index`` past the end of
+    the list as turns advance; this helper handles the wrap so callers
+    never have to think about it.
+    """
+    return turn_order[turn_index % len(turn_order)]
+
+
+def build_context(sentences: list[dict[str, Any]], visibility: str) -> str:
+    """Build the modal's "context" pre-fill for the current writer.
+
+    * ``blind`` — only the most recent sentence is shown, so each writer
+      riffs only off the previous beat (classic Exquisite Corpse).
+    * Any other value (typically ``full``) — the entire story so far is
+      shown, so writers can keep continuity.
+    """
+    if not sentences:
+        return ""
+    if visibility == "blind":
+        return sentences[-1]["text"]
+    return " ".join(s["text"] for s in sentences)
+
+
+def append_sentence(
+    payload: dict[str, Any], author_id: int | None, text: str
+) -> list[dict[str, Any]]:
+    """Append a new sentence dict to ``payload["sentences"]`` and return it.
+
+    Mutates ``payload`` in place. ``author_id`` may be ``None`` for the
+    starter line (rendered as "Narrator" in the reveal embed). Returns
+    the updated list so the caller can pass it directly to
+    ``update_game_payload`` without re-reading.
+    """
+    sentences: list[dict[str, Any]] = payload.setdefault("sentences", [])
+    sentences.append({"author_id": author_id, "text": text})
+    return sentences
+
+
+def should_end_after_skip(consecutive_skips: int, num_writers: int) -> bool:
+    """Return True iff every writer in the rotation has skipped in a row.
+
+    When this trips the run loop ends the story early ("All writers
+    were skipped — ending the story.") rather than spinning forever.
+    """
+    return consecutive_skips >= num_writers
+
+
+def assemble_story_text(
+    sentences: list[dict[str, Any]], max_len: int = _DESCRIPTION_BUDGET
+) -> str:
+    """Join all sentence texts into the reveal embed's description.
+
+    Each sentence's stored text is escaped with
+    ``discord.utils.escape_markdown`` (sentences are stored raw — see
+    the cog) and joined with single spaces. If the result exceeds
+    ``max_len``, it is truncated to ``max_len - 3`` characters plus an
+    ellipsis so the embed stays under Discord's 4096-char description
+    cap.
+    """
+    text = " ".join(discord.utils.escape_markdown(s["text"]) for s in sentences)
+    if len(text) > max_len:
+        text = text[: max_len - 3] + "…"
+    return text
+
+
+def build_attribution_lines(
+    sentences: list[dict[str, Any]],
+    name_resolver: Callable[[int], str],
+) -> list[str]:
+    """Render the per-sentence ``**Name:** *text*`` attribution lines.
+
+    ``name_resolver`` maps a non-None author uid to a display name; the
+    cog passes a guild-aware closure, tests pass a dict-backed lambda.
+    A ``None`` author (the starter line) is attributed to "Narrator".
+    Both the name and the text are escaped so user input never breaks
+    markdown.
+    """
+    esc = discord.utils.escape_markdown
+    lines: list[str] = []
+    for s in sentences:
+        author_id = s["author_id"]
+        if author_id:
+            name = esc(name_resolver(author_id))
+        else:
+            name = "Narrator"
+        lines.append(f"**{name}:** *{esc(s['text'])}*")
+    return lines
+
+
+def chunk_attribution_lines(
+    lines: list[str], max_field_len: int = _FIELD_VALUE_LIMIT
+) -> list[list[str]]:
+    """Group rendered lines into per-field chunks under the field-len cap.
+
+    Each chunk's joined-with-newlines length stays at or under
+    ``max_field_len`` (1024 — Discord embed field-value limit). The
+    caller renders each chunk as one embed field, optionally labelled
+    "(pt. N)" when there's more than one chunk. Mirrors the per-line
+    accumulator in the cog's ``_reveal_story`` so the truncation
+    behavior is preserved.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        # Match the cog's accumulator exactly: ``chunk_len + len(line) + 1``
+        # (the +1 is the newline join separator).
+        if current_len + len(line) + 1 > max_field_len and current:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def trim_attribution_lines(
+    lines: list[str], max_len: int = ATTRIBUTION_CARD_BUDGET
+) -> tuple[list[str], int]:
+    """Keep whole attribution lines under a char budget; report how many
+    didn't fit.
+
+    Unlike :func:`chunk_attribution_lines` (which groups *every* line into
+    per-field chunks for a multi-field embed with no fixed ceiling on field
+    count), the recap card has exactly one section for this text and a
+    single budget for the whole message — so this **drops** lines from the
+    end once the budget is spent rather than grouping them, and returns the
+    drop count so the card can say "+N more not shown" instead of silently
+    reading as complete. Whole lines only: a line is never cut mid-string,
+    so a caller can join the result with newlines and get valid markdown.
+    """
+    kept: list[str] = []
+    total = 0
+    for i, line in enumerate(lines):
+        add = len(line) + (1 if kept else 0)  # +1 for the join newline
+        if total + add > max_len:
+            return kept, len(lines) - i
+        kept.append(line)
+        total += add
+    return kept, 0
+
+
+def note_turn_outcome(misses: dict[int, int], player_id: int, *, missed: bool) -> int:
+    """Record whether ``player_id``'s turn produced a sentence.
+
+    ``misses`` counts each writer's *consecutive* missed turns; a written
+    sentence resets theirs to zero. Returns the writer's new streak.
+    """
+    if missed:
+        misses[player_id] = misses.get(player_id, 0) + 1
+    else:
+        misses[player_id] = 0
+    return misses[player_id]
+
+
+def should_drop_writer(misses: dict[int, int], player_id: int) -> bool:
+    """True once a writer has missed :data:`MAX_CONSECUTIVE_MISSES` in a row."""
+    return misses.get(player_id, 0) >= MAX_CONSECUTIVE_MISSES
+
+
+def rotation_after_turn(
+    turn_order: list[int], turn_index: int, remove: Iterable[int] = (),
+) -> tuple[list[int], int]:
+    """Advance one turn and drop ``remove`` from the rotation.
+
+    Returns ``(new_order, new_index)`` where ``new_order[new_index]`` is the
+    writer who would have been next had nobody left — or, if they left too,
+    the first writer after them who is still in. An emptied rotation returns
+    ``([], 0)``; the caller ends the story.
+    """
+    if not turn_order:
+        return [], 0
+    gone = {int(p) for p in remove}
+    n = len(turn_order)
+    next_pos = (turn_index + 1) % n
+    new_order = [p for p in turn_order if p not in gone]
+    if not new_order:
+        return [], 0
+    for step in range(n):
+        candidate = turn_order[(next_pos + step) % n]
+        if candidate in new_order:
+            return new_order, new_order.index(candidate)
+    return new_order, 0  # unreachable: new_order is non-empty
+
+
+def writer_may_skip(
+    presser_id: int,
+    *,
+    turn_order: list[int],
+    opened_at: float,
+    now: float,
+) -> bool:
+    """May a non-host writer skip the current turn?
+
+    Only a writer still in the rotation, and only once the turn has been
+    open for :data:`WRITER_SKIP_AFTER_SECONDS`. The host and mods are not
+    gated here — they may always skip.
+    """
+    if presser_id not in turn_order:
+        return False
+    return now - opened_at >= WRITER_SKIP_AFTER_SECONDS
+
+
+def writer_skip_unlock_at(opened_at: float) -> int:
+    """Epoch at which :func:`writer_may_skip` starts saying yes."""
+    return int(opened_at + WRITER_SKIP_AFTER_SECONDS)
+
+
+def format_drop_notice(player_name: str) -> str:
+    """The announcement when a writer is dropped for missing turns.
+
+    ``player_name`` is a member display name; escaped against both
+    mentions and markdown, matching :func:`format_story_opening`.
+    """
+    safe = discord.utils.escape_markdown(discord.utils.escape_mentions(player_name))
+    return (
+        f"📖 {safe} missed {MAX_CONSECUTIVE_MISSES} turns in a row and has been "
+        "dropped from the rotation."
+    )
+
+
+def format_leave_notice(player_name: str) -> str:
+    """The announcement when a writer leaves mid-story.
+
+    ``player_name`` is a member display name; escaped against both
+    mentions and markdown, matching :func:`format_story_opening`.
+    """
+    safe = discord.utils.escape_markdown(discord.utils.escape_mentions(player_name))
+    return f"📖 {safe} left the story — the rotation carries on without them."
+
+
+def roster_for_payout(
+    players: list[int], sentences: list[dict[str, Any]], left: Iterable[int],
+) -> list[int]:
+    """Who the reveal pays: everyone who joined, minus writers who **left**
+    without ever writing a sentence. A writer dropped for missing turns
+    stays — they sat through the game; leaving was not their choice.
+    """
+    wrote = {s.get("author_id") for s in sentences if s.get("author_id")}
+    gone = {int(p) for p in left}
+    return [p for p in players if p not in gone or p in wrote]

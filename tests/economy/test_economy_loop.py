@@ -1,0 +1,2208 @@
+"""Tests for services/economy_loop — the hourly tick body.
+
+Covers the Stage-0/1 XP→currency day roll and the Stage-2 quest surface it
+also drives: daily/weekly rotate-tag rotation, community settlement on the ISO
+week change, and stale sign-off claim expiry (with after-commit DMs).
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime
+from unittest.mock import AsyncMock
+
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.economy.rentals import GRACE_SECONDS, WEEK_SECONDS
+from bot_modules.economy import loop as economy_loop
+from bot_modules.economy.loop import (
+    run_claim_expiry,
+    run_guild_day_roll,
+    run_guild_rentals,
+    run_tick,
+)
+from bot_modules.economy.quests_service import (
+    claim_quest,
+    create_quest,
+    set_community_progress,
+    set_quest_active,
+)
+from bot_modules.economy.rentals_service import rent_perk
+from bot_modules.economy.service import (
+    apply_credit,
+    get_balance,
+    load_econ_settings,
+    save_econ_settings,
+)
+from tests.db_template import migrated_db
+
+GUILD = 123
+USER = 1001
+OTHER = 1002
+
+D1 = "2026-07-10"  # Fri, ISO 2026-W28
+D2 = "2026-07-11"  # Sat, ISO 2026-W28  (same week as D1 → day roll only)
+D3 = "2026-07-12"  # Sun, ISO 2026-W28
+DSUN = "2026-07-12"  # Sun, ISO 2026-W28
+DMON = "2026-07-13"  # Mon, ISO 2026-W29  (DSUN→DMON crosses the ISO week)
+WEEK_28 = "2026-W28"
+
+
+def _ts(day: str, hour: int = 12) -> float:
+    return datetime.fromisoformat(f"{day}T{hour:02d}:00:00+00:00").timestamp()
+
+
+# ── fake discord objects ──────────────────────────────────────────────
+
+
+class _Member:
+    def __init__(self, booster: bool = False) -> None:
+        self.premium_since = object() if booster else None
+
+
+class _Guild:
+    def __init__(self, gid: int, members: dict[int, _Member] | None = None) -> None:
+        self.id = gid
+        self._members = members or {}
+
+    def get_member(self, uid: int) -> _Member | None:
+        return self._members.get(uid)
+
+
+class _Bot:
+    def __init__(self, guilds: list[_Guild]) -> None:
+        self.guilds = list(guilds)
+        self._by_id = {g.id: g for g in guilds}
+
+    def get_guild(self, gid: int) -> _Guild | None:
+        return self._by_id.get(gid)
+
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def db(tmp_path):
+    db_path = tmp_path / "test.db"
+    migrated_db(db_path)
+    return db_path
+
+
+def _enable(db_path, guild_id=GUILD, **overrides) -> None:
+    # Set bonuses zeroed — single-quest boards would otherwise pay the
+    # clear-the-board bonus on every claim and skew exact balances.
+    values: dict[str, object] = {
+        "enabled": True,
+        "xp_per_coin": 10.0,
+        "quest_set_bonus_daily": 0,
+        "quest_set_bonus_weekly": 0,
+    }
+    values.update(overrides)
+    with open_db(db_path) as conn:
+        save_econ_settings(conn, guild_id, values)
+
+
+def _add_xp(db_path, user_id, amount, ts, guild_id=GUILD) -> None:
+    with open_db(db_path) as conn:
+        conn.execute(
+            "INSERT INTO xp_events (guild_id, user_id, source, amount, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, "message", amount, ts),
+        )
+
+
+def _roll(bot, db_path, now_ts, guild_id=GUILD) -> None:
+    with open_db(db_path) as conn:
+        run_guild_day_roll(bot, conn, guild_id, now_ts)
+
+
+async def _tick(bot, db_path, now_ts) -> None:
+    await run_tick(bot, db_path, now_ts)
+
+
+def _mark(db_path, guild_id=GUILD) -> str | None:
+    with open_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_local_day FROM econ_day_marks WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+    return row["last_local_day"] if row else None
+
+
+def _balance(db_path, user_id=USER, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        return get_balance(conn, guild_id, user_id)
+
+
+def _conversion_count(db_path, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM econ_conversions WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()["n"]
+
+
+# ── tests ─────────────────────────────────────────────────────────────
+
+
+def test_first_run_sets_mark_only(db):
+    _enable(db)
+    _add_xp(db, USER, 100.0, _ts(D1))  # present but must NOT be converted
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))
+
+    assert _mark(db) == D1
+    assert _balance(db) == 0
+    assert _conversion_count(db) == 0
+
+
+def test_day_roll_converts_all_users_and_advances_mark(db):
+    _enable(db)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))  # first run → mark D1
+
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _add_xp(db, OTHER, 50.0, _ts(D1))
+    _roll(bot, db, _ts(D2))  # roll → convert D1
+
+    assert _mark(db) == D2
+    assert _balance(db, USER) == 10  # 100 / 10
+    assert _balance(db, OTHER) == 5  # 50 / 10
+    assert _conversion_count(db) == 2
+
+
+def test_double_tick_same_day_converts_nothing_new(db):
+    _enable(db)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _roll(bot, db, _ts(D2))
+    assert _balance(db) == 10
+
+    # Same local day again — the mark guard short-circuits.
+    _roll(bot, db, _ts(D2, hour=18))
+
+    assert _balance(db) == 10
+    assert _conversion_count(db) == 1
+
+
+def test_remainder_carries_across_two_consecutive_rolls(db):
+    _enable(db)  # xp_per_coin = 10
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))  # first run → mark D1
+
+    _add_xp(db, USER, 15.0, _ts(D1))
+    _roll(bot, db, _ts(D2))  # 15 → 1 coin, remainder 5
+    assert _balance(db) == 1
+
+    _add_xp(db, USER, 15.0, _ts(D2))
+    _roll(bot, db, _ts(D3))  # 15 + carry 5 = 20 → 2 coins
+
+    assert _balance(db) == 3  # 1 + 2
+    assert _mark(db) == D3
+
+
+def test_disabled_guild_skipped(db):
+    # economy not enabled — no mark, no conversion even with XP present.
+    _add_xp(db, USER, 100.0, _ts(D1))
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))
+    _roll(bot, db, _ts(D2))
+
+    assert _mark(db) is None
+    assert _balance(db) == 0
+    assert _conversion_count(db) == 0
+
+
+def test_faucet_off_converts_nothing_but_still_rolls(db):
+    # xp_per_coin 0 (the shipped default) = faucet off: the day still rolls
+    # (mark advances) but no XP is converted and no conversion row is written —
+    # so a later re-enable resumes from that day rather than dumping a backlog.
+    _enable(db, xp_per_coin=0.0)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))  # first run → mark D1
+
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _roll(bot, db, _ts(D2))  # roll D1 → but faucet off
+
+    assert _mark(db) == D2  # the day still rolled
+    assert _balance(db) == 0  # nothing minted
+    assert _conversion_count(db) == 0  # nothing accumulated
+
+
+def test_booster_member_gets_ceil(db):
+    _enable(db)  # booster_multiplier default 1.5
+    bot = _Bot([_Guild(GUILD, {USER: _Member(booster=True)})])
+    _roll(bot, db, _ts(D1))
+
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _roll(bot, db, _ts(D2))
+
+    assert _balance(db) == 15  # ceil(10 * 1.5)
+
+
+def test_guild_missing_from_cache_handled(db):
+    # Guild not in bot.guilds cache → member_is_booster returns False, but the
+    # conversion still proceeds (non-booster credit).
+    _enable(db)
+    bot = _Bot([])  # GUILD is absent from the cache
+    _roll(bot, db, _ts(D1))
+
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _roll(bot, db, _ts(D2))
+
+    assert _mark(db) == D2
+    assert _balance(db) == 10  # non-booster amount
+
+
+def test_crash_between_conversions_and_mark_update_replays_safely(db):
+    _enable(db)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))
+    _add_xp(db, USER, 100.0, _ts(D1))
+    _roll(bot, db, _ts(D2))
+    assert _balance(db) == 10
+
+    # Simulate a crash after conversions but before the mark advanced: rewind
+    # the mark to D1 and replay the same tick. process_conversion idempotency
+    # must prevent a second credit.
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_day_marks SET last_local_day = ? WHERE guild_id = ?",
+            (D1, GUILD),
+        )
+
+    _roll(bot, db, _ts(D2))
+
+    assert _balance(db) == 10  # unchanged
+    assert _conversion_count(db) == 1
+    assert _mark(db) == D2
+
+
+# ── Stage-2 quest surface ─────────────────────────────────────────────
+
+
+def _create_quest(
+    db_path,
+    *,
+    qtype,
+    reward=0,
+    signoff=0,
+    rotate_tag="",
+    community_target=None,
+    active=False,
+    guild_id=GUILD,
+) -> int:
+    with open_db(db_path) as conn:
+        qid = create_quest(
+            conn,
+            guild_id,
+            title=f"{qtype}-{rotate_tag or 'q'}",
+            description="",
+            qtype=qtype,
+            reward=reward,
+            signoff=signoff,
+            criteria="",
+            starts_at=None,
+            ends_at=None,
+            rotate_tag=rotate_tag,
+            community_target=community_target,
+            created_by=None,
+        )
+        if active:
+            set_quest_active(conn, guild_id, qid, True)
+    return qid
+
+
+def _is_active(db_path, qid) -> bool:
+    with open_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT active FROM econ_quests WHERE id = ?", (qid,)
+        ).fetchone()
+    return bool(row["active"])
+
+
+def _set_progress(db_path, qid, current, target) -> None:
+    with open_db(db_path) as conn:
+        set_community_progress(conn, qid, current, target=target)
+
+
+def _add_activity(db_path, user_id, guild_id=GUILD, when=None) -> None:
+    """Seed member_activity so the member counts as a 30-day active.
+
+    Default ``when`` to NOW and leave it there unless a test is specifically
+    about the activity window. The settlement path reads the population
+    through ``active_member_ids``, which measures ``days`` back from
+    ``time.time()`` — the real clock, not the fabricated ``now_ts`` a roll is
+    driven with. Three month-roll tests used to seed 2026-07-28 to look like
+    "active during the July they simulate"; that read as active only while
+    real time sat within 30 days of it, and they went red for good on
+    2026-08-27 when the cutoff crossed it, paying the top-contributor bonus
+    with no tier payouts behind it (15 instead of 75).
+    """
+    when = time.time() if when is None else when
+    with open_db(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO member_activity "
+            "(guild_id, user_id, last_channel_id, last_message_id, last_message_at) "
+            "VALUES (?, ?, 0, 0, ?)",
+            (guild_id, user_id, when),
+        )
+
+
+def _payout_count(db_path, qid) -> int:
+    with open_db(db_path) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM econ_community_payouts WHERE quest_id = ?",
+            (qid,),
+        ).fetchone()["n"]
+
+
+def _settled_at(db_path, qid):
+    with open_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT settled_at FROM econ_community_progress WHERE quest_id = ?",
+            (qid,),
+        ).fetchone()
+    return row["settled_at"] if row else None
+
+
+def _ledger_kind_count(db_path, kind, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM econ_ledger WHERE guild_id = ? AND kind = ?",
+            (guild_id, kind),
+        ).fetchone()["n"]
+
+
+def _rewind_marks(db_path, local_day, iso_week, guild_id=GUILD) -> None:
+    with open_db(db_path) as conn:
+        conn.execute(
+            "UPDATE econ_day_marks SET last_local_day = ?, last_iso_week = ? "
+            "WHERE guild_id = ?",
+            (local_day, iso_week, guild_id),
+        )
+
+
+def _make_pending_claim(db_path, quest_id, user_id, period, guild_id=GUILD) -> None:
+    with open_db(db_path) as conn:
+        settings = load_econ_settings(conn, guild_id)
+        claim_quest(
+            conn,
+            settings,
+            guild_id,
+            quest_id,
+            user_id,
+            period=period,
+            booster=False,
+        )
+
+
+# ── daily rotation (day roll only) ─────────────────────────────────────
+
+
+def test_daily_rotation_fires_on_day_roll_weekly_pool_untouched(db):
+    _enable(db)
+    d_a = _create_quest(db, qtype="daily", rotate_tag="dy", active=True)
+    d_b = _create_quest(db, qtype="daily", rotate_tag="dy")
+    w_1 = _create_quest(db, qtype="weekly", rotate_tag="wk", active=True)
+    w_2 = _create_quest(db, qtype="weekly", rotate_tag="wk")
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))  # first sight → mark only
+    _roll(bot, db, _ts(D2))  # same ISO week: day roll, no week roll
+
+    assert not _is_active(db, d_a)  # daily pool advanced …
+    assert _is_active(db, d_b)
+    assert _is_active(db, w_1)  # … weekly pool did NOT
+    assert not _is_active(db, w_2)
+
+
+def test_disabled_guild_leaves_quests_untouched(db):
+    # No _enable → run_guild_day_roll returns before any rotation or mark.
+    d_a = _create_quest(db, qtype="daily", rotate_tag="dy", active=True)
+    d_b = _create_quest(db, qtype="daily", rotate_tag="dy")
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))
+    _roll(bot, db, _ts(D2))
+
+    assert _mark(db) is None
+    assert _is_active(db, d_a)
+    assert not _is_active(db, d_b)
+
+
+# ── weekly rotation + community settlement (ISO week change) ───────────
+
+
+def test_week_roll_rotates_weekly_and_settles_community(db):
+    _enable(db)
+    w_1 = _create_quest(db, qtype="weekly", rotate_tag="wk", active=True)
+    w_2 = _create_quest(db, qtype="weekly", rotate_tag="wk")
+    qc = _create_quest(db, qtype="community", reward=30, community_target=5, active=True)
+    _set_progress(db, qc, 5, 5)  # completed
+    _add_activity(db, USER)
+    _add_activity(db, OTHER)
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(DSUN))  # first sight → mark (W28)
+    _roll(bot, db, _ts(DMON))  # week change W28 → W29
+
+    assert not _is_active(db, w_1)  # weekly pool advanced
+    assert _is_active(db, w_2)
+    assert _payout_count(db, qc) == 2
+    assert _settled_at(db, qc) is not None
+    assert _ledger_kind_count(db, "quest_community") == 2
+    assert _balance(db, USER) == 30
+    assert _balance(db, OTHER) == 30
+
+
+def _rollup_count(db_path, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM econ_metrics_weekly WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()["n"]
+
+
+def _rollup(db_path, iso_week, guild_id=GUILD):
+    with open_db(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM econ_metrics_weekly WHERE guild_id = ? AND iso_week = ?",
+            (guild_id, iso_week),
+        ).fetchone()
+
+
+def test_week_roll_computes_metrics_rollup_once(db):
+    _enable(db)
+    # A credit inside W28 so the rollup has real ledger data to summarise.
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_ledger "
+            "(guild_id, user_id, amount, kind, actor_id, meta, created_at) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?)",
+            (GUILD, USER, 40, "login", _ts(D1)),  # D1 is in W28
+        )
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(DSUN))  # first sight → mark W28, no rollup
+    assert _rollup_count(db) == 0
+
+    _roll(bot, db, _ts(DMON))  # week change W28 → W29: roll up the CLOSED week
+    assert _rollup_count(db) == 1
+    row = _rollup(db, WEEK_28)
+    assert row is not None
+    assert row["minted"] == 40  # the seeded login credit
+
+    # A second tick in the new week must not create another rollup (PK-idempotent).
+    _rewind_marks(db, DSUN, WEEK_28)
+    _roll(bot, db, _ts(DMON))
+    assert _rollup_count(db) == 1
+
+
+def test_same_week_day_roll_computes_no_metrics(db):
+    _enable(db)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))  # W28 first sight
+    _roll(bot, db, _ts(D2))  # still W28 → day roll only, no week roll
+    assert _rollup_count(db) == 0
+
+
+def test_same_week_day_roll_does_not_settle_community(db):
+    _enable(db)
+    qc = _create_quest(db, qtype="community", reward=30, community_target=5, active=True)
+    _set_progress(db, qc, 5, 5)
+    _add_activity(db, USER)
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))  # W28
+    _roll(bot, db, _ts(D2))  # still W28 → day roll only
+
+    assert _payout_count(db, qc) == 0
+    assert _settled_at(db, qc) is None
+    assert _balance(db, USER) == 0
+
+
+def test_signoff_community_not_auto_settled(db):
+    _enable(db)
+    qc = _create_quest(
+        db, qtype="community", reward=30, signoff=1, community_target=5, active=True
+    )
+    _set_progress(db, qc, 5, 5)  # completed but needs manual sign-off
+    _add_activity(db, USER)
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(DSUN))
+    _roll(bot, db, _ts(DMON))  # week change
+
+    assert _payout_count(db, qc) == 0
+    assert _settled_at(db, qc) is None
+    assert _balance(db, USER) == 0
+
+
+def test_community_settlement_booster_ceil(db):
+    _enable(db)  # booster_multiplier default 1.5
+    qc = _create_quest(db, qtype="community", reward=30, community_target=1, active=True)
+    _set_progress(db, qc, 1, 1)
+    _add_activity(db, USER)
+    bot = _Bot([_Guild(GUILD, {USER: _Member(booster=True)})])
+
+    _roll(bot, db, _ts(DSUN))
+    _roll(bot, db, _ts(DMON))
+
+    assert _balance(db, USER) == 45  # ceil(30 * 1.5)
+
+
+def test_community_settlement_exactly_once_on_crash_replay(db):
+    _enable(db)
+    qc = _create_quest(db, qtype="community", reward=30, community_target=1, active=True)
+    _set_progress(db, qc, 1, 1)
+    _add_activity(db, USER)
+    _add_activity(db, OTHER)
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(DSUN))
+    _roll(bot, db, _ts(DMON))  # settles both members
+    assert _payout_count(db, qc) == 2
+    assert _ledger_kind_count(db, "quest_community") == 2
+
+    # Simulate a crash after settlement but before the mark advanced: rewind
+    # BOTH marks so the replay re-enters the roll path (not the day==today
+    # early return). The quest is already settled (settled_at set), so
+    # list_settleable_community_quests filters it out — this exercises the
+    # settled_at guard + mark idempotency, NOT the reserve-row path (that is
+    # covered by test_settlement_reserve_rows_prevent_double_credit).
+    _rewind_marks(db, DSUN, WEEK_28)
+    _roll(bot, db, _ts(DMON))
+
+    assert _payout_count(db, qc) == 2  # no double reservation
+    assert _ledger_kind_count(db, "quest_community") == 2  # no double credit
+    assert _balance(db, USER) == 30
+    assert _balance(db, OTHER) == 30
+
+
+def test_settlement_reserve_rows_prevent_double_credit(db):
+    # Drive settle_community_quest a second time with a payout row already
+    # present: the reserve-row INSERT OR IGNORE must skip the re-credit.
+    _enable(db)
+    qc = _create_quest(db, qtype="community", reward=30, community_target=1, active=True)
+    _set_progress(db, qc, 1, 1)
+    _add_activity(db, USER)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(DSUN))
+    _roll(bot, db, _ts(DMON))  # settles USER once; reserve row written
+    assert _balance(db, USER) == 30
+
+    # Clear settled_at so the quest is settleable again, but KEEP the payout
+    # reservation, then replay: the reserve row is the only thing stopping a
+    # second credit.
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_community_progress SET settled_at = NULL WHERE quest_id = ?",
+            (qc,),
+        )
+    _rewind_marks(db, DSUN, WEEK_28)
+    _roll(bot, db, _ts(DMON))
+
+    assert _balance(db, USER) == 30  # not 60
+    assert _payout_count(db, qc) == 1
+    assert _ledger_kind_count(db, "quest_community") == 1
+
+
+def test_null_last_iso_week_backfills_without_retroactive_settle(db):
+    # A pre-064 mark row has NULL last_iso_week; a week roll off it must backfill
+    # the week rather than fire a spurious community settlement.
+    _enable(db)
+    qc = _create_quest(db, qtype="community", reward=30, community_target=1, active=True)
+    _set_progress(db, qc, 1, 1)
+    _add_activity(db, USER)
+    bot = _Bot([_Guild(GUILD)])
+
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO econ_day_marks (guild_id, last_local_day, last_iso_week) "
+            "VALUES (?, ?, NULL)",
+            (GUILD, DSUN),
+        )
+
+    _roll(bot, db, _ts(DMON))  # week 'changes' but last_week was NULL
+
+    assert _payout_count(db, qc) == 0
+    assert _settled_at(db, qc) is None
+    assert _balance(db, USER) == 0
+    with open_db(db) as conn:
+        week = conn.execute(
+            "SELECT last_iso_week FROM econ_day_marks WHERE guild_id = ?", (GUILD,)
+        ).fetchone()["last_iso_week"]
+    assert week == "2026-W29"  # backfilled to the current week
+
+
+# ── stale claim expiry + DMs (run_tick) ───────────────────────────────
+
+
+class _NotifyRecorder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, str | None]] = []
+
+    async def __call__(
+        self, bot, db_path, guild_id, user_id, *, embed=None, content=None
+    ) -> bool:
+        self.calls.append((guild_id, user_id, content))
+        return True
+
+
+async def test_run_tick_announces_expired_claims_once_and_never_dms(db, monkeypatch):
+    """An expiry is the third sign-off outcome and goes where the other two go:
+    the register channel. It used to DM the claimant; nothing about a sign-off
+    DMs any more."""
+    _enable(db)
+    quest_id = _create_quest(db, qtype="daily", reward=15, signoff=1, active=True)
+    _make_pending_claim(db, quest_id, USER, D1)
+    _make_pending_claim(db, quest_id, OTHER, D1)
+
+    recorder = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", recorder)
+    announced = AsyncMock(return_value=True)
+    repainted = AsyncMock()
+    monkeypatch.setattr(economy_loop, "announce_signoff_outcome", announced)
+    monkeypatch.setattr(economy_loop, "refresh_signoff_board", repainted)
+    bot = _Bot([])  # isolate expiry from the per-guild roll
+
+    # Claims were created at wall-clock now; expire 8 days in the future so the
+    # 7-day cutoff catches them (expire_stale_claims reads now_ts, not the clock).
+    future = time.time() + 8 * 86400
+    await _tick(bot, db, future)
+
+    told = {(c.kwargs["state"], c.kwargs["user_id"]) for c in announced.await_args_list}
+    assert told == {("expired", USER), ("expired", OTHER)}
+    assert recorder.calls == []  # no DMs, for either claimant
+    # Two claims in one guild, one repaint — the board shows both at once.
+    repainted.assert_awaited_once()
+
+    # Second tick: rows are already 'expired', so nothing is announced again.
+    announced.reset_mock()
+    repainted.reset_mock()
+    await _tick(bot, db, future + 3600)
+    assert announced.await_args_list == []
+    repainted.assert_not_awaited()
+
+
+def test_run_claim_expiry_returns_notices_with_quest_title(db):
+    _enable(db)
+    quest_id = _create_quest(db, qtype="daily", reward=15, signoff=1, active=True)
+    _make_pending_claim(db, quest_id, USER, D1)
+
+    future = time.time() + 8 * 86400
+    with open_db(db) as conn:
+        notices = run_claim_expiry(conn, future)
+
+    assert len(notices) == 1
+    assert notices[0].user_id == USER
+    assert notices[0].guild_id == GUILD
+    assert notices[0].quest_id == quest_id
+    assert notices[0].quest_title  # non-empty, drawn from the quest row
+    # Carried so the announcer can apply the register's privacy rule without
+    # re-reading the quest.
+    assert notices[0].trigger_kind == ""
+
+
+# ── paid-request expiry names its request ──────────────────────────────
+
+
+def test_every_expiry_sweep_names_the_request_it_expired(db):
+    """The sweep has to hand the caller a submission id, or the card it just
+    refunded goes on showing Approve/Decline in the approvals channel for good
+    — the board self-corrects, a posted message does not."""
+    _enable(
+        db,
+        price_pin_of_day=150, pin_channel_id=6668, pin_expire_days=3,
+        flash_theme_enabled=True, price_flash_theme=300,
+        theme_channel_id=6666, theme_expire_days=3,
+    )
+    from bot_modules.economy.pin_service import submit_pin
+    from bot_modules.economy.theme_service import submit_theme
+
+    with open_db(db) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, USER, 5000, "grant", actor_id=9001)
+        pin_id = submit_pin(conn, settings, GUILD, USER, "Raid at eight").submission_id
+        theme_id = submit_theme(
+            conn, settings, GUILD, USER, "Cursed Cooking", "The idea"
+        ).submission_id
+        stale = time.time() - 60 * 86400
+        for table in (
+            "econ_pin_submissions", "econ_theme_submissions",
+        ):
+            conn.execute(f"UPDATE {table} SET created_at = ?", (stale,))
+
+    now = time.time()
+    with open_db(db) as conn:
+        pin_sweep = economy_loop.run_pin_expiry(conn, GUILD, now)
+        theme_sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+
+    assert [n.submission_id for n in pin_sweep.refunds] == [pin_id]
+    assert [n.submission_id for n in theme_sweep.refunds] == [theme_id]
+
+
+# ── Pin of the Day expiry (run_pin_expiry) ─────────────────────────────
+
+
+def _pin(db_path, user_id=USER, message="gm gamers"):
+    from bot_modules.economy.pin_service import submit_pin
+
+    with open_db(db_path) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, user_id, 200, "grant", actor_id=9001)
+        return submit_pin(conn, settings, GUILD, user_id, message).submission_id
+
+
+def test_run_pin_expiry_unpins_live_and_refunds_pending(db):
+    from bot_modules.economy.pin_service import go_live
+
+    _enable(db, price_pin_of_day=30, pin_channel_id=5555, pin_expire_days=3)
+    now = time.time()
+    # A live pin whose 24h ran out (must be unpinned, NOT refunded)…
+    live_sid = _pin(db, user_id=USER, message="live one")
+    with open_db(db) as conn:
+        go_live(
+            conn, live_sid, resolver_id=9001,
+            pin_channel_id=5555, pin_message_id=42, now=now - 2 * 86400,
+        )
+    # …and a pending pin nobody reviewed (must expire + refund).
+    pending_sid = _pin(db, user_id=USER + 1, message="stale")
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_pin_submissions SET created_at = ? WHERE id = ?",
+            (now - 10 * 86400, pending_sid),
+        )
+
+    with open_db(db) as conn:
+        sweep = economy_loop.run_pin_expiry(conn, GUILD, now)
+
+    assert sweep.unpins == [(5555, 42)]
+    assert len(sweep.refunds) == 1
+    assert sweep.refunds[0].user_id == USER + 1
+    assert sweep.refunds[0].refund == 30
+    assert sweep.refunds[0].unit  # non-empty
+    with open_db(db) as conn:
+        # The live pin's owner kept their spend; the pending owner was refunded.
+        assert get_balance(conn, GUILD, USER) == 170
+        assert get_balance(conn, GUILD, USER + 1) == 200
+
+
+def test_run_pin_expiry_skips_disabled_guild(db):
+    _enable(db, guild_id=GUILD + 1, enabled=False)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_pin_expiry(conn, GUILD + 1, time.time())
+    assert sweep.refunds == []
+    assert sweep.unpins == []
+
+
+# ── Community Bounty expiry (run_bounty_expiry) ────────────────────────
+
+
+def test_run_bounty_expiry_refunds_all_and_notices(db):
+    from bot_modules.economy.bounty_service import contribute, create_bounty
+
+    _enable(db, bounty_channel_id=555, bounty_min_stake=10, bounty_expire_days=14)
+    now = time.time()
+    with open_db(db) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, USER, 200, "grant", actor_id=9001)
+        apply_credit(conn, GUILD, USER + 1, 200, "grant", actor_id=9001)
+        bid = create_bounty(
+            conn, settings, GUILD, USER, title="do a thing", description="",
+            stake=50, now=now,
+        ).bounty_id
+        contribute(conn, settings, GUILD, bid, USER + 1, 30, now=now)
+        # Age it past the window.
+        conn.execute(
+            "UPDATE econ_bounties SET expires_at = ? WHERE id = ?", (now - 100, bid)
+        )
+        conn.execute(
+            "UPDATE econ_bounties SET card_channel_id = 555, card_message_id = 42 "
+            "WHERE id = ?",
+            (bid,),
+        )
+
+    with open_db(db) as conn:
+        notices = economy_loop.run_bounty_expiry(conn, GUILD, now)
+
+    assert len(notices) == 1
+    assert notices[0].bounty_id == bid
+    assert notices[0].card_message_id == 42
+    assert set(notices[0].refunded_user_ids) == {USER, USER + 1}
+    with open_db(db) as conn:
+        assert get_balance(conn, GUILD, USER) == 200  # opener refunded
+        assert get_balance(conn, GUILD, USER + 1) == 200  # contributor refunded
+
+
+def test_run_bounty_expiry_skips_disabled_guild(db):
+    _enable(db, guild_id=GUILD + 1, enabled=False)
+    with open_db(db) as conn:
+        assert economy_loop.run_bounty_expiry(conn, GUILD + 1, time.time()) == []
+
+
+async def test_run_tick_escapes_bounty_title_in_refund_dm(db, monkeypatch):
+    """The refund DM's bounty title comes straight from the member-typed
+    title column (only length-validated) — an unbalanced ** in it must not
+    forge a markdown close/masked-link into the automated DM (bug found in
+    the completeness re-audit)."""
+    from bot_modules.economy.bounty_service import create_bounty
+
+    # bounty_views isn't in this group's file list — stub its two Discord
+    # calls so the test exercises run_tick's own DM content, not the card
+    # repaint (which the fake bot/guild can't service anyway).
+    monkeypatch.setattr(
+        "bot_modules.economy.bounty_views.refresh_card_by_id",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "bot_modules.economy.bounty_views.refresh_bounty_hub", AsyncMock()
+    )
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+
+    _enable(db, bounty_channel_id=555, bounty_min_stake=10, bounty_expire_days=14)
+    now = time.time()
+    with open_db(db) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, USER, 200, "grant", actor_id=9001)
+        bid = create_bounty(
+            conn, settings, GUILD, USER,
+            title="Free Nitro** [claim now](http://phish.example",
+            description="", stake=50, now=now,
+        ).bounty_id
+        conn.execute(
+            "UPDATE econ_bounties SET expires_at = ? WHERE id = ?", (now - 100, bid)
+        )
+        conn.execute(
+            "UPDATE econ_bounties SET card_channel_id = 555, card_message_id = 42 "
+            "WHERE id = ?",
+            (bid,),
+        )
+
+    await _tick(_rental_bot(), db, now)
+
+    contents = [c for _, uid, c in notify.calls if uid == USER]
+    assert len(contents) == 1
+    assert "\\*\\*" in contents[0]  # the title's ** arrives escaped
+    # The bot's own bold wrapper still reads as bold around the escaped title.
+    assert contents[0].startswith("The bounty **Free Nitro\\*\\*")
+
+
+# ── rental billing pass (run_guild_rentals) ────────────────────────────
+
+# Anchor rental time on a plain float so week arithmetic is exact and tz-free.
+RT0 = 2_000_000.0
+PRICE_COLOR = 50  # EconSettings.price_role_color default
+PRICE_ICON = 75  # EconSettings.price_role_icon default
+
+
+class _PerkRecorder:
+    """Async stand-ins for the perk_actions projector, patched onto the loop.
+
+    ``gate`` is either a bool (all perks) or a {perk: bool} map; flipping it
+    between ticks simulates a guild gaining/losing a role feature. Records every
+    apply/revoke/gate call so tests can assert the exact post-commit wiring.
+    """
+
+    def __init__(self, gate: bool | dict[str, bool] = True) -> None:
+        self.gate = gate
+        self.gate_calls: list[tuple[int, str]] = []
+        self.apply_calls: list[tuple[int, int]] = []
+        self.revoke_calls: list[tuple[int, int]] = []
+
+    async def feature_gate_ok(self, bot, guild_id, perk) -> bool:
+        self.gate_calls.append((guild_id, perk))
+        if isinstance(self.gate, dict):
+            return self.gate.get(perk, True)
+        return self.gate
+
+    async def apply_role_perks(self, bot, db_path, guild_id, user_id) -> bool:
+        self.apply_calls.append((guild_id, user_id))
+        return True
+
+    async def revoke_role_perks(self, bot, db_path, guild_id, user_id) -> None:
+        self.revoke_calls.append((guild_id, user_id))
+
+
+def _patch_perks(monkeypatch, gate: bool | dict[str, bool] = True) -> _PerkRecorder:
+    rec = _PerkRecorder(gate)
+    monkeypatch.setattr(economy_loop, "feature_gate_ok", rec.feature_gate_ok)
+    monkeypatch.setattr(economy_loop, "apply_role_perks", rec.apply_role_perks)
+    monkeypatch.setattr(economy_loop, "revoke_role_perks", rec.revoke_role_perks)
+    return rec
+
+
+def _fund(db_path, user_id, amount, guild_id=GUILD) -> None:
+    with open_db(db_path) as conn:
+        apply_credit(conn, guild_id, user_id, amount, "grant")
+
+
+def _rent(db_path, user_id, perk, *, beneficiary_id=None, now=RT0, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        settings = load_econ_settings(conn, guild_id)
+        row = rent_perk(
+            conn, settings, guild_id, user_id, perk,
+            beneficiary_id=beneficiary_id, now=now,
+        )
+        return int(row["id"])
+
+
+def _rental(db_path, rental_id):
+    with open_db(db_path) as conn:
+        return dict(
+            conn.execute(
+                "SELECT * FROM econ_rentals WHERE id = ?", (rental_id,)
+            ).fetchone()
+        )
+
+
+def _set_rental(db_path, rental_id, **cols) -> None:
+    assigns = ", ".join(f"{k} = ?" for k in cols)
+    with open_db(db_path) as conn:
+        conn.execute(
+            f"UPDATE econ_rentals SET {assigns} WHERE id = ?",
+            (*cols.values(), rental_id),
+        )
+
+
+async def _rental_tick(bot, db_path, now_ts, guild_id=GUILD) -> None:
+    await run_guild_rentals(bot, db_path, guild_id, now_ts)
+
+
+def _rental_bot():
+    return _Bot([_Guild(GUILD)])
+
+
+# ── charge / grace / retry ─────────────────────────────────────────────
+
+
+async def test_due_charge_advances_silently_without_drift(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)  # first week upfront + one renewal
+    rid = _rent(db, USER, "role_color")  # charges 50 upfront → balance 50
+    assert _balance(db) == PRICE_COLOR
+    due = _rental(db, rid)["next_bill_at"]  # == RT0 + WEEK
+
+    # Tick a bit *after* the anniversary: the charge must advance from the
+    # scheduled time, not from ``now`` (no drift).
+    await _rental_tick(_rental_bot(), db, due + 100.0)
+
+    row = _rental(db, rid)
+    assert row["state"] == "active"
+    assert row["next_bill_at"] == due + WEEK_SECONDS  # scheduled+week, not now+week
+    assert _balance(db) == 0  # second 50 charged
+    assert notify.calls == []  # silent renewal
+    assert rec.apply_calls == [] and rec.revoke_calls == []
+
+
+async def test_insufficient_enters_grace_dm_once_then_retry_silent(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_COLOR)  # exactly one week — renewal will fail
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+
+    await _rental_tick(_rental_bot(), db, due)  # debit fails → enter grace
+    row = _rental(db, rid)
+    assert row["state"] == "grace"
+    assert row["grace_since"] == due
+    assert len(notify.calls) == 1
+    assert "grace" in (notify.calls[0][2] or "")
+    assert rec.revoke_calls == []
+
+    # Second tick still inside the 36h window → retry, silent (no repeat DM).
+    await _rental_tick(_rental_bot(), db, due + 3600.0)
+    assert _rental(db, rid)["state"] == "grace"
+    assert len(notify.calls) == 1  # still just the one
+    assert rec.revoke_calls == []
+
+
+async def test_funded_retry_recovers_silently(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(_rental_bot(), db, due)  # → grace
+    assert _rental(db, rid)["state"] == "grace"
+
+    # Top the wallet up, then retry inside the window → silent recovery.
+    _fund(db, USER, PRICE_COLOR)
+    notify.calls.clear()
+    await _rental_tick(_rental_bot(), db, due + 7200.0)
+
+    row = _rental(db, rid)
+    assert row["state"] == "active"
+    assert row["grace_since"] is None
+    assert row["next_bill_at"] == due + WEEK_SECONDS  # advanced from scheduled
+    assert _balance(db) == 0
+    # Grace never revoked the perk, so recovery re-projects nothing and is silent.
+    assert notify.calls == []
+    assert rec.apply_calls == [] and rec.revoke_calls == []
+
+
+# ── revoke / cancel ────────────────────────────────────────────────────
+
+
+async def test_grace_elapsed_revokes_and_dms_owner(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(_rental_bot(), db, due)  # → grace
+    notify.calls.clear()
+
+    # Past the 36h grace window → revoke.
+    await _rental_tick(_rental_bot(), db, due + GRACE_SECONDS + 1.0)
+
+    assert _rental(db, rid)["state"] == "lapsed"
+    assert rec.revoke_calls == [(GUILD, USER)]  # beneficiary == owner here
+    assert len(notify.calls) == 1
+    assert (GUILD, USER) == (notify.calls[0][0], notify.calls[0][1])
+    assert "lapsed" in (notify.calls[0][2] or "")
+
+
+async def test_grace_elapsed_gift_dms_owner_and_beneficiary(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_COLOR)  # payer funds one week only
+    rid = _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(_rental_bot(), db, due)  # → grace
+    notify.calls.clear()
+
+    await _rental_tick(_rental_bot(), db, due + GRACE_SECONDS + 1.0)  # → revoke
+
+    assert _rental(db, rid)["state"] == "lapsed"
+    assert rec.revoke_calls == [(GUILD, OTHER)]  # beneficiary, not payer
+    dmed = {(gid, uid) for gid, uid, _ in notify.calls}
+    assert dmed == {(GUILD, USER), (GUILD, OTHER)}  # owner + courtesy to friend
+
+
+async def test_cancel_at_period_end_revokes_with_no_dm(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+    _set_rental(db, rid, cancel_at_period_end=1)
+
+    await _rental_tick(_rental_bot(), db, due)  # anniversary of a cancelled rental
+
+    assert _rental(db, rid)["state"] == "cancelled"
+    assert _balance(db) == PRICE_COLOR  # NOT charged the second week
+    assert rec.revoke_calls == [(GUILD, USER)]  # beneficiary revoked …
+    assert notify.calls == []  # … but member-initiated: silent
+
+
+# ── the guild stops selling a perk (Shop & Perks checkboxes) ───────────
+
+
+async def test_withdrawn_perk_runs_to_expiry_then_ends_and_dms(db, monkeypatch):
+    """End to end through the loop: nothing mid-week, then a DM'd ending.
+
+    ``cancel_period_end`` is deliberately silent because the member asked for
+    it; this one is the server's decision, so it has to say so.
+    """
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)  # funded for a second week they won't be charged
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+
+    # The admin unchecks the box mid-week: nothing happens to anyone.
+    _enable(db, shop_role_color_enabled=False)
+    await _rental_tick(_rental_bot(), db, due - 1.0)
+    assert _rental(db, rid)["state"] == "active"
+    assert rec.revoke_calls == [] and notify.calls == []
+    assert _balance(db) == PRICE_COLOR
+
+    # At the anniversary it ends, unbilled and revoked, and they are told why.
+    await _rental_tick(_rental_bot(), db, due)
+    assert _rental(db, rid)["state"] == "cancelled"
+    assert _balance(db) == PRICE_COLOR  # NOT charged a second week
+    assert rec.revoke_calls == [(GUILD, USER)]
+    assert len(notify.calls) == 1
+    body = notify.calls[0][2] or ""
+    assert "stopped offering" in body
+    assert "haven't been charged" in body
+    # The human label, not the raw perk key — "your **role_color** perk" is
+    # not a sentence to send a member.
+    assert "Custom Role Color" in body
+    assert "role_color" not in body
+
+
+async def test_withdrawn_gift_dms_both_the_payer_and_the_wearer(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color", beneficiary_id=OTHER)
+    due = _rental(db, rid)["next_bill_at"]
+    _enable(db, shop_role_color_enabled=False)
+
+    await _rental_tick(_rental_bot(), db, due)
+
+    assert _rental(db, rid)["state"] == "cancelled"
+    assert rec.revoke_calls == [(GUILD, OTHER)]  # the wearer loses the role
+    dmed = {(gid, uid) for gid, uid, _ in notify.calls}
+    assert dmed == {(GUILD, USER), (GUILD, OTHER)}
+
+
+async def test_re_enabling_before_the_anniversary_renews_as_normal(db, monkeypatch):
+    """Reversible, because nothing is written when a perk goes off sale."""
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+
+    _enable(db, shop_role_color_enabled=False)
+    await _rental_tick(_rental_bot(), db, due - 100.0)
+    _enable(db, shop_role_color_enabled=True)  # thought better of it
+    await _rental_tick(_rental_bot(), db, due)
+
+    row = _rental(db, rid)
+    assert row["state"] == "active"
+    assert row["next_bill_at"] == due + WEEK_SECONDS
+    assert _balance(db) == 0  # charged the second week, as normal
+    assert rec.revoke_calls == [] and notify.calls == []
+
+
+# ── feature-gate suspension sweep ──────────────────────────────────────
+
+
+async def test_feature_loss_suspends_once_and_freezes_billing(db, monkeypatch):
+    _enable(db)
+    rec = _patch_perks(monkeypatch, gate=False)  # server lacks the icon feature
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_ICON)  # one week only → a charge would fail if attempted
+    rid = _rent(db, USER, "role_icon")
+    due = _rental(db, rid)["next_bill_at"]
+
+    await _rental_tick(_rental_bot(), db, due)  # due, but feature gone → suspend
+    row = _rental(db, rid)
+    assert row["suspended"] == 1
+    assert row["state"] == "active"  # suspended, NOT billed → never entered grace
+    assert row["grace_since"] is None
+    assert _balance(db) == 0  # nothing charged while suspended
+    assert len(notify.calls) == 1
+    assert "paused" in (notify.calls[0][2] or "")
+
+    # Feature still gone next tick: no transition → no second DM, still frozen.
+    await _rental_tick(_rental_bot(), db, due + 3600.0)
+    assert _rental(db, rid)["suspended"] == 1
+    assert len(notify.calls) == 1  # not re-notified
+    assert rec.revoke_calls == []  # suspended rental is skipped by billing
+
+
+async def test_a_break_paused_rental_is_left_to_the_break(db, monkeypatch):
+    """Take a Break pauses billing through the same suspended flag; a healthy
+    gate on the next tick must not resume it, nor DM the owner that a feature
+    came back — the break's end owns the resume."""
+    from bot_modules.breaks.store import create_break
+    from bot_modules.economy.rentals_service import set_beneficiary_rentals_paused
+
+    _enable(db)
+    _patch_perks(monkeypatch, gate=True)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_ICON)
+    rid = _rent(db, USER, "role_icon")
+    with open_db(db) as conn:
+        create_break(conn, guild_id=GUILD, user_id=USER, stored_roles=[], swapped_spicy=False)
+        assert set_beneficiary_rentals_paused(conn, GUILD, USER, True, now=RT0 + 500.0) == 1
+
+    await _rental_tick(_rental_bot(), db, RT0 + 1000.0)
+
+    assert _rental(db, rid)["suspended"] == 1
+    assert notify.calls == []
+
+
+async def test_feature_return_unsuspends_and_reprojects(db, monkeypatch):
+    _enable(db)
+    gate = {"role_icon": False}
+    rec = _patch_perks(monkeypatch, gate=gate)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, PRICE_ICON)
+    rid = _rent(db, USER, "role_icon")  # anniversary a week out
+
+    # Feature lost well before the anniversary → suspend, no billing yet.
+    await _rental_tick(_rental_bot(), db, RT0 + 1000.0)
+    assert _rental(db, rid)["suspended"] == 1
+    notify.calls.clear()
+
+    # Feature returns, still before the (frozen-span-pushed) anniversary.
+    gate["role_icon"] = True
+    await _rental_tick(_rental_bot(), db, RT0 + 2000.0)
+
+    row = _rental(db, rid)
+    assert row["suspended"] == 0
+    assert rec.apply_calls == [(GUILD, USER)]  # re-projected on resume
+    assert rec.revoke_calls == []  # resume never revokes
+    assert len(notify.calls) == 1
+    assert "resumed" in (notify.calls[0][2] or "")
+
+
+# ── guard rails: disabled guild + idempotence ──────────────────────────
+
+
+async def test_disabled_guild_rental_pass_untouched(db, monkeypatch):
+    _enable(db)  # enable to create the rental …
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+    _enable(db, enabled=False)  # … then turn economy off
+
+    await _rental_tick(_rental_bot(), db, due + WEEK_SECONDS)  # long overdue
+
+    row = _rental(db, rid)
+    assert row["state"] == "active"
+    assert row["next_bill_at"] == due  # not advanced
+    assert _balance(db) == PRICE_COLOR  # not charged
+    assert notify.calls == []
+    assert rec.revoke_calls == [] and rec.gate_calls == []
+
+
+async def test_double_tick_idempotent_over_rental_pass(db, monkeypatch):
+    _enable(db)
+    _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+
+    await _rental_tick(_rental_bot(), db, due)  # charge
+    after_first = _rental(db, rid)
+    assert after_first["next_bill_at"] == due + WEEK_SECONDS
+    assert _balance(db) == 0
+
+    # Immediate second tick at the same clock: nothing due → no change.
+    await _rental_tick(_rental_bot(), db, due)
+    after_second = _rental(db, rid)
+    assert after_second["next_bill_at"] == after_first["next_bill_at"]
+    assert _balance(db) == 0
+    assert _ledger_kind_count(db, "rental") == 2  # upfront + one renewal, no more
+    assert notify.calls == []
+
+
+async def test_run_tick_drives_the_rental_pass(db, monkeypatch):
+    # Integration: exercise the real entry point (run_tick's per-guild loop),
+    # not run_guild_rentals directly, so the wiring itself is covered.
+    _enable(db)
+    _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 2 * PRICE_COLOR)
+    rid = _rent(db, USER, "role_color")
+    due = _rental(db, rid)["next_bill_at"]
+
+    await _tick(_rental_bot(), db, due)  # the actual hourly tick (run_tick)
+
+    row = _rental(db, rid)
+    assert row["state"] == "active"
+    assert row["next_bill_at"] == due + WEEK_SECONDS  # renewal charged + advanced
+    assert _balance(db) == 0
+
+
+# ── community weeklies: gap-week alternation + beats (stage 3) ────────
+
+
+def _mk_community_kind(db_path, *, title, kind, reward=30, guild_id=GUILD) -> int:
+    with open_db(db_path) as conn:
+        return create_quest(
+            conn, guild_id,
+            title=title, description="d", qtype="community", reward=reward,
+            signoff=0, criteria="", starts_at=None, ends_at=None,
+            rotate_tag="", community_target=None, created_by=None,
+            trigger_kind=kind,
+        )
+
+
+def _mk_monthly_kind(db_path, *, title, kind, reward=30, guild_id=GUILD) -> int:
+    """A monthly guild-wide goal (auto-tracked, community-measured)."""
+    with open_db(db_path) as conn:
+        return create_quest(
+            conn, guild_id,
+            title=title, description="d", qtype="monthly", reward=reward,
+            signoff=0, criteria="", starts_at=None, ends_at=None,
+            rotate_tag="", community_target=None, created_by=None,
+            trigger_kind=kind,
+        )
+
+
+def _fire(db_path, kind, user_id, occ, day, guild_id=GUILD) -> None:
+    from bot_modules.economy.quests_service import fire_trigger_quests
+
+    with open_db(db_path) as conn:
+        settings = load_econ_settings(conn, guild_id)
+        fire_trigger_quests(
+            conn, settings, guild_id, kind, user_id,
+            local_day=day, occurrence=occ, booster=False,
+        )
+
+
+def _roll_beats(bot, db_path, now_ts, guild_id=GUILD):
+    with open_db(db_path) as conn:
+        return list(run_guild_day_roll(bot, conn, guild_id, now_ts).beats)
+
+
+def _community_state(db_path, qid):
+    with open_db(db_path) as conn:
+        q = conn.execute(
+            "SELECT active, community_target, last_run_week, community_slot "
+            "FROM econ_quests WHERE id = ?", (qid,),
+        ).fetchone()
+        p = conn.execute(
+            "SELECT current, settled_at FROM econ_community_progress "
+            "WHERE quest_id = ?", (qid,),
+        ).fetchone()
+        return q, p
+
+
+def test_community_weekly_gap_week_lifecycle(db):
+    """Slot 1 keeps one-week-on/one-week-off; slot 2 refills with no gap
+    (2026-07-22 decision) so the board is never fully dark."""
+    _enable(db)
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    qa = _mk_community_kind(db, title="Msgs", kind="message_sent")
+    qb = _mk_community_kind(db, title="Replies", kind="reply_sent")
+    qc = _mk_community_kind(db, title="Reacts", kind="reaction_given")
+    _add_activity(db, USER)
+
+    _roll(bot, db, _ts(D1))  # first sight: marks only
+
+    # W28 → W29 roll: first-ever community week fills BOTH slots at once —
+    # slot 1 takes the library's lowest-id never-run pick (qa), slot 2 takes
+    # the next (qb) — each with an auto-sized (floor) target.
+    beats = _roll_beats(bot, db, _ts("2026-07-13"))
+    assert len([b for b in beats if "kicked off" in b.text]) == 2
+    q, p = _community_state(db, qa)
+    assert int(q["active"]) == 1 and int(q["community_target"]) == 10
+    assert q["last_run_week"] == "2026-W29" and int(q["community_slot"]) == 1
+    q, _ = _community_state(db, qb)
+    assert int(q["active"]) == 1 and int(q["community_slot"]) == 2
+
+    # Members act on slot 1's kind during the run week; slot 2's kind sees
+    # nothing, so it settles at 0%.
+    for i in range(7):
+        _fire(db, "message_sent", USER, f"m{i}", "2026-07-15")
+
+    # W29 → W30 roll: both runs close together (both started the same
+    # week). Slot 1 settles and takes its gap week (nothing reactivates
+    # there — "the win breathes"); slot 2 settles too but refills the SAME
+    # roll with the next library pick (qc), since it has no gap.
+    beats = _roll_beats(bot, db, _ts("2026-07-20"))
+    assert len([b for b in beats if "resolved" in b.text]) == 2
+    assert len([b for b in beats if "kicked off" in b.text]) == 1
+    q, p = _community_state(db, qa)
+    assert int(q["active"]) == 0 and p["settled_at"] is not None
+    # 2 tiers × 30 flat + 15 top-contributor bonus.
+    assert _balance(db, USER) == 75
+    q, _ = _community_state(db, qb)
+    assert int(q["active"]) == 0  # slot 2's run also closed
+    q, _ = _community_state(db, qc)
+    assert int(q["active"]) == 1 and int(q["community_slot"]) == 2
+    assert q["last_run_week"] == "2026-W30"
+
+    # W30 → W31 roll: slot 1's gap week is over → it reclaims a library
+    # pick; slot 2's qc also closes this roll (it too only ran one week)
+    # and immediately refills. The board never went empty in between.
+    beats = _roll_beats(bot, db, _ts("2026-07-27"))
+    assert any("kicked off" in b.text for b in beats)
+    q, _ = _community_state(db, qa)  # slot 1 reclaimed by the lowest-id pick
+    assert int(q["active"]) == 1 and int(q["community_slot"]) == 1
+    q, _ = _community_state(db, qc)
+    assert int(q["active"]) == 0  # settled again after its one week
+
+
+def test_repair_orphaned_community_quests_self_heals(db):
+    """2026-07-22 bug: a seed script flipped active=1 directly on library
+    community quests, bypassing activate_community_weekly entirely — no
+    target, no slot. The repair runs every tick (not just week rolls),
+    cleans those up, and immediately fills both slots from clean picks."""
+    _enable(db)
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    _roll(bot, db, _ts(D1))  # first sight: establishes marks (W28)
+
+    orphan_a = _mk_community_kind(db, title="Orphan A", kind="message_sent")
+    orphan_b = _mk_community_kind(db, title="Orphan B", kind="reply_sent")
+    clean_a = _mk_community_kind(db, title="Clean A", kind="reaction_given")
+    clean_b = _mk_community_kind(db, title="Clean B", kind="voice_session")
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_quests SET active = 1 WHERE id IN (?, ?)",
+            (orphan_a, orphan_b),
+        )
+
+    # Same-day tick (no day/week roll) — the repair still runs every tick.
+    beats = _roll_beats(bot, db, _ts(D1, hour=18))
+    assert len([b for b in beats if "kicked off" in b.text]) == 2
+
+    ids = (orphan_a, orphan_b, clean_a, clean_b)
+    with open_db(db) as conn:
+        rows = conn.execute(
+            "SELECT id, active, community_target, community_slot "
+            "FROM econ_quests WHERE id IN (?, ?, ?, ?)",
+            ids,
+        ).fetchall()
+    # No row is left in the corrupted state (active with no real target) —
+    # whichever two the tie-break picked, both are properly slotted.
+    assert not any(r["active"] and r["community_target"] is None for r in rows)
+    active_rows = [r for r in rows if r["active"]]
+    assert len(active_rows) == 2
+    assert all(int(r["community_target"]) > 0 for r in active_rows)
+    assert {int(r["community_slot"]) for r in active_rows} == {1, 2}
+
+    # A later same-day tick is a no-op — the repair doesn't keep firing
+    # once the orphans are gone, so it never overrides a real gap week.
+    beats = _roll_beats(bot, db, _ts(D1, hour=20))
+    assert beats == []
+    with open_db(db) as conn:
+        rows2 = conn.execute(
+            "SELECT id, active FROM econ_quests WHERE id IN (?, ?, ?, ?)", ids,
+        ).fetchall()
+    assert {r["id"] for r in rows2 if r["active"]} == {r["id"] for r in active_rows}
+
+
+def test_month_roll_settles_and_rotates_monthly(db):
+    """Monthly goals are guild-wide, single-lane, no gap month: a month close
+    settles the outgoing goal (tier payouts to 30d-actives) and activates the
+    next pool member for the new month."""
+    _enable(db)
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    qa = _mk_monthly_kind(db, title="July msgs", kind="message_sent")
+    qb = _mk_monthly_kind(db, title="Aug replies", kind="reply_sent")
+    _add_activity(db, USER)  # 30d-active is measured against the real clock
+
+    _roll(bot, db, _ts("2026-07-10"))  # first sight: marks only, no month roll
+
+    # A July day roll bootstraps the single monthly lane (lowest-id never-run
+    # pick qa), auto-sized to the floor (10, no kind activity seeded).
+    beats = _roll_beats(bot, db, _ts("2026-07-11"))
+    assert len([b for b in beats if "kicked off" in b.text]) == 1
+    q, _ = _community_state(db, qa)
+    assert int(q["active"]) == 1 and int(q["community_target"]) == 10
+    assert q["last_run_week"] == "2026-07" and int(q["community_slot"]) == 1
+    assert int(_community_state(db, qb)[0]["active"]) == 0  # not yet its turn
+
+    # Members hit qa's kind during July: 7/10 crosses tiers 1 and 2.
+    for i in range(7):
+        _fire(db, "message_sent", USER, f"m{i}", "2026-07-15")
+
+    # July → August roll: qa settles, qb activates for August. No gap month.
+    beats = _roll_beats(bot, db, _ts("2026-08-01"))
+    assert len([b for b in beats if "resolved" in b.text]) == 1
+    assert len([b for b in beats if "kicked off" in b.text]) == 1
+    q, p = _community_state(db, qa)
+    assert int(q["active"]) == 0 and p["settled_at"] is not None
+    # 2 tiers × 30 flat + 15 top-contributor bonus.
+    assert _balance(db, USER) == 75
+    q, _ = _community_state(db, qb)
+    assert int(q["active"]) == 1 and q["last_run_week"] == "2026-08"
+    assert int(q["community_slot"]) == 1
+
+
+def test_same_month_day_roll_does_not_settle_monthly(db):
+    """A day roll that stays inside the calendar month never settles or
+    rotates the monthly goal — only a month boundary does."""
+    _enable(db)
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    qa = _mk_monthly_kind(db, title="July msgs", kind="message_sent")
+    _add_activity(db, USER)  # 30d-active is measured against the real clock
+
+    _roll(bot, db, _ts("2026-07-10"))
+    _roll_beats(bot, db, _ts("2026-07-11"))  # bootstrap July goal
+    for i in range(7):
+        _fire(db, "message_sent", USER, f"m{i}", "2026-07-14")
+
+    # Another July day roll (and week roll W28→W29): no month change.
+    beats = _roll_beats(bot, db, _ts("2026-07-16"))
+    assert not any("resolved" in b.text for b in beats)
+    q, p = _community_state(db, qa)
+    assert int(q["active"]) == 1 and p["settled_at"] is None
+    assert _balance(db, USER) == 0  # nothing paid mid-month
+
+
+def test_month_roll_settlement_exactly_once_on_crash_replay(db):
+    """Replaying the month-roll tick (crash before the mark advanced) must not
+    pay the monthly settlement twice — reservation rows + the mark guard it."""
+    _enable(db)
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    _mk_monthly_kind(db, title="July msgs", kind="message_sent")
+    _add_activity(db, USER)  # 30d-active is measured against the real clock
+    _roll(bot, db, _ts("2026-07-10"))
+    _roll_beats(bot, db, _ts("2026-07-11"))
+    for i in range(7):
+        _fire(db, "message_sent", USER, f"m{i}", "2026-07-15")
+
+    _roll_beats(bot, db, _ts("2026-08-01"))
+    assert _balance(db, USER) == 75
+    # Simulate a replay of the SAME closed month by rewinding the mark and
+    # reactivating qa as August's live goal, then rolling the same day again:
+    # the tier-payout reservation rows already exist, so nothing re-pays.
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_day_marks SET last_community_month = '2026-07' "
+            "WHERE guild_id = ?", (GUILD,),
+        )
+    _roll_beats(bot, db, _ts("2026-08-01", hour=13))
+    assert _balance(db, USER) == 75  # unchanged
+
+
+def test_monthly_hourly_beats_final24_uses_month_end(db):
+    """The monthly goal's final-24h nudge keys off the calendar month end, not
+    the ISO week end."""
+    from bot_modules.economy.loop import community_hourly_pulse
+
+    _enable(db)
+    _mk_monthly_kind(db, title="July msgs", kind="message_sent")
+    bot = _Bot([_Guild(GUILD, {USER: _Member()})])
+    _roll(bot, db, _ts("2026-07-10"))
+    _roll_beats(bot, db, _ts("2026-07-11"))  # bootstrap July goal (target 10)
+    # Mid-month: no final-24h beat (a week may be ending, but the month isn't).
+    with open_db(db) as conn:
+        assert not any(
+            "Final 24h" in b.text
+            for b in community_hourly_pulse(conn, GUILD, _ts("2026-07-15")).beats
+        )
+    # Last day of July, <24h to Aug 1: the final-24h nudge fires.
+    with open_db(db) as conn:
+        beats = community_hourly_pulse(conn, GUILD, _ts("2026-07-31", hour=6)).beats
+    assert any("Final 24h" in b.text for b in beats)
+
+
+def test_community_hourly_pulse_fires_each_thing_once(db):
+    """A tier crossing surfaces as a public echo, the 24h nudge as a host DM.
+
+    The split landed 2026-07-29: a milestone is news the moment it happens, so
+    the bot posts it directly instead of DMing the host a sheet to write up.
+    ``notified_tier`` remains the once-only guarantee for both.
+    """
+    from bot_modules.economy.loop import community_hourly_pulse
+    from bot_modules.economy.quests_service import (
+        activate_community_weekly,
+    )
+
+    _enable(db)
+    qid = _mk_community_kind(db, title="Msgs", kind="message_sent")
+    with open_db(db) as conn:
+        activate_community_weekly(conn, GUILD, qid, target=10, week="2026-W29")
+    for i in range(5):  # 50% → tier 1
+        _fire(db, "message_sent", USER, f"x{i}", "2026-07-15")
+
+    now = _ts("2026-07-15")  # Wed of W29 — far from week end
+    with open_db(db) as conn:
+        pulse = community_hourly_pulse(conn, GUILD, now)
+    # The crossing is a crossing, not a beat — nothing is DMed for it.
+    assert pulse.beats == ()
+    assert len(pulse.crossings) == 1
+    cross = pulse.crossings[0]
+    assert (cross.quest_id, cross.tier, cross.title) == (qid, 1, "Msgs")
+    assert (cross.current, cross.target, cross.contributors) == (5, 10, 1)
+    with open_db(db) as conn:
+        assert community_hourly_pulse(conn, GUILD, now).crossings == ()
+
+    # Sunday inside the final day → the 24h nudge, still a host beat, once.
+    sunday = _ts("2026-07-19", hour=12)
+    with open_db(db) as conn:
+        pulse = community_hourly_pulse(conn, GUILD, sunday)
+    assert len(pulse.beats) == 1 and "Final 24h" in pulse.beats[0].text
+    assert pulse.crossings == ()
+    with open_db(db) as conn:
+        assert community_hourly_pulse(conn, GUILD, sunday).beats == ()
+
+
+# ── voice-style lapse reverts the live channel (sinks round 3, stage 3) ─
+
+
+async def test_voice_style_revoke_reverts_channel_not_role(db, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    import discord as _discord
+
+    _enable(db, price_voice_style=30, shop_voice_style_enabled=True)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 30)  # one week only — renewal fails into grace, then lapses
+    rid = _rent(db, USER, "voice_style")
+    with open_db(db) as conn:
+        conn.execute(
+            "INSERT INTO voice_master_channels "
+            "(channel_id, guild_id, owner_id, created_at) VALUES (?, ?, ?, 1)",
+            (555, GUILD, USER),
+        )
+
+    channel = MagicMock(spec=_discord.VoiceChannel)
+    channel.id = 555
+    channel.edit = AsyncMock()
+    member = MagicMock()
+    member.display_name = "Alice"
+    member.name = "alice"
+    guild = _Guild(GUILD)
+    guild.get_channel = lambda cid: channel if cid == 555 else None
+    guild.get_member = lambda uid: member if uid == USER else None
+    bot = _Bot([guild])
+
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(bot, db, due)  # -> grace
+    await _rental_tick(bot, db, due + GRACE_SECONDS + 1.0)  # -> revoke
+
+    assert _rental(db, rid)["state"] == "lapsed"
+    # The live channel walked back to the template, no role revoke fired.
+    channel.edit.assert_awaited_once()
+    kwargs = channel.edit.await_args.kwargs
+    assert kwargs["name"] == "Alice's Room"
+    assert rec.revoke_calls == []
+
+
+async def test_voice_style_revoke_without_live_channel_is_quiet(db, monkeypatch):
+    _enable(db, price_voice_style=30, shop_voice_style_enabled=True)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    _fund(db, USER, 30)
+    rid = _rent(db, USER, "voice_style")
+
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(_rental_bot(), db, due)
+    await _rental_tick(_rental_bot(), db, due + GRACE_SECONDS + 1.0)
+
+    assert _rental(db, rid)["state"] == "lapsed"
+    assert rec.revoke_calls == []  # no role touch, no crash on missing channel
+
+
+# ── emoji rental lapse deletes the emoji (sinks round 3, stage 4) ──────
+
+
+async def test_emoji_lapse_deletes_emoji_and_closes_submission(db, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot_modules.economy import emoji_service as emoji_svc
+
+    _enable(db)
+    rec = _patch_perks(monkeypatch)
+    notify = _NotifyRecorder()
+    monkeypatch.setattr(economy_loop, "notify_member", notify)
+    with open_db(db) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, USER, settings.price_emoji, "grant")
+        out = emoji_svc.submit_sponsorship(
+            conn, settings, GUILD, USER,
+            name="party_blob", image_path="/tmp/party.png", animated=False,
+            blocklist_patterns=[], taken_names=set(), guild_slots_free=True,
+        )
+        emoji_svc.claim_approval(conn, out.submission_id, resolver_id=1)
+        row = emoji_svc.finalize_upload(
+            conn, settings, out.submission_id, emoji_id=777, now=RT0
+        )
+        rid = int(row["rental_id"])
+
+    emoji = MagicMock()
+    emoji.delete = AsyncMock()
+    guild = _Guild(GUILD)
+    guild.get_emoji = lambda eid: emoji if eid == 777 else None
+    bot = _Bot([guild])
+
+    due = _rental(db, rid)["next_bill_at"]
+    await _rental_tick(bot, db, due)  # renewal fails (escrow spent) -> grace
+    await _rental_tick(bot, db, due + GRACE_SECONDS + 1.0)  # -> revoke
+
+    assert _rental(db, rid)["state"] == "lapsed"
+    emoji.delete.assert_awaited_once()
+    assert rec.revoke_calls == []  # no role involved
+    with open_db(db) as conn:
+        sub = emoji_svc.get_submission(conn, out.submission_id)
+    assert sub is not None and sub["state"] == "cancelled"
+
+
+# ── raffle draw at the week roll (sinks round 3, stage 5) ──────────────
+
+
+def test_week_roll_draws_raffle_exactly_once(db):
+    from bot_modules.economy import raffle_service as raffle_svc
+
+    _enable(db, raffle_enabled=True, price_raffle_ticket=10, raffle_max_tickets=10)
+    with open_db(db) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, USER, 100, "grant")
+        raffle_svc.buy_tickets(conn, settings, GUILD, USER, "2026-W28", 5)
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))          # first sight → mark W28
+    _roll(bot, db, _ts("2026-07-13"))  # Monday → W29: week rolls, W28 drawn
+
+    with open_db(db) as conn:
+        draw = raffle_svc.get_draw(conn, GUILD, "2026-W28")
+        assert draw is not None
+        assert draw["winner_id"] == USER and draw["tickets"] == 5
+        # Read on the same simulated clock the draw was stamped with. The
+        # voucher expires VOUCHER_LIFETIME_DAYS (28) after the roll, so a
+        # wall-clock read here only passed while real "today" happened to
+        # still be inside that window — it went red on 2026-08-10 with
+        # nothing having changed.
+        voucher = raffle_svc.live_voucher(
+            conn, GUILD, USER, now=_ts("2026-07-13")
+        )
+        assert voucher is not None
+
+        # Replay the same roll: marks already advanced, and even a forced
+        # re-draw of W28 is refused by the draws PK.
+        assert raffle_svc.draw_raffle(conn, GUILD, "2026-W28") is None
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM econ_vouchers WHERE user_id = ?",
+            (USER,),
+        ).fetchone()["n"] == 1
+
+
+def test_week_roll_raffle_disabled_draws_nothing(db):
+    from bot_modules.economy import raffle_service as raffle_svc
+
+    _enable(db)  # raffle off (default)
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))
+    _roll(bot, db, _ts("2026-07-13"))
+    with open_db(db) as conn:
+        assert raffle_svc.get_draw(conn, GUILD, "2026-W28") is None
+
+
+# ── hoard tax at the week roll (demurrage, migration 100) ──────────────
+
+
+def test_week_roll_collects_hoard_tax_exactly_once(db):
+    from bot_modules.economy import demurrage_service as demurrage_svc
+
+    _enable(db, demurrage_rate_pct=10, demurrage_threshold=500)
+    with open_db(db) as conn:
+        apply_credit(conn, GUILD, USER, 1500, "grant")
+    bot = _Bot([_Guild(GUILD)])
+
+    _roll(bot, db, _ts(D1))            # first sight → mark W28
+    _roll(bot, db, _ts("2026-07-13"))  # Monday → W29: week rolls, W28 swept
+
+    assert _balance(db) == 1400  # 10% of the 1000 over the floor
+    with open_db(db) as conn:
+        sweep = demurrage_svc.get_sweep(conn, GUILD, "2026-W28")
+        assert sweep is not None and int(sweep["total"]) == 100
+        # Replay: the sweeps PK refuses a re-collection of the same week.
+        settings = load_econ_settings(conn, GUILD)
+        assert demurrage_svc.run_sweep(conn, settings, GUILD, "2026-W28") is None
+    assert _balance(db) == 1400
+
+
+def test_week_roll_demurrage_disabled_collects_nothing(db):
+    from bot_modules.economy import demurrage_service as demurrage_svc
+
+    _enable(db)  # rate 0 (default)
+    with open_db(db) as conn:
+        apply_credit(conn, GUILD, USER, 1500, "grant")
+    bot = _Bot([_Guild(GUILD)])
+    _roll(bot, db, _ts(D1))
+    _roll(bot, db, _ts("2026-07-13"))
+    assert _balance(db) == 1500
+    with open_db(db) as conn:
+        assert demurrage_svc.get_sweep(conn, GUILD, "2026-W28") is None
+
+
+# ── weekly flip echo copy (was a pinging leaderboard post until 2026-07-29) ──
+
+from bot_modules.economy.quests import tier_echo_line  # noqa: E402
+from bot_modules.economy.loop import flip_echo_detail  # noqa: E402
+
+
+def test_flip_detail_keeps_the_pool_count_and_spotlight():
+    detail = flip_echo_detail(5, "Answer the QOTD")
+    assert "5" in detail and "/bank quests" in detail
+    assert "Spotlight" in detail and "Answer the QOTD" in detail
+
+
+def test_flip_detail_omits_the_spotlight_line_when_none_is_featured():
+    detail = flip_echo_detail(3, None)
+    assert "Spotlight" not in detail
+    assert "3" in detail
+
+
+def test_flip_detail_mentions_nobody():
+    """The ping went with the channel: Event Echo posts silently.
+
+    The old leaderboard post opened with `<@&game_role>`. Nothing in the copy
+    may reintroduce that — the echo's own AllowedMentions.none() would render
+    it as dead highlighted text rather than a notification.
+    """
+    assert "<@&" not in flip_echo_detail(5, "Answer the QOTD")
+    assert "@everyone" not in flip_echo_detail(5, None)
+
+
+def test_tier_echo_line_reports_the_tier_and_the_crowd():
+    line = tier_echo_line(2, 72, 100, 14)
+    assert "Tier 2 down" in line
+    assert "72%" in line and "14 of you" in line
+    assert "next tier's on the board" in line
+
+
+def test_tier_echo_line_does_not_promise_a_tier_after_the_last():
+    """A host would have caught this; an unedited bot post would not.
+
+    The copy came from the beat sheet's "Suggested post", which a human was
+    expected to fix up. Posting it verbatim means the full clear can't still
+    be pointing at a next tier.
+    """
+    line = tier_echo_line(3, 100, 100, 14)
+    assert "full clear" in line
+    assert "next tier" not in line
+
+
+def test_tier_echo_line_never_names_the_goal():
+    """The echo's headline carries the title; repeating it wastes the line."""
+    assert "Send Messages" not in tier_echo_line(1, 40, 100, 3)
+
+
+@pytest.mark.parametrize(
+    "panel, echoed",
+    [
+        pytest.param({"guide_channel_id": 77, "guide_message_id": 88},
+                     True, id="panel-posted"),
+        # Regressions from the old behavior, accepted with the move: these
+        # guilds used to get a post in the leaderboard or bank channel.
+        pytest.param({"guide_channel_id": 77, "guide_message_id": 0},
+                     False, id="channel-set-but-panel-never-posted"),
+        pytest.param({"guide_channel_id": 0, "guide_message_id": 0},
+                     False, id="no-panel-at-all"),
+    ],
+)
+async def test_quest_flip_echo_needs_a_panel_to_link_at(db, monkeypatch, panel, echoed):
+    """"New quests are up" pointing nowhere is an alarm, not an announcement.
+
+    The panel message is the only surface that renders the week's quests, so
+    it is what the echo links at — the same gate `raffle_last_call` applies to
+    the shop panel, for the same reason.
+    """
+    from unittest.mock import AsyncMock
+
+    from bot_modules.economy import loop
+
+    _enable(db, **panel)
+    monkeypatch.setattr(loop.echo_svc, "echo_quest_flip", AsyncMock(return_value=True))
+    bot = _Bot([_Guild(GUILD)])
+
+    await loop._echo_quest_flip(bot, db, GUILD, _ts("2026-07-27"))
+
+    assert loop.echo_svc.echo_quest_flip.await_count == (1 if echoed else 0)
+    if echoed:
+        kwargs = loop.echo_svc.echo_quest_flip.await_args.kwargs
+        assert kwargs["week"] == "2026-W31"
+        assert (kwargs["channel_id"], kwargs["message_id"]) == (77, 88)
+
+
+# ── DB work never blocks the event loop (review A1) ───────────────────────────
+
+
+def _direct_open_db_calls(source: str) -> list[str]:
+    """Async functions in the module that call ``open_db`` on the event loop.
+
+    A blocking ``with open_db(...)`` inside an ``async def`` body stalls every
+    other coroutine for the duration of the transaction. The loop's convention
+    is to push the query into a sync closure and ``await asyncio.to_thread``
+    it, so ``open_db`` may only appear inside a nested plain ``def``.
+    """
+    import ast
+
+    offenders: list[str] = []
+
+    def _scan(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef):
+                continue  # a sync closure — that's the to_thread target
+            if isinstance(child, ast.AsyncFunctionDef):
+                _scan(child, child.name)
+                continue
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "open_db"
+                and owner
+            ):
+                offenders.append(owner)
+            _scan(child, owner)
+
+    _scan(ast.parse(source), "")
+    return offenders
+
+
+def test_no_blocking_db_calls_in_async_bodies():
+    from pathlib import Path
+
+    source = Path(economy_loop.__file__).read_text(encoding="utf-8")
+    assert _direct_open_db_calls(source) == []
+
+
+# ── Flash Theme sweep (run_theme_expiry) ───────────────────────────────
+
+THEME_CH = 6666
+
+
+def _theme_on(db_path, **overrides):
+    values = dict(
+        flash_theme_enabled=True, price_flash_theme=100,
+        theme_channel_id=THEME_CH, theme_expire_days=3, theme_hours=24,
+    )
+    values.update(overrides)
+    _enable(db_path, **values)
+
+
+def _theme(db_path, user_id=USER, title="Cursed Cooking"):
+    from bot_modules.economy.theme_service import submit_theme
+
+    with open_db(db_path) as conn:
+        settings = load_econ_settings(conn, GUILD)
+        apply_credit(conn, GUILD, user_id, 500, "grant", actor_id=9001)
+        return submit_theme(
+            conn, settings, GUILD, user_id, title, "Post the worst thing you ate."
+        ).submission_id
+
+
+def _queue(db_path, user_id=USER, title="Cursed Cooking"):
+    from bot_modules.economy.theme_service import approve
+
+    sid = _theme(db_path, user_id, title)
+    with open_db(db_path) as conn:
+        approve(conn, sid, resolver_id=9001)
+    return sid
+
+
+def test_run_theme_expiry_takes_down_a_finished_theme_without_refunding(db):
+    """A theme that ran its window is a completed purchase."""
+    from bot_modules.economy.theme_service import go_live
+
+    _theme_on(db)
+    now = time.time()
+    sid = _queue(db)
+    with open_db(db) as conn:
+        go_live(
+            conn, sid, theme_channel_id=THEME_CH, theme_message_id=42,
+            window_seconds=86400, now=now - 2 * 86400,
+        )
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert sweep.unpins == [(THEME_CH, 42)]
+        assert sweep.refunds == []
+        assert get_balance(conn, GUILD, USER) == 400
+
+
+def test_run_theme_expiry_refunds_a_theme_no_mod_reviewed(db):
+    _theme_on(db)
+    now = time.time()
+    sid = _theme(db, user_id=USER + 1)
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_theme_submissions SET created_at = ? WHERE id = ?",
+            (now - 10 * 86400, sid),
+        )
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert [n.user_id for n in sweep.refunds] == [USER + 1]
+        assert sweep.refunds[0].refund == 100
+        assert get_balance(conn, GUILD, USER + 1) == 500
+
+
+def test_run_theme_expiry_promotes_the_next_theme_when_the_channel_is_free(db):
+    _theme_on(db)
+    sid = _queue(db)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, time.time())
+        assert sweep.promote is not None
+        assert sweep.promote["id"] == sid
+        assert sweep.settings is not None
+
+
+def test_a_running_theme_blocks_promotion(db):
+    """A paid theme is never cut short to make room for the next one."""
+    from bot_modules.economy.theme_service import go_live
+
+    _theme_on(db)
+    now = time.time()
+    first = _queue(db, user_id=USER, title="First")
+    _queue(db, user_id=USER + 1, title="Second")
+    with open_db(db) as conn:
+        go_live(conn, first, theme_channel_id=THEME_CH, theme_message_id=42,
+                window_seconds=86400, now=now)
+    with open_db(db) as conn:
+        assert economy_loop.run_theme_expiry(conn, GUILD, now).promote is None
+
+
+def test_a_handover_happens_inside_one_tick(db):
+    """The take-down frees the channel, so the next theme is picked in the same
+    sweep rather than leaving the channel bare for an hour."""
+    from bot_modules.economy.theme_service import go_live
+
+    _theme_on(db)
+    now = time.time()
+    first = _queue(db, user_id=USER, title="First")
+    second = _queue(db, user_id=USER + 1, title="Second")
+    with open_db(db) as conn:
+        go_live(conn, first, theme_channel_id=THEME_CH, theme_message_id=42,
+                window_seconds=86400, now=now - 2 * 86400)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert sweep.unpins == [(THEME_CH, 42)]
+        assert sweep.promote is not None and sweep.promote["id"] == second
+
+
+def test_an_empty_queue_promotes_nothing(db):
+    """A day with no theme is a normal day — nothing is posted."""
+    _theme_on(db)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, time.time())
+        assert sweep.promote is None and sweep.unpins == [] and sweep.refunds == []
+
+
+@pytest.mark.parametrize(
+    "off",
+    [
+        pytest.param(dict(flash_theme_enabled=False), id="toggle-off"),
+        pytest.param(dict(theme_channel_id=0), id="no-channel"),
+        pytest.param(dict(enabled=False), id="economy-off"),
+    ],
+)
+def test_run_theme_expiry_skips_a_disabled_guild(db, off):
+    _theme_on(db)
+    sid = _queue(db)
+    assert sid
+    _theme_on(db, **off)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, time.time())
+        assert sweep.promote is None and sweep.unpins == [] and sweep.refunds == []
+
+
+def test_a_free_themed_day_still_runs(db):
+    """Price 0 means free here, not disabled — the toggle is the off switch."""
+    _theme_on(db, price_flash_theme=0)
+    sid = _queue(db)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, time.time())
+        assert sweep.promote is not None and sweep.promote["id"] == sid
+
+
+def test_switching_themes_off_still_takes_down_a_running_one(db):
+    """Unchecking "Sell themed days" while a theme is live must not strand it:
+    the row would sit in `live` forever with its announcement never unpinned,
+    and because `live` counts as in-flight that buyer could never buy again."""
+    from bot_modules.economy.theme_service import go_live
+
+    _theme_on(db)
+    now = time.time()
+    sid = _queue(db)
+    with open_db(db) as conn:
+        go_live(conn, sid, theme_channel_id=THEME_CH, theme_message_id=42,
+                window_seconds=86400, now=now - 2 * 86400)
+    _theme_on(db, flash_theme_enabled=False)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert sweep.unpins == [(THEME_CH, 42)]
+        assert sweep.promote is None  # but nothing new starts
+
+
+def test_switching_themes_off_still_refunds_unreviewed_requests(db):
+    _theme_on(db)
+    now = time.time()
+    sid = _theme(db, user_id=USER + 1)
+    with open_db(db) as conn:
+        conn.execute(
+            "UPDATE econ_theme_submissions SET created_at = ? WHERE id = ?",
+            (now - 10 * 86400, sid),
+        )
+    _theme_on(db, theme_channel_id=0)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert [n.user_id for n in sweep.refunds] == [USER + 1]
+        assert get_balance(conn, GUILD, USER + 1) == 500
+
+
+def test_a_disabled_economy_sweeps_nothing_at_all(db):
+    """The economy being off is different from themes being off: nothing runs."""
+    from bot_modules.economy.theme_service import go_live
+
+    _theme_on(db)
+    now = time.time()
+    sid = _queue(db)
+    with open_db(db) as conn:
+        go_live(conn, sid, theme_channel_id=THEME_CH, theme_message_id=42,
+                window_seconds=86400, now=now - 2 * 86400)
+    _theme_on(db, enabled=False)
+    with open_db(db) as conn:
+        sweep = economy_loop.run_theme_expiry(conn, GUILD, now)
+        assert sweep.unpins == [] and sweep.refunds == [] and sweep.promote is None
+
+
+# ── emoji sponsorship expiry ─────────────────────────────────────────
+
+
+def test_emoji_expiry_never_refunds_another_guilds_submission(db):
+    """One guild's pass sweeps its own queue on its own dial, nobody else's.
+
+    The loop runs this once per guild. Guild A expires after 1 day; guild B
+    gives staff 14. A 5-day-old pending submission in B is inside B's window,
+    so A's pass must leave it pending and B's member's escrow where it is —
+    until 2026-09-14 the SELECT had no guild predicate, and A's pass refunded
+    it on A's dial with the notice filtered out, so nobody was even told.
+    """
+    from bot_modules.economy.emoji_service import (
+        get_submission,
+        submit_sponsorship,
+    )
+
+    other_guild = GUILD + 1
+    _enable(db, price_emoji=60, emoji_sponsor_expire_days=1)
+    _enable(db, guild_id=other_guild, price_emoji=60, emoji_sponsor_expire_days=14)
+    now = time.time()
+    with open_db(db) as conn:
+        apply_credit(conn, other_guild, OTHER, 100, "grant", actor_id=USER)
+        sub = submit_sponsorship(
+            conn, load_econ_settings(conn, other_guild), other_guild, OTHER,
+            name="their_blob", image_path="/tmp/their_blob.png", animated=False,
+            blocklist_patterns=[], taken_names=set(), guild_slots_free=True,
+        )
+        conn.execute(
+            "UPDATE econ_emoji_submissions SET created_at = ? WHERE id = ?",
+            (now - 5 * 86400, sub.submission_id),
+        )
+
+        assert economy_loop.run_emoji_expiry(conn, GUILD, now) == []
+        assert get_submission(conn, sub.submission_id)["state"] == "pending"
+        assert get_balance(conn, other_guild, OTHER) == 40
+
+        # B's own pass, on B's dial, still leaves it: 5 days < 14.
+        assert economy_loop.run_emoji_expiry(conn, other_guild, now) == []
+        assert get_balance(conn, other_guild, OTHER) == 40

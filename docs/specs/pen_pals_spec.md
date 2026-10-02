@@ -1,0 +1,359 @@
+# Pen Pals — Feature Spec
+
+Members opt in to a pairing pool. How they're paired depends on the guild's **Pairing Mode** (`pen_pals_config.match_mode`, dashboard-set, default `instant`):
+
+- **Instant**: joining pairs immediately when an eligible member is already waiting; otherwise the joiner sits in the pool and is paired the moment the next eligible member joins. The background loop also sweeps each pool every 5 minutes, so anyone who was ineligible at join time is paired within minutes of becoming eligible.
+- **Scheduled**: joining never pairs on the spot; everyone queues, and the whole eligible pool is drawn in one batch at the configured day and hour (`auto_round_dow` / `auto_round_hour`, guild-local via `tz_offset_hours`; default every day at 12:00).
+
+Each pair gets a private two-person text channel with a conversation-starter from the question bank posted into it, torn down after a configurable session length (default 24 hours). **A member is in at most one pen pal chat at a time**, and is only re-matched once their last chat has been over for a configurable cooldown (default a month). The goal is low-stakes 1-on-1 connection inside the server. Session length, match cooldown, question-swap cap, close-warning window, and question-suppress window are all configured on the dashboard's Pen Pals → Timing & Limits section; Pairing Mode lives with the rest of the Setup fields.
+
+## Commands
+
+| Command | Type | Permission | Purpose |
+|---|---|---|---|
+| `/penpals join` | Slash | Everyone (server only) | Instant mode: matched on the spot if someone eligible is waiting, otherwise queued until the next person joins. Scheduled mode: always queued, paired in the next scheduled round |
+| `/penpals leave` | Slash | Everyone (server only) | Leave the pool **and stay out**; works mid-chat too, and holds until you rejoin. Command description: "Leave the Pen Pals pool — works mid-chat, and holds until you rejoin." |
+| `/penpals status` | Slash | Everyone (server only) | Ephemeral: current pairing state, time remaining, or pool position |
+| `/penpals block` | Slash | Everyone (server only) | Ephemeral panel to manage your own "never match me with these members" list |
+| `/penpals new-question` | Slash | Session members (active channel only) | Replace the current question with a fresh one from the bank (max 3 per session) |
+| `/penpals end` | Slash | Everyone (active channel only) | Start a 15-second confirm to close your current pen pal early |
+| `/penpals pair <user1> <user2>` | Slash | Manage Guild | Force-pair two members who are both waiting in the pool, bypassing queue order and cooldown |
+| `/penpals round` | Slash | Manage Guild | Force a pool sweep now instead of waiting for the automatic one (the 5-minute tick in instant mode, or the configured daily round in scheduled mode; default every day at 12:00 server-local time) |
+| Pen Pals | Web (dashboard) | Moderator | One page under Social. Settings: category, opt-in role, question category, log + panel channels, session opening message, never-match separations. Below them, the question-bank manager (`game_type = 'pen_pals'`) |
+
+## Behavior
+
+### Pool and pairing
+
+`/penpals join` adds the invoker to the pool. In **instant mode** it then immediately looks for a partner: a candidate is eligible when they are **not already in an active session** and are past the re-match cooldown; among the eligible waiters (oldest signup first) the bot takes the oldest one the invoker has never been paired with, and matches nobody if they have all been pen pals with the invoker before. If a partner is found the channel opens right there and the invoker is told "🖊️ Matched! Say hi to @them in #channel." If nobody is eligible (an empty pool, everyone waiting is on cooldown or already chatting, everyone waiting has already been their pen pal, or the invoker is themselves on cooldown), they're told "You're in the pool! The moment someone else joins, your private channel opens automatically." In **scheduled mode**, joining never attempts a match; the invoker is always told "You're in the pool! Matches go out once a day at 12:00 PM server time" (the copy quotes the guild's configured round day and hour), and pairing happens only in the daily round below. A member already in an active pen pal is blocked from joining at all until their session expires or they end it early; in instant mode, a pairing that fails (permissions, a lost race, a member who left) leaves the joiner in the pool rather than costing them their spot.
+
+**One chat at a time** is enforced in three places: the join guard, the eligibility filter (so a stale pool row can never hand someone a second channel), and a final re-check inside the pairing transaction that aborts and deletes the freshly-created channel if a concurrent join won the race.
+
+Rounds pair the *eligible* pool members (see **Match cooldown**) in FIFO order, leaving ineligible members in the pool; if an odd number is eligible, the last one stays in. In **instant mode**, rounds are the sweeper for whoever instant matching left behind (the odd one out, members who joined while on cooldown, failed pairs): the background tick runs a round for every such guild whose pool holds **two or more eligible members**, checked every 5 minutes, so a backlog clears on its own without any schedule. In **scheduled mode**, rounds are the *only* way anyone gets paired: the background tick runs one round per guild once each scheduled local day, the first tick at or after the configured hour (`_scheduled_round_due` compares guild-local dates against `last_auto_round_at`, so a bot restart after the hour catches up immediately rather than waiting for the next day, and the round never fires twice in one day even if ticks drift; when `auto_round_dow` names a weekday the round only runs on it). `/penpals round` forces the same sweep immediately in either mode and reports ephemerally: "Paired **N** pairs. **M** members still in the pool (waiting or on cooldown)."; the pool count includes members left behind by the cooldown, so it isn't the number who'll pair next.
+
+### Channel lifecycle
+
+**Creation.** The bot creates a text channel under the configured Pen Pals category. Name format: `penpals-<user1>-<user2>` (display names, lowercased, spaces replaced with `-`, truncated to 100 chars total). Permissions: the two members and the bot always get full view/send; who else gets a view overwrite depends on **Room visibility** below (admin roles by default; mods too only when the dashboard's room-visibility setting says so). When the guild's question category is `all` (NSFW prompts included), the channel is created age-restricted so the channel gate matches the content that can appear in it.
+
+The bot posts two messages in sequence and pins the first:
+
+**Message 1: intro card (pinned)**
+
+A Components V2 card (`layouts.build_intro_layout`), no embed:
+
+```
+## 🖊️ Pen Pals
+{pen_pals_config.intro_message}        (omitted entirely when blank — the default)
+────
+**{user1}** × **{user2}**               (display names, never mentions)
+Closes <t:{unix_expiry}:R>, on <t:{unix_expiry}:F>
+`/penpals new-question` — swap the prompt ({max_question_swaps} max)
+`/penpals end` — leave this chat early
+                                        (the swap line is omitted entirely when the dial is 0)
+-# Admins can see this channel.         (varies with room visibility —
+                                        "Admins and mods can see this channel." or
+                                        "This channel is visible to everyone (they can read, not post).")
+```
+
+The card names the pair and pings nobody: it is sent with
+`AllowedMentions.none()`, because the opening message is admin-written and may
+hold a mention. The ping is message 2's job.
+
+**Room visibility** (`pen_pals_config.room_visibility`, dashboard select, default
+`admin`). Each pairing's channel is private to the two members; this controls who
+else gets a view overwrite, built in `_create_channel` from the guild's
+`admin_role_ids` / `mod_role_ids`:
+
+| Value | Who else can see |
+|---|---|
+| `admin` *(default)* | configured admin roles only (Discord admins bypass overwrites regardless) |
+| `mods` | admin roles **and** mod roles |
+| `everyone` | `@everyone` can view + read history, but only the two members and staff can post (watch-only public room) |
+
+**The default is `admin`, on purpose** (Ben, 2026-09-30: "the visibility should
+be only admins and the users"). It was `mods` from migration 126 until then, and
+`mods` is still the *column's* default; SQLite cannot change one in place, so
+every insert names the value (`_ensure_config_row`) rather than leaning on the
+schema; `test_a_row_created_by_the_timers_save_is_admins_only` fails if that is
+reverted. A row that already says `mods` cannot be told from a choice and is
+left alone: an existing guild moves only when someone sets **Who Can See Each
+Chat** on the dashboard. A change applies to rooms created **after** the setting
+is saved; open rooms keep the overwrites they were made with. Unresolvable
+configured role ids are skipped. The signup panel's privacy line follows the
+same dial, so it never promises more privacy than the rooms have.
+
+**Message 2: first question**
+
+```
+[small lobby strip, "Pen Pals" drawn between the leaves]
+## 🖊️ Your First Question             (dropped when the strip carries the name)
+<@user1> <@user2>                      (pings exactly these two)
+💬 Here's your first question:
+> {question}
+[hub footer]
+```
+
+Every conversation starter; this one, the daily top-up ("A New Question",
+"💬 A new question to keep things going:") and a `/penpals new-question` swap
+("Question Swapped", "🔄 New question (N swaps remaining):"); is this
+Components V2 card (`layouts.build_question_layout`). **It pings both members
+in its body**, sent with an allow-list of exactly those two, since a V2 message
+has no `content=` to carry a ping; each member is named once, by the ping. It
+wears the small lobby strip and the hub footer (Ben, 2026-09-30: "do the small
+banners for new questions in the channel"), pinned in `LOBBY_ART_BUILDERS`.
+With no Lobby Header uploaded it is a plain `## 🖊️` card, and a failure to
+read or draw the art posts it plain rather than losing the question.
+
+The expiry timestamp uses Discord's absolute + relative format so both users see it in their local time.
+
+**Session countdown (default 24 hours, configurable).** A background task checks active sessions every 5 minutes. When `now ≥ expiry_at`, the channel is deleted. A warning is posted when the configured close-warning window remains (default 1 hour): "⏰ This pen pal channel closes in 1 hour." Deletion only removes the channel; no transcript is produced.
+
+**Expiry returns members to the pool (`_close_expired_and_requeue`).** A match is the only thing that drains the pool, so before 2026-08-14 (when expiry re-pooled nobody and said nothing) every round left the pool smaller than it found it and refilling depended entirely on members walking back to the signup panel of their own accord. The Golden Meadow's pool ran down to a single member and made no matches for five days. Now, when a session runs its full course, **both members go back in the pool** and each gets a DM: "🖊️ Your pen pal channel has closed — your time with @them is up… You're back in the Pen Pals pool. You can be matched again `<t:…:R>`," with a **Leave the pool** button. The copy deliberately names no duration: session length is a per-guild dial, and `match_cooldown_seconds` ships at **30 days**, so "a new match can come along any time" would be a month wrong on a guild that never touched it. The wait is rendered as a Discord relative timestamp, and that sentence is replaced by "any time" only when the cooldown is genuinely 0.
+
+There are two exceptions. The first is a **durable opt-out** (see *Leaving the pool*): a member who has left the pool is not put back by this path or any other, is recorded as `skip`/`opted_out`, and is sent the plain "your time is up" DM with no button; they already know, and offering to undo a decision they just made is the bot arguing with them. The second is engagement. A member who **posted nothing at all** in the channel is *not* re-pooled: recycling someone who ghosted into another member's 24 hours costs a real member their turn. They get the softer note instead ("That one stayed quiet, so we've unqueued you for now. Hop back in whenever you're up for another.") with a **Join the pool** button. Whether someone spoke is read from the guild-wide `messages` metadata log (author + timestamp, no text; the same source the reply reminder uses), keyed on the channel id, which identifies exactly one session for all time.
+
+Re-pooling does not mean re-matching: a requeued member is in the pool immediately but stays **ineligible until `match_cooldown_seconds` has passed since this close** (see **Match cooldown**), so nobody is handed a new partner seconds after saying goodbye. The close is claimed *before* the channel is deleted, exactly as on the abnormal paths, so the `on_guild_channel_delete` our own delete fires finds the session already closed and does nothing; a chat that simply ran its course must never be reported to its members as abandoned.
+
+**The requeue cannot restart a pool that has already drained**: it fires on expiry, so a guild with no active sessions has nothing to trigger it. That was The Golden Meadow's state on 2026-08-15 (pool 1, active sessions 0), and a one-off seed (`scripts/backfill_pen_pals_pool.py`, deleted 2026-09-30; git history keeps it) was written for it: it pooled every member whose most recent closed session they actually posted in, backdating `joined_at` to that session's close so FIFO order reflects who has waited longest. It did not bypass the cooldown and sent no DMs.
+
+It reads **live Discord state** (guild members + `opt_in_role_id`), not session history, and pools only members who are still in the guild and hold the opt-in role. History cannot tell you who left, and a departed member seeded into the pool is a row nothing can ever clear. `--no-discord` skips that check for offline dry runs and is refused alongside `--apply`.
+
+A member who has **left the guild** is never re-pooled, checked against `channel.guild` at expiry. `on_member_remove` is the only thing that prunes the pool, and a member who leaves while the bot is down never fires it; their session survives to expiry, and re-pooling them would plant a row nothing can clear. Their event is recorded as `skip`/`departed` rather than `inactive`: there is nobody left to tell, and no button that would help them.
+
+Members are checked for a seat **before** the engagement test, not after: someone already pooled or already in another chat keeps what they have either way, and testing them for silence first would tell a still-queued member they had been unqueued.
+
+The DM buttons are their own `DynamicItem`s (`pen_pals:dm:join:{guild_id}` / `pen_pals:dm:leave:{guild_id}`) rather than the panel's: a DM interaction carries no guild, so the guild is named in the custom_id and resolved from the bot cache. They run the same handlers as the panel buttons, opt-in role gate included; a DM button is not a way around a role check. The DM path additionally checks `guild.get_member(...)`, which the panel path gets for free: pressing a button in a guild channel proves membership, a DM button proves nothing, and the DM outlives the membership. Without that check a member who left could re-insert a pool row for a guild they aren't in, and nothing would clear it; `_do_pair` refuses on the missing member, but `_do_round` has already taken their would-be partner out of that round, so a real member loses a match every round indefinitely.
+
+**Early close.** `/penpals end` in the active channel prompts the invoker for a 15-second confirm ("⚠️ End This Chat Early?", a red **End Session** and a grey **Cancel**). Either member can initiate; the channel is deleted on confirmation. **Cancel is silent**; the confirm deletes itself and nothing else changes, and a confirm left alone grays its buttons out after the 15 seconds. The other member receives a DM: "🖊️ Your Pen Pal Chat Ended Early — Your partner ended the chat early." The DM's server icon and `-# From {server}` line name the server, so the body does not.
+
+**Partner leaves mid-session.** If a session member leaves (voluntarily, kicked, or banned), `on_member_remove` closes the session (`close_reason = 'member_left'`), deletes the channel, and returns the *surviving* partner to the pool for a fresh match. The departed member is dropped from the pool and never re-queued. The survivor gets a DM: "🖊️ Your Pen Pal Chat Ended Early — Your partner is no longer available. You've been put back in the Pen Pals pool for a new match." A survivor who has **opted out** is told too, with the same DM ending "You've left the pool, so we haven't put you back in — join again whenever you'd like another." Not re-pooling someone is never a reason to say nothing: an abnormal close deletes a channel out from under a live conversation, which is the ending that most needs explaining. This does **not** run the expiry path, so `pen_pal_complete` (the quest hook) does not fire for an abandoned session.
+
+**Partner takes a break** (2026-09-26, `end_for_break`). Take a Break ends the member's session the same way (channel deleted, partner re-pooled and sent the same "no longer available" DM, so nothing says why), with `close_reason = 'member_break'`. A member only waiting in the pool is taken out (`leave`/`break` pool event). No opt-out is written, and they are **not** re-pooled when the break ends: they rejoin from the Pen Pals panel. See `docs/specs/take_a_break_spec.md`.
+
+**Channel deleted.** If a mod deletes an active pen pal channel, `on_guild_channel_delete` closes the session (`close_reason = 'channel_deleted'`) and returns **both** members to the pool with the same DM. Since a ban's channel deletion also fires this event, the close is claimed atomically; whichever handler runs first wins, and the duplicate is a no-op, so no one is re-queued twice.
+
+**Channel already gone.** If the channel is missing when the background task goes to clean up (e.g. it was deleted while the bot was offline, so `on_guild_channel_delete` never fired), the session is closed with `close_reason = 'channel_missing'` and both members are returned to the pool; the same teardown as a manual delete.
+
+### Questions
+
+Questions are drawn from `games_question_bank` where `game_type = 'pen_pals'`, using the shared tags model: rows tagged `nsfw` are only served when the guild's question category is `all`. The pair's question history is tracked per session to avoid repeating within the 24-hour window; the draw itself is round-robin (least-recently-served row first, ties random) so the same small pool doesn't resurface a question across separate sessions until every row has been served once. If the bank is exhausted the bot serves a single static question (`_FALLBACK_QUESTION`) so a matched pair is never handed an empty round. The AI generation fallback that used to sit here (`prompt_config.json` → `games.pen_pals`) went away with the Prompts & AI studios.
+
+**Automatic cadence.** The auto-question machinery fires every 24 hours after pairing:
+
+```
+{user1.mention} {user2.mention}
+💬 A new question to keep things going:
+> {question}
+```
+
+In practice a default-length (24-hour) session shows only the opening question: the first follow-up would land exactly as the channel closes, and the background task suppresses any auto-question if less than the configured question-suppress window remains (default 2 hours). Members who want a fresh prompt sooner use the manual swap.
+
+**Manual swap.** `/penpals new-question` posts a question immediately out of cycle, visibly delineating the conversation:
+
+```
+{user1.mention} {user2.mention}
+🔄 New question ({n} swap(s) remaining):
+> {question}
+```
+
+A manual swap does not reset the 24-hour auto-cadence clock. After the configured swap cap is used (default 3) the command is blocked: "You've used all N question swaps for this session."
+
+### Reply reminders
+
+`pen_pals_config.reply_reminder_seconds` (dashboard, **0 = off, the default**) nudges
+whoever the room is waiting on. On each 5-minute tick, `_reply_reminder_due` reads
+the most recent message in the channel authored by *either member* (from the
+guild-wide `messages` metadata log, which keeps author + timestamp and no text,
+so Pen Pals needs no ingest of its own), and if that message is older than
+the configured window, the member who is **not** its author gets:
+
+```
+👋 {quiet.mention} — your pen pal's still waiting on a reply. No rush, but don't leave them hanging!
+```
+
+`allowed_mentions` allow-lists that one member: the partner is prose, not a ping.
+
+**Once per silence.** `pen_pals_sessions.reply_reminder_sent_at` stamps the nudge
+and is compared against the last member message rather than being cleared on reply:
+once the quiet member speaks, their message is newer than the stamp and the next
+lull re-arms on its own. The stamp is written even when the send fails, so an
+unpostable channel can't re-qualify every tick.
+
+Four things suppress a reminder:
+
+- **Nobody has spoken yet.** Only member messages count, so an unanswered
+  auto-question is not somebody's partner waiting on them; that is the question
+  cadence's business, not this.
+- **The closing warning is out** (`close_warning_sent`, including a warning posted
+  on this same tick); no "reply!" stacked on "this closes in an hour".
+- **A question was posted on this tick**, which already pinged both members.
+- **The pair is blocked or on the no-contact list.** Neither ends a running
+  session, so the reminder has to check at send time: nudging someone toward a
+  partner they have since blocked is exactly what those lists exist to prevent.
+
+There is no per-member opt-out; the dial is guild-level.
+
+### Match cooldown
+
+A member is only eligible for a new pairing once they've had no pen pal for a configurable cooldown (default a month), measured from the moment their most recent chat **ended** (`closed_at`, falling back to `started_at` for a session still open; `_last_pen_pal_ended_at`). The cooldown is rest *between* chats, so it does not tick while a chat is running: a 48-hour cooldown means 48 hours of quiet after the channel closes, whatever the session length. (It was originally anchored to `started_at`, which made real rest `cooldown - session_length` and made any cooldown shorter than the session no rest at all.) It applies to both sides of a match on every path: instant matching (when in that mode) checks the joiner *and* the candidate, and a round (instant mode's sweep or scheduled mode's daily draw) skips ineligible members and leaves them untouched in the pool. They become eligible automatically once the cooldown has passed. Set it to 0 to allow back-to-back chats. `/penpals pair <user1> <user2>` is an explicit admin override and ignores the cooldown, but not the one-chat-at-a-time rule, and not consent: both members must already be in the pool (`/penpals join`), the same population a round draws from. There is no bypass flag; if an override is ever wanted it belongs on the dashboard.
+
+### No-repeat pairing
+
+Both paths share `_pick_partner`: among the *eligible* candidates it takes the oldest waiter the member has **never** been paired with in this guild. The exclusion list (`_past_partners`) is all-time, not a recency window; two members who have been pen pals once are never matched again.
+
+This is a hard gate, not a preference. When every eligible candidate is a past partner, `_pick_partner` returns `None` and the member stays pooled for a later round; a repeat is deferred until someone new turns up, never forced. The member is left in the pool untouched on both paths; instant matching tells the joiner "You're in the pool!", and a round skips them and moves on.
+
+The cooldown alone cannot deliver this, which is what the original preference-only version missed: the cooldown runs from the pair's *shared* session, so **both halves come off it at the same instant** and float back into a pool that may hold nobody else. The two guild rematches observed in production (2026-07-23 → 2026-07-25, both at cooldown + ~1 minute) were exactly this; the fallback-to-oldest branch handing each member back the person they had just finished with.
+
+`/penpals pair <user1> <user2>` remains the admin override and ignores the no-repeat gate, the same way it ignores the cooldown.
+
+### Opt-in role (optional)
+
+If an opt-in role is configured, `/penpals join` requires the invoker to hold that role. Members without it are told: "You need the **{role}** role to join Pen Pals." This lets the server gate participation (e.g., require Level 5 or a verified role).
+
+### Leaving the pool (durable opt-out)
+
+Leaving is a preference, not a row deletion. `/penpals leave`, the panel's **Leave Pool** button, the closing DM's **Leave the pool** button and the **Leave Pen Pals** button on a member's own `/info` card (recorded as `info_panel`) all run one handler, which clears the pool row *and* writes `pen_pals_optouts` (migration 174). Nothing re-pools an opted-out member: both requeue paths skip them (recording `skip`/`opted_out`), `_eligible_pool` filters them as a last gate before pairing, and the one-off seed passed over them. Joining, by any surface, clears the flag, and is the only thing that does; there is no staff-side clear, because an opt-out is the member's own decision about being put in a private room with a stranger.
+
+**It works while you are matched**, which is the whole point. Before 2026-08-20 a matched member was by definition not in the pool, so every leave surface answered "❌ You're not in the pool" and did nothing, and being matched is exactly when someone decides they have had enough. The only window the old code offered was the gap between one chat closing and the next round, reachable only through a DM that a member with DMs closed never receives. Leaving mid-chat does **not** end the conversation (that is `/penpals end`) and is invisible to the partner; it decides only what happens when the chat closes, and `/penpals status` is the one place it is reflected back.
+
+This mattered because expiry re-pools (below): before the flag existed, leaving held only until your current chat ended, so anyone who had ever been matched could not stay out. A TGM member was put back by the bot on 08-17 and matched again on 08-19 with no `join` of her own anywhere in `pen_pals_pool_events`; the pool had no way to remember she had asked to be left alone.
+
+The opt-out is **per guild**: leaving one server's pool is not leaving another's.
+
+### Never-match blocks
+
+Two sources feed one exclusion list, and matching treats every entry as **symmetric**; a pairing is skipped whenever any entry connects the two members in either direction:
+
+- **Member blocks (self-service).** `/penpals block` opens an ephemeral panel: a user-select adds people to your personal "never match me with them" list, a select of your current blocks removes them, and **Done** closes the panel. One member blocking is enough to prevent that pairing, and the other side is never told they were blocked. Blocking is directional intent but symmetric in effect; it does **not** end a chat you're already in (use `/penpals end` for that). Self- and bot-selections are ignored.
+- **Admin separations.** The dashboard Pen Pals panel has a "Never-match separations" section where a mod pairs two members who must never be matched, regardless of either member's own list. Separations are normalized to one row per couple (order-independent) and are independent of member blocks; replacing the separation list never touches anyone's personal blocks, and unblocking a member never clears an admin separation.
+
+The opt-out is enforced on the same principle: both requeue paths check it, `_eligible_pool` filters it before matching, and `_force_pair_status` checks it too; `/penpals pair` never runs through `_eligible_pool`, so without that a stray pool row would let a mod undo a member's own decision, which is the one thing the feature promises no staff control can do. An opted-out member is reported to the mod as "hasn't opted in", which is what they are.
+
+Enforcement is layered so no path can slip a blocked pair through: instant matching filters the candidate, a round filters each candidate and leaves anyone with no un-blocked partner pooled for a later round, and a final check inside the pairing transaction (`_do_pair`) refuses; this last one also covers `/penpals pair`, which tells the admin "these two can't be paired — one has blocked the other, or they're on the separations list."
+
+### Pool sweep
+
+In instant mode there is no round schedule to configure; the 5-minute sweep always gets there first. In scheduled mode the round *is* the schedule, and it is dashboard-configurable: **Scheduled Round** on the Pen Pals settings panel writes `auto_round_dow` (-1 = every day, 0-6 = Monday-Sunday) and `auto_round_hour` (0-23), both read in the guild's own time through `tz_offset_hours`. *Amended 2026-08-29*: those two columns had existed since migration 048 and were read by nothing; the round fired at a hard-coded 8am America/New_York for every server, whatever its timezone. `last_auto_round_at` records the timestamp of the last round and, in scheduled mode, doubles as the "did today's round already run" marker. Pair confirmations go to the configured log channel (or nowhere if none is set).
+
+### Cards (Components V2)
+
+Every Pen Pals card is a Components V2 layout built by a pure function in
+`pen_pals/layouts.py` (converted 2026-09-30; `docs/components_v2_style_guide.md`).
+The one-line replies to join, leave, pair and round, the closing warning and
+the reply reminder stay plain messages.
+
+| Card | Where | Paradigm |
+|---|---|---|
+| Signup panel | sticky, public | 1 (hub panel) |
+| Help | ephemeral, from the panel | 7 (notice) |
+| Room intro | pinned in the pair's channel | 7 (notice) |
+| Channel closed | DM | 7 (notice, one button in two of three states) |
+| Chat ended early (partner unavailable / partner ended it) | DM | 7 (notice) |
+| `/penpals status` | ephemeral | 7 (notice) |
+| `/penpals block` | ephemeral | 2 (settings panel) |
+| `/penpals end` confirm | ephemeral | 10 (confirm destructive) |
+| Question (first, daily, swapped) | the pair's room, pings both | 7 (notice) |
+
+- **The signup panel** says what Pen Pals is (quoting the guild's own session
+  length), how a match happens under the guild's pairing mode, how many are
+  waiting, and who can see a chat (following **Room visibility**), over **Join
+  Pool** and **Leave Pool**. Both are grey: Join was green as an embed, and green
+  is kept for the yes on a decision card.
+- **Help** sits beside the panel's title and answers ephemerally with the
+  guild's dashboard doc whose key is **`penpals`**, read at click time. Renaming
+  that doc's key disconnects the button; with no such doc the card says there is
+  no Pen Pals guide yet.
+- **Panel art.** The panel opens on the guild's tall hub banner and closes on
+  the hub footer (`core.layout.hub_banner` / `hub_footer`, pinned in
+  `HUB_BANNER_BUILDERS`), like the other channel hubs (Ben, 2026-09-30: "use the
+  big headers on the panel"). With Branding's **Title in the Banner** on, "Pen
+  Pals" is drawn into the banner and the `##` heading is dropped. Nothing draws
+  on a guild with no panel art uploaded.
+- **Persistent ids are unchanged**: `pen_pals:join`, `pen_pals:leave`,
+  `pen_pals:dm:join:{guild_id}`, `pen_pals:dm:leave:{guild_id}`, so a panel or
+  a closing DM posted as an embed still works. The builders emit plain buttons
+  carrying those ids; the `DynamicItem`s registered in `cog_load` answer them.
+- **Names, not mentions.** The intro, the closing DM and status name a member
+  by display name. Status resolves the partner through `build_name_fn`, so a
+  partner who has left reads as their last known name or `User <id>`. The
+  closing DM says "your pen pal" instead of a name when the pair has been
+  blocked or put on the no-contact list since they were matched; the same
+  words a departed partner gets, so nothing marks the pair out.
+
+## User-visible errors
+
+| When | The user sees |
+|---|---|
+| Pen Pals category not configured | "Pen Pals isn't set up yet — ask an admin." |
+| Already in an active session | "You already have an active pen pal. Use `/penpals status` to see it." |
+| Already in the pool | "You're already in the pool. Use `/penpals status` to check your position." |
+| `/penpals status` when not in the pool and no active session | "You're not in the pool and have no active pen pal. Use `/penpals join` to sign up." |
+| `/penpals status` after opting out | "You left the Pen Pals pool `<t:…:R>` and won't be matched. Use `/penpals join` — or the **Join Pool** button on the signup panel — whenever you want back in." |
+| Leaving the pool with nothing to leave | **Not an error since 2026-08-20.** Leaving always succeeds; see *Leaving the pool*. The old "❌ You're not in the pool" was true of the row and false of the intent |
+| Joining while matched, having previously opted out | "✅ You're back in Pen Pals. Your current chat runs until `<t:…:R>`. When it closes you'll go back in the pool for a new match, as long as you've posted in it." |
+| Opt-in role required but missing | "You need the **{role}** role to join Pen Pals." |
+| `/penpals new-question` outside an active pen pal channel | "This command only works in an active pen pal channel." |
+| All 3 question swaps used | "You've used all 3 question swaps for this session." |
+| Bot lacks Manage Channels in the category, on `/penpals pair` | "❌ Failed to create the channel — check bot permissions." (other paths, such as an instant match or a round, fail silently and leave the members pooled; see **Pool and pairing**) |
+| `/penpals pair` on a member who never joined the pool | "**{name}** hasn't opted in to Pen Pals — they need to run `/penpals join` first. Force-pairing skips the queue, not consent." |
+| `/penpals pair` on a blocked/separated pair | "These two can't be paired — one has blocked the other, or they're on the Pen Pals separations list. Clear the block first if this is intended." |
+| Early-close confirm timed out | The confirm's buttons grey out in place; nothing is closed. |
+| Invoker already has DMs closed for early-close DM to the other party | Silent; DM failure doesn't block channel deletion. |
+
+## Non-goals
+
+- **No anonymity.** Both members can see who they've been paired with from the moment the channel is created. The appeal is connecting with a known-community-member, not a blind pen pal.
+- **No multi-person channels.** Pairs only; no trios or group rooms.
+- **No transcript on close.** Channels are deleted without export. Members who want a record should copy it themselves before the timer expires.
+- **No image or file restrictions.** The channel is a normal Discord text channel; members can send anything their Discord permissions allow.
+- **No carry-over.** When a session ends, no message carries over to a follow-up session. Each pairing starts fresh.
+
+## Configuration
+
+Per-guild keys set via the dashboard:
+
+- **Category**: the Discord category under which pen pal channels are created. Required.
+- **Pairing Mode**: `instant` (default) or `scheduled`. See **Pool and pairing** above.
+- **Opt-in role**: if set, only members with this role can `/penpals join`. Optional.
+- **Question category**: `sfw` (default) or `all` (includes NSFW questions). Optional.
+- **Log channel**: where the bot posts pair confirmations. Optional.
+- **Session opening message**: free text (up to 1000 characters) shown under
+  the heading of the pinned intro card when a pair's channel opens, above
+  who they're matched with and when the chat ends. Optional; blank (the
+  default) omits it entirely.
+- **Enabled**: per-guild on/off switch. Default off.
+- **Never-match separations**: mod-defined pairs of members who must never be matched. Optional; independent of members' own `/penpals block` lists.
+
+**Timing & Limits** (separate dashboard section):
+
+- **Session length**: how long a matched channel stays open. Default 24 hours.
+- **Re-match cooldown**: how long a member must go without a pen pal, counted from the end of their last chat, before they're eligible again. Default 30 days; 0 allows back-to-back chats.
+- **Max question swaps**: how many times a pair can swap the conversation-starter per session. Default 3.
+- **Close-warning window**: how much session time must remain to post the "closing soon" notice. Default 1 hour.
+- **Question-suppress window**: skip posting a new auto-question if less than this much session time remains. Default 2 hours.
+- **Reply-reminder window**: how long a member message can sit unanswered before the quiet partner is nudged. Default 0 (no reminders). See **Reply reminders** above.
+
+## Stored data
+
+**`pen_pals_sessions`**: one row per active or closed pair: `session_id`, `guild_id`, `channel_id`, `user1_id`, `user2_id`, `started_at`, `expiry_at`, `next_question_at`, `question_swaps_used`, `closed_at`, `state` (`active` / `closed`), `close_reason` (`expired` / `early` / `member_left` / `member_break` / `channel_deleted` / `channel_missing`). `next_question_at` advances by 24 hours each time an auto question fires; the background task also uses it to decide whether to post. `reply_reminder_sent_at` stamps the last reply nudge (0 = none yet) and is compared against the last member message, which is what makes reminders fire once per silence rather than once per session.
+
+An erasure **closes then scrubs** rather than deleting (2026-09-17, bug #222). A live session is closed with `close_reason = 'purged'` first, because the orphan-channel sweep on boot keys on a *closed* session: delete the row and the private channel stands forever with nothing left that knows to remove it. Then the member's id is zeroed in whichever seat they held and the row survives, because it is also the other member's all-time no-repeat memory: Art 17(3)(e), applied to the column rather than the row. A returning member is therefore matchable with their old pen pal again, and the surviving member is not re-pooled (erasure runs out-of-band with no bot in hand); one Join press restores them.
+
+**`pen_pals_pool`**: one row per queued member: `guild_id`, `user_id`, `joined_at`. Cleared by `purge_user_data` (2026-09-17, bug #222): it is a live queue rather than a record, and an erased member left in it would be matched and given a private channel.
+
+**`pen_pals_pool_events`** (migration 160): append-only history of pool movement: `guild_id`, `user_id`, `at`, `action` (`join` / `leave` / `skip`), `reason` (`panel`, `command`, `dm`, `info_panel`, `requeue_expired`, `requeue_abnormal`, `backfill`, `matched`, `departed`, `inactive`, `opted_out`, `break`). The pool table is current-state only, which made the two questions you actually ask of a matchmaking pool ("were these people matched, or did they drop out?" and "how long has this been stuck?") unanswerable from the data; the 2026-08-14 stall had to be reconstructed from session timestamps. `skip` is the odd one out: nothing moved, and the row records that a closing session deliberately did *not* re-pool someone, because they never posted (`inactive`), had left the guild (`departed`), or have opted out (`opted_out`, migration 174). Metadata only, and cleared by `purge_user_data`; see `docs/data_register.md`. Surfaced on the dashboard as **Pool Activity** (`GET /config/pen-pals/pool-events`, moderator).
+
+**`pen_pals_optouts`** (migration 174): one row per member who has asked not to be matched: `guild_id`, `user_id`, `at`. Presence is the whole state; `at` records when they *first* asked and is not refreshed by pressing Leave again. Kept as its own table rather than a column on `pen_pals_pool` precisely because the pool row is the thing that keeps being deleted. Cleared by joining, and by `purge_user_data`; see `docs/data_register.md`. Surfaced on the dashboard as **Opted Out** under Pool Activity (same moderator endpoint), read-only.
+
+**`pen_pals_questions`**: which questions have been shown per session: `id`, `session_id`, `question_text`, `shown_at`. Used for no-repeat within a session and for logging what was asked.
+
+**`pen_pals_blocks`**: never-match entries: `guild_id`, `user_id`, `blocked_user_id`, `source` (`member` / `admin`), `created_at`. Member rows are directional (blocker → blockee); admin rows are normalized to `(min_id, max_id)`, one per couple. The match exclusion (`_is_blocked_pair`) treats any row as symmetric across both directions and both sources. An erasure **splits on who the record protects** (2026-09-17, bug #222): the member's own `member`-source rows are deleted as their own preference, while a block somebody else placed against them and an admin separation in either direction are preserved on Art 17(3)(e) as protective records about another member or a moderator decision, which an erasure must not be a way to clear.
+
+Past pairings are queried from `pen_pals_sessions` for the no-repeat check. No separate history table is needed.
+
+---
+
+## Elevator pitch
+
+Most servers have hundreds of members who never talk to each other beyond the same handful of regulars. Pen Pals quietly solves that. Members opt in and, if anyone else is waiting, land immediately in a private channel with someone they probably haven't spoken to one-on-one, a conversation starter already waiting, no awkward "so… hi." The 24-hour window creates just enough structure to make it feel like an event rather than a neglected DM thread. After the timer expires the channel disappears, so there's no pressure to maintain it forever. In instant mode nobody sits waiting for a scheduled round, and a server that prefers a predictable daily "drop" instead can switch to scheduled mode and pair the whole pool at once every morning. Either way the re-match cooldown keeps it from becoming a chore: a slow, low-stakes way for the whole community to actually meet.

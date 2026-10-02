@@ -1,0 +1,33 @@
+#!/bin/sh
+# Hand a merge to the QA card poster. Usually that posts nothing.
+#
+# git does NOT run post-commit for `git merge` — merges get this hook
+# instead. A --no-ff merge commit posts no card by design: the branch it
+# lands is a feature, and a feature's single card is written from everything
+# the branch ever shipped when /dk-ship tears the session down (see
+# post_branch_card, and CLAUDE.md § Commits). The hook is kept for the
+# fast-forward case, where HEAD is a plain commit that never saw
+# post-commit — that still earns its own card.
+#
+# $1 is git's squash flag — a squash merge stages changes without creating
+# a merge commit, so there is nothing to expand; skip it.
+#
+# Installed by scripts/hooks/install.sh into the shared common-dir hooks,
+# same as post-commit. Never fails the merge: every path exits 0.
+# Escape hatch: DK_NO_QUEUE_POST=1 git merge ...
+
+[ -n "$DK_NO_QUEUE_POST" ] && exit 0
+[ "$1" = "1" ] && exit 0
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+script="$top/scripts/post_testing_docs.py"
+
+[ -f "$script" ] || exit 0
+[ -f "$top/.env" ] || exit 0
+
+sha=$(git rev-parse HEAD 2>/dev/null) || exit 0
+
+# Bounded so a network stall can never hold the merge open.
+timeout 90 python3 "$script" --commit "$sha" 2>&1 | sed 's/^/  /'
+
+exit 0

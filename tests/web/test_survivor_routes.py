@@ -1,0 +1,758 @@
+"""Tests for /api/survivor/* — the feature's entire admin surface.
+
+Route-layer behavior the service suite can't see: the config id
+string/int round-trip (snowflake precision), the create-season two-phase
+flow and its degraded role paths, and the 404/409/422 mappings. The
+schedule ingest is stubbed at the module boundary — no network, ever.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.survivor import service as svc
+from bot_modules.survivor.espn import ParsedGame
+
+# A user id comfortably above 2^53 — JS Number would mangle it.
+BIG_ID = 987654321098765432
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Stub the season sweep: creates succeed with an empty ingest unless a
+    test overrides the stub with games of its own."""
+    monkeypatch.setattr(
+        "bot_modules.survivor.espn.fetch_season",
+        AsyncMock(return_value=([], 0, [])),
+    )
+
+
+def _auth_member():
+    """The session's user as a live guild member — auth re-checks perms
+    against the guild whenever ctx.bot is attached (fail-closed)."""
+    m = MagicMock()
+    m.id = 1
+    m.bot = False
+    m.guild_permissions = MagicMock(value=0x8, administrator=True)
+    m.display_name = "tester"
+    default_role = MagicMock(id=0)
+    default_role.is_default = MagicMock(return_value=True)
+    m.roles = [default_role]
+    return m
+
+
+def _attach_bot(fake_ctx, *, roles=(), create_role=None):
+    member = _auth_member()
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.roles = list(roles)
+    # **kwargs: the shared provisioner also passes permissions/hoist/
+    # mentionable (bot_modules/core/role_provision.py).
+    guild.create_role = create_role or AsyncMock(
+        side_effect=lambda name, **kw: MagicMock(id=hash(name) % 10**9, name=name)
+    )
+    guild.get_channel = MagicMock(return_value=None)
+    guild.get_member = MagicMock(
+        side_effect=lambda uid: member if int(uid) == 1 else None
+    )
+    guild.get_role = MagicMock(return_value=None)
+    bot = MagicMock()
+    bot.get_guild = MagicMock(
+        side_effect=lambda gid: guild if gid == fake_ctx.guild_id else None
+    )
+    fake_ctx.bot = bot
+    return guild
+
+
+def _create_season(client, name="The Long Autumn", year=2026):
+    return client.post(
+        "/api/survivor/season", json={"name": name, "season_year": year}
+    )
+
+
+# ── create season ─────────────────────────────────────────────────────
+
+
+def test_create_season_degraded_bot_offline(authed_client, fake_ctx, web_db):
+    resp = _create_season(authed_client)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["season"]["status"] == "enrolling"
+    assert any("bot offline" in note for note in data["role_report"])
+    assert "schedule" in data["schedule_report"]
+    # The audit row is durable — written even when the Discord mirror can't be.
+    with open_db(web_db) as conn:
+        row = conn.execute(
+            "SELECT action, actor_id FROM audit_log "
+            "WHERE action = 'survivor_season_create'"
+        ).fetchone()
+    assert row is not None and row["actor_id"] == 1
+
+
+def test_second_create_is_a_422_not_a_role_spray(authed_client, fake_ctx):
+    guild = _attach_bot(fake_ctx)
+    assert _create_season(authed_client).status_code == 200
+    guild.create_role.reset_mock()
+    resp = _create_season(authed_client, name="Second")
+    assert resp.status_code == 422
+    assert "already has a live season" in resp.json()["detail"]
+    # The refused create must not have touched the guild's role list.
+    guild.create_role.assert_not_called()
+
+
+def test_create_season_creates_missing_roles_and_stores_ids(
+    authed_client, fake_ctx
+):
+    _attach_bot(fake_ctx)
+    resp = _create_season(authed_client)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert sum("created" in note for note in data["role_report"]) == 3
+    config = data["season"]["config"]
+    # Ids stored, and serialized as strings on the wire.
+    for key in ("role_survivor_id", "role_ghost_id", "role_sole_survivor_id"):
+        assert isinstance(config[key], str) and config[key] != "0"
+
+
+def test_create_season_without_manage_roles_degrades(authed_client, fake_ctx):
+    forbidden = discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+    _attach_bot(fake_ctx, create_role=AsyncMock(side_effect=forbidden))
+    resp = _create_season(authed_client)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert sum("Manage Roles" in note for note in data["role_report"]) == 3
+    assert data["season"]["config"]["role_survivor_id"] == "0"
+
+
+def test_create_season_reports_full_slate_not_just_inserts(
+    authed_client, fake_ctx, monkeypatch
+):
+    game = ParsedGame(
+        game_id="g1", week=1, home="SEA", away="NE",
+        kickoff_utc="2026-09-10T00:20:00+00:00", status="scheduled",
+        favorite="SEA", favorite_prob=0.6225, winner=None,
+    )
+    monkeypatch.setattr(
+        "bot_modules.survivor.espn.fetch_season",
+        AsyncMock(return_value=([game], 0, [7])),
+    )
+    resp = _create_season(authed_client)
+    assert resp.status_code == 200
+    report = resp.json()["schedule_report"]
+    assert "1 games, 1 new" in report
+    assert "[7]" in report  # failed weeks surfaced, not swallowed
+
+
+# ── config round-trip ─────────────────────────────────────────────────
+
+
+def test_config_id_keys_round_trip_as_strings(authed_client, fake_ctx):
+    _create_season(authed_client)
+    big = str(BIG_ID)
+    resp = authed_client.put(
+        "/api/survivor/config", json={"channel_id": big, "strikes": 2}
+    )
+    assert resp.status_code == 200
+    config = resp.json()["config"]
+    # Snowflake precision: the exact digits survive the int round-trip.
+    assert config["channel_id"] == big
+    assert config["strikes"] == 2
+    # And the overview serves it back the same way.
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["season"]["config"]["channel_id"] == big
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"channel_id": "not-a-number"}, id="unparseable-id"),
+        pytest.param({"nonsense_key": 1}, id="unknown-key"),
+        pytest.param({"strikes": 99}, id="out-of-range"),
+    ],
+)
+def test_config_rejections_are_422(authed_client, fake_ctx, body):
+    _create_season(authed_client)
+    assert authed_client.put("/api/survivor/config", json=body).status_code == 422
+
+
+def test_config_without_a_season_is_422(authed_client):
+    resp = authed_client.put("/api/survivor/config", json={"strikes": 1})
+    assert resp.status_code == 422
+
+
+# ── overview ──────────────────────────────────────────────────────────
+
+
+def test_overview_player_ids_are_strings(authed_client, fake_ctx, web_db):
+    _create_season(authed_client)
+    with open_db(web_db) as conn:
+        season = svc.get_active_season(conn, fake_ctx.guild_id)
+        svc.add_player(conn, season, BIG_ID, joined_at=1.0)
+        conn.commit()
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["players"][0]["user_id"] == str(BIG_ID)
+
+
+# ── roster ────────────────────────────────────────────────────────────
+
+
+def test_eliminate_and_revive_conflict_mapping(authed_client, fake_ctx, web_db):
+    _create_season(authed_client)
+    with open_db(web_db) as conn:
+        season = svc.get_active_season(conn, fake_ctx.guild_id)
+        svc.add_player(conn, season, BIG_ID, joined_at=1.0)
+        conn.commit()
+
+    path = f"/api/survivor/player/{BIG_ID}"
+    assert authed_client.post(f"{path}/eliminate", json={"week": 3}).status_code == 200
+    # Already a ghost → 409, not a silent success.
+    assert authed_client.post(f"{path}/eliminate", json={"week": 4}).status_code == 409
+    assert authed_client.post(f"{path}/revive", json={}).status_code == 200
+    assert authed_client.post(f"{path}/revive", json={}).status_code == 409
+    # A stranger was never alive here.
+    assert (
+        authed_client.post(
+            "/api/survivor/player/424242/eliminate", json={"week": 1}
+        ).status_code
+        == 409
+    )
+    # Durable audit rows for the member-affecting actions.
+    with open_db(web_db) as conn:
+        actions = [
+            r["action"]
+            for r in conn.execute(
+                "SELECT action FROM audit_log WHERE target_id = ? ORDER BY id",
+                (BIG_ID,),
+            ).fetchall()
+        ]
+    assert actions == ["survivor_eliminate", "survivor_revive"]
+
+
+# ── announcement ──────────────────────────────────────────────────────
+
+
+def test_announcement_needs_season_then_channel(authed_client, fake_ctx):
+    assert (
+        authed_client.post("/api/survivor/announcement", json={}).status_code == 422
+    )
+    _create_season(authed_client)
+    resp = authed_client.post("/api/survivor/announcement", json={})
+    assert resp.status_code == 422
+    assert "channel" in resp.json()["detail"].lower()
+
+
+def test_announcement_bot_offline_is_503(authed_client, fake_ctx):
+    _create_season(authed_client)
+    authed_client.put("/api/survivor/config", json={"channel_id": "555"})
+    fake_ctx.bot = None
+    assert (
+        authed_client.post("/api/survivor/announcement", json={}).status_code == 503
+    )
+
+
+def _occupy_casino(fake_ctx, channel_id: int) -> None:
+    """Put the casino hub — a bot-chasing panel — in a channel."""
+    from bot_modules.core.db_utils import open_db
+
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO config (guild_id, key, value) VALUES (?, ?, ?)",
+            (fake_ctx.guild_id, "casino_panel_channel_id", str(channel_id)),
+        )
+
+
+def _occupy_pen_pals(fake_ctx, channel_id: int) -> None:
+    from bot_modules.core.db_utils import open_db
+
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO pen_pals_config (guild_id, panel_channel_id) VALUES (?, ?)",
+            (fake_ctx.guild_id, channel_id),
+        )
+
+
+def test_announcement_refuses_a_channel_the_casino_hub_holds(
+    authed_client, fake_ctx
+):
+    """Two panels that both chase the bot's own posts is the configuration
+    that stormed in prod; one of them is always the buried one."""
+    guild = _attach_bot(fake_ctx)
+    _create_season(authed_client)
+    authed_client.put("/api/survivor/config", json={"channel_id": "555"})
+    _occupy_casino(fake_ctx, 555)
+
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = 555
+    channel.send = AsyncMock()
+    guild.get_channel = MagicMock(return_value=channel)
+
+    resp = authed_client.post("/api/survivor/announcement", json={})
+    assert resp.status_code == 400
+    assert "casino hub panel" in resp.json()["detail"]
+    channel.send.assert_not_awaited()
+
+
+def test_announcement_warns_beside_a_human_only_panel(
+    authed_client, fake_ctx, monkeypatch
+):
+    monkeypatch.setattr(
+        "bot_modules.core.branding.resolve_accent_color",
+        AsyncMock(return_value=discord.Color.default()),
+    )
+    guild = _attach_bot(fake_ctx)
+    _create_season(authed_client)
+    authed_client.put("/api/survivor/config", json={"channel_id": "555"})
+    _occupy_pen_pals(fake_ctx, 555)
+
+    message = MagicMock(id=BIG_ID)
+    message.pin = AsyncMock()
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = 555
+    channel.send = AsyncMock(return_value=message)
+    guild.get_channel = MagicMock(
+        side_effect=lambda cid: channel if int(cid) == 555 else None
+    )
+
+    resp = authed_client.post("/api/survivor/announcement", json={})
+    assert resp.status_code == 200
+    assert "pen pals panel" in resp.json()["warning"]
+    channel.send.assert_awaited_once()
+
+
+def test_announcement_posts_unpinned_and_stores_message_id(
+    authed_client, fake_ctx, monkeypatch
+):
+    # resolve_accent_color reads the bot avatar, which a MagicMock guild
+    # can't serve — same stub voice_master's route tests use.
+    monkeypatch.setattr(
+        "bot_modules.core.branding.resolve_accent_color",
+        AsyncMock(return_value=discord.Color.default()),
+    )
+    guild = _attach_bot(fake_ctx)
+    _create_season(authed_client)
+    authed_client.put("/api/survivor/config", json={"channel_id": "555"})
+
+    message = MagicMock(id=BIG_ID)
+    message.pin = AsyncMock()
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = 555
+    channel.send = AsyncMock(return_value=message)
+    guild.get_channel = MagicMock(
+        side_effect=lambda cid: channel if int(cid) == 555 else None
+    )
+
+    resp = authed_client.post("/api/survivor/announcement", json={})
+    assert resp.status_code == 200
+    data = resp.json()
+    # Never pinned (2026-09-02): the sticky machinery replaces this exact
+    # message on the next chat line, so a pin only ever lasted until someone
+    # spoke — and left a "pinned a message" notice behind every Wednesday.
+    message.pin.assert_not_awaited()
+    assert "pinned" not in data
+    assert data["message_id"] == str(BIG_ID)  # snowflake stays a string
+    # Stored in config so the Join flow can refresh the counter.
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["season"]["config"]["announcement_message_id"] == str(BIG_ID)
+    # The posted view carries the persistent Join button.
+    (_, kwargs) = channel.send.call_args
+    custom_ids = [item.custom_id for item in kwargs["view"].children]
+    assert any(cid.startswith("survivor_join:") for cid in custom_ids)
+
+
+def test_repost_retires_the_previous_announcement(
+    authed_client, fake_ctx, monkeypatch
+):
+    # Regression (08-17 review): a repost pinned a second announcement and
+    # left the old one live with a frozen counter — the setup-pin swamp.
+    monkeypatch.setattr(
+        "bot_modules.core.branding.resolve_accent_color",
+        AsyncMock(return_value=discord.Color.default()),
+    )
+    guild = _attach_bot(fake_ctx)
+    _create_season(authed_client)
+    authed_client.put("/api/survivor/config", json={"channel_id": "555"})
+
+    old_partial = MagicMock()
+    old_partial.delete = AsyncMock()
+    messages = iter([MagicMock(id=111, pin=AsyncMock()),
+                     MagicMock(id=222, pin=AsyncMock())])
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = 555
+    channel.send = AsyncMock(side_effect=lambda **kw: next(messages))
+    channel.get_partial_message = MagicMock(return_value=old_partial)
+    guild.get_channel = MagicMock(
+        side_effect=lambda cid: channel if int(cid) == 555 else None
+    )
+
+    first = authed_client.post("/api/survivor/announcement", json={})
+    assert first.status_code == 200
+    assert first.json()["retired_previous"] is False
+
+    second = authed_client.post("/api/survivor/announcement", json={})
+    assert second.status_code == 200
+    assert second.json()["retired_previous"] is True
+    channel.get_partial_message.assert_called_with(111)
+    old_partial.delete.assert_awaited_once()
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["season"]["config"]["announcement_message_id"] == "222"
+
+
+def test_eliminate_week_out_of_bounds_is_422(authed_client, fake_ctx):
+    _create_season(authed_client)
+    resp = authed_client.post(
+        f"/api/survivor/player/{BIG_ID}/eliminate", json={"week": 99}
+    )
+    assert resp.status_code == 422
+
+
+# ── week card + manual settle ─────────────────────────────────────────
+
+
+def _seed_week(web_db, fake_ctx):
+    """A tiny settled-ish week: one final-ready game, one scheduled."""
+    with open_db(web_db) as conn:
+        conn.execute(
+            "INSERT INTO nfl_games (season_year, week, game_id, home, away,"
+            " kickoff_utc) VALUES"
+            " (2026, 1, 'g-a', 'SEA', 'NE', '2026-09-10T00:20:00+00:00'),"
+            " (2026, 1, 'g-b', 'KC', 'LV', '2099-09-13T17:00:00+00:00')"
+        )
+        season = svc.get_active_season(conn, fake_ctx.guild_id)
+        svc.add_player(conn, season, BIG_ID, joined_at=1.0)
+        conn.execute(
+            "INSERT INTO survivor_picks (season_id, guild_id, user_id, week, slot,"
+            " team, game_id) VALUES (?, ?, ?, 1, 1, 'NE', 'g-a')",
+            (season["id"], season["guild_id"], BIG_ID),
+        )
+        conn.commit()
+        return season
+
+
+def test_week_card_shape(authed_client, fake_ctx, web_db):
+    assert authed_client.get("/api/survivor/week").status_code == 422  # no season
+    _create_season(authed_client)
+    _seed_week(web_db, fake_ctx)
+    data = authed_client.get("/api/survivor/week").json()
+    assert data["week"] == 1
+    assert {g["game_id"] for g in data["games"]} == {"g-a", "g-b"}
+    assert data["alive"] == 1 and data["picked"] == 1
+
+
+def test_manual_settle_grades_and_corrects(authed_client, fake_ctx, web_db):
+    _create_season(authed_client)
+    season = _seed_week(web_db, fake_ctx)
+
+    resp = authed_client.post(
+        "/api/survivor/settle", json={"game_id": "g-a", "outcome": "sea"}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["correction"] is False
+    assert data["changes"][str(season["id"])]["graded"] == 1
+    with open_db(web_db) as conn:
+        row = conn.execute(
+            "SELECT result FROM survivor_picks WHERE season_id = ?",
+            (season["id"],),
+        ).fetchone()
+        assert row["result"] == "loss"
+        player = conn.execute(
+            "SELECT strikes_used FROM survivor_players WHERE season_id = ?",
+            (season["id"],),
+        ).fetchone()
+        assert player["strikes_used"] == 1
+        audit = conn.execute(
+            "SELECT extra FROM audit_log WHERE action = 'survivor_manual_settle'"
+        ).fetchone()
+        assert audit is not None
+
+    # The correction path: flip the winner, the strike unwinds.
+    resp = authed_client.post(
+        "/api/survivor/settle", json={"game_id": "g-a", "outcome": "NE"}
+    )
+    assert resp.json()["correction"] is True
+    with open_db(web_db) as conn:
+        player = conn.execute(
+            "SELECT strikes_used, status FROM survivor_players WHERE season_id = ?",
+            (season["id"],),
+        ).fetchone()
+        assert (player["strikes_used"], player["status"]) == (0, "alive")
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param({"game_id": "g-a", "outcome": "KC"}, "Outcome must be",
+                     id="wrong-team"),
+        pytest.param({"game_id": "nope", "outcome": "SEA"}, "No such game",
+                     id="unknown-game"),
+    ],
+)
+def test_manual_settle_validation(authed_client, fake_ctx, web_db, body, match):
+    _create_season(authed_client)
+    _seed_week(web_db, fake_ctx)
+    resp = authed_client.post("/api/survivor/settle", json=body)
+    assert resp.status_code == 422
+    assert match in resp.json()["detail"]
+
+
+# ── weekly clock ──────────────────────────────────────────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _seed_week1_game(fake_ctx, kickoff: datetime) -> None:
+    """A single week-1 game so pick_week resolves to 1."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO nfl_games (season_year, week, game_id, home, away,"
+            " kickoff_utc, status) VALUES (?, 1, 'w1', 'SEA', 'NE', ?, 'scheduled')",
+            (2026, kickoff.isoformat()),
+        )
+
+
+def test_clock_route_needs_a_season(authed_client):
+    assert authed_client.get("/api/survivor/clock").status_code == 422
+
+
+def test_clock_route_shows_a_spent_week_one(authed_client, fake_ctx):
+    _create_season(authed_client)
+    _seed_week1_game(fake_ctx, datetime.now(timezone.utc) + timedelta(days=3))
+    authed_client.put("/api/survivor/config", json={"last_slate_week": 1})
+
+    data = authed_client.get("/api/survivor/clock").json()
+    assert data["week"] == 1
+    by = {r["task"]: r for r in data["tasks"]}
+    assert by["slate"]["spent"] is True and by["slate"]["fired_week"] == 1
+    assert by["lastcall"]["spent"] is False
+    assert by["slate"]["next_ts"] > 0
+
+
+def test_cancel_runs_immediate_and_a_second_press_refunds_nothing(
+    authed_client, fake_ctx, web_db, monkeypatch
+):
+    from web_server.routes import survivor as route
+
+    _create_season(authed_client)
+    calls = []
+    real = route.open_db_immediate
+
+    def spy(*a, **kw):
+        calls.append(a)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(route, "open_db_immediate", spy)
+    first = authed_client.post("/api/survivor/season/cancel")
+    assert first.status_code == 200
+    assert len(calls) == 1  # the refund ran under the immediate helper
+    second = authed_client.post("/api/survivor/season/cancel")
+    assert second.status_code == 422
+    assert "No live season" in second.json()["detail"]
+    with open_db(web_db) as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM econ_ledger WHERE kind = 'survivor_refund'"
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_reset_rearms_the_slate_and_audits(authed_client, fake_ctx, web_db):
+    _create_season(authed_client)
+    _seed_week1_game(fake_ctx, datetime.now(timezone.utc) + timedelta(days=3))
+    authed_client.put("/api/survivor/config", json={"last_slate_week": 1})
+
+    resp = authed_client.post("/api/survivor/tasks/slate/reset", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True, "task": "slate", "week": 1, "fired_week": 0,
+    }
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["season"]["config"]["last_slate_week"] == 0
+    with open_db(web_db) as conn:
+        row = conn.execute(
+            "SELECT extra FROM audit_log WHERE action = 'survivor_task_reset'"
+        ).fetchone()
+    assert row is not None and '"task": "slate"' in row["extra"]
+    # Nothing left to reset now.
+    again = authed_client.post("/api/survivor/tasks/slate/reset", json={})
+    assert again.status_code == 422
+    assert "nothing to reset" in again.json()["detail"]
+
+
+@pytest.mark.parametrize("task", ["reckoning", "bogus"])
+def test_reset_refuses_the_reckoning_and_unknown_tasks(
+    authed_client, fake_ctx, task
+):
+    _create_season(authed_client)
+    _seed_week1_game(fake_ctx, datetime.now(timezone.utc) + timedelta(days=3))
+    authed_client.put("/api/survivor/config", json={"last_reckoned_week": 1})
+    resp = authed_client.post(f"/api/survivor/tasks/{task}/reset", json={})
+    assert resp.status_code == 422
+    over = authed_client.get("/api/survivor/overview").json()
+    assert over["season"]["config"]["last_reckoned_week"] == 1
+
+
+# ── hosts (survivor_spec.md §3.4, 2026-09-12) ─────────────────────────
+
+
+HOST_ID = 42
+
+
+def _member_client(fake_ctx):
+    """A signed-in guild member with no admin bit (user 42)."""
+    from tests.web.conftest import set_session_cookie, web_client
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    client = web_client(create_app(fake_ctx, auth=auth))
+    set_session_cookie(client, auth.create_session_cookie(
+        user_id=HOST_ID,
+        username="host",
+        access_token="token",
+        permission_bits=0,
+        guild_id=fake_ctx.guild_id,
+        guilds=[{"id": fake_ctx.guild_id, "name": "Test Guild", "icon": None}],
+    ))
+    return client
+
+
+def _make_host(fake_ctx, guild_id=None):
+    with open_db(fake_ctx.db_path) as conn:
+        svc.add_host(conn, guild_id or fake_ctx.guild_id, HOST_ID, added_by=1)
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("host_in", "code"),
+    [
+        pytest.param("none", 403, id="plain-member"),
+        pytest.param("this", 200, id="host"),
+        # Hosting another guild's Survivor grants nothing here.
+        pytest.param("other", 403, id="host-elsewhere"),
+    ],
+)
+def test_survivor_panel_admits_hosts(fake_ctx, host_in, code):
+    if host_in == "this":
+        _make_host(fake_ctx)
+    elif host_in == "other":
+        _make_host(fake_ctx, guild_id=fake_ctx.guild_id + 1)
+    with _member_client(fake_ctx) as client:
+        assert client.get("/api/survivor/overview").status_code == code
+        assert client.get("/api/me").json()["survivor_host"] is (code == 200)
+
+
+def test_a_host_cannot_manage_hosts(fake_ctx):
+    _make_host(fake_ctx)
+    with _member_client(fake_ctx) as client:
+        assert client.get("/api/survivor/hosts").status_code == 403
+        assert client.post(
+            "/api/survivor/hosts", json={"user_id": "77"}
+        ).status_code == 403
+        assert client.delete(f"/api/survivor/hosts/{HOST_ID}").status_code == 403
+
+
+def test_every_game_route_is_host_gated_and_host_routes_admin_only():
+    """The whole panel opens to hosts ("Everything", Billy 2026-09-12) —
+    destructive routes included — but only admins choose the hosts."""
+    import inspect
+
+    from web_server.deps import require_survivor_host
+    from web_server.routes import survivor as routes
+
+    host_routes = {"list_hosts", "add_host", "remove_host"}
+    seen = 0
+    for route in routes.router.routes:
+        fn = route.endpoint
+        deps = [
+            p.default.dependency
+            for p in inspect.signature(fn).parameters.values()
+            if hasattr(p.default, "dependency")
+        ]
+        if fn.__name__ in host_routes:
+            assert require_survivor_host not in deps, fn.__name__
+            assert deps, fn.__name__
+        else:
+            assert require_survivor_host in deps, fn.__name__
+            seen += 1
+    assert seen == 16
+
+
+def test_me_says_not_a_host_by_default(authed_client):
+    assert authed_client.get("/api/me").json()["survivor_host"] is False
+
+
+def test_admin_adds_lists_and_removes_hosts(authed_client, fake_ctx, web_db):
+    resp = authed_client.post("/api/survivor/hosts", json={"user_id": str(BIG_ID)})
+    assert resp.status_code == 200
+    assert resp.json() == {"hosts": [str(BIG_ID)]}
+    assert authed_client.post(
+        "/api/survivor/hosts", json={"user_id": str(BIG_ID)}
+    ).status_code == 409
+    assert authed_client.get("/api/survivor/hosts").json() == {"hosts": [str(BIG_ID)]}
+
+    assert authed_client.delete(f"/api/survivor/hosts/{BIG_ID}").json() == {"hosts": []}
+    assert authed_client.delete(f"/api/survivor/hosts/{BIG_ID}").status_code == 404
+
+    with open_db(web_db) as conn:
+        rows = conn.execute(
+            "SELECT action, actor_id FROM audit_log WHERE target_id = ? ORDER BY id",
+            (BIG_ID,),
+        ).fetchall()
+    assert [(r["action"], r["actor_id"]) for r in rows] == [
+        ("survivor_host_add", 1), ("survivor_host_remove", 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "expected"),
+    [
+        pytest.param("post", "/api/survivor/hosts", {"user_id": str(BIG_ID)},
+                     "Pumpkin can now run Survivor", id="host-added"),
+        pytest.param("delete", f"/api/survivor/hosts/{BIG_ID}", None,
+                     "Pumpkin is no longer a Survivor host", id="host-removed"),
+        pytest.param("post", f"/api/survivor/player/{BIG_ID}/eliminate",
+                     {"week": 3}, "Pumpkin marked dead in week 3", id="eliminated"),
+        pytest.param("post", f"/api/survivor/player/{BIG_ID}/revive", {},
+                     "Pumpkin walks again", id="revived"),
+    ],
+)
+def test_mod_log_mirror_names_the_member_rather_than_mentioning_them(
+    authed_client, fake_ctx, web_db, monkeypatch, method, path, body, expected
+):
+    """The summary lands in an embed, where a ``<@id>`` renders as a bare
+    number to any moderator whose client hasn't cached that member."""
+    mirror = AsyncMock()
+    monkeypatch.setattr(
+        "web_server.routes.survivor.mirror_admin_action_to_mod_log", mirror
+    )
+    _create_season(authed_client)
+    with open_db(web_db) as conn:
+        conn.execute(
+            "INSERT INTO known_users (guild_id, user_id, username, is_bot) "
+            "VALUES (?, ?, 'Pumpkin', 0)",
+            (fake_ctx.guild_id, BIG_ID),
+        )
+        season = svc.get_active_season(conn, fake_ctx.guild_id)
+        svc.add_player(conn, season, BIG_ID, joined_at=1.0)
+        if "revive" in path:
+            svc.eliminate_player(conn, season["id"], BIG_ID, 1)
+        if method == "delete":
+            svc.add_host(conn, fake_ctx.guild_id, BIG_ID, added_by=1)
+        conn.commit()
+    mirror.reset_mock()
+
+    kwargs = {"json": body} if body is not None else {}
+    assert getattr(authed_client, method)(path, **kwargs).status_code == 200
+
+    summary = mirror.await_args.kwargs["summary"]
+    assert summary.startswith(expected)
+    assert "<@" not in summary
+
+
+@pytest.mark.parametrize("user_id", ["", "abc", "0"])
+def test_add_host_rejects_a_blank_member(authed_client, user_id):
+    resp = authed_client.post("/api/survivor/hosts", json={"user_id": user_id})
+    assert resp.status_code == 422

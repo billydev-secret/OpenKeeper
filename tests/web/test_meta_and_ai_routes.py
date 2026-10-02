@@ -1,0 +1,784 @@
+"""Tests for /api/me, /api/meta/*, /api/system/stats, and /api/config/ai/*."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from bot_modules.core.db_utils import open_db
+from bot_modules.shared.ai_config import list_prompts
+from web_server.routes.meta import MEMBER_PAGE_DEFAULT, MEMBER_PAGE_MAX
+
+
+# ── Shared mock helpers ──────────────────────────────────────────────
+
+
+def _auth_member():
+    """A member object matching the authed_client session (uid=1)."""
+    m = MagicMock()
+    m.id = 1
+    m.name = "tester"
+    m.display_name = "tester"
+    m.bot = False
+    m.guild_permissions = MagicMock(value=0x8)
+    m.status = "online"
+    default_role = MagicMock(id=0, name="@everyone")
+    default_role.is_default = MagicMock(return_value=True)
+    m.roles = [default_role]
+    return m
+
+
+def _attach_bot(fake_ctx, *, roles=None, members=None, channels=None):
+    members = members or []
+    roles = roles or []
+    channels = channels or []
+
+    # Always include the auth session user so auth doesn't reject the request.
+    auth_user = _auth_member()
+    all_members = [auth_user, *members]
+    by_id = {m.id: m for m in all_members}
+
+    guild = MagicMock()
+    guild.id = fake_ctx.guild_id
+    guild.name = "Test Guild"
+    guild.members = all_members
+    guild.roles = roles
+    guild.channels = channels
+    guild.get_member = MagicMock(side_effect=lambda uid: by_id.get(int(uid)))
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    fake_ctx.bot = bot
+    return guild
+
+
+# ── /api/me ───────────────────────────────────────────────────────────
+
+
+def test_me_returns_user_info_without_bot(authed_client):
+    resp = authed_client.get("/api/me")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["user_id"] == "1"
+    assert body["username"] == "tester"
+    assert "admin" in body["perms"]
+    assert body["guild_id"] == "123"
+    assert body["status"] is None  # no bot → no live status
+    assert body["games_editor_role_id"] is None
+
+
+def test_me_returns_live_status_when_bot_available(authed_client, fake_ctx):
+    _attach_bot(fake_ctx)
+    resp = authed_client.get("/api/me")
+    body = resp.json()
+    assert body["status"] == "online"
+    assert body["guild_name"] == "Test Guild"
+
+
+def test_me_returns_games_editor_role_when_set(authed_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO games_editor_role (guild_id, role_id) VALUES (?, ?)",
+            (fake_ctx.guild_id, 555),
+        )
+    resp = authed_client.get("/api/me")
+    assert resp.json()["games_editor_role_id"] == "555"
+
+
+# ── /api/guilds and /api/guilds/{id}/select ───────────────────────────
+
+
+def test_guilds_lists_session_guilds(authed_client, fake_ctx):
+    resp = authed_client.get("/api/guilds")
+    body = resp.json()
+    assert body["active_guild_id"] == str(fake_ctx.guild_id)
+    assert body["primary_guild_id"] == str(fake_ctx.guild_id)
+    assert len(body["guilds"]) == 1
+    assert body["guilds"][0]["id"] == str(fake_ctx.guild_id)
+
+
+def test_select_guild_rejects_unauthorized_guild(authed_client, fake_ctx):
+    """A guild the user isn't a member of must be rejected by the cookie validator."""
+    resp = authed_client.post("/api/guilds/999/select")
+    # update_session_guild returns None for a guild not in the cookie's list
+    # → 400 Invalid guild selection
+    assert resp.status_code == 400
+
+
+def test_select_guild_rejects_user_not_in_guild(authed_client, fake_ctx):
+    """If the bot reports the target guild but the user isn't a member, 403."""
+    target_guild = MagicMock()
+    target_guild.id = 999
+    target_guild.name = "Other Guild"
+    target_guild.get_member = MagicMock(return_value=None)  # user not in this guild
+    target_guild.members = []
+    target_guild.roles = []
+
+    auth_member = _auth_member()
+    home_guild = MagicMock()
+    home_guild.id = fake_ctx.guild_id
+    home_guild.get_member = MagicMock(return_value=auth_member)
+    home_guild.members = [auth_member]
+    home_guild.roles = []
+    home_guild.channels = []
+
+    bot = MagicMock()
+    # Return different guilds for different IDs
+    bot.get_guild = MagicMock(
+        side_effect=lambda gid: target_guild if gid == 999 else home_guild
+    )
+    fake_ctx.bot = bot
+
+    resp = authed_client.post("/api/guilds/999/select")
+    assert resp.status_code == 403
+
+
+# ── /api/meta/roles ───────────────────────────────────────────────────
+
+
+def test_meta_roles_returns_db_fallback_without_bot(authed_client, fake_ctx):
+    """No live bot → role list derived from role_events history."""
+    import time
+    with open_db(fake_ctx.db_path) as conn:
+        # Grant > revoke nets to 1 → member_count 1; another role nets to 0.
+        conn.execute(
+            "INSERT INTO role_events (granted_at, guild_id, user_id, role_name, action) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), fake_ctx.guild_id, 100, "VIP", "grant"),
+        )
+        conn.execute(
+            "INSERT INTO role_events (granted_at, guild_id, user_id, role_name, action) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), fake_ctx.guild_id, 101, "VIP", "grant"),
+        )
+        conn.execute(
+            "INSERT INTO role_events (granted_at, guild_id, user_id, role_name, action) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), fake_ctx.guild_id, 102, "Guest", "grant"),
+        )
+        conn.execute(
+            "INSERT INTO role_events (granted_at, guild_id, user_id, role_name, action) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), fake_ctx.guild_id, 102, "Guest", "remove"),
+        )
+
+    resp = authed_client.get("/api/meta/roles")
+    assert resp.status_code == 200
+    rows = resp.json()
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["VIP"]["member_count"] == 2
+    # Guest netted to 0; max(0, 0) — still appears
+    assert by_name["Guest"]["member_count"] == 0
+
+
+def test_meta_roles_returns_live_data_when_bot_available(authed_client, fake_ctx):
+    """When the bot guild is connected, roles come from the live guild."""
+    role = MagicMock()
+    role.id = 9001
+    role.name = "Mod"
+    role.color = MagicMock(value=0xFF00FF)
+    role.members = [MagicMock(), MagicMock()]
+    role.position = 5
+    role.managed = False
+    role.is_default = MagicMock(return_value=False)
+
+    _attach_bot(fake_ctx, roles=[role])
+    resp = authed_client.get("/api/meta/roles")
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "Mod"
+    assert body[0]["color"] == "#ff00ff"
+    assert body[0]["member_count"] == 2
+
+
+# ── /api/meta/members ─────────────────────────────────────────────────
+
+
+def test_meta_members_falls_back_to_known_users(authed_client, fake_ctx):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO known_users (user_id, guild_id, username, display_name) VALUES (?, ?, ?, ?)",
+            (101, fake_ctx.guild_id, "alice#0001", "Alice"),
+        )
+        conn.execute(
+            "INSERT INTO known_users (user_id, guild_id, username, display_name) VALUES (?, ?, ?, ?)",
+            (102, fake_ctx.guild_id, "bob#0002", "Bob"),
+        )
+
+    resp = authed_client.get("/api/meta/members")
+    body = resp.json()
+    names = {m["display_name"] for m in body}
+    assert names >= {"Alice", "Bob"}
+
+
+def test_meta_members_marks_left_members_when_bot_available(authed_client, fake_ctx):
+    """Members in known_users but NOT in the live guild get left_server=True."""
+    current = MagicMock()
+    current.id = 101
+    current.name = "alice"
+    current.display_name = "Alice"
+    current.bot = False
+
+    _attach_bot(fake_ctx, members=[current])
+
+    with open_db(fake_ctx.db_path) as conn:
+        # 101 is still present; 102 has left
+        conn.execute(
+            "INSERT INTO known_users (user_id, guild_id, username, display_name) VALUES (?, ?, ?, ?)",
+            (102, fake_ctx.guild_id, "bob#0002", "Bob"),
+        )
+
+    resp = authed_client.get("/api/meta/members")
+    body = resp.json()
+    by_id = {m["id"]: m for m in body}
+    assert by_id["101"].get("left_server") is not True  # current
+    assert by_id["102"]["left_server"] is True  # left
+
+
+# ── /api/meta/members: bounded paging (2026-08 review residue) ────────
+#
+# The endpoint used to return every current member PLUS every known_users row
+# ever recorded, unpaginated — a payload that grows monotonically with churn.
+# A naive cap was rejected once because the dashboard's pickers filter a cached
+# list CLIENT-side, so anything the cap dropped became unselectable. The bound
+# is only safe alongside ?q= and ?ids=, and these tests are the pair: the page
+# IS trimmed, and nobody trimmed off it is out of reach.
+
+
+def _seed_known_users(fake_ctx, count, *, start=700000000000000000, prefix="ghost"):
+    """`count` departed members, named so they sort together alphabetically."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.executemany(
+            "INSERT INTO known_users (user_id, guild_id, username, display_name)"
+            " VALUES (?, ?, ?, ?)",
+            [
+                (
+                    start + i,
+                    fake_ctx.guild_id,
+                    f"{prefix}{i:05d}",
+                    f"{prefix.title()} {i:05d}",
+                )
+                for i in range(count)
+            ],
+        )
+
+
+def _live_member(user_id, username, display_name):
+    """`name` is a MagicMock constructor kwarg, so it has to be set after."""
+    m = MagicMock(bot=False)
+    m.id = user_id
+    m.name = username
+    m.display_name = display_name
+    return m
+
+
+def _add_known_user(fake_ctx, user_id, username, display_name):
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO known_users (user_id, guild_id, username, display_name)"
+            " VALUES (?, ?, ?, ?)",
+            (user_id, fake_ctx.guild_id, username, display_name),
+        )
+
+
+def test_meta_members_is_bounded_by_default(authed_client, fake_ctx):
+    """A corpus far larger than the page still answers with one page."""
+    _seed_known_users(fake_ctx, MEMBER_PAGE_DEFAULT + 250)
+    body = authed_client.get("/api/meta/members").json()
+    assert len(body) == MEMBER_PAGE_DEFAULT
+
+
+def test_meta_members_search_reaches_past_the_default_page(authed_client, fake_ctx):
+    """THE load-bearing case: the member a cap would have made unreachable.
+
+    "Zelda" sorts after every seeded ghost, so she is well off the end of the
+    default page — and typing her name has to find her anyway, because that is
+    the only thing that makes trimming the page safe.
+    """
+    _seed_known_users(fake_ctx, MEMBER_PAGE_DEFAULT + 250)
+    _add_known_user(fake_ctx, 800000000000000001, "zelda", "Zelda Farbottom")
+
+    page = authed_client.get("/api/meta/members").json()
+    assert "800000000000000001" not in {m["id"] for m in page}, (
+        "the fixture no longer puts Zelda off the default page"
+    )
+
+    found = authed_client.get("/api/meta/members", params={"q": "zelda"}).json()
+    assert [m["id"] for m in found] == ["800000000000000001"]
+    assert found[0]["display_name"] == "Zelda Farbottom"
+
+
+def test_meta_members_search_matches_a_pasted_id(authed_client, fake_ctx):
+    """Copying an id out of Discord is the mobile way to find someone."""
+    _add_known_user(fake_ctx, 800000000000000001, "zelda", "Zelda Farbottom")
+    found = authed_client.get(
+        "/api/meta/members", params={"q": "800000000000000001"}
+    ).json()
+    assert [m["id"] for m in found] == ["800000000000000001"]
+
+
+def test_meta_members_search_treats_like_wildcards_literally(authed_client, fake_ctx):
+    """An unescaped `%` in the needle would turn any search into match-all."""
+    _seed_known_users(fake_ctx, 5)
+    _add_known_user(fake_ctx, 800000000000000002, "ten%off", "Ten%Off")
+    assert [
+        m["id"] for m in authed_client.get(
+            "/api/meta/members", params={"q": "%"}
+        ).json()
+    ] == ["800000000000000002"]
+
+
+def test_meta_members_resolves_saved_ids_off_the_page(authed_client, fake_ctx):
+    """A config pointing at someone who left years ago still renders by name."""
+    _seed_known_users(fake_ctx, MEMBER_PAGE_DEFAULT + 250)
+    _add_known_user(fake_ctx, 800000000000000001, "zelda", "Zelda Farbottom")
+
+    body = authed_client.get(
+        "/api/meta/members", params={"ids": "800000000000000001,not-an-id"}
+    ).json()
+    assert [m["id"] for m in body] == ["800000000000000001"]
+    assert body[0]["display_name"] == "Zelda Farbottom"
+
+
+def test_meta_members_ids_beat_a_tiny_limit(authed_client, fake_ctx):
+    """`ids` exists to render a saved config; a stray limit must not trim it."""
+    _add_known_user(fake_ctx, 800000000000000001, "zelda", "Zelda")
+    _add_known_user(fake_ctx, 800000000000000002, "yuri", "Yuri")
+    body = authed_client.get(
+        "/api/meta/members",
+        params={"ids": "800000000000000001,800000000000000002", "limit": 1},
+    ).json()
+    assert {m["id"] for m in body} == {
+        "800000000000000001",
+        "800000000000000002",
+    }
+
+
+@pytest.mark.parametrize("limit", [0, -5, MEMBER_PAGE_MAX + 500])
+def test_meta_members_limit_out_of_range_is_refused(authed_client, fake_ctx, limit):
+    """A page size outside 1-MEMBER_PAGE_MAX is refused, not quietly resized.
+
+    The picker asking for 2500 and silently receiving 2000 reads as "this
+    guild has 2000 members" to every caller downstream.
+    """
+    _seed_known_users(fake_ctx, MEMBER_PAGE_MAX + 10)
+    assert (
+        authed_client.get("/api/meta/members", params={"limit": limit}).status_code
+        == 422
+    )
+
+
+@pytest.mark.parametrize("limit", [1, 3, MEMBER_PAGE_MAX])
+def test_meta_members_honours_a_limit_inside_its_range(authed_client, fake_ctx, limit):
+    _seed_known_users(fake_ctx, MEMBER_PAGE_MAX + 10)
+    body = authed_client.get("/api/meta/members", params={"limit": limit}).json()
+    assert len(body) == limit
+
+
+def test_meta_members_page_spends_its_budget_on_current_members(
+    authed_client, fake_ctx
+):
+    """Current members are what a cold picker needs; departures fill the rest.
+
+    The live roster is bounded by guild size and does NOT grow with churn — the
+    known_users tail is the half that grows forever, so it is the half the
+    budget trims.
+    """
+    alice = _live_member(101, "alice", "Alice")
+    bob = _live_member(102, "bob", "Bob")
+    _attach_bot(fake_ctx, members=[alice, bob])
+    _add_known_user(fake_ctx, 999, "zed", "Zed")
+
+    # Budget of 2, and three humans are present (alice, bob, the auth user).
+    body = authed_client.get("/api/meta/members", params={"limit": 2}).json()
+    assert len(body) == 2
+    assert all(m.get("left_server") is not True for m in body)
+
+    # Zed is off the page, and still one search away — with the departure
+    # marking the shared option builder keys its "(left the server)" label on.
+    found = authed_client.get(
+        "/api/meta/members", params={"q": "zed", "limit": 2}
+    ).json()
+    assert [(m["id"], m["left_server"]) for m in found] == [("999", True)]
+
+
+def test_meta_members_ids_never_return_a_current_member_twice(
+    authed_client, fake_ctx
+):
+    """known_users keeps a row for people who are still here; the guild copy
+    wins, so an id present in both must not come back as two options."""
+    alice = _live_member(101, "alice", "Alice")
+    _attach_bot(fake_ctx, members=[alice])
+    _add_known_user(fake_ctx, 101, "alice", "Alice")
+
+    body = authed_client.get("/api/meta/members", params={"ids": "101"}).json()
+    assert [m["id"] for m in body] == ["101"]
+    assert body[0]["left_server"] is False
+
+
+# ── /api/meta/channels ────────────────────────────────────────────────
+
+
+def test_meta_channels_filters_to_text_only(authed_client, fake_ctx):
+    """With no bot, falls back to processed_messages channels (text only)."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO processed_messages (message_id, guild_id, channel_id, user_id, created_at, processed_at) VALUES (?, ?, ?, ?, 0, 0)",
+            (1, fake_ctx.guild_id, 555, 1),
+        )
+        conn.execute(
+            "INSERT INTO processed_messages (message_id, guild_id, channel_id, user_id, created_at, processed_at) VALUES (?, ?, ?, ?, 0, 0)",
+            (2, fake_ctx.guild_id, 666, 1),
+        )
+
+    resp = authed_client.get("/api/meta/channels?types=text")
+    body = resp.json()
+    assert {c["id"] for c in body} == {"555", "666"}
+
+
+def test_meta_channels_returns_empty_without_text_in_filter(authed_client):
+    """No bot + non-text filter → empty (no fallback for voice/category/thread)."""
+    resp = authed_client.get("/api/meta/channels?types=voice")
+    assert resp.json() == []
+
+
+def test_meta_channels_cannot_judge_exposure_without_a_gateway(
+    authed_client, fake_ctx
+):
+    """The DB fallback has no permission overwrites to compute from, so it
+    reports None. A caller warning about exposure must read that as "don't
+    know", never as "safe"."""
+    with open_db(fake_ctx.db_path) as conn:
+        conn.execute(
+            "INSERT INTO processed_messages (message_id, guild_id, channel_id, "
+            "user_id, created_at, processed_at) VALUES (?, ?, ?, ?, 0, 0)",
+            (3, fake_ctx.guild_id, 777, 1),
+        )
+
+    body = authed_client.get("/api/meta/channels?types=text").json()
+    assert [c["everyone_can_read"] for c in body] == [None]
+
+
+def test_meta_channels_reports_what_everyone_can_read(authed_client, fake_ctx):
+    """Backs the approvals-channel exposure warning on the economy panel."""
+    public = _PermChannel(1, "general", public=True)
+    private = _PermChannel(2, "mod-room", public=False)
+    # The session user has to be on the guild: with a bot attached, auth
+    # re-derives permissions from live membership instead of the cookie.
+    admin = SimpleNamespace(
+        id=1, bot=False, display_name="tester", roles=(),
+        guild_permissions=SimpleNamespace(value=0x8),
+    )
+    guild = _PermGuild(fake_ctx.guild_id, [public, private], [admin])
+    fake_ctx.bot = SimpleNamespace(get_guild=lambda gid: guild)
+
+    body = authed_client.get("/api/meta/channels?types=text").json()
+    by_id = {c["id"]: c["everyone_can_read"] for c in body}
+    assert by_id == {"1": True, "2": False}
+
+
+def _PermChannel(channel_id, name, *, public):
+    """A TextChannel stand-in whose @everyone perms are computable.
+
+    Spec'd to the real class because the route selects channels by isinstance.
+    """
+    import discord
+    from unittest.mock import MagicMock
+
+    ch = MagicMock(spec=discord.TextChannel)
+    ch.id = channel_id
+    ch.name = name
+    ch.nsfw = False
+    ch.category = None
+    ch.parent = None
+    ch.permissions_for = lambda _role: SimpleNamespace(
+        read_messages=public, view_channel=public
+    )
+    return ch
+
+
+class _PermGuild:
+    def __init__(self, guild_id, channels, members=None):
+        self.id = guild_id
+        self.channels = channels
+        self.default_role = SimpleNamespace(id=guild_id)
+        self.members = members or []
+
+    def get_member(self, member_id):
+        return next((m for m in self.members if m.id == member_id), None)
+
+
+# ── /api/system/stats ─────────────────────────────────────────────────
+
+
+def test_system_stats_returns_expected_shape(authed_client):
+    resp = authed_client.get("/api/system/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "cpu_percent" in body
+    assert "memory" in body
+    assert "disk" in body
+    assert "network" in body
+    assert "interfaces" in body
+    assert body["memory"]["percent"] >= 0
+    assert body["disk"]["percent"] >= 0
+
+
+# ── /api/config/ai ────────────────────────────────────────────────────
+
+
+def test_get_ai_config_returns_expected_sections(authed_client):
+    with patch("bot_modules.shared.ollama_client.status",
+               return_value={"available": False, "model": None}):
+        resp = authed_client.get("/api/config/ai")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "llm_status" in body
+    assert "prompts" in body
+    # One model is loaded at a time, chosen by the model-source fields — the
+    # panel offers no per-command model choice, so the payload carries none.
+    assert "known_models" not in body
+    assert "mod_model" not in body
+    assert all("model" not in p for p in body["prompts"])
+    # Every known prompt key must appear in the response
+    expected_keys = {p.key for p in list_prompts()}
+    actual_keys = {p["key"] for p in body["prompts"]}
+    assert actual_keys == expected_keys
+
+
+def test_put_ai_prompt_persists_override(authed_client, fake_ctx):
+    """Full round-trip: PUT a prompt override, GET it back.
+
+    The panel is primary-guild-only and its prompts are bot-wide, so the row
+    lands at guild_id=0 — where the active guild and every other guild resolve
+    it through the legacy fallback. Writing it at the active guild's id (the old
+    behaviour) left a second guild with no editable surface at all.
+    """
+    key = list_prompts()[0].key
+    resp = authed_client.put(
+        f"/api/config/ai/prompts/{key}", json={"text": "Custom prompt text"}
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.shared.ai_config import get_prompt
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_prompt(conn, key, 0) == "Custom prompt text"
+        assert get_prompt(conn, key, fake_ctx.guild_id) == "Custom prompt text"
+        # A guild that has no dashboard of its own reads the same text.
+        assert get_prompt(conn, key, 1476999999999999998) == "Custom prompt text"
+
+
+def test_restore_original_clears_a_legacy_guild_zero_override(authed_client, fake_ctx):
+    """The button used to put the *old override* back, not the default.
+
+    reset_prompt deleted only the active guild's row; prod's only row for this
+    key lived at guild_id=0, so get_prompt fell straight back onto it and the
+    Edited badge returned on the next load.
+    """
+    key = "ai_prompt_watch_check"
+    from bot_modules.core.db_utils import set_config_value
+    from bot_modules.shared.ai_config import get_prompt_with_source
+
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, key, "These are bulk messages.", 0)
+
+    assert authed_client.delete(f"/api/config/ai/prompts/{key}").status_code == 200
+
+    with open_db(fake_ctx.db_path) as conn:
+        _, is_override = get_prompt_with_source(conn, key, fake_ctx.guild_id)
+    assert is_override is False
+
+
+def test_saving_clears_a_stale_guild_scoped_row(authed_client, fake_ctx):
+    """An override written by the old guild-scoped panel must not shadow."""
+    key = list_prompts()[0].key
+    from bot_modules.core.db_utils import set_config_value
+    from bot_modules.shared.ai_config import get_prompt
+
+    with open_db(fake_ctx.db_path) as conn:
+        set_config_value(conn, key, "stale per-guild text", fake_ctx.guild_id)
+
+    authed_client.put(f"/api/config/ai/prompts/{key}", json={"text": "the new text"})
+
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_prompt(conn, key, fake_ctx.guild_id) == "the new text"
+
+
+def test_put_ai_prompt_rejects_unknown_key(authed_client):
+    resp = authed_client.put(
+        "/api/config/ai/prompts/does_not_exist", json={"text": "x"}
+    )
+    assert resp.status_code == 404
+
+
+def test_delete_ai_prompt_clears_override(authed_client, fake_ctx):
+    key = list_prompts()[0].key
+
+    # Seed an override and verify the round-trip works.
+    authed_client.put(f"/api/config/ai/prompts/{key}", json={"text": "custom"})
+    from bot_modules.shared.ai_config import get_prompt_with_source
+    with open_db(fake_ctx.db_path) as conn:
+        text, is_override = get_prompt_with_source(conn, key, fake_ctx.guild_id)
+    assert text == "custom"
+    assert is_override is True
+
+    resp = authed_client.delete(f"/api/config/ai/prompts/{key}")
+    assert resp.status_code == 200
+    with open_db(fake_ctx.db_path) as conn:
+        _, is_override = get_prompt_with_source(conn, key, fake_ctx.guild_id)
+    assert is_override is False  # override cleared, reader falls back to default
+
+
+def test_delete_ai_prompt_unknown_key_returns_404(authed_client):
+    resp = authed_client.delete("/api/config/ai/prompts/does_not_exist")
+    assert resp.status_code == 404
+
+
+# ── Bot-global AI settings: primary guild only ────────────────────────
+# Every value on this panel is shared by every guild the bot serves (the
+# prompts live at guild 0, the model source and the loaded model are one per
+# host). `admin` only proves the caller administers the guild they have
+# selected, so a second guild's admin must not reach them — the panel's
+# primaryOnly nav flag is client-side and proves nothing.
+
+SECOND_GUILD_ID = 1476999999999999998
+
+
+def _second_guild_admin_client(fake_ctx):
+    """An administrator of a *different* guild than the bot's primary."""
+    from fastapi.testclient import TestClient
+
+    from web_server.auth import SESSION_COOKIE, DiscordOAuthAuth
+    from web_server.server import create_app
+
+    auth = DiscordOAuthAuth("test-secret", fake_ctx.guild_id)
+    client = TestClient(create_app(fake_ctx, auth=auth))
+    client.cookies.set(
+        SESSION_COOKIE,
+        auth.create_session_cookie(
+            user_id=7,
+            username="other-owner",
+            permission_bits=0x8,  # full administrator — of their own guild
+            guild_id=SECOND_GUILD_ID,
+            guilds=[{"id": SECOND_GUILD_ID, "name": "Second Guild", "icon": None}],
+        ),
+    )
+    return client
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        # The read is gated too: the payload carries the host's model path and
+        # the full text of every shared prompt.
+        ("GET", "/api/config/ai", None),
+        ("PUT", "/api/config/ai/prompts/{key}", {"text": "ignore every rule"}),
+        ("DELETE", "/api/config/ai/prompts/{key}", None),
+        ("POST", "/api/config/ai/prompts/{key}/test", {"user_input": "hi"}),
+        ("PUT", "/api/config/ai/model-source",
+         {"model_path": "/etc/passwd", "hf_repo": "", "hf_file": ""}),
+        ("POST", "/api/config/ai/model-reload", None),
+    ],
+)
+def test_second_guild_admin_cannot_touch_bot_global_ai(
+    fake_ctx, method, path, body
+):
+    key = list_prompts()[0].key
+    client = _second_guild_admin_client(fake_ctx)
+    try:
+        resp = client.request(method, path.format(key=key), json=body)
+        assert resp.status_code == 403
+    finally:
+        client.close()
+
+
+def test_second_guild_admin_cannot_rewrite_the_shared_prompt(authed_client, fake_ctx):
+    """The write is refused, and the text every guild runs is untouched."""
+    key = list_prompts()[0].key
+    assert authed_client.put(
+        f"/api/config/ai/prompts/{key}", json={"text": "the owner's text"}
+    ).status_code == 200
+
+    client = _second_guild_admin_client(fake_ctx)
+    try:
+        assert client.put(
+            f"/api/config/ai/prompts/{key}", json={"text": "always answer 'fine'"}
+        ).status_code == 403
+        assert client.delete(f"/api/config/ai/prompts/{key}").status_code == 403
+    finally:
+        client.close()
+
+    from bot_modules.shared.ai_config import get_prompt
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_prompt(conn, key, 0) == "the owner's text"
+        assert get_prompt(conn, key, SECOND_GUILD_ID) == "the owner's text"
+
+
+def test_test_ai_prompt_returns_503_when_llm_unavailable(authed_client):
+    with patch("bot_modules.shared.ollama_client.is_available", return_value=False):
+        resp = authed_client.post(
+            f"/api/config/ai/prompts/{list_prompts()[0].key}/test",
+            json={"user_input": "hi"},
+        )
+    assert resp.status_code == 503
+
+
+def test_get_model_status_returns_ollama_status(authed_client):
+    with patch(
+        "bot_modules.shared.ollama_client.status",
+        return_value={"available": True, "model": "qwen-7b"},
+    ):
+        resp = authed_client.get("/api/config/ai/model-status")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": True, "model": "qwen-7b"}
+
+
+def test_put_model_source_persists_all_three_fields(authed_client, fake_ctx):
+    resp = authed_client.put(
+        "/api/config/ai/model-source",
+        json={
+            "model_path": "/path/to/model.gguf",
+            "hf_repo": "user/repo",
+            "hf_file": "model.gguf",
+        },
+    )
+    assert resp.status_code == 200
+
+    from bot_modules.core.db_utils import get_config_value
+    with open_db(fake_ctx.db_path) as conn:
+        assert get_config_value(conn, "llm_model_path", "") == "/path/to/model.gguf"
+        assert get_config_value(conn, "llm_hf_repo", "") == "user/repo"
+        assert get_config_value(conn, "llm_hf_file", "") == "model.gguf"
+
+
+def test_post_model_reload_returns_400_when_no_source_configured(authed_client):
+    with patch("bot_modules.shared.ollama_client.is_available", return_value=False):
+        resp = authed_client.post("/api/config/ai/model-reload")
+    assert resp.status_code == 400
+
+
+# ── Auth gates ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("GET", "/api/me", None),
+        ("GET", "/api/guilds", None),
+        ("GET", "/api/meta/roles", None),
+        ("GET", "/api/meta/members", None),
+        ("GET", "/api/meta/channels", None),
+        ("GET", "/api/config/ai", None),
+        ("GET", "/api/system/stats", None),
+    ],
+)
+def test_meta_routes_require_auth(fake_ctx, method, path, body):
+    from fastapi.testclient import TestClient
+
+    from web_server.auth import DiscordOAuthAuth
+    from web_server.server import create_app
+
+    app = create_app(fake_ctx, auth=DiscordOAuthAuth("test-secret", fake_ctx.guild_id))
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get(path) if method == "GET" else client.post(path, json=body or {})
+    assert resp.status_code in (401, 403), f"{method} {path} should require auth"
+    client.close()

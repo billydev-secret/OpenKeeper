@@ -1,0 +1,184 @@
+"""Async SQLite helpers for Pressure Cooker. All SQL lives here."""
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING
+
+from bot_modules.duels import db as duels_db
+from bot_modules.duels.db import (
+    CHALLENGE_RESPONSE_SECONDS,
+    NAMING_WINDOW_SECONDS,
+    active_idle_seconds,
+)
+
+from bot_modules.games.utils import game_store
+from .game import PressureGame, game_from_row, pumps_to_json
+
+if TYPE_CHECKING:
+    from bot_modules.games.db import GamesDb
+
+_GAME_TYPE = "pressure"
+
+_NON_TERMINAL = (
+    "PENDING", "ACCEPTED", "ACTIVE", "RESOLVED",
+)
+
+# ── Config (shim → duels/db) ──────────────────────────────────────────────────
+
+async def get_config(db: GamesDb, guild_id: int) -> dict:
+    return await duels_db.get_config(db, guild_id, _GAME_TYPE)
+
+
+async def upsert_config(db: GamesDb, guild_id: int, **fields) -> None:
+    await duels_db.upsert_config(db, guild_id, _GAME_TYPE, **fields)
+
+
+# ── Games ─────────────────────────────────────────────────────────────────────
+
+async def create_game(
+    db: GamesDb,
+    guild_id: int,
+    channel_id: int,
+    challenger_id: int,
+    target_id: int,
+    stakes_text: str | None,
+    nick_stake: bool = False,
+) -> int:
+    return await db.lastrowid(
+        """
+        INSERT INTO pressure_games
+            (guild_id, channel_id, challenger_id, target_id, stakes_text, nick_stake,
+             state, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
+        """,
+        (guild_id, channel_id, challenger_id, target_id, stakes_text, int(nick_stake),
+         time.time()),
+    )
+
+
+async def get_game(db: GamesDb, game_id: int) -> PressureGame | None:
+    row = await db.fetchone("SELECT * FROM pressure_games WHERE id = ?", (game_id,))
+    return game_from_row(row) if row else None
+
+
+async def get_active_game_for_pair(
+    db: GamesDb, guild_id: int, user_a: int, user_b: int
+) -> PressureGame | None:
+    row = await game_store.fetch_live_game_for_pair(
+        db, "pressure_games", guild_id, user_a, user_b, _NON_TERMINAL
+    )
+    return game_from_row(row) if row else None
+
+
+async def get_pending_game_for_challenger(
+    db: GamesDb, guild_id: int, channel_id: int, challenger_id: int
+) -> PressureGame | None:
+    row = await game_store.fetch_pending_game_for_challenger(
+        db, "pressure_games", guild_id, channel_id, challenger_id
+    )
+    return game_from_row(row) if row else None
+
+
+async def set_game_state(db: GamesDb, game_id: int, state: str, **extra_fields) -> None:
+    await game_store.set_game_state(db, "pressure_games", game_id, state, **extra_fields)
+
+
+async def save_pump(db: GamesDb, game: PressureGame) -> None:
+    await db.execute(
+        """
+        UPDATE pressure_games
+        SET gauge = ?, active_player = ?, last_pump_at = ?,
+            pumps_json = ?, state = ?, winner_id = ?, loser_id = ?, resolved_at = ?
+        WHERE id = ?
+        """,
+        (
+            game.gauge,
+            game.active_player,
+            game.last_pump_at,
+            pumps_to_json(game.pumps),
+            game.state,
+            game.winner_id,
+            game.loser_id,
+            game.resolved_at,
+            game.id,
+        ),
+    )
+
+
+async def fetch_active_games(db: GamesDb) -> list[PressureGame]:
+    rows = await db.fetchall("SELECT * FROM pressure_games WHERE state = 'ACTIVE'")
+    return [game_from_row(r) for r in rows]
+
+
+async def fetch_resolved_games(db: GamesDb) -> list[PressureGame]:
+    rows = await db.fetchall(
+        "SELECT * FROM pressure_games "
+        "WHERE state IN ('RESOLVED', 'RESOLVED_NO_NICK', 'NICKED', 'NO_NICK_SET')"
+    )
+    return [game_from_row(r) for r in rows]
+
+
+async def fetch_sweepable_games(db: GamesDb, now: float) -> list[PressureGame]:
+    #: ``last_pump_at`` is NULL until the first pump lands, and ``NULL <= ?``
+    #: is never true in SQLite -- so an accepted game nobody pumped could never
+    #: be swept, and the pair stayed locked out by the duplicate-challenge
+    #: guard forever. Every sibling duel stamps its activity column on INSERT;
+    #: this one doesn't, so fall back to when the game started.
+    rows = await db.fetchall(
+        """
+        SELECT * FROM pressure_games
+        WHERE
+          (state = 'PENDING'  AND created_at  <= ?)
+       OR (state = 'ACTIVE'   AND COALESCE(last_pump_at, created_at) <= ?)
+       OR (state = 'RESOLVED' AND resolved_at  <= ?)
+        """,
+        (
+            now - CHALLENGE_RESPONSE_SECONDS,
+            now - active_idle_seconds(_GAME_TYPE),
+            now - NAMING_WINDOW_SECONDS,
+        ),
+    )
+    return [game_from_row(r) for r in rows]
+
+
+# ── Nicks (shim → duels/db) ───────────────────────────────────────────────────
+
+async def apply_nick(
+    db: GamesDb,
+    game_id: int,
+    guild_id: int,
+    loser_id: int,
+    winner_id: int,
+    original_nick: str | None,
+    imposed_nick: str,
+    sentence_hours: int,
+) -> int:
+    return await duels_db.apply_nick(
+        db,
+        game_id=game_id,
+        game_type=_GAME_TYPE,
+        guild_id=guild_id,
+        loser_id=loser_id,
+        winner_id=winner_id,
+        original_nick=original_nick,
+        imposed_nick=imposed_nick,
+        sentence_hours=sentence_hours,
+    )
+
+
+async def fetch_expired_nicks(db: GamesDb, now: float) -> list[dict]:
+    return await duels_db.fetch_expired_nicks(db, now, _GAME_TYPE)
+
+
+# ── Cooldowns (shim → duels/db) ───────────────────────────────────────────────
+
+async def check_cooldown(
+    db: GamesDb, guild_id: int, user_a: int, user_b: int, cooldown_hours: int
+) -> float | None:
+    return await duels_db.check_cooldown(
+        db, guild_id, _GAME_TYPE, user_a, user_b, cooldown_hours
+    )
+
+
+async def set_cooldown(db: GamesDb, guild_id: int, user_a: int, user_b: int) -> None:
+    await duels_db.set_cooldown(db, guild_id, _GAME_TYPE, user_a, user_b)

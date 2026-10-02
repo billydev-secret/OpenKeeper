@@ -1,0 +1,528 @@
+"""Promotion-review cards for members who lost access and came back.
+
+The bot already posts a *promotion review* card to the Level 5 Log Channel
+(``xp_level_5_log_channel_id``) when a member reaches Level 5 (see
+:func:`bot_modules.xp.service.maybe_log_level_5`). This module extends
+that channel with two more triggers, and adds a persistent **Grant access**
+button to the cards:
+
+* **pruned-return** — an automated sweep pulled a role (recorded in
+  ``role_prune_events``; see :mod:`role_grant_audit_service`) and the member is
+  active again, detected the moment they post a message anywhere. The Grant
+  button re-adds a configured role and closes their open prune events.
+* **sleeper** — a member held in the inactive/"sleeper" channel
+  (``inactive_members``; the channel is ``inactive_channel_id``) posts there
+  again. The Grant button runs the full inactive-reactivate flow.
+
+Both new triggers ship **dark** until the Level 5 Log Channel is configured;
+the pruned-return trigger additionally needs ``promotion_review_grant_role_id``.
+
+All three cards ping ``promotion_review_ping_role_id`` — the role managers who
+*review* promotions — when it is set, and fall back to the guild's
+``mod_role_ids`` when it is not, so a card never posts to nobody (see
+:func:`ping_role_ids`). Both are a different role from
+``promotion_review_grant_role_id``, which is what the Grant button *hands out*;
+pinging *that* would notify everyone who already has access.
+
+This module owns the durable card ledger (``promotion_review_cards``, migration
+112) and the pure gating logic. The Discord embed + persistent buttons live in
+:mod:`bot_modules.xp.promotion_review_views`; the message-hot-path hook
+uses :func:`is_watched` for an O(1) filter before ever touching the DB.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+
+from bot_modules.core.db_utils import get_config_int, get_config_value, open_db
+from bot_modules.inactive.store import active_inactive_user_ids
+from bot_modules.onboarding.intake import service as intake_svc
+
+CHANNEL_KEY = "xp_level_5_log_channel_id"  # the promotion-reviews channel
+GRANT_ROLE_KEY = "promotion_review_grant_role_id"
+PING_ROLE_KEY = "promotion_review_ping_role_id"
+SLEEPER_CHANNEL_KEY = "inactive_channel_id"
+
+KIND_PRUNED_RETURN = "pruned_return"
+KIND_SLEEPER = "sleeper"
+
+RESOLUTION_GRANTED = "granted"
+RESOLUTION_REACTIVATED = "reactivated"
+RESOLUTION_DISMISSED = "dismissed"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+def review_channel_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    return get_config_int(conn, CHANNEL_KEY, guild_id)
+
+
+def grant_role_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    return get_config_int(conn, GRANT_ROLE_KEY, guild_id)
+
+
+def ping_role_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    """The explicitly configured review-ping role, or 0.
+
+    Distinct from :func:`grant_role_id`, which is the role *handed to* the
+    member when someone presses Grant — pinging that one would notify every
+    member who already has access, which is the opposite of the intent.
+
+    Prefer :func:`ping_role_ids`, which adds the mod-role fallback. This stays
+    as the reader for the dial alone.
+    """
+    return get_config_int(conn, PING_ROLE_KEY, guild_id)
+
+
+def ping_role_ids(conn: sqlite3.Connection, guild_id: int) -> list[int]:
+    """Roles to ping when a review card posts — the dial, else the mod roles.
+
+    The dial wins whenever it is set, so a guild that wants a narrower or
+    wider circle than its moderators simply names one.
+
+    The fallback exists because a stored 0 here is usually an artifact, not a
+    decision: XP Settings saves as one form, so changing any XP dial writes a
+    0 over this one, and prod shows exactly that — the main guild has held 0
+    while its promotion cards posted silent to nobody. Falling back to the
+    roles that can actually *action* a card (``AppContext.member_is_mod``
+    gates on the guild's configured mod/admin roles) means the card reaches the people it
+    is for, and matches what the economy's approval cards do with their
+    manager role.
+
+    Admin roles are deliberately not included: they overlap the mod roles in
+    every configured guild and adding them would only ping the same people
+    twice under a second name.
+    """
+    explicit = ping_role_id(conn, guild_id)
+    if explicit > 0:
+        return [explicit]
+    return _csv_ids(conn, "mod_role_ids", guild_id)
+
+
+def _csv_ids(conn: sqlite3.Connection, key: str, guild_id: int) -> list[int]:
+    """Parse a comma-separated id config value, skipping anything unparseable."""
+    raw = get_config_value(conn, key, "", guild_id) or ""
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0 and value not in out:
+            out.append(value)
+    return out
+
+
+def sleeper_channel_id(conn: sqlite3.Connection, guild_id: int) -> int:
+    return get_config_int(conn, SLEEPER_CHANNEL_KEY, guild_id)
+
+
+def is_enabled(conn: sqlite3.Connection, guild_id: int) -> bool:
+    """True once there's a promotion-reviews channel to post cards into.
+
+    A card can post as long as the review channel is set; the pruned-return
+    *button* additionally needs a grant role, gated per-kind in
+    :func:`evaluate_trigger`.
+    """
+    return review_channel_id(conn, guild_id) > 0
+
+
+# ---------------------------------------------------------------------------
+# Card ledger
+# ---------------------------------------------------------------------------
+
+
+def get_open_card(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> sqlite3.Row | None:
+    """The member's un-resolved review card, if one is already posted."""
+    return conn.execute(
+        "SELECT * FROM promotion_review_cards "
+        "WHERE guild_id = ? AND user_id = ? AND resolved_at IS NULL",
+        (guild_id, user_id),
+    ).fetchone()
+
+
+def get_card(conn: sqlite3.Connection, card_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM promotion_review_cards WHERE id = ?", (card_id,)
+    ).fetchone()
+
+
+def reserve_card(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    kind: str,
+    created_at: float,
+) -> int | None:
+    """Claim the single open-card slot for a member; returns the new card id.
+
+    Inserts a placeholder (channel/message filled in once the card is actually
+    posted). The partial unique index makes a racing second insert fail — we
+    return ``None`` so that caller treats it as "already carded" and skips,
+    which is how two near-simultaneous messages can't both post a card.
+    """
+    try:
+        cursor = conn.execute(
+            "INSERT INTO promotion_review_cards "
+            "(guild_id, user_id, kind, channel_id, message_id, created_at) "
+            "VALUES (?, ?, ?, 0, 0, ?)",
+            (guild_id, user_id, kind, created_at),
+        )
+    except sqlite3.IntegrityError:
+        return None
+    return int(cursor.lastrowid or 0)
+
+
+def set_card_message(
+    conn: sqlite3.Connection, card_id: int, channel_id: int, message_id: int
+) -> None:
+    """Attach the posted message's location to a reserved card row."""
+    conn.execute(
+        "UPDATE promotion_review_cards SET channel_id = ?, message_id = ? WHERE id = ?",
+        (channel_id, message_id, card_id),
+    )
+
+
+def delete_card(conn: sqlite3.Connection, card_id: int) -> None:
+    """Roll back a reserved card whose post never made it to Discord."""
+    conn.execute("DELETE FROM promotion_review_cards WHERE id = ?", (card_id,))
+
+
+def resolve_card(
+    conn: sqlite3.Connection,
+    card_id: int,
+    resolved_by: int,
+    resolved_at: float,
+    resolution: str,
+) -> int:
+    """Close an open card; returns rows updated (0 if already resolved)."""
+    cursor = conn.execute(
+        "UPDATE promotion_review_cards "
+        "SET resolved_at = ?, resolved_by = ?, resolution = ? "
+        "WHERE id = ? AND resolved_at IS NULL",
+        (resolved_at, resolved_by, resolution, card_id),
+    )
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Level 5 cards — not ledger-backed, refreshed in place
+# ---------------------------------------------------------------------------
+#
+# The Level 5 card (xp_service.maybe_log_level_5) predates the ledger above and
+# is keyed by member id, not a card row, so we track where each was posted and
+# re-render its one live field. See docs/specs/promotion_review_spec.md.
+
+SPICY_FIELD_NAME = "Spicy access"
+SPICY_GRANTED = "✅ Granted"
+SPICY_NOT_GRANTED = "❌ Not granted"
+#: Spicy is saved in a break snapshot and comes back on return — held, not
+#: stripped (docs/specs/take_a_break_spec.md).
+SPICY_ON_BREAK = "🌙 On a break"
+SPICY_ON_BREAK_LITE = "🌙 On a break (Spicy Lite)"
+
+
+def spicy_access_value(has_nsfw: bool, *, on_break: bool = False, lite: bool = False) -> str:
+    """The "Spicy access" field value for a member's current role state.
+
+    ``on_break`` means the Spicy role sits in the member's break snapshot, and
+    ``lite`` that Spicy Lite was swapped in for it. Shared by the poster and
+    the refresh hook so the two can't drift apart.
+    """
+    if has_nsfw:
+        return SPICY_GRANTED
+    if on_break:
+        return SPICY_ON_BREAK_LITE if lite else SPICY_ON_BREAK
+    return SPICY_NOT_GRANTED
+
+
+def level_5_card_opted_out(
+    optin_role_id: int, member_role_ids: set[int], role_exists: bool
+) -> bool:
+    """Is this member's Level 5 card withheld for want of the NSFW opt-in?
+
+    The card's Grant button hands out NSFW access, so a member who never chose
+    @NSFW Interested gets no card, no ping and no button (Ben, 2026-09-30);
+    picking the role later posts it (:func:`level_5_card_due_on_optin`). The
+    dial is intake's Stage 2 opt-in, and unset (0) keeps every card. A deleted
+    role does **not** withhold: Stage 2 fails closed there, but a card that
+    failed closed would hide every new Level 5 member from mods without a word.
+    """
+    verdict = intake_svc.stage2_optin_verdict(optin_role_id, member_role_ids, role_exists)
+    return verdict == intake_svc.OPTIN_NOT_OPTED_IN
+
+
+def level_5_card_due_on_optin(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    *,
+    grant_level: int,
+    has_access: bool,
+) -> float | None:
+    """The member's total XP if picking the opt-in now owes them a Level 5 card.
+
+    ``None`` unless the card was withheld: the member already holds access, or
+    hasn't had Level ``grant_level`` announced (the level-up path posts it
+    then), or a card was already posted or is parked behind the tenure bar —
+    so toggling the role can never post a second one.
+    """
+    if has_access:
+        return None
+    row = conn.execute(
+        "SELECT total_xp, announced_level FROM member_xp WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if row is None or int(row["announced_level"]) < grant_level:
+        return None
+    if level_5_cards_for(conn, guild_id, user_id):
+        return None
+    if conn.execute(
+        "SELECT 1 FROM pending_promotion_posts WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone():
+        return None
+    return float(row["total_xp"])
+
+
+def record_level_5_card(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    message_id: int,
+    created_at: float,
+) -> None:
+    """Remember a posted Level 5 card so it stays refreshable.
+
+    Idempotent on ``message_id``: the immediate post path and the deferred
+    recheck loop must never double-record the same send.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO xp_level_5_cards "
+        "(guild_id, user_id, channel_id, message_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, channel_id, message_id, created_at),
+    )
+
+
+def level_5_cards_for(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> list[sqlite3.Row]:
+    """Every Level 5 card posted for a member, oldest first."""
+    return conn.execute(
+        "SELECT * FROM xp_level_5_cards WHERE guild_id = ? AND user_id = ? ORDER BY id",
+        (guild_id, user_id),
+    ).fetchall()
+
+
+def forget_level_5_card(conn: sqlite3.Connection, card_id: int) -> None:
+    """Drop a card whose message is gone, so it isn't fetched forever."""
+    conn.execute("DELETE FROM xp_level_5_cards WHERE id = ?", (card_id,))
+
+
+# ---------------------------------------------------------------------------
+# Trigger populations
+# ---------------------------------------------------------------------------
+
+
+def open_prune_user_ids(conn: sqlite3.Connection, guild_id: int) -> set[int]:
+    """Members with at least one open (unrestored) auto-sweep prune event.
+
+    Role-agnostic on purpose: any sweep that stripped a role qualifies the
+    member — the grant button re-adds the *configured* role.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT user_id FROM role_prune_events "
+        "WHERE guild_id = ? AND restored_at IS NULL",
+        (guild_id,),
+    ).fetchall()
+    return {int(r["user_id"]) for r in rows}
+
+
+def carded_user_ids(conn: sqlite3.Connection, guild_id: int) -> set[int]:
+    return {
+        int(r["user_id"])
+        for r in conn.execute(
+            "SELECT user_id FROM promotion_review_cards "
+            "WHERE guild_id = ? AND resolved_at IS NULL",
+            (guild_id,),
+        ).fetchall()
+    }
+
+
+def watch_candidates(conn: sqlite3.Connection, guild_id: int) -> set[int]:
+    """Everyone the hot path should watch: owed a card by either new trigger.
+
+    = (open prune events ∪ currently inactive-held) − already carded. Sleepers
+    are included by user id; the channel condition is checked at post time.
+    """
+    pruned = open_prune_user_ids(conn, guild_id)
+    sleepers = active_inactive_user_ids(conn, guild_id)
+    return (pruned | sleepers) - carded_user_ids(conn, guild_id)
+
+
+def evaluate_trigger(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, posted_channel_id: int
+) -> str | None:
+    """Which card kind (if any) a message from ``user_id`` should post.
+
+    Returns ``KIND_PRUNED_RETURN``, ``KIND_SLEEPER``, or ``None``. The
+    authoritative DB-truth gate the hot path confirms with before posting.
+    """
+    if not is_enabled(conn, guild_id):
+        return None
+    if get_open_card(conn, guild_id, user_id) is not None:
+        return None
+    # Pruned-return: an open prune event, a configured grant role, any channel.
+    if grant_role_id(conn, guild_id) > 0 and user_id in open_prune_user_ids(
+        conn, guild_id
+    ):
+        return KIND_PRUNED_RETURN
+    # Sleeper: held inactive AND posting in the sleeper channel.
+    sleeper_chan = sleeper_channel_id(conn, guild_id)
+    if (
+        sleeper_chan > 0
+        and posted_channel_id == sleeper_chan
+        and user_id in active_inactive_user_ids(conn, guild_id)
+    ):
+        return KIND_SLEEPER
+    return None
+
+
+def still_candidate(conn: sqlite3.Connection, guild_id: int, user_id: int) -> bool:
+    """True if the member still belongs on the watch set at all (any channel).
+
+    Used to decide whether a no-op message (e.g. a sleeper posting outside the
+    sleeper channel) should drop them from the watch set or keep them for later.
+    """
+    return (
+        user_id in open_prune_user_ids(conn, guild_id)
+        or user_id in active_inactive_user_ids(conn, guild_id)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Card-content helpers
+# ---------------------------------------------------------------------------
+
+
+def pruned_roles_for(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> list[tuple[int, float | None]]:
+    """``(role_id, pruned_at)`` for each open prune event, most recent first."""
+    rows = conn.execute(
+        "SELECT role_id, MAX(pruned_at) AS pruned_at FROM role_prune_events "
+        "WHERE guild_id = ? AND user_id = ? AND restored_at IS NULL "
+        "GROUP BY role_id ORDER BY pruned_at DESC",
+        (guild_id, user_id),
+    ).fetchall()
+    return [
+        (
+            int(r["role_id"]),
+            float(r["pruned_at"]) if r["pruned_at"] is not None else None,
+        )
+        for r in rows
+    ]
+
+
+def mark_prunes_restored(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, restored_at: float
+) -> int:
+    """Close every open prune event for the member (they got access back)."""
+    cursor = conn.execute(
+        "UPDATE role_prune_events SET restored_at = ? "
+        "WHERE guild_id = ? AND user_id = ? AND restored_at IS NULL",
+        (restored_at, guild_id, user_id),
+    )
+    return cursor.rowcount
+
+
+def member_level(conn: sqlite3.Connection, guild_id: int, user_id: int) -> int:
+    """The member's current level for the card, 0 if they have no XP row."""
+    row = conn.execute(
+        "SELECT level FROM member_xp WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    return int(row["level"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# In-memory watch registry — the message hot-path accelerator
+# ---------------------------------------------------------------------------
+#
+# on_message fires constantly; a DB round-trip per message is unacceptable. We
+# keep a per-guild set of user ids that *might* be owed a card so the hot path
+# is a single set-membership test. The set is seeded at startup (warm) and fed
+# by the prune sweep (note_pruned) and the inactive-hold path (note_inactive) —
+# the only writers of the two populations — so it never goes stale on the way
+# in. A stale-positive is harmless: evaluate_trigger re-checks the DB and
+# discard() drops members who no longer qualify.
+
+_watch: dict[int, set[int]] = {}
+_lock = threading.Lock()
+
+
+def warm(db_path, guild_ids) -> None:
+    """Seed the watch registry at startup for every enabled guild."""
+    with open_db(db_path) as conn:
+        seeded: dict[int, set[int]] = {}
+        for gid in guild_ids:
+            if is_enabled(conn, gid):
+                seeded[gid] = watch_candidates(conn, gid)
+    with _lock:
+        _watch.clear()
+        _watch.update(seeded)
+
+
+def note_pruned(db_path, guild_id: int, user_ids) -> None:
+    """Add freshly-pruned members to the watch set (called from the sweep)."""
+    _note_many(db_path, guild_id, user_ids)
+
+
+def note_inactive(db_path, guild_id: int, user_id: int) -> None:
+    """Add a freshly inactive-held member to the watch set."""
+    _note_many(db_path, guild_id, [user_id])
+
+
+def _note_many(db_path, guild_id: int, user_ids) -> None:
+    ids = {int(u) for u in user_ids}
+    if not ids:
+        return
+    with open_db(db_path) as conn:
+        if not is_enabled(conn, guild_id):
+            return
+    with _lock:
+        _watch.setdefault(guild_id, set()).update(ids)
+
+
+def is_watched(guild_id: int, user_id: int) -> bool:
+    """O(1) hot-path test: might this member be owed a review card?"""
+    bucket = _watch.get(guild_id)
+    return bucket is not None and user_id in bucket
+
+
+def add_watched(guild_id: int, user_id: int) -> None:
+    with _lock:
+        _watch.setdefault(guild_id, set()).add(user_id)
+
+
+def discard(guild_id: int, user_id: int) -> None:
+    """Drop a member from the watch set once carded or no longer a candidate."""
+    with _lock:
+        bucket = _watch.get(guild_id)
+        if bucket is not None:
+            bucket.discard(user_id)
+
+
+def _reset_watch_for_tests() -> None:
+    with _lock:
+        _watch.clear()

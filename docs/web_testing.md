@@ -1,0 +1,431 @@
+# Web / dashboard testing
+
+Beyond the per-feature route tests (`tests/web/test_*_routes.py`), a set of
+cross-cutting sweeps guard properties that no single route test owns. Two tiers:
+
+- **Default suite** (every push, no browser): fast TestClient / static checks.
+- **Browser suite** (`browser` marker; gate.py scoped, nightly full): real
+  Chromium via Playwright. Excluded from the default run; auto-skips where
+  Playwright/Chromium isn't installed. Needs `python -m playwright install
+  chromium` on a new machine.
+
+## Environment hermeticity
+
+`bot_modules.core.config` calls `load_dotenv(override=True)` at **module
+scope**, so importing almost anything merges the developer's real `.env` into
+`os.environ`, and the production checkout has one. A test that reads an
+application setting therefore behaved differently on the machine that serves
+the dashboard than on CI or in a worktree. It cannot be undone from outside
+pytest (the file wins over the process environment by design), so it is undone
+inside: `tests/conftest.py` has an autouse `_hermetic_env` fixture that removes
+every name in `SCRUBBED_ENV_VARS` for the duration of each test.
+
+**Global, not per-directory.** The dashboard's surface is not `tests/web/`:
+`tests/test_web_routes.py` builds its own dashboard app outside that directory,
+and `DASHBOARD_BASE_URL` / `SUPPORT_USER_ID` are read by two bot-side services
+(`advisor_service`, `auto_delete_service`) as well. A fixture scoped to
+`tests/web/` reaches none of them.
+
+Scrubbed to *absent*, not pinned to a value: absent is what CI and a fresh
+clone see, and it makes `_auto_detect_auth` fail closed if a test forgets to
+pass `auth=` rather than quietly picking up the real Discord client id. A test
+that needs a value sets it with `monkeypatch.setenv`, which runs after the
+fixture and still wins.
+
+`tests/tooling/test_env_hermeticity.py` is the gate. It greps `src/web_server` and
+`src/bot_modules` for every `os.getenv` / `os.environ` read and **fails** if a
+name is in neither `SCRUBBED_ENV_VARS` nor `ENV_NOT_SCRUBBED`: the companion
+list of reads that must survive, each with its reason (`JAVA_HOME` is a
+toolchain path, `HF_HOME` a model cache, `BOT_ENV` a config selector). So a new
+environment read forces that classification at the commit that adds it, rather
+than surfacing later as a test that is red on one machine only. Two further
+tests fail on a stale entry and on a name classified both ways.
+
+**Cookie transport.** `DASHBOARD_BASE_URL` is the one that bites hardest.
+`routes/oauth._is_secure()` reads it, and every route that re-signs the session
+cookie (`/api/guilds/{id}/select`, the OAuth callback) passes the result as the
+cookie's `Secure` flag. An https value plus an http-speaking `TestClient` means
+httpx **stores the new cookie and never sends it back**, and a domain-less
+`client.cookies.set(SESSION_COOKIE, …)` is a different jar key from the
+server's, so the stale pre-switch cookie survives beside it and wins. That
+combination made two B-SEC1 tests read a leak that the server never had.
+
+The transport half is built into the shared fixtures rather than left to
+each test to remember: `web_client(app)` in `tests/web/conftest.py` speaks
+`https://testserver`, and `set_session_cookie(client, value)` pins the cookie
+to `testserver.local` (`http.cookiejar`'s form for a dotless host) so the
+server's own `Set-Cookie` displaces it instead of landing beside it.
+`open_client` and `authed_client` both use them, and any hand-rolled client
+should too. `test_web_security_fixes.py` additionally parametrizes the two
+guild-switch tests across both dashboard schemes.
+
+## Default-suite sweeps
+
+### Authorization — `test_authz_sweep.py`
+Enumerates every registered route and, on the *real* `DiscordOAuthAuth` backend
+with **no** session, asserts each non-public route returns 401/403, never a
+2xx. A route that forgets `Depends(require_perms(...))` shows up as a leak. The
+design rule ("everything gated, never ship an unenforced control") becomes
+mechanical instead of per-route vigilance. Public routes (login, OAuth, static)
+are allowlisted. Perm-*level* checks (admin vs moderator) stay in each
+route's own test; this sweep only proves anonymous callers get nothing.
+
+**Swagger and the OpenAPI schema are admin-gated, not public.** FastAPI's
+built-in `docs_url`/`openapi_url` routes accept no dependency, so they were
+public by construction and handed anyone who found the URL a browsable
+inventory of every route and request body. `server.py` switches both defaults
+off and registers `/api/_docs` and `/api/openapi.json` by hand behind
+`require_perms({"admin"})`. Both are `include_in_schema=False`, so this sweep
+cannot see them, and like `manual.html` they get explicit tests at the bottom of
+the file, including one asserting FastAPI's ungated defaults stay 404.
+
+**`/static/` is public with one carve-out:** `static/manual.html` is the staff
+and moderator guide, so it is served by an explicit authed route registered
+*before* the `StaticFiles` mount (which would otherwise serve it to anyone).
+Every other asset (css, js, images) stays public because the login page needs
+them. The gating is pinned by tests in this file: anonymous gets a redirect to
+`/login`, an authenticated session gets 200. If you ever add a second sensitive
+static file, it needs the same treatment; the mount does not gate anything.
+
+### Security headers — `test_security_headers.py`
+One outermost middleware in `server.py` attaches `X-Content-Type-Options`,
+`X-Frame-Options` and `Referrer-Policy` to every response, plus a
+Content-Security-Policy. Outermost on purpose: a 401, a 403 and a 429 carry
+them too, and those are the responses a prober actually sees.
+
+The CSP is the *verified* policy, not the strictest one that parses: a CSP
+that breaks a panel gets deleted wholesale by the next person, so the tests
+pin both directions:
+
+* `script-src 'self'`, no `'unsafe-inline'`. The dashboard's three inline
+  scripts (login.html's error decoder, manual.html's TOC builder, and its
+  print button's `onclick`) moved to `static/login.js` and `static/manual.js`.
+  Those two sit at the static root, **not** under `static/js/`; `js/` is the
+  dashboard app's module graph, and neither page loads any of it. CI's eslint
+  target is therefore `src/web_server/static`, not `static/js`: these are the
+  two files whose only failure mode under the CSP is silence, so a lint scope
+  that stops at `js/` reads everything except the part that matters.
+* `style-src` keeps `'unsafe-inline'`, a deliberate anomaly with its own
+  test, because the panels emit `style="..."` in markup strings in dozens of
+  places. (`Element.style` assignment from JS is CSSOM and unaffected either
+  way.)
+* `/api/_docs` is exempt from the CSP alone: Swagger UI loads its assets from
+  cdn.jsdelivr.net. The other headers still apply, and the schema route it
+  fetches is not exempt.
+
+Three source guards keep the policy true rather than nominally true, since
+blocked script simply never runs and the page half-works:
+
+* No inline `<script>` or `on*=` in the three HTML pages.
+* No inline event handler in any JS under `static/`: the whole tree, not just
+  `js/`, so the two root-level files are covered. There is **no allowlist**:
+  the walk strips comments first, which is what made emptying it possible.
+  md-preview.js was the last holdout and now binds with `addEventListener`;
+  its comment still quotes the `onclick="return false"` it used to render, and
+  matching that prose is what kept an allowlist alive after the handler was
+  gone. `tests/web/test_frontend_wiring.py` sweeps `static/js/` for the same
+  thing from the panel side; the two overlap deliberately and neither is
+  redundant, since only the security-headers one reaches the static root.
+* No `eval(` or `new Function(` anywhere under `static/`. `script-src 'self'`
+  carries no `'unsafe-eval'`, so both throw in the page. This is not
+  hypothetical: the CSP caught the table test harness rebuilding column
+  formatters with `new Function`, which had worked only because no policy had
+  ever been sent.
+
+### Request body ceiling — `test_body_size_limit.py`
+`_BodySizeLimitMiddleware` refuses a request whose declared `Content-Length`
+exceeds `MAX_BODY_BYTES` (32 MB) with a 413, before the body is read. The
+per-route 8 MB per-file caps are unchanged and still do the real validation;
+this is layered above them to stop the absurd request, not to second-guess
+them: 32 MB is four files at the per-file cap, which is more than any panel
+sends.
+
+One gap is deliberate and carries a `strict=True` xfail so it stays visible: a
+chunked request declares no `Content-Length`, and counting bytes as they
+stream would mean taking the receive channel away from every route beneath the
+middleware. Both real clients always declare a length.
+
+### Bounded inputs — `test_bounded_inputs.py`
+**Out of range is 422, never a clamp.** A bounded number (a paging `limit`, a
+report's `days`, an admin-typed dial) is refused when it falls outside its
+range, and nothing is written. The dashboard used to do both depending on the
+route: most inputs clamped, so `?limit=100000` came back 200 with 500 rows and
+a duel fuse typed as 1s stored as 5s under a green *Saved* while the form
+still read 1. A clamp tells the admin their number was accepted when a
+different number was stored, and the panel has no way to know it should
+re-read the form.
+
+Declare the bound where the value enters: `Query(ge=, le=)` on a query
+parameter, `Field(ge=, le=)` on a body model, so FastAPI raises it and the
+number sits where a reader looks for it. `helpers.require_in_range` is for the
+handful whose bounds are table-driven (the six duel panels share
+`_DUEL_GAMES`); it emits Pydantic's own `type`/`msg`/`loc`, so the panels need
+no second error branch. Two properties beyond the refusal are pinned here: a
+rejected field writes **none** of its form's values, and the edges are
+inclusive (0 cooldown hours, 0 challenges-per-hour meaning unlimited, and
+`days=0` on the inactive report meaning "the whole scope").
+
+Derived numbers still clamp and a test says so: Little Libs' blank count off
+its paragraph count, `meta/members` widening its page budget to fit an
+explicit id list. Nobody typed those, so there is nobody to refuse.
+
+`tests/contracts/test_settings_registry_contract.py` holds the other half: every bounded
+key in the AI advisor's settings registry must name the body model that
+enforces it, and a bounded key with no such row now fails the suite.
+
+### Undeclared fields — `test_request_body_forbid.py`
+**A field the model doesn't declare is 422, never dropped.** Pydantic's default
+ignores an unknown key, which is how a field renamed in panel JS (or in the
+model) saves nothing under a green *Saved*. Every JSON body model carries
+`model_config = ConfigDict(extra="forbid")`, and the sweep walks
+`app.openapi()`: each JSON request body and every model nested in it (through
+`$ref`, list items and unions) must publish `additionalProperties: false`. A
+subclass inherits its base's config, so the six duel bodies get it from
+`DuelSharedConfigUpdate`. A free-form `dict` field (Games `options`, a Mahjong
+card) is not a model and is not held to it; multipart upload bodies are
+FastAPI's own and are skipped. When the panel genuinely needs a new field, add
+it to the model; the 422 names the key.
+
+### Snowflake precision — `test_snowflake_precision.py`
+Discord ids are ~2^60; a bare JSON number loses precision above 2^53 and the
+dashboard rounds it into a different, non-existent id (see the "Snowflake JS
+precision" note). A recursive walker flags any int > 2^53 in a response. Applied
+three ways: unit tests on the walker; a broad sweep of no-param GET endpoints
+with the active guild set to a real snowflake (catches guild-id echoes; heavy /
+external endpoints excluded so an in-process handler can't hang the suite); and
+round-trips through the two hand-serialized features most likely to regress
+(announcements, role menus).
+
+### Import bindings — `test_js_import_bindings.py`
+One unresolvable name in an `import { … }` list kills the *whole* ES module, so
+the panel never mounts and the user gets `Failed to load <Panel>: Importing
+binding name 'apiGet' is not found.`, which is how the Meadow Mahjong panel
+shipped in 2026-08 (`apiGet` from `api.js`, which exports `api`). Nothing
+always-on saw it: the eslint config (`eslintConfig` in `package.json`) extends
+`eslint:recommended`, which has no import-resolution rule, and the browser tier
+was blind to it as well (below). A plain source parse now checks every named
+import in every module against the target's real exports, following
+`export … from` re-exports. No browser, no marker, ~0.6s.
+
+### Broken manual links — `test_help_links.py`
+The in-dashboard manual (`static/manual.html`) rewrites `href="#x"` links to
+help routes or in-page anchors; a target that's neither is a silent dead link
+(a real one, `#role-menus`, shipped that way). Pure text parse: every internal
+link must resolve to a help-section anchor or an existing element id, and every
+help-nav anchor must have a matching manual section.
+
+## Browser suite (`browser` marker)
+
+Shares one Playwright harness (`scripts/mobile_layout_scan.py`: serve the app
+under OpenAuth, enumerate panels from the nav, navigate + settle). The harness
+neutralizes the per-IP rate limiter in-process; every browser request comes
+from one loopback IP, which the limiter would otherwise 429, burying the signal.
+
+**Every tier selects browser tests by the `browser` marker over `tests/web/`,
+never by filename.** A list of files is what once left five of the seven
+browser test files running in no tier at all. `tests/tooling/test_gate_mobile_scope.py`
+fails if the gate or a workflow names a browser test file, and that includes a
+comment naming one.
+
+### Responsive layout — `test_mobile_layout.py`
+Every panel at 390/768/1280 must keep content on-screen (no viewport overflow,
+no clipped-unreachable content). Also tagged `mobile` so `-m mobile` runs just
+it. Full detail: [mobile_layout_testing.md](mobile_layout_testing.md).
+
+### Panel load health — `test_panel_console.py`
+Every panel must mount with no uncaught JS exception, no `console.error` (beyond
+resource-load failures, which the network check owns), and no failed/4xx-5xx
+same-origin request. Nothing else exercises the vanilla-JS panels past a syntax
+check, so a panel that throws on mount would otherwise ship green. It also
+asserts the module **loaded at all**: `app.js` `await import()`s a panel inside
+a `try` and paints `Failed to load <label>: …` on rejection, and because that
+rejection is *caught* it raises no `pageerror`, no `console.error` and no failed
+request; the total failure of a panel was the one mount problem this sweep
+could not see, and Meadow Mahjong swept green while broken. The banner prefix is
+app.js's alone (`mountAsync` says "Couldn't load this page."), so the DOM check
+can't collide with a panel whose first fetch merely failed. The bot-less
+test env makes bot-dependent endpoints return 503 (tolerated; can't happen in
+prod); the SSE log stream and favicon are tolerated; `greeter-response`'s
+no-data report 404 is allowlisted.
+
+### Accessibility — `test_panel_a11y.py`
+Every panel, once settled, must pass axe-core's WCAG 2.0/2.1/2.2 A and AA rules
+with **no allowlist**: contrast, accessible names, 24px targets (WCAG 2.5.8),
+keyboard-reachable scroll boxes. axe is an npm devDependency pinned in
+`package.json`, injected per context with `bypass_csp=True` (the dashboard's
+CSP forbids inline script). Without `node_modules/axe-core` the file skips
+locally and **fails under CI**, whose browser jobs `npm install` it. Born green
+(standards audit 3.14): the first sweep's 177 nodes were fixed with it: 158
+were guide links drawn in `--blurple` (2.74:1) instead of `--blurple-text`.
+It sees only what a bare load draws; a control behind a click or a data row
+needs an interaction scenario, or a hand-set floor like `.filter-chip-x`'s.
+Reuses `test_panel_console.py`'s server and browser fixtures.
+
+### Picker dropdown — `test_filter_select_dropdown.py`
+`js/filter-select.js` backs the searchable pickers in 43 panels, so it gets its
+own gate rather than riding on whichever panel happens to mount one. Mounts the
+widget straight from the shipped module (no panel data: the bot-less env 503s
+the channel/role fetches) and asserts it is `display: none` until focused, opens
+anchored flush under its input, and stays anchored across a scroll. Each case
+runs twice: once normally, once with `HTMLElement.prototype.showPopover` deleted
+to exercise the no-Popover-API path: the iOS failure where the list had no
+`display` rule of its own and stranded itself hundreds of pixels from its field.
+
+Note the limit of that simulation: deleting the methods does not stop Chromium
+applying `[popover]` UA *styles*, so it reproduces the positioning and
+lost-visibility half of the iOS bug, not an engine that ignores the attribute
+entirely.
+
+A third case stubs `window.visualViewport` with a non-zero `offsetTop` and a
+shrunk `height` (what an iOS on-screen keyboard leaves behind) and asserts the
+list still lands flush on its input. Chromium has no software keyboard and
+Playwright cannot shift the visual viewport, so reporting the offset is the only
+way to reach that branch on this hardware. It guards a real regression: the
+placement folded `visualViewport.offsetTop` into the coordinates, which
+displaced the list by exactly that many pixels on a phone (the "dropdown
+floating loose in the corner" report) while staying a no-op on desktop, where
+the offset is always 0, invisible to every other case in this file. The offset
+does still belong in the *fit* test that decides whether to flip above the
+field, so one parameter row puts the field low enough to force that flip and
+asserts the list is flush on top of the input rather than merely above it.
+
+The desktop-shaped `no-keyboard` row is deliberate: it fails the same way if the
+fix ever degrades into a phone-only special case.
+
+A second fixture mounts the widget with real snowflake ids to cover **matching
+by id**: pasting a channel id finds its row, a short numeric filter does not
+drag in every id containing that digit (the `MIN_ID_FILTER_LEN` gate), and name
+search is unaffected. The shipped fixture's `"1"`/`"2"`/`"3"` ids are shorter
+than that gate, so they cannot exercise the path. This came from a real
+mobile report: copying an id out of Discord (the natural move when the name
+carries an emoji and a box separator) returned an empty list, which reads as
+"the bot can't see any channels".
+
+### Failure states that lied — `test_error_states_surface.py`
+Four shapes where a rejection was handled in a way that was worse than not
+handling it: a refresh that kept the old numbers, a retry that could never run,
+an unsaved-edits warning that disarmed itself, and a first-load failure that
+replaced the whole panel with an error nothing could clear. The first three are
+pinned per panel, by name, so the lists shrink as panels are fixed. The fourth
+is pinned by **shape**: a catch on a bare call at the top level of `mount()`
+whose body writes into the whole container belongs to `mountAsync`, which draws
+a Try again. A catch that writes into one named region is a partial failure and
+stays: `channels.js` renders its comparison table whether or not the health
+section loaded, and routing that through `mountAsync` would blank the working
+half to report the broken one. The file's own docstring is the spec for each
+shape.
+
+### Shared-layer safety — `test_shared_js_safety.py`
+Same reasoning as the picker gate, for the other modules almost every panel
+imports. The first three cases come from the 2026-08-06 deep review; the
+submit guard and the 422 field name were added on 2026-09-20.
+
+`js/table.js` renders cells as **text by default**, with a per-column
+`html: true` opt-in. It used to interpolate the raw value *and* any `format()`
+return straight into `innerHTML`, and six report panels feed it raw Discord
+display names, so a nickname of `<img src=x onerror=…>` executed in a
+moderator's session on every page view (stored XSS). The tests render that
+nickname through the formatted path, the unformatted `raw ?? ""` path
+(a display name rendered with no `format`) and a column *label* (a panel can build
+one out of a display name), and assert no element was injected and no handler
+fired. Two more assert the `html: true` columns still render their markup, and
+that opting one column in does not lift escaping off its neighbors, the way
+this fix would otherwise silently blank the colored score/trend cells.
+
+`js/config-helpers.js` memoizes `/api/config` and every `/api/meta/*` list in
+module globals, all of it scoped to the **active** guild, and a guild switch
+re-mounts panels without reloading the page. The test stubs `fetch` as two
+different guilds, walks load → `resetMetaCaches()` → load, and asserts on what a
+mounted channel *picker* offers: the surface that used to lie, and whose value
+a save then wrote to the wire. A control case (no reset) proves the memo still
+works within a guild. The app.js side of that wiring is a cheap source check in
+`tests/web/test_frontend_wiring.py`, which also sweeps every `syncHash()` /
+`history.replaceState("#/…")` id against the router's registered routes; the
+bug there was `panels/todo.js` writing `#/todo` for a page registered as
+`mod-todo`, so every render left a URL that reloads to "Page Not Available".
+
+Three **source sweeps** live in that file and hard-fail the suite rather than
+warn. A panel may not wire its own `addEventListener("submit", …)`: it goes
+through `guardedSubmit`, and the exemption list is meant to shrink. No file
+under `static/js/` may carry an inline `onclick=`/`onchange=`/`onsubmit=`
+attribute, for the CSP reason above (comments are stripped before the scan,
+since `md-preview.js` and `table.js` both discuss such an attribute in prose).
+And the eslint bans on the native dialogs and on network outside `api.js` are
+pinned as config, together with the requirement that each of the three
+`eslint-disable-next-line` opt-outs has a prose reason on the line above it.
+Those last two read `package.json`'s `eslintConfig`, which the remote test
+runner does not sync, so they **skip** in the pre-commit tier and are enforced by CI, which is
+also where the eslint job that applies the rules runs.
+
+The same file gates the **bounded member list**. `/api/meta/members` returns a
+page now (live roster first, departed users filling whatever budget is left)
+instead of every person who has ever joined, and that is only safe because
+`filterSelect` / `multiFilterSelect` take an `opts.search` callback: the widget
+keeps filtering its prefetch locally *and* asks the server as the user types.
+The tests stub the endpoint as a two-row page with a departed member behind it
+and run the same scenario twice: the `search: null` control is the regression a
+naive server cap would have shipped, where that member is not merely hard to
+find but impossible to select. Two more cover the other halves: a saved id the
+page didn't include still resolves to a name (`?ids=`), and a reply landing
+after the panel unmounts is dropped rather than rendered into a detached list.
+The source side (`memberSearch()` wired into both shared mount helpers, and no
+panel building member options without it) is swept in `test_frontend_wiring.py`
+alongside the `resetMetaCaches()` check, which now covers the `Map` memos too.
+The endpoint's own bound, search and id resolution are route tests in
+`test_meta_and_ai_routes.py`.
+
+`js/md-preview.js` put the link **text** in the `href` (`$1`, not `$2`), which
+also forfeited the https-only validation the pattern does on the URL: a
+`[javascript:alert(1)](https://ok)` link produced a real `javascript:` href,
+stopped only by an `onclick` a middle-click walks past. That `onclick` is gone
+too: it was an inline attribute, which `script-src 'self'` refuses to run, so
+it read as handled while doing nothing and a click took the author off a page
+holding unsaved text. A delegated listener replaces it, and a browser case
+dispatches a real cancelable click to prove the navigation is prevented and no
+inline handler came back.
+
+`js/config-helpers.js`'s **`guardedSubmit`** has five cases, because it is the
+single funnel every dashboard form now submits through: a double click runs the
+handler once, six frantic clicks still run it once, two `requestSubmit()` calls
+(the Enter-in-a-text-field path, which never touches the button) run it once, a
+submit on a section held read-only leaves the button disabled afterwards rather
+than "restoring" it to enabled, and (the one that is easy to forget) a handler
+that **throws** still hands the button back and clears the in-flight flag, or a
+single 503 on Save leaves the admin with a dead button and no way out but a
+reload.
+
+`js/api.js` names the offending field on a 422. FastAPI puts it in `loc` and
+nowhere else (`msg` is "Input should be less than or equal to 23"), which on a
+config page with six dials tells an admin a value is wrong without saying
+which box. The tests stub a response carrying one validation error, two, and an
+error with no `loc` at all, and assert the last two still read as sentences.
+
+The two panel sweeps use a **fresh browser context per panel** and wait for the
+layout to settle before measuring: shared-context state bleed and mid-render
+snapshots otherwise make results flap between runs.
+
+## Where each runs
+
+| | default suite (per push) | gate.py --quick | gate.py --scoped | nightly |
+|---|---|---|---|---|
+| authz / snowflake / help-links | ✅ | not run (no pytest) | when a `src/web_server/` change maps them in | ✅ |
+| mobile layout / panel console / accessibility | skipped (no browser) | scoped to changed panels* | scoped to changed panels* | full |
+
+`--quick` runs **no pytest at all** (ruff + pyright + the scoped browser panel
+checks when dashboard assets changed) and is now the only *local* tier that
+runs either heavy check: the pre-commit hook and the full gate leave both to
+CI's `browser` job and pyright step, so the authz/snowflake/help-links sweeps
+never run under it; under `--scoped` they run only when the staged diff touches
+`src/web_server/` and the mapping pulls their test files in.
+
+\* gate.py runs the browser suite (`-m browser`) only when a commit touches
+dashboard assets, scoped to the affected panels (`PANEL_SCOPE`); all-panel
+sweeps run phone-width only to stay fast (`PANEL_VIEWPORTS`). Non-fatal without a
+browser. Scope mapping (`mobile_scope`) is covered by
+`tests/tooling/test_gate_mobile_scope.py`.
+
+## Adding a route? Two freebies
+A new route is covered by the authz sweep automatically (add it to
+`PUBLIC_PATHS` only if it's genuinely public). Its body model is held to
+`extra="forbid"` automatically too: give it the one-line `model_config`. If it returns ids, the snowflake
+walker (`find_precision_risks`) is importable for your own route test.

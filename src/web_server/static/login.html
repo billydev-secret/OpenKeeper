@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>Dungeon Keeper &mdash; Dashboard</title>
+  <style>
+    /* The two faces the dashboard itself uses, declared inline rather than by
+       pulling in the whole 4,500-line app.css for one screen. Latin subset
+       only — a login page has no member names in it. */
+    @font-face {
+      font-family: "Archivo";
+      font-style: normal;
+      font-weight: 100 900;
+      font-stretch: 62% 125%;
+      font-display: swap;
+      src: url("/static/fonts/archivo-var-latin.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Public Sans";
+      font-style: normal;
+      font-weight: 100 900;
+      font-display: swap;
+      src: url("/static/fonts/publicsans-var-latin.woff2") format("woff2");
+    }
+    :root {
+      /* This page has its own stylesheet and never loads app.css, so it
+         needs its own declaration — otherwise the browser paints the
+         scrollbar and focus ring light on a dark sign-in screen. */
+      color-scheme: dark;
+      --sans: "Public Sans", "Noto Sans", "Helvetica Neue", helvetica, arial, sans-serif;
+      --display: "Archivo", "Public Sans", "Helvetica Neue", helvetica, arial, sans-serif;
+      --bg: #2b2d31;
+      --bg-alt: #313338;
+      --ink: #dbdee1;
+      --ink-dim: #949ba4;
+      --gold-solid: #E6B84C;
+      --red: #9E3B2E;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--ink);
+    }
+    .wrap {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .card {
+      background: var(--bg-alt);
+      border-radius: 12px;
+      padding: 48px 40px;
+      text-align: center;
+      max-width: 420px;
+      width: 100%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+    }
+    .brand {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--gold-solid);
+      margin-bottom: 6px;
+    }
+    .title {
+      font-family: var(--display);
+      font-size: 28px;
+      font-weight: 700;
+      font-variation-settings: "wdth" 112, "wght" 700;
+      letter-spacing: -0.01em;
+      color: var(--ink);
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 14px;
+      color: var(--ink-dim);
+      margin-bottom: 16px;
+    }
+    .blurb {
+      font-size: 13px;
+      color: var(--ink-dim);
+      line-height: 1.5;
+      margin-bottom: 28px;
+    }
+    .error {
+      background: rgba(158,59,46,0.2);
+      border: 1px solid var(--red);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: var(--ink);
+      display: none;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      background: #5865F2;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: #4752c4; }
+    .btn svg { width: 22px; height: 22px; flex-shrink: 0; }
+    .footer {
+      margin-top: 28px;
+      font-size: 12px;
+      color: var(--ink-dim);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="brand">DK</div>
+      <div class="title">Dungeon Keeper</div>
+      <div class="subtitle">Server dashboard &mdash; settings, stats &amp; guides</div>
+      <div class="blurb">
+        Log in with Discord to check your stats and streaks, set up your profile and
+        perks, read the guides, and &mdash; if you help run a server &mdash; configure
+        everything the bot does there.
+      </div>
+      <div class="error" id="error-block"></div>
+      <a class="btn" href="/auth/discord">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.27 5.33C17.94 4.71 16.5 4.26 15 4a.09.09 0 0 0-.07.03c-.18.33-.39.76-.53 1.09a16.09 16.09 0 0 0-4.8 0c-.14-.34-.35-.76-.54-1.09-.01-.02-.04-.03-.07-.03-1.5.26-2.93.71-4.27 1.33-.01 0-.02.01-.03.02-2.72 4.07-3.47 8.03-3.1 11.95 0 .02.01.04.03.05 1.8 1.32 3.53 2.12 5.24 2.65.03.01.06 0 .07-.02.4-.55.76-1.13 1.07-1.74.02-.04 0-.08-.04-.09-.57-.22-1.11-.48-1.64-.78-.04-.02-.04-.08-.01-.11.11-.08.22-.17.33-.25.02-.02.05-.02.07-.01 3.44 1.57 7.15 1.57 10.55 0 .02-.01.05-.01.07.01.11.09.22.17.33.26.04.03.04.09-.01.11-.52.31-1.07.56-1.64.78-.04.01-.05.06-.04.09.32.61.68 1.19 1.07 1.74.03.01.06.02.09.01 1.72-.53 3.45-1.33 5.25-2.65.02-.01.03-.03.03-.05.44-4.53-.73-8.46-3.1-11.95-.01-.01-.02-.02-.04-.02zM8.52 14.91c-1.03 0-1.89-.95-1.89-2.12s.84-2.12 1.89-2.12c1.06 0 1.9.96 1.89 2.12 0 1.17-.84 2.12-1.89 2.12zm6.97 0c-1.03 0-1.89-.95-1.89-2.12s.84-2.12 1.89-2.12c1.06 0 1.9.96 1.89 2.12 0 1.17-.83 2.12-1.89 2.12z"/></svg>
+        Log in with Discord
+      </a>
+      <div class="footer">You'll only see servers you share with Dungeon Keeper.</div>
+    </div>
+  </div>
+  <script src="/static/login.js?v=1"></script>
+</body>
+</html>

@@ -1,0 +1,1092 @@
+"""Voice Control service layer — pure DB CRUD and business helpers.
+
+Schema lives in ``migrations/005_voice_master.sql``. All functions here take a
+sqlite3 Connection (matching ``db_utils.open_db``) and are sync. Discord-side
+glue lives in ``voice/master/cog.py``.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+import time
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+    import discord
+
+log = logging.getLogger("dungeonkeeper.voice_master")
+
+
+# Discord enforces 2 channel edits per 10 minutes per channel.
+EDIT_WINDOW_S: float = 600.0
+
+# Discord caps voice channel names at 100 characters and a category at 50 channels.
+MAX_NAME_LEN: int = 100
+CATEGORY_CHANNEL_CAP: int = 50
+
+# Default name template — used when no admin override and no saved name.
+DEFAULT_NAME_TEMPLATE: str = "{display_name}'s Room"
+
+
+# ---------------------------------------------------------------------------
+# Per-guild config (stored in the existing `config` table under voice_master_*)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VoiceMasterConfig:
+    # The sticky panel's channel/message ids are deliberately NOT here: the
+    # cog tracks them through the raw config keys on the message path (see
+    # voice_master_cog._panel_ids), and nothing ever read them off this
+    # dataclass.
+    hub_channel_id: int
+    category_id: int
+    control_channel_id: int
+    default_name_template: str
+    default_user_limit: int
+    default_bitrate: int
+    create_cooldown_s: int
+    max_per_member: int
+    trust_cap: int
+    block_cap: int
+    owner_grace_s: int
+    empty_grace_s: int
+    trusted_prune_days: int
+    disable_saves: bool
+    saveable_fields: frozenset[str]
+    post_inline_panel: bool
+    spectator_gate_role_id: int
+
+
+# The saveable-profile tokens, in one place. The Voice Control panel renders a
+# checkbox per entry, the config route validates against it, and
+# ``should_save_profile_field`` looks the chosen key up here. It drifted once:
+# the route still validated the three pre-dial names (locked/hidden/spectator)
+# that the single access dial replaced, so "access" — offered by the panel and
+# asked for by the command — could never be saved, and the guild that had it
+# ticked lost it silently (2026-08-29 config audit, finding #59).
+SAVEABLE_FIELD_KEYS: tuple[str, ...] = ("name", "limit", "access", "trusted", "blocked")
+
+_DEFAULT_SAVEABLE = frozenset(SAVEABLE_FIELD_KEYS)
+
+
+_CONFIG_DEFAULTS: dict[str, str] = {
+    "voice_master_hub_channel_id": "0",
+    "voice_master_category_id": "0",
+    "voice_master_control_channel_id": "0",
+    "voice_master_panel_channel_id": "0",
+    "voice_master_panel_message_id": "0",
+    "voice_master_default_name_template": DEFAULT_NAME_TEMPLATE,
+    "voice_master_default_user_limit": "0",
+    "voice_master_default_bitrate": "0",
+    "voice_master_create_cooldown_s": "30",
+    "voice_master_max_per_member": "1",
+    "voice_master_trust_cap": "25",
+    "voice_master_block_cap": "25",
+    "voice_master_owner_grace_s": "300",
+    "voice_master_empty_grace_s": "15",
+    "voice_master_trusted_prune_days": "0",
+    "voice_master_disable_saves": "0",
+    "voice_master_saveable_fields": ",".join(sorted(_DEFAULT_SAVEABLE)),
+    "voice_master_post_inline_panel": "1",
+    "voice_master_spectator_gate_role_id": "0",
+}
+
+
+def _parse_int(raw: str, default: int) -> int:
+    s = raw.strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return default
+
+
+def _parse_bool(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_voice_master_config(
+    conn: sqlite3.Connection, guild_id: int
+) -> VoiceMasterConfig:
+    """Load the full per-guild Voice Control config in one shot."""
+    from bot_modules.core.db_utils import get_config_value as _get  # avoid cycle at module import
+
+    raw: dict[str, str] = {
+        key: _get(conn, key, default, guild_id)
+        for key, default in _CONFIG_DEFAULTS.items()
+    }
+    # An unset key falls back to the default CSV above; a *stored* empty string
+    # is an admin who unchecked every Saveable Fields box, and stays empty —
+    # resurrecting the defaults there silently reverted their choice.
+    saveable_csv = raw["voice_master_saveable_fields"]
+    saveable = frozenset(s.strip() for s in saveable_csv.split(",") if s.strip())
+    return VoiceMasterConfig(
+        hub_channel_id=_parse_int(raw["voice_master_hub_channel_id"], 0),
+        category_id=_parse_int(raw["voice_master_category_id"], 0),
+        control_channel_id=_parse_int(raw["voice_master_control_channel_id"], 0),
+        default_name_template=raw["voice_master_default_name_template"]
+            or DEFAULT_NAME_TEMPLATE,
+        default_user_limit=_parse_int(raw["voice_master_default_user_limit"], 0),
+        default_bitrate=_parse_int(raw["voice_master_default_bitrate"], 0),
+        create_cooldown_s=_parse_int(raw["voice_master_create_cooldown_s"], 30),
+        max_per_member=_parse_int(raw["voice_master_max_per_member"], 1),
+        trust_cap=_parse_int(raw["voice_master_trust_cap"], 25),
+        block_cap=_parse_int(raw["voice_master_block_cap"], 25),
+        owner_grace_s=_parse_int(raw["voice_master_owner_grace_s"], 300),
+        empty_grace_s=_parse_int(raw["voice_master_empty_grace_s"], 15),
+        trusted_prune_days=_parse_int(raw["voice_master_trusted_prune_days"], 0),
+        disable_saves=_parse_bool(raw["voice_master_disable_saves"]),
+        saveable_fields=saveable,
+        post_inline_panel=_parse_bool(raw["voice_master_post_inline_panel"]),
+        spectator_gate_role_id=_parse_int(
+            raw["voice_master_spectator_gate_role_id"], 0
+        ),
+    )
+
+
+def set_voice_master_config_value(
+    conn: sqlite3.Connection, guild_id: int, key: str, value: str
+) -> None:
+    """Upsert a single voice_master_* config key for the given guild."""
+    if key not in _CONFIG_DEFAULTS:
+        raise ValueError(f"unknown voice control config key: {key}")
+    from bot_modules.core.db_utils import set_config_value as _set
+
+    _set(conn, key, value, guild_id)
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VoiceProfile:
+    """Saved per-member channel preferences.
+
+    ``locked``/``hidden``/``spectator``/``age_gated`` together encode the
+    owner's single access-state dial (see :func:`profile_access_state`):
+    ``locked`` always implies ``hidden`` and the NSFW flag, ``spectator`` implies
+    age-gating, and ``age_gated`` on its own is the "NSFW but open" state.
+    """
+    saved_name: str | None
+    saved_limit: int
+    locked: bool
+    hidden: bool
+    bitrate: int | None
+    spectator: bool = False
+    age_gated: bool = False
+
+
+def default_profile() -> VoiceProfile:
+    return VoiceProfile(
+        saved_name=None,
+        saved_limit=0,
+        locked=False,
+        hidden=False,
+        bitrate=None,
+        spectator=False,
+        age_gated=False,
+    )
+
+
+def restorable_profile(
+    profile: VoiceProfile,
+    *,
+    disable_saves: bool,
+    saveable_fields: Iterable[str],
+) -> VoiceProfile:
+    """Strip the saved fields this guild no longer permits persisting.
+
+    The restore-side mirror of ``should_save_profile_field``: unchecking a
+    Saveable Field on the dashboard has to stop an already-saved value coming
+    back on the next room, not merely stop new saves — otherwise a value the
+    admin turned off keeps re-applying forever. ``bitrate`` has no
+    saveable-field token of its own and is left alone.
+    """
+    if disable_saves:
+        return default_profile()
+    allowed = set(saveable_fields)
+    if "name" not in allowed:
+        profile = replace(profile, saved_name=None)
+    if "limit" not in allowed:
+        profile = replace(profile, saved_limit=0)
+    if "access" not in allowed:
+        profile = replace(
+            profile, locked=False, hidden=False, spectator=False, age_gated=False
+        )
+    return profile
+
+
+@dataclass(frozen=True)
+class ActiveChannel:
+    channel_id: int
+    guild_id: int
+    owner_id: int
+    created_at: float
+    last_edit_at_1: float
+    last_edit_at_2: float
+    owner_left_at: float | None
+
+
+# ---------------------------------------------------------------------------
+# Active channel CRUD
+# ---------------------------------------------------------------------------
+
+
+def insert_active_channel(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    guild_id: int,
+    owner_id: int,
+    now: float | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO voice_master_channels
+            (channel_id, guild_id, owner_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (channel_id, guild_id, owner_id, now if now is not None else time.time()),
+    )
+
+
+def get_active_channel(
+    conn: sqlite3.Connection, channel_id: int, guild_id: int | None = None
+) -> ActiveChannel | None:
+    """Look up a tracked channel by id.
+
+    Pass ``guild_id`` to scope the lookup to a single guild — callers that
+    accept a channel id from an untrusted source (e.g. a web route path
+    param) must do so, otherwise a foreign-guild id can resolve a row that
+    belongs to another guild and be acted on across the tenant boundary.
+    """
+    if guild_id is not None:
+        row = conn.execute(
+            "SELECT channel_id, guild_id, owner_id, created_at, "
+            "last_edit_at_1, last_edit_at_2, owner_left_at "
+            "FROM voice_master_channels WHERE channel_id = ? AND guild_id = ?",
+            (channel_id, guild_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT channel_id, guild_id, owner_id, created_at, "
+            "last_edit_at_1, last_edit_at_2, owner_left_at "
+            "FROM voice_master_channels WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return ActiveChannel(
+        channel_id=row["channel_id"],
+        guild_id=row["guild_id"],
+        owner_id=row["owner_id"],
+        created_at=row["created_at"],
+        last_edit_at_1=row["last_edit_at_1"],
+        last_edit_at_2=row["last_edit_at_2"],
+        owner_left_at=row["owner_left_at"],
+    )
+
+
+def get_owned_channel(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int
+) -> ActiveChannel | None:
+    """Return the (single) active channel owned by this user, if any."""
+    row = conn.execute(
+        "SELECT channel_id, guild_id, owner_id, created_at, "
+        "last_edit_at_1, last_edit_at_2, owner_left_at "
+        "FROM voice_master_channels "
+        "WHERE guild_id = ? AND owner_id = ? "
+        "ORDER BY created_at ASC LIMIT 1",
+        (guild_id, owner_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return ActiveChannel(
+        channel_id=row["channel_id"],
+        guild_id=row["guild_id"],
+        owner_id=row["owner_id"],
+        created_at=row["created_at"],
+        last_edit_at_1=row["last_edit_at_1"],
+        last_edit_at_2=row["last_edit_at_2"],
+        owner_left_at=row["owner_left_at"],
+    )
+
+
+def list_active_channels(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[ActiveChannel]:
+    rows = conn.execute(
+        "SELECT channel_id, guild_id, owner_id, created_at, "
+        "last_edit_at_1, last_edit_at_2, owner_left_at "
+        "FROM voice_master_channels WHERE guild_id = ?",
+        (guild_id,),
+    ).fetchall()
+    return [
+        ActiveChannel(
+            channel_id=r["channel_id"],
+            guild_id=r["guild_id"],
+            owner_id=r["owner_id"],
+            created_at=r["created_at"],
+            last_edit_at_1=r["last_edit_at_1"],
+            last_edit_at_2=r["last_edit_at_2"],
+            owner_left_at=r["owner_left_at"],
+        )
+        for r in rows
+    ]
+
+
+def active_channel_count(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int
+) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM voice_master_channels "
+        "WHERE guild_id = ? AND owner_id = ?",
+        (guild_id, owner_id),
+    ).fetchone()
+    return int(row["n"])
+
+
+def delete_active_channel(conn: sqlite3.Connection, channel_id: int) -> None:
+    conn.execute(
+        "DELETE FROM voice_master_channels WHERE channel_id = ?", (channel_id,)
+    )
+
+
+def set_owner_left_at(
+    conn: sqlite3.Connection, channel_id: int, value: float | None
+) -> None:
+    conn.execute(
+        "UPDATE voice_master_channels SET owner_left_at = ? WHERE channel_id = ?",
+        (value, channel_id),
+    )
+
+
+def set_owner(
+    conn: sqlite3.Connection, channel_id: int, new_owner_id: int
+) -> None:
+    conn.execute(
+        "UPDATE voice_master_channels SET owner_id = ?, owner_left_at = NULL "
+        "WHERE channel_id = ?",
+        (new_owner_id, channel_id),
+    )
+
+
+def record_edit_in_db(
+    conn: sqlite3.Connection, channel_id: int, *, now: float
+) -> None:
+    """Push ``now`` into the channel's edit-timestamp pair (FIFO)."""
+    row = conn.execute(
+        "SELECT last_edit_at_1, last_edit_at_2 FROM voice_master_channels "
+        "WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    if row is None:
+        return
+    new1, new2 = record_edit(now, row["last_edit_at_1"], row["last_edit_at_2"])
+    conn.execute(
+        "UPDATE voice_master_channels "
+        "SET last_edit_at_1 = ?, last_edit_at_2 = ? "
+        "WHERE channel_id = ?",
+        (new1, new2, channel_id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profile CRUD
+# ---------------------------------------------------------------------------
+
+
+def load_profile(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> VoiceProfile | None:
+    row = conn.execute(
+        "SELECT saved_name, saved_limit, locked, hidden, bitrate, spectator, "
+        "age_gated "
+        "FROM voice_master_profiles WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return VoiceProfile(
+        saved_name=row["saved_name"],
+        saved_limit=int(row["saved_limit"]),
+        locked=bool(row["locked"]),
+        hidden=bool(row["hidden"]),
+        bitrate=int(row["bitrate"]) if row["bitrate"] is not None else None,
+        spectator=bool(row["spectator"]),
+        age_gated=bool(row["age_gated"]),
+    )
+
+
+def save_profile(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    profile: VoiceProfile,
+    *,
+    now: float | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO voice_master_profiles
+            (guild_id, user_id, saved_name, saved_limit, locked, hidden, bitrate,
+             spectator, age_gated, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+            saved_name=excluded.saved_name,
+            saved_limit=excluded.saved_limit,
+            locked=excluded.locked,
+            hidden=excluded.hidden,
+            bitrate=excluded.bitrate,
+            spectator=excluded.spectator,
+            age_gated=excluded.age_gated,
+            updated_at=excluded.updated_at
+        """,
+        (
+            guild_id,
+            user_id,
+            profile.saved_name,
+            profile.saved_limit,
+            int(profile.locked),
+            int(profile.hidden),
+            profile.bitrate,
+            int(profile.spectator),
+            int(profile.age_gated),
+            now if now is not None else time.time(),
+        ),
+    )
+
+
+def update_profile_field(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    *,
+    field: str,
+    value: object,
+    now: float | None = None,
+) -> None:
+    """Patch one field of a member's profile, creating defaults if absent."""
+    profile = load_profile(conn, guild_id, user_id) or default_profile()
+    kwargs: dict[str, object] = {
+        "saved_name": profile.saved_name,
+        "saved_limit": profile.saved_limit,
+        "locked": profile.locked,
+        "hidden": profile.hidden,
+        "bitrate": profile.bitrate,
+        "spectator": profile.spectator,
+        "age_gated": profile.age_gated,
+    }
+    if field not in kwargs:
+        raise ValueError(f"unknown profile field: {field}")
+    kwargs[field] = value
+    save_profile(conn, guild_id, user_id, VoiceProfile(**kwargs), now=now)  # type: ignore[arg-type]
+
+
+def delete_profile(
+    conn: sqlite3.Connection, guild_id: int, user_id: int
+) -> None:
+    conn.execute(
+        "DELETE FROM voice_master_profiles WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trust / block list CRUD (shared shape; thin wrappers below)
+# ---------------------------------------------------------------------------
+
+
+def _list_targets(
+    conn: sqlite3.Connection, table: str, guild_id: int, owner_id: int
+) -> list[int]:
+    rows = conn.execute(
+        f"SELECT target_id FROM {table} "
+        "WHERE guild_id = ? AND owner_id = ? "
+        "ORDER BY added_at ASC",
+        (guild_id, owner_id),
+    ).fetchall()
+    return [int(r["target_id"]) for r in rows]
+
+
+def _add_target_with_cap(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    guild_id: int,
+    owner_id: int,
+    target_id: int,
+    cap: int,
+    now: float | None = None,
+) -> tuple[bool, int | None]:
+    """Insert a target; if the list would exceed ``cap``, evict the oldest first.
+
+    Returns ``(added, evicted_target_id)``. ``added`` is False only if
+    target was already in the list (idempotent).
+    """
+    exists = conn.execute(
+        f"SELECT 1 FROM {table} WHERE guild_id = ? AND owner_id = ? AND target_id = ?",
+        (guild_id, owner_id, target_id),
+    ).fetchone()
+    if exists:
+        return (False, None)
+    evicted: int | None = None
+    if cap > 0:
+        current = _list_targets(conn, table, guild_id, owner_id)
+        if len(current) >= cap:
+            evicted = current[0]
+            conn.execute(
+                f"DELETE FROM {table} "
+                "WHERE guild_id = ? AND owner_id = ? AND target_id = ?",
+                (guild_id, owner_id, evicted),
+            )
+    conn.execute(
+        f"INSERT INTO {table} (guild_id, owner_id, target_id, added_at) "
+        "VALUES (?, ?, ?, ?)",
+        (guild_id, owner_id, target_id, now if now is not None else time.time()),
+    )
+    return (True, evicted)
+
+
+def _remove_target(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    guild_id: int,
+    owner_id: int,
+    target_id: int,
+) -> bool:
+    cur = conn.execute(
+        f"DELETE FROM {table} "
+        "WHERE guild_id = ? AND owner_id = ? AND target_id = ?",
+        (guild_id, owner_id, target_id),
+    )
+    return cur.rowcount > 0
+
+
+def list_trusted(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int
+) -> list[int]:
+    return _list_targets(conn, "voice_master_trusted", guild_id, owner_id)
+
+
+def add_trusted(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    owner_id: int,
+    target_id: int,
+    *,
+    cap: int = 25,
+    now: float | None = None,
+) -> tuple[bool, int | None]:
+    return _add_target_with_cap(
+        conn,
+        "voice_master_trusted",
+        guild_id=guild_id,
+        owner_id=owner_id,
+        target_id=target_id,
+        cap=cap,
+        now=now,
+    )
+
+
+def remove_trusted(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int, target_id: int
+) -> bool:
+    return _remove_target(
+        conn,
+        "voice_master_trusted",
+        guild_id=guild_id,
+        owner_id=owner_id,
+        target_id=target_id,
+    )
+
+
+def list_blocked(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int
+) -> list[int]:
+    return _list_targets(conn, "voice_master_blocked", guild_id, owner_id)
+
+
+def effective_blocked(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    owner_id: int,
+) -> list[int]:
+    """Blocklist to actually ENFORCE: the owner's own list plus no-contact.
+
+    Neither half is optional. The Saveable Fields whitelist gates whether a
+    *new* block may be saved (``validate_block_add`` refuses to the member's
+    face when "Block list" is unchecked); it never silently stops an existing
+    block being applied. A block is the member's own safety choice, not part
+    of the room's look, and every caller of this function is an enforcement
+    site — channel create, /voice lock, hide and spectate alike.
+
+    Deliberately separate from :func:`list_blocked`, which backs everything
+    the owner can *see* (``/voice blocked list``, the profile embed, the
+    dashboard). Folding no-contact partners into the visible list would show
+    him her name sitting in his own blocklist — a block he never set — which
+    tells him she acted against him. That is the disclosure this whole
+    feature exists to avoid, arriving through a completely different door.
+
+    Symmetric without needing a second pass: each owner's effective list
+    picks up their own partners, so her room denies him and his denies her.
+    """
+    from bot_modules.no_contact.service import (  # noqa: PLC0415
+        no_contact_partners_conn,
+    )
+
+    own = _list_targets(conn, "voice_master_blocked", guild_id, owner_id)
+    seen = set(own)
+    partners = no_contact_partners_conn(conn, guild_id, owner_id)
+    return own + [p for p in sorted(partners) if p not in seen]
+
+
+def add_blocked(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    owner_id: int,
+    target_id: int,
+    *,
+    cap: int = 25,
+    now: float | None = None,
+) -> tuple[bool, int | None]:
+    return _add_target_with_cap(
+        conn,
+        "voice_master_blocked",
+        guild_id=guild_id,
+        owner_id=owner_id,
+        target_id=target_id,
+        cap=cap,
+        now=now,
+    )
+
+
+def remove_blocked(
+    conn: sqlite3.Connection, guild_id: int, owner_id: int, target_id: int
+) -> bool:
+    return _remove_target(
+        conn,
+        "voice_master_blocked",
+        guild_id=guild_id,
+        owner_id=owner_id,
+        target_id=target_id,
+    )
+
+
+def remove_member_from_all_lists(
+    conn: sqlite3.Connection, guild_id: int, target_id: int
+) -> int:
+    """Remove a member from every owner's trust + block list in this guild.
+
+    Used when the target leaves or is banned. Returns rows affected.
+    """
+    n1 = conn.execute(
+        "DELETE FROM voice_master_trusted WHERE guild_id = ? AND target_id = ?",
+        (guild_id, target_id),
+    ).rowcount
+    n2 = conn.execute(
+        "DELETE FROM voice_master_blocked WHERE guild_id = ? AND target_id = ?",
+        (guild_id, target_id),
+    ).rowcount
+    return n1 + n2
+
+
+# ---------------------------------------------------------------------------
+# Name blocklist
+# ---------------------------------------------------------------------------
+
+
+def list_name_blocklist(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[str]:
+    rows = conn.execute(
+        "SELECT pattern FROM voice_master_name_blocklist "
+        "WHERE guild_id = ? ORDER BY pattern",
+        (guild_id,),
+    ).fetchall()
+    return [r["pattern"] for r in rows]
+
+
+def add_name_blocklist(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    pattern: str,
+    added_by: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Returns True on insert, False if pattern already present."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO voice_master_name_blocklist "
+        "(guild_id, pattern, added_at, added_by) VALUES (?, ?, ?, ?)",
+        (
+            guild_id,
+            pattern.lower(),
+            now if now is not None else time.time(),
+            added_by,
+        ),
+    )
+    return cur.rowcount > 0
+
+
+def remove_name_blocklist(
+    conn: sqlite3.Connection, guild_id: int, pattern: str
+) -> bool:
+    cur = conn.execute(
+        "DELETE FROM voice_master_name_blocklist "
+        "WHERE guild_id = ? AND pattern = ?",
+        (guild_id, pattern.lower()),
+    )
+    return cur.rowcount > 0
+
+
+def name_is_blocked(
+    name: str, patterns: list[str]
+) -> bool:
+    """Case-insensitive substring match against any pattern."""
+    needle = name.lower()
+    return any(p in needle for p in patterns if p)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — edit budget
+# ---------------------------------------------------------------------------
+
+
+def can_edit(
+    now: float, last1: float, last2: float, *, window: float = EDIT_WINDOW_S
+) -> tuple[bool, float]:
+    """Whether a channel edit is allowed under Discord's 2-per-window limit.
+
+    Returns ``(allowed, retry_after_seconds)``. ``retry_after_seconds`` is 0
+    when allowed.
+    """
+    if now - last2 >= window:
+        return (True, 0.0)
+    if now - last1 >= window:
+        return (True, 0.0)
+    # Both slots within the window — wait until the older one ages out.
+    older = min(last1, last2)
+    retry = window - (now - older)
+    return (False, max(retry, 0.0))
+
+
+def record_edit(
+    now: float, last1: float, last2: float
+) -> tuple[float, float]:
+    """Push ``now`` into the (last1, last2) FIFO; oldest evicted.
+
+    The returned pair preserves the invariant that the two slots hold the
+    two most recent edit timestamps. Slot order itself isn't meaningful.
+    """
+    return (max(last1, last2), now)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — name template
+# ---------------------------------------------------------------------------
+
+
+_TEMPLATE_TOKENS = re.compile(r"\{(display_name|username)\}")
+
+
+def render_name_template(
+    template: str, *, display_name: str, username: str, max_len: int = 100
+) -> str:
+    """Substitute ``{display_name}`` / ``{username}`` and truncate to Discord's 100-char limit."""
+    def sub(m: re.Match[str]) -> str:
+        return display_name if m.group(1) == "display_name" else username
+
+    out = _TEMPLATE_TOKENS.sub(sub, template).strip()
+    if not out:
+        out = f"{display_name}'s Room"
+    return out[:max_len]
+
+
+def resolve_channel_name(
+    *,
+    saved_name: str | None,
+    template: str,
+    display_name: str,
+    username: str,
+    blocklist_patterns: list[str],
+) -> tuple[str, bool]:
+    """Pick the final channel name, falling back to the template if blocked.
+
+    Returns ``(name, fell_back)``. ``fell_back`` is True when ``saved_name``
+    would have been used but matched the blocklist and the template was
+    substituted instead.
+    """
+    if saved_name:
+        if not name_is_blocked(saved_name, blocklist_patterns):
+            return (saved_name[:MAX_NAME_LEN], False)
+        # Saved name is blocked — fall through to template.
+        rendered = render_name_template(
+            template, display_name=display_name, username=username
+        )
+        return (rendered, True)
+    return (
+        render_name_template(template, display_name=display_name, username=username),
+        False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lock-state name decoration
+# ---------------------------------------------------------------------------
+#
+# A temp channel's name carries a leading icon advertising whether it's open
+# to everyone or locked (others must knock / ask to join). The icon is purely
+# cosmetic: it is stripped before a name is blocklist-checked or saved to a
+# profile, so it never stacks across lock/unlock toggles nor leaks into
+# ``saved_name``.
+
+LOCKED_NAME_ICON: str = "❓"   # locked — others must knock to ask to join
+OPEN_NAME_ICON: str = "👋"     # unlocked — all welcome
+_STATE_NAME_ICONS: tuple[str, ...] = (LOCKED_NAME_ICON, OPEN_NAME_ICON)
+
+
+def strip_state_icon(name: str) -> str:
+    """Return ``name`` with any leading lock-state icon removed.
+
+    Idempotent and safe on bare names — only an icon sitting at the very
+    start (optionally followed by whitespace) is stripped.
+    """
+    for icon in _STATE_NAME_ICONS:
+        if name.startswith(icon):
+            return name[len(icon):].lstrip()
+    return name
+
+
+def decorate_channel_name(
+    name: str, *, locked: bool, max_len: int = MAX_NAME_LEN
+) -> str:
+    """Prefix ``name`` with the lock-state icon, replacing any existing one.
+
+    Strips a prior icon first so repeated lock/unlock toggles never stack
+    prefixes (``❓ ❓ Room``). Truncated to Discord's name limit.
+
+    No longer used on the live channel name — lock state is advertised via the
+    voice channel *status* line (``lock_status_text``) instead, which rides a
+    separate endpoint immune to the 2-edits-per-10-minutes name rate limit.
+    Kept for the strip/idempotence helpers and their tests.
+    """
+    base = strip_state_icon(name)
+    icon = LOCKED_NAME_ICON if locked else OPEN_NAME_ICON
+    return f"{icon} {base}"[:max_len]
+
+
+# ---------------------------------------------------------------------------
+# Lock-state voice channel status
+# ---------------------------------------------------------------------------
+#
+# A voice channel carries a free-text "status" line shown under its name in the
+# channel list. We use it to advertise the room's lock state. Unlike the channel
+# name, status edits go through ``PUT /channels/{id}/voice-status`` — a separate
+# rate-limit bucket from the name's brutal 2-per-10-minutes limit — so it can be
+# toggled freely on every lock/unlock.
+
+# Member-facing copy says "NSFW", not "age-gated" (2026-07-27): the server is
+# 21+ throughout, so the age framing described a gate nobody is on the wrong
+# side of, while NSFW is what members actually call the rooms. The mechanism is
+# unchanged — every state but open still sets Discord's own NSFW flag, and the
+# ``age_gated`` column keeps its name.
+OPEN_STATUS_TEXT: str = "👋 All welcome"
+NSFW_STATUS_TEXT: str = "🔞 NSFW · all welcome"
+LOCKED_STATUS_TEXT: str = "🔒 NSFW · ask to join"
+SPECTATE_STATUS_TEXT: str = "🎭 NSFW · spectators welcome"
+
+
+def lock_status_text(*, locked: bool) -> str:
+    """Voice-channel status string advertising the room's lock state."""
+    return LOCKED_STATUS_TEXT if locked else OPEN_STATUS_TEXT
+
+
+def access_status_text(*, mode: str) -> str:
+    """Voice-channel status string for an access mode.
+
+    Modes mirror the access states (``open``/``nsfw``/``lock``/``spectate``);
+    ``lock`` is accepted as the status alias for the locked state.
+    """
+    if mode in ("lock", "locked"):
+        return LOCKED_STATUS_TEXT
+    if mode == "spectate":
+        return SPECTATE_STATUS_TEXT
+    if mode == "nsfw":
+        return NSFW_STATUS_TEXT
+    return OPEN_STATUS_TEXT
+
+
+# ---------------------------------------------------------------------------
+# Access state <-> saved-profile mapping
+# ---------------------------------------------------------------------------
+#
+# The owner controls room access through one 4-state dial. These are the
+# canonical state keys and their translation to/from the saved-profile flags
+# (locked/hidden/spectator/age_gated). Kept here — next to the profile CRUD and
+# status text — so persistence and the command layer share one source of truth.
+
+ACCESS_OPEN: str = "open"
+ACCESS_NSFW: str = "nsfw"
+ACCESS_LOCKED: str = "locked"
+ACCESS_SPECTATE: str = "spectate"
+
+ACCESS_STATES: tuple[str, ...] = (
+    ACCESS_OPEN, ACCESS_NSFW, ACCESS_LOCKED, ACCESS_SPECTATE
+)
+
+
+def profile_access_state(profile: VoiceProfile) -> str:
+    """Collapse a saved profile's flags to its single access state.
+
+    Precedence matches the states' semantics and tolerates legacy rows: a
+    spectator profile is spectator; a locked profile is the NSFW locked
+    state (old ``locked`` rows predate the ``age_gated`` column but locking now
+    always implies age-gating); ``age_gated`` alone is the NSFW-open state.
+    Legacy hidden-only profiles (``hidden`` without ``locked``) fall through to
+    open — the standalone hidden state no longer exists.
+    """
+    if profile.spectator:
+        return ACCESS_SPECTATE
+    if profile.locked:
+        return ACCESS_LOCKED
+    if profile.age_gated:
+        return ACCESS_NSFW
+    return ACCESS_OPEN
+
+
+def access_state_profile_flags(state: str) -> dict[str, bool]:
+    """The saved-profile flag values for an access state.
+
+    Locked implies hidden + NSFW; spectator implies NSFW; NSFW-open sets the
+    NSFW flag only; open clears everything.
+    """
+    return {
+        "locked": state == ACCESS_LOCKED,
+        "hidden": state == ACCESS_LOCKED,
+        "spectator": state == ACCESS_SPECTATE,
+        "age_gated": state != ACCESS_OPEN,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — reconciliation planner
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReconciliationPlan:
+    """What to do at startup with each tracked channel."""
+    db_to_delete: list[int]            # rows to remove from voice_master_channels
+    discord_to_delete: list[int]       # voice channels to delete via API
+    orphan_warnings: list[int]         # untracked channels in target category
+
+
+def compute_reconciliation_actions(
+    *,
+    tracked_channel_ids: list[int],
+    present_channel_ids: set[int],
+    channels_with_humans: set[int],
+    category_voice_channel_ids: set[int],
+    hub_channel_id: int,
+) -> ReconciliationPlan:
+    """Plan startup cleanup of voice-master-tracked channels.
+
+    Args:
+        tracked_channel_ids: channel_ids currently in voice_master_channels.
+        present_channel_ids: channel_ids that still exist on Discord.
+        channels_with_humans: subset of present channels that have ≥1 non-bot member.
+        category_voice_channel_ids: every voice channel in the target category.
+        hub_channel_id: the Hub channel ID, never treated as orphan.
+    """
+    db_to_delete: list[int] = []
+    discord_to_delete: list[int] = []
+    for cid in tracked_channel_ids:
+        if cid not in present_channel_ids:
+            db_to_delete.append(cid)
+            continue
+        if cid not in channels_with_humans:
+            discord_to_delete.append(cid)
+            db_to_delete.append(cid)
+
+    tracked_set = set(tracked_channel_ids)
+    orphan_warnings = sorted(
+        cid
+        for cid in category_voice_channel_ids
+        if cid != hub_channel_id and cid not in tracked_set
+    )
+    return ReconciliationPlan(
+        db_to_delete=sorted(set(db_to_delete)),
+        discord_to_delete=sorted(set(discord_to_delete)),
+        orphan_warnings=orphan_warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
+async def trusted_prune_loop(
+    bot: discord.Client, db_path: Path
+) -> None:
+    """Once per day, prune trust-list entries for members inactive past the configured threshold.
+
+    Threshold is per-guild via ``voice_master_trusted_prune_days`` (0 = never).
+    Activity is sourced from xp_system's member_activity table.
+    """
+    import asyncio
+    from bot_modules.core.db_utils import open_db
+    from bot_modules.core.xp_system import get_member_last_activity_map
+
+    await bot.wait_until_ready()
+    log.info("voice_master: trusted_prune_loop started")
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                with open_db(db_path) as conn:
+                    cfg = load_voice_master_config(conn, guild.id)
+                    if cfg.trusted_prune_days <= 0:
+                        continue
+                    rows = conn.execute(
+                        "SELECT DISTINCT target_id FROM voice_master_trusted "
+                        "WHERE guild_id = ?",
+                        (guild.id,),
+                    ).fetchall()
+                    target_ids = [int(r["target_id"]) for r in rows]
+                    if not target_ids:
+                        continue
+                    activity = get_member_last_activity_map(conn, guild.id, target_ids)
+                cutoff = time.time() - cfg.trusted_prune_days * 86400
+                stale = [
+                    uid for uid in target_ids
+                    if uid not in activity or activity[uid].created_at < cutoff
+                ]
+                if not stale:
+                    continue
+                with open_db(db_path) as conn:
+                    placeholders = ",".join("?" for _ in stale)
+                    conn.execute(
+                        f"DELETE FROM voice_master_trusted "
+                        f"WHERE guild_id = ? AND target_id IN ({placeholders})",
+                        [guild.id, *stale],
+                    )
+                log.info(
+                    "voice_master: pruned %d stale trust entries in guild %d",
+                    len(stale), guild.id,
+                )
+        except Exception:
+            log.exception("voice_master: trusted_prune_loop error")
+        await asyncio.sleep(86400)  # once a day
+
+

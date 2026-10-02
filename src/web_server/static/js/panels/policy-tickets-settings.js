@@ -1,0 +1,63 @@
+import { loadConfig, apiPut, showStatus, guardForm, lockUnlessAdmin, mountAsync, guardedSubmit } from "../config-helpers.js";
+
+/**
+ * The settings half of the Policy Tickets page. Mounted into a region by
+ * panels/policy-tickets.js, below the ticket list, and locked read-only for
+ * non-admins. Not a nav page in its own right.
+ */
+export function mountSettings(container) {
+  container.innerHTML = `<div class="empty">Loading configuration…</div>`;
+
+  return mountAsync(container, async () => {
+    const config = await loadConfig();
+    const p = config.policy || {};
+    const currentHours = Number.isInteger(p.vote_timeout_hours) ? p.vote_timeout_hours : 72;
+
+    container.innerHTML = `
+      <div>
+        <div class="section-label">Settings</div>
+        <div class="field-hint" style="margin-bottom:12px;">How long the mod team has to vote on a proposal. Community ballots use the same deadline.</div>
+        <form class="form form-cards" data-form>
+          <div class="card">
+            <div class="section-label">Voting</div>
+            <div class="field">
+              <label for="pt-timeout">Voting Deadline (hours)</label>
+              <input type="number" name="vote_timeout_hours" id="pt-timeout" required
+                min="1" max="720" step="1" value="${currentHours}" style="max-width:140px;" />
+              <div class="field-hint">Moderators who haven't voted by then count as
+                absent. One “no” still rejects; if nobody votes, it fails.</div>
+            </div>
+          </div>
+
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button type="submit" class="btn btn-primary">Save</button>
+            <span data-status></span>
+          </div>
+        </form>
+      </div>
+    `;
+
+    const form = container.querySelector("[data-form]");
+    const status = container.querySelector("[data-status]");
+    const input = form.querySelector("[name=vote_timeout_hours]");
+
+    guardForm(form);
+
+    guardedSubmit(form, async () => {
+      const hours = parseInt(input.value, 10);
+      if (!Number.isFinite(hours) || hours < 1 || hours > 720) {
+        showStatus(status, false, "Voting Deadline must be a number of hours from 1 to 720");
+        input.focus();
+        return;
+      }
+      try {
+        await apiPut("/api/config/policy", { vote_timeout_hours: hours });
+        showStatus(status, true);
+      } catch (err) {
+        showStatus(status, false, err.message);
+      }
+    });
+
+    lockUnlessAdmin(container);
+  }, { errorMsg: "Couldn’t load the policy ticket settings." });
+}

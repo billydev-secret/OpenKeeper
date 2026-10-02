@@ -1,0 +1,128 @@
+"""Tests for rebuilding a game's roster from its stored payload.
+
+``game_roster`` is what lets the two outside-the-game end paths — the 24-hour
+sweep and ``force_end_active_game`` (``/games end``) — pay the same room the
+game's own completion site would have. Each case below mirrors the cited cog.
+"""
+from __future__ import annotations
+
+import pytest
+
+from bot_modules.games.utils.game_roster import (
+    ANON_ROSTER_TYPES,
+    NO_ROSTER_TYPES,
+    roster_from_payload,
+)
+from bot_modules.games.fantasies.logic import build_result_entry
+
+
+@pytest.mark.parametrize(
+    "game_type, payload, expected",
+    [
+        # traditional — opted-in categories; rounds = questions asked.
+        ("traditional", {"participants": [1, 2, 3], "asked": {"1": "q"}}, ([1, 2, 3], 1)),
+        # Ids round-trip as strings, junk is dropped, a double-join collapses.
+        ("traditional", {"participants": ["4", None, "x", 4]}, ([4], 0)),
+        # clapback — joined players; rounds = round_history entries.
+        ("clapback", {"players": [1, 2], "round_history": [{}, {}]}, ([1, 2], 2)),
+        # compliment / mfk — the join pool.
+        ("compliment", {"participants": [7, 8]}, ([7, 8], 0)),
+        ("mfk", {"participants": [1, 2, 3, 4]}, ([1, 2, 3, 4], 0)),
+        # story — the writer list...
+        ("story", {"players": [5, 6]}, ([5, 6], 0)),
+        # ...minus a Leave-presser who never wrote (``left`` is persisted by
+        # the turn loop), mirroring the reveal's ``roster_for_payout`` (S3)...
+        ("story", {
+            "players": [5, 6, 7], "left": ["7"],
+            "sentences": [{"author_id": None, "text": "Once"}],
+        }, ([5, 6], 0)),
+        # ...while a leaver who did write a line is still paid.
+        ("story", {
+            "players": [5, 6, 7], "left": [7],
+            "sentences": [{"author_id": 7, "text": "upon"}],
+        }, ([5, 6, 7], 0)),
+        # legitlibs — players, one scored round.
+        ("legitlibs", {"players": [9, 10]}, ([9, 10], 1)),
+        # rushmore — the draft roster the view seeds from the payload.
+        ("rushmore", {"players": [2, 3], "rounds": {"1": {}}}, ([2, 3], 1)),
+        # ttl — the played list is the round count, and the scores keys (one
+        # per voter since 2026-09-04, vote-games-57) widen the roster so a
+        # member who only ever guessed is paid...
+        ("ttl", {"played": ["11", "12"], "scores": {"11": {}, "99": {}}}, ([11, 12, 99], 2)),
+        # ...and legacy payloads fall back to scores keys for both.
+        ("ttl", {"scores": {"11": {}, "12": {}}}, ([11, 12], 2)),
+        # nhie — `lives` keeps eliminated players at 0 hp, so it is the full
+        # roster; an eliminated player can still be the guiltiest winner.
+        ("nhie", {"lives": {"1": 0, "2": 3}}, ([1, 2], 0)),
+        # ama — askers plus hot seats; asker_id 0 is the AI sentinel.
+        ("ama", {"questions": [
+            {"asker_id": 1, "hot_seat_id": 2},
+            {"asker_id": 0, "hot_seat_id": 2},
+        ]}, ([1, 2], 2)),
+        # hottakes — voters plus authors; a winning author may never have voted.
+        ("hottakes", {"results": [{"voters": [1, 2], "author": 3}]}, ([1, 2, 3], 1)),
+        ("hottakes", {"results": [{"voters": [1], "author": None}]}, ([1], 1)),
+        # fantasies — entry authors plus everyone who voted either way. The
+        # row is built by the cog's own builder so the two cannot drift: until
+        # 2026-09-04 the extractor read same_votes/nope_votes keys the builder
+        # never stored, and only authors were ever paid (anon-tail-64).
+        ("fantasies", {"results": [
+            build_result_entry(
+                text="x", category="fantasy", author=1, same_votes=[2], nope_votes=[3],
+            ),
+        ]}, ([1, 2, 3], 1)),
+        # wyr — everyone who voted either option in any round.
+        ("wyr", {"rounds": {"1": {"a": [1, 2], "b": [3]}}}, ([1, 2, 3], 1)),
+        # mlt — vote keys, not the survivors-only `players` list.
+        ("mlt", {"rounds": {"1": {"votes": {"1": 9, "2": 9}}}, "players": [1]}, ([1, 2], 1)),
+        # price — every uid that submitted a price in any round.
+        ("price", {"rounds": {"1": {"prices": {"4": 10, "5": 20}}}}, ([4, 5], 1)),
+        # Self-stored games record their roster under `players`, one round.
+        ("risky_roll", {"players": [10, 11], "rolls": {"10": 40, "11": 90}}, ([10, 11], 1)),
+        ("chicken", {"players": [1, 2, 3], "winner_id": 3}, ([1, 2, 3], 1)),
+        ("quickdraw", {"players": ["1", "2"], "winner_id": 2}, ([1, 2], 1)),
+        # mahjong — a settled hand self-recorded with its human seats (M3).
+        ("mahjong", {"players": [21, 22, 23], "winner_id": 22, "hand_no": 3}, ([21, 22, 23], 1)),
+        # Prompt-style types have no joined roster and must stay unpaid.
+        ("ffa", {"prompt": "x", "seen": ["x"]}, ([], 0)),
+        ("photo", {"submissions": {"1": "url"}}, ([], 0)),
+        # Unknown type, empty and missing payloads.
+        ("no_such_game", {"players": [1]}, ([], 0)),
+        ("traditional", {}, ([], 0)),
+        ("traditional", None, ([], 0)),
+    ],
+)
+def test_roster_from_payload(game_type, payload, expected):
+    assert roster_from_payload(game_type, payload) == expected
+
+
+def test_anonymous_types_are_paid_but_never_named():
+    """ffa's repliers are a roster for the faucet and nothing else: the type is
+    in ANON_ROSTER_TYPES (the session merge skips it) and not in
+    NO_ROSTER_TYPES (the sweep still pays it)."""
+    assert ANON_ROSTER_TYPES == {"ffa"}
+    assert not (ANON_ROSTER_TYPES & NO_ROSTER_TYPES)
+    assert roster_from_payload("ffa", {"prompts": [{"repliers": [4, 9]}]}) == ([4, 9], 1)
+
+
+@pytest.mark.parametrize("game_type", sorted(NO_ROSTER_TYPES))
+def test_no_roster_types_never_pay(game_type):
+    """ffa and photo are posts, not games players sign into."""
+    assert roster_from_payload(game_type, {"players": [1, 2], "participants": [3]}) == ([], 0)
+
+
+@pytest.mark.parametrize(
+    "game_type, payload",
+    [
+        ("wyr", {"rounds": "not-a-dict"}),
+        ("hottakes", {"results": [None, "junk"]}),
+        ("ama", {"questions": [{"asker_id": "nope"}]}),
+        ("mlt", {"rounds": {"1": "junk"}}),
+        ("nhie", {"lives": "junk"}),
+        ("price", {"rounds": {"1": {"prices": "junk"}}}),
+    ],
+)
+def test_malformed_payload_yields_no_roster_instead_of_raising(game_type, payload):
+    """A bad payload costs its own game a roster, never the sweep it's found in."""
+    players, _rounds = roster_from_payload(game_type, payload)
+    assert players == []

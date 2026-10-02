@@ -1,0 +1,141 @@
+"""Pure decision logic for the Would-You-Rather cog.
+
+All functions here take and return plain Python values so they're unit-
+testable without spinning up Discord. The cog calls these from inside
+its button callbacks and modal handlers; the Discord glue (sending the
+message, persisting via :func:`update_game_payload`) stays in the cog.
+
+WYR doesn't share the full traditional/T-or-D spine (no opt-in
+categories, no weighted question target — questions come from an
+external bank or a FIFO user-submitted queue). What it does have is:
+
+- :func:`parse_question_input` — split ``"a | b"`` into a tuple, or
+  return ``None`` when the input is malformed.
+- :func:`toggle_vote` — flip a user's vote between the two option lists
+  in place. WYR's analog of the traditional cog's ``toggle_pref`` — it
+  mutates two mutable lists rather than a payload dict, but the shape
+  ("returns metadata the caller echoes back to the user") is identical.
+- :func:`record_show_vote` / :func:`shown_on_side` — a voter's own
+  choice to be named beside their pick (vote-games-61: the old
+  host/mod-only Reveal Voters refused most of the room).
+- :func:`most_divisive_round` / :func:`count_votes` / :func:`played_rounds`
+  — the numbers the game-over recap shows (vote-games-52: WYR had no
+  in-game ending and no recap at all; the "most divisive" rule mirrors
+  ``games_session.logic.build_game_highlight``).
+"""
+
+from __future__ import annotations
+
+
+def parse_question_input(text: str) -> tuple[str, str] | None:
+    """Parse the optional ``question`` slash-command argument.
+
+    The format is ``"option a | option b"`` with a literal ``|`` between
+    the two options. Both halves must be non-empty after stripping. An
+    empty or whitespace-only ``text`` returns ``None`` (the cog then
+    falls back to the question bank).
+
+    Returns the ``(option_a, option_b)`` tuple, or ``None`` when the
+    input is missing OR malformed — the cog distinguishes the two by
+    inspecting the original ``text.strip()`` value before calling.
+    """
+    if not text.strip():
+        return None
+    parts = text.split("|", 1)
+    if len(parts) != 2:
+        return None
+    a = parts[0].strip()
+    b = parts[1].strip()
+    if not a or not b:
+        return None
+    return (a, b)
+
+
+def toggle_vote(
+    votes_a: list[int],
+    votes_b: list[int],
+    user_id: int,
+    choice: str,
+) -> bool:
+    """Record ``user_id``'s vote for ``choice`` (``"a"`` or ``"b"``).
+
+    Mutates ``votes_a`` / ``votes_b`` in place: removes the user from
+    the other side first (so toggling counts as a switch, not a double-
+    vote) then appends to the chosen side if they're not already there.
+
+    Returns ``True`` when the user was on the OTHER side just before
+    this call (so the cog can append " (changed)" to its ephemeral
+    confirmation), ``False`` for a fresh vote or a no-op re-press.
+    """
+    if choice not in ("a", "b"):
+        raise ValueError(f"choice must be 'a' or 'b', got {choice!r}")
+
+    if choice == "a":
+        same_side, other_side = votes_a, votes_b
+    else:
+        same_side, other_side = votes_b, votes_a
+
+    changed = user_id in other_side
+    if changed:
+        other_side.remove(user_id)
+    if user_id not in same_side:
+        same_side.append(user_id)
+    return changed
+
+
+def record_show_vote(
+    votes_a: list[int],
+    votes_b: list[int],
+    shown: list[int],
+    user_id: int,
+) -> str:
+    """Record ``user_id``'s choice to be named beside their pick.
+
+    Mutates ``shown`` in place. Returns ``"shown"`` when the user was
+    added, ``"not_voted"`` when they have no vote to show (nothing
+    changes), or ``"already"`` for an idempotent re-press. Showing is
+    for the round — a voter who later switches sides is still shown, on
+    the side they are now on.
+    """
+    if user_id not in votes_a and user_id not in votes_b:
+        return "not_voted"
+    if user_id in shown:
+        return "already"
+    shown.append(user_id)
+    return "shown"
+
+
+def shown_on_side(side: list[int], shown: list[int]) -> list[int]:
+    """The voters on ``side`` who chose to be named, in vote order."""
+    return [uid for uid in side if uid in shown]
+
+
+def played_rounds(rounds: dict) -> list[dict]:
+    """Rounds that actually had a question, in round order.
+
+    A round left waiting for a prompt (``q == ""``) never happened and is
+    neither counted nor a recap candidate.
+    """
+    out: list[dict] = []
+    for key in sorted(rounds or {}, key=lambda k: int(k) if str(k).isdigit() else 0):
+        rd = rounds[key]
+        if isinstance(rd, dict) and rd.get("q"):
+            out.append(rd)
+    return out
+
+
+def count_votes(rounds: dict) -> int:
+    """Every 🅰️ and 🅱️ vote cast across the game."""
+    return sum(len(rd.get("a") or []) + len(rd.get("b") or []) for rd in played_rounds(rounds))
+
+
+def most_divisive_round(rounds: dict) -> dict | None:
+    """The round with the closest 🅰️/🅱️ split — the game's best moment.
+
+    Only rounds with at least one vote qualify; a 0–0 round is a tie but
+    not a divisive one. Ties on the margin go to the earlier round.
+    """
+    voted = [rd for rd in played_rounds(rounds) if (rd.get("a") or rd.get("b"))]
+    if not voted:
+        return None
+    return min(voted, key=lambda rd: abs(len(rd.get("a") or []) - len(rd.get("b") or [])))

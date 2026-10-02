@@ -1,0 +1,276 @@
+import {
+  loadConfig,
+  loadChannels,
+  apiPut,
+  showStatus,
+  field,
+  numInput,
+  checkbox,
+  sectionCard,
+  mountChannelPicker,
+  guardForm,
+  renderMetaWarning,
+  mountAsync,
+  guardedSubmit,
+} from "../config-helpers.js";
+
+export function mount(container) {
+  container.textContent = "";
+  const wrap = document.createElement("div");
+  wrap.className = "panel";
+  const loading = document.createElement("div");
+  loading.className = "empty";
+  loading.textContent = "Loading config…";
+  wrap.appendChild(loading);
+  container.appendChild(wrap);
+
+  return mountAsync(container, async () => {
+    const [config, channels] = await Promise.all([loadConfig(), loadChannels()]);
+    const c = config.casino || {};
+    // Name is edited on the Branding panel; this panel just wears it.
+    const br = config.branding || {};
+    const casinoName =
+      (br.casino_name || "").trim() || br.default_casino_name || "Golden Meadow";
+
+    container.textContent = "";
+    const panel = document.createElement("div");
+    panel.className = "panel";
+
+    const hdr = document.createElement("header");
+    const h2 = document.createElement("h2");
+    h2.textContent = `The ${casinoName} Casino`;
+    const sub = document.createElement("div");
+    sub.className = "subtitle";
+    sub.textContent =
+      "House gambling games played for your server currency. Picking a channel " +
+      "opens the casino and hosts its hub panel there. Rename it on Branding.";
+    hdr.append(h2, sub);
+    panel.appendChild(hdr);
+
+    const warning = renderMetaWarning();
+    if (warning) {
+      const w = document.createElement("div");
+      w.innerHTML = warning;
+      panel.appendChild(w.firstElementChild);
+    }
+
+    const form = document.createElement("form");
+    form.className = "form form-cards";
+    panel.appendChild(form);
+
+    const card = (title) => sectionCard(form, title);
+
+    // ── Where the casino lives — this channel is the master switch. ──────
+    const cardWiring = card("Casino Channel");
+    const chanSlot = document.createElement("span");
+    cardWiring.appendChild(field(
+      "Casino Channel",
+      chanSlot,
+      "Where the hub panel sits and every game is played. \"(disabled)\" " +
+        "closes the casino and removes the panel — no more bets.",
+    ));
+    const chanPicker = mountChannelPicker(
+      chanSlot, channels, String(c.channel_id || "0"),
+      { emptyValue: "0", emptyLabel: "(disabled)", label: "Casino Channel" },
+    );
+
+    const cardStakes = card("Betting Limits");
+    cardStakes.appendChild(field(
+      "Minimum Bet", numInput("min_bet", c.min_bet ?? 5, 1),
+      "The smallest stake any table accepts. Bets below this are refused.",
+    ));
+    cardStakes.appendChild(field(
+      "Maximum Bet", numInput("max_bet", c.max_bet ?? 100, 0),
+      "The largest stake allowed on a single play. Enter 0 for no per-bet " +
+        "ceiling — the daily cap below still applies.",
+    ));
+    cardStakes.appendChild(field(
+      "Daily Wager Cap", numInput("daily_wager_cap", c.daily_wager_cap ?? 500, 0),
+      "The most one member can stake in a server day, across every table. " +
+        "0 removes the cap. Your main lever on how fast the casino moves " +
+        "currency.",
+    ));
+
+    cardStakes.appendChild(field(
+      "Maximum Payout Per Play", numInput("max_payout", c.max_payout ?? 0, 0),
+      "The most one play can pay out in total, at any table. 0 means no ceiling. " +
+        "The progressive jackpot is exempt.",
+    ));
+
+    const cardComp = card("Daily Comp");
+    cardComp.appendChild(field(
+      "Daily Comp (free spin amount)",
+      numInput("daily_comp", c.daily_comp ?? 0, 0, "1", 100000),
+      "A free slots spin, on the house, once per member per server day: a " +
+        "\uD83C\uDF81 Daily Comp button joins the hub panel and pays whatever " +
+        "the reels land at this stake. Nothing is wagered \u2014 it never " +
+        "counts against the daily cap, the stats or the jackpot. 0 (the " +
+        "default) offers no comp and hides the button.",
+    ));
+
+    // Wrapping flex row (not fixed-width) so phones stack the toggles.
+    const cardTables = card("Games");
+    const tables = document.createElement("div");
+    tables.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px;";
+    tables.append(
+      checkbox("coinflip_enabled", c.coinflip_enabled !== false, "Coinflip"),
+      checkbox("slots_enabled", c.slots_enabled !== false, "Slots"),
+      checkbox("blackjack_enabled", c.blackjack_enabled !== false, "Blackjack"),
+      checkbox("roulette_enabled", c.roulette_enabled !== false, "Roulette"),
+      checkbox("derby_enabled", c.derby_enabled !== false, "Derby"),
+      checkbox("baccarat_enabled", c.baccarat_enabled !== false, "Baccarat"),
+      checkbox("dice_enabled", c.dice_enabled !== false, "Dice"),
+      checkbox("war_enabled", c.war_enabled !== false, "War"),
+      checkbox("keno_enabled", c.keno_enabled !== false, "Keno"),
+      checkbox("mines_enabled", c.mines_enabled !== false, "Mines"),
+    );
+    cardTables.appendChild(field(
+      "Open Tables", tables,
+      "Unchecked games refuse all bets and disappear from the hub panel.",
+    ));
+
+    const cardJackpot = card("Progressive Jackpot");
+    const jackpotRow = document.createElement("div");
+    jackpotRow.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px;";
+    jackpotRow.append(
+      checkbox("jackpot_enabled", c.jackpot_enabled !== false, "Run a Progressive Jackpot"),
+    );
+    cardJackpot.appendChild(field(
+      "Jackpot", jackpotRow,
+      "A share of every losing bet builds one shared pot. Three 7️⃣s on the " +
+        "slots wins whichever is bigger, the pot or the flat 120× payout. " +
+        "Unchecked, slots always pay the flat 120×.",
+    ));
+    cardJackpot.appendChild(field(
+      "Share of Each Losing Bet (percent)",
+      numInput("jackpot_cut_pct", c.jackpot_cut_pct ?? 5, 0, "1", 100),
+      "0–100; 5 is the default. A bigger share grows the pot faster but " +
+        "destroys less currency — it's parked for one future winner instead.",
+    ));
+    cardJackpot.appendChild(field(
+      "Starting Pot After a Win",
+      numInput("jackpot_seed", c.jackpot_seed ?? 100, 0),
+      "What the pot resets to once someone wins it, created out of nothing " +
+        "each time — keep it modest.",
+    ));
+
+    const cardTiming = card("Table Timing");
+    cardTiming.appendChild(field(
+      "Abandoned Round Timeout (seconds)",
+      numInput("round_idle_seconds", c.round_idle_seconds ?? 600, 60, "1", 840),
+      "Roulette, Derby, Baccarat, Dice and Keno are private \u2014 you bet in " +
+        "your own window and press a button to resolve. This safety net " +
+        "auto-resolves a round left untouched this long. 60\u2013840 seconds " +
+        "(Discord stops updating a private message after 15 minutes).",
+    ));
+    cardTiming.appendChild(field(
+      "Blackjack Idle Timeout (seconds)",
+      numInput("blackjack_idle_seconds", Math.min(c.blackjack_idle_seconds ?? 180, 840), 30, "1", 840),
+      "A blackjack hand or War standoff untouched this long resolves " +
+        "automatically. 30\u2013840 seconds (private hand messages can only " +
+        "be updated for 14 minutes).",
+    ));
+
+    const cardFloor = card("Casino Floor");
+    cardFloor.appendChild(field(
+      "Big-Win Broadcast Threshold",
+      numInput("broadcast_min_payout", c.broadcast_min_payout ?? 0, 0),
+      "Players spin privately, but the floor ticker shows recent action. A " +
+        "win of at least this much \u2014 that also clears the multiple " +
+        "below \u2014 posts a public recap in the casino channel. The recap " +
+        "carries no buttons. 0 never broadcasts (jackpot hits are always " +
+        "announced).",
+    ));
+    cardFloor.appendChild(field(
+      "Broadcast Minimum Multiple",
+      numInput("broadcast_min_mult", c.broadcast_min_mult ?? 3, 1, "1", 1000),
+      "A win must also pay at least this many times its stake to be " +
+        "announced, so a routine even-money win on a big stake stays " +
+        "private while a 6\u00d7 slots hit on a small one still posts. 3 is " +
+        "the default; 1 announces on the amount alone.",
+    ));
+    const pingRow = document.createElement("div");
+    pingRow.style.cssText = "display:flex; flex-wrap:wrap; gap:8px 16px;";
+    pingRow.append(
+      checkbox(
+        "broadcast_ping_enabled", c.broadcast_ping_enabled !== false,
+        "Ping the room (@here) on Legendary wins",
+      ),
+    );
+    cardFloor.appendChild(field(
+      "Legendary Win Ping", pingRow,
+      "The rarest broadcasts \u2014 the biggest payouts this casino has ever " +
+        "handed over \u2014 are announced with an @here so nobody misses one. " +
+        "Uncheck this and those wins still get their own public message, " +
+        "just without pinging everyone in the channel. No other win pings.",
+    ));
+
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; gap:8px; align-items:center;";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "submit";
+    saveBtn.className = "btn btn-primary";
+    saveBtn.textContent = "Save";
+    const statusEl = document.createElement("span");
+    row.append(saveBtn, statusEl);
+    form.appendChild(row);
+
+    guardForm(form);
+
+    guardedSubmit(form, async () => {
+      const fd = new FormData(form);
+      const nums = {};
+      for (const [name, label, min, max] of [
+        ["min_bet", "Minimum Bet", 1, null],
+        ["max_bet", "Maximum Bet", 0, null],
+        ["daily_wager_cap", "Daily Wager Cap", 0, null],
+        ["max_payout", "Maximum Payout Per Play", 0, null],
+        ["daily_comp", "Daily Comp", 0, 100000],
+        ["jackpot_cut_pct", "Share of Each Losing Bet", 0, 100],
+        ["jackpot_seed", "Starting Pot After a Win", 0, null],
+        ["round_idle_seconds", "Abandoned Round Timeout", 60, 840],
+        ["blackjack_idle_seconds", "Blackjack Idle Timeout", 30, 840],
+        ["broadcast_min_payout", "Big-Win Broadcast Threshold", 0, null],
+        ["broadcast_min_mult", "Broadcast Minimum Multiple", 1, 1000],
+      ]) {
+        const raw = String(fd.get(name) ?? "").trim();
+        const v = parseInt(raw, 10);
+        const bounds = max == null ? `${min} or more` : `between ${min} and ${max}`;
+        if (raw === "" || !Number.isFinite(v) || v < min || (max != null && v > max)) {
+          showStatus(statusEl, false, `${label} must be a whole number ${bounds}.`);
+          form.querySelector(`[name="${name}"]`).focus();
+          return;
+        }
+        nums[name] = v;
+      }
+      if (nums.max_bet && nums.min_bet > nums.max_bet) {
+        showStatus(statusEl, false, "Minimum Bet cannot be larger than Maximum Bet.");
+        form.querySelector('[name="min_bet"]').focus();
+        return;
+      }
+      try {
+        await apiPut("/api/config/casino", {
+          channel_id: chanPicker.getValue() || "0", // string — snowflake rule
+          ...nums,
+          coinflip_enabled: fd.has("coinflip_enabled"),
+          slots_enabled: fd.has("slots_enabled"),
+          blackjack_enabled: fd.has("blackjack_enabled"),
+          roulette_enabled: fd.has("roulette_enabled"),
+          derby_enabled: fd.has("derby_enabled"),
+          baccarat_enabled: fd.has("baccarat_enabled"),
+          dice_enabled: fd.has("dice_enabled"),
+          war_enabled: fd.has("war_enabled"),
+          keno_enabled: fd.has("keno_enabled"),
+          mines_enabled: fd.has("mines_enabled"),
+          jackpot_enabled: fd.has("jackpot_enabled"),
+          broadcast_ping_enabled: fd.has("broadcast_ping_enabled"),
+        });
+        showStatus(statusEl, true);
+      } catch (err) {
+        showStatus(statusEl, false, err.message);
+      }
+    });
+
+    container.appendChild(panel);
+  }, { errorMsg: "Couldn’t load the casino settings." });
+}

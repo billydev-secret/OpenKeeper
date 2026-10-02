@@ -1,0 +1,637 @@
+"""Economy register — the public transaction feed for a channel.
+
+A bank register: every currency movement, posted as it happens, each entry
+saying what it was *for*. ``econ_ledger`` is the single source of truth
+(nothing mutates a wallet without going through ``apply_credit`` /
+``apply_debit``), so draining it by ``id`` catches every payout, purchase,
+transfer, and staff grant — including dashboard grants — with no per-call-site
+hooks to forget.
+
+The feed is **completions only**: a ledger row exists once a transaction has
+happened, so there is no per-tick progress spam. A counted quest's entry shows
+its final tally ("5/5") rather than the ticks that got there.
+
+Pure collector + builder — all Discord I/O stays in the loop. The builder takes
+a ``resolve_name`` callable so it never touches the gateway itself.
+
+The channel lives in the ``econ_`` config (``register_channel_id``); unset (0)
+means the feature is off. ``register_cursor_id`` is the bot-managed drain
+cursor (same bookkeeping pattern as ``guide_message_id``).
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import discord
+
+from bot_modules.core.branding import FIELD_VALUE_LIMIT, escape_to_fit
+from bot_modules.economy import quests as quest_logic
+from bot_modules.shared.embeds import footer_emoji, rel_ts as _rel
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from bot_modules.economy.service import EconSettings
+
+
+def _text(content: str) -> discord.ui.TextDisplay[Any]:
+    return discord.ui.TextDisplay(content)
+
+# Ledger kinds the register never posts.
+#
+# ``login`` and ``conversion`` are the automated per-member faucets: they fire
+# once per active member and all land together at the guild-local day roll, so
+# posting them would bury every quest, purchase and transfer under a nightly
+# burst of routine noise. They still hit the ledger, the wallet, and the
+# metrics rollup — they are simply not news.
+#
+# ``transfer_in`` is skipped because a transfer writes two rows (out + in) for
+# one event; the register posts the ``transfer_out`` leg as a single
+# consolidated "A → B" entry instead of reporting the same movement twice.
+#
+# ``casino_stake`` / ``casino_payout`` are skipped because slot pulls and
+# coinflips write 1-2 rows per play — sustained play outruns the drain
+# budget (8 per 30s tick), and once the backlog crosses the stale cutoff
+# the drain silently drops OTHER kinds' entries queued behind the bet
+# spam. Casino results already post publicly in the casino channel, so the
+# feed loses no news; ``casino_refund`` still posts (rare, and it's how a
+# restart's make-whole sweep shows its receipts). All three keep their
+# ``_KIND_DISPLAY`` entries for /bank wallet.
+SKIP_KINDS: tuple[str, ...] = (
+    "login",
+    "conversion",
+    "transfer_in",
+    "casino_stake",
+    "casino_payout",
+    # Like transfers, a tip writes both legs; posting only the payer's side
+    # keeps one event to one feed entry.
+    "tip_in",
+    # A staff removal is a correction or a sanction, not news: broadcasting
+    # "we took N coins off <member>" to the whole server is a different act
+    # from celebrating a grant, and nobody asked for it to be public. It stays
+    # on the Operations page's Ledger Audit, and keeps its ``_KIND_DISPLAY``
+    # entry so the member still sees it in their own /bank wallet history.
+    "admin_remove",
+)
+
+# Per-kind glyph + human label. The label is the fallback memo for kinds whose
+# meta carries nothing extra to say.
+_KIND_DISPLAY: dict[str, tuple[str, str]] = {
+    "quest": ("💰", "Quest reward"),
+    "quest_bonus": ("🎉", "Quest board clear"),
+    "quest_community": ("🤝", "Community quest"),
+    "rental": ("🛒", "Perk rental"),
+    "transfer_out": ("↔️", "Transfer sent"),
+    "transfer_in": ("↔️", "Transfer received"),
+    "tip_out": ("💸", "Reaction tip sent"),
+    "tip_in": ("💸", "Reaction tip received"),
+    "login": ("📅", "Daily login"),
+    "milestone": ("🏆", "Streak milestone"),
+    "conversion": ("✨", "XP conversion"),
+    "qotd": ("💬", "Question of the day"),
+    "drop": ("🪂", "Coin drop claimed"),
+    "photo_post": ("📸", "Photo Challenge post"),
+    "quest_community_bonus": ("🤝", "Community quest bonus"),
+    "game_participation": ("🎲", "Game participation"),
+    "game_win": ("🥇", "Game win"),
+    "cat_catch": ("🐱", "Cat caught"),
+    "mention_award": ("🪑", "Mention award"),
+    "grant": ("🎁", "Staff grant"),
+    "admin_remove": ("🧾", "Removed by staff"),
+    "quest_reroll": ("🔁", "Quest reroll"),
+    "qa_reward": ("🧪", "QA testing reward"),
+    "streak_shield": ("🛡️", "Streak shield"),
+    "emoji_sponsor": ("😀", "Emoji sponsorship"),
+    "raffle_ticket": ("🎟️", "Raffle tickets"),
+    "demurrage": ("🐉", "Hoard tax"),
+    "wager_stake": ("⚔️", "Game wager staked"),
+    "wager_payout": ("🎰", "Game wager won"),
+    "wager_refund": ("↩️", "Game wager refunded"),
+    "emoji_sponsor_refund": ("↩️", "Emoji sponsorship refund"),
+    "pin_sponsor": ("📌", "Pinned message"),
+    "pin_sponsor_refund": ("↩️", "Pinned-message refund"),
+    "bounty_stake": ("🎯", "Bounty stake"),
+    "bounty_payout": ("🏆", "Bounty won"),
+    "bounty_refund": ("↩️", "Bounty refund"),
+    "casino_stake": ("🎰", "Casino bet"),
+    "casino_payout": ("🎰", "Casino win"),
+    "casino_refund": ("↩️", "Casino refund"),
+}
+
+_FALLBACK_DISPLAY = ("🪙", "Adjustment")
+
+
+def kind_display(kind: str) -> tuple[str, str]:
+    """A ledger kind's (glyph, human label) — the register's shared vocabulary.
+
+    Any surface that lists ledger rows (the register feed, ``/bank wallet``)
+    routes ``kind`` through this so one map owns the icons and wording. An
+    unmapped kind degrades to the coin glyph plus a title-cased kind name
+    (``qa_void`` → ``Qa void``), never a raw snake_case token.
+    """
+    if kind in _KIND_DISPLAY:
+        return _KIND_DISPLAY[kind]
+    return _FALLBACK_DISPLAY[0], kind.replace("_", " ").capitalize()
+
+# Human labels for the rentable perks (rentals_service._PERKS). gift_color
+# stays although the kind retired in migration 091: ledger meta was not
+# rewritten, so pre-090 rental rows still carry it.
+_PERK_LABELS: dict[str, str] = {
+    "role_color": "Custom role color",
+    "role_name": "Custom role name",
+    "role_icon": "Role icon",
+    "role_gradient": "Gradient role color",
+    "role_holographic": "Holographic role color",
+    "role_preset": "Palette role color",
+    "voice_style": "Voice room lease",
+    "emoji": "Sponsored emoji",
+    "custom_item": "Custom shop item",
+    "gift_color": "Gifted role color",
+}
+
+_LOGIN_SOURCE_LABELS = {"text": "text", "voice": "voice"}
+
+
+@dataclass(frozen=True)
+class RegisterEntry:
+    """One drained ledger row, with everything the embed needs pre-resolved."""
+
+    ledger_id: int
+    user_id: int
+    amount: int  # signed: + credit, − debit
+    kind: str
+    actor_id: int | None
+    meta: dict
+    created_at: float
+    # The wallet balance immediately AFTER this row was applied.
+    balance_after: int
+    # Resolved from meta at collect time (quest rows only).
+    quest_title: str = ""
+    quest_target: int = 1
+
+
+def _parse_meta(raw: object) -> dict:
+    """Best-effort decode of a ledger row's JSON meta blob."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _anon_quest_ids(conn: sqlite3.Connection, guild_id: int) -> list[int]:
+    """Quest ids the register must never post a payout for.
+
+    Quests on a privacy-suppressed trigger kind (:data:`quests.ANON_KINDS`):
+    posting "**X** earned *Send a Whisper*" seconds after an anonymous whisper
+    lands in the feed names the whisperer by timing correlation, which is the
+    whole thing the anonymity is for. The set covers more than anonymity now —
+    ``pen_pal`` pays both halves of a pairing at once, so two adjacent cards
+    name who was matched with whom, and a ``guess_post`` card names the answer
+    to a live Guess Who round. The member still sees the credit on every
+    private surface — their own ``/quests`` log and ``/bank wallet`` read the
+    ledger directly, and neither goes through here.
+    """
+    return [
+        int(r["id"])
+        for r in conn.execute(
+            "SELECT id FROM econ_quests WHERE guild_id = ? AND trigger_kind IN "
+            f"({','.join('?' * len(quest_logic.ANON_KINDS))})",
+            [guild_id, *sorted(quest_logic.ANON_KINDS)],
+        ).fetchall()
+    ]
+
+
+def collect_register_entries(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    after_id: int,
+    limit: int,
+) -> list[RegisterEntry]:
+    """Drain up to ``limit`` postable ledger rows newer than ``after_id``.
+
+    Oldest first. :data:`SKIP_KINDS` and anonymous-kind quest payouts (see
+    :func:`_anon_quest_ids`) are filtered out in SQL, not afterwards, for two
+    reasons: a midnight burst of login/conversion rows can't consume the whole
+    batch and starve the entries anyone wants to read, and — the sharper one —
+    the drain cursor only advances over rows this function *returns*. A batch
+    that filtered to empty in Python would leave the cursor parked, re-read the
+    same rows next tick, and stall the feed permanently.
+
+    Balances are reconstructed rather than read live — the live wallet balance
+    is only right for the newest row. The rewind walks **every** row for these
+    members (skipped kinds included): a login row sitting between two posted
+    entries still moved the balance, so ignoring it would print arithmetic that
+    doesn't add up. All reads share one connection snapshot, so a concurrent
+    credit can't skew it.
+    """
+    skips = ",".join("?" * len(SKIP_KINDS))
+    anon_ids = _anon_quest_ids(conn, guild_id)
+    # ``meta`` is NULL on plenty of rows and json_extract would raise on a
+    # hand-written non-JSON one, so normalise before reaching into it.
+    meta_json = "CASE WHEN json_valid(meta) THEN meta ELSE '{}' END"
+    # Two ways a row is suppressed. Its ``quest_id`` names a suppressed quest —
+    # the payout itself. Or it carries ``anon``, stamped by the claim path on
+    # everything *else* that claim wrote: the board-clear bonus (no quest_id at
+    # all) and the daily_complete tick (the progression quest's id, not the
+    # suppressed one). Both land in the same transaction as the payout, so an
+    # unfiltered one names the member at the exact second the payout was
+    # suppressed for.
+    anon_clause = (
+        f" AND COALESCE(json_extract({meta_json}, '$.anon'), 0) = 0"
+    )
+    if anon_ids:
+        anon_clause += (
+            f" AND COALESCE(json_extract({meta_json}, '$.quest_id'), 0) "
+            f"NOT IN ({','.join('?' * len(anon_ids))})"
+        )
+    rows = conn.execute(
+        f"""
+        SELECT id, user_id, amount, kind, actor_id, meta, created_at
+        FROM econ_ledger
+        WHERE guild_id = ? AND id > ? AND kind NOT IN ({skips}){anon_clause}
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (guild_id, after_id, *SKIP_KINDS, *anon_ids, limit),
+    ).fetchall()
+    if not rows:
+        return []
+
+    batch_ids = {int(r["id"]) for r in rows}
+    min_id = min(batch_ids)
+    user_ids = {int(r["user_id"]) for r in rows}
+    placeholders = ",".join("?" * len(user_ids))
+
+    balances = {
+        int(r["user_id"]): int(r["balance"])
+        for r in conn.execute(
+            f"SELECT user_id, balance FROM econ_wallets "
+            f"WHERE guild_id = ? AND user_id IN ({placeholders})",
+            [guild_id, *user_ids],
+        ).fetchall()
+    }
+    # Every row from the batch's start onward, unfiltered — the rewind needs
+    # the movements we are NOT posting just as much as the ones we are.
+    movements = conn.execute(
+        f"SELECT id, user_id, amount FROM econ_ledger "
+        f"WHERE guild_id = ? AND user_id IN ({placeholders}) AND id >= ? "
+        f"ORDER BY id ASC",
+        [guild_id, *user_ids, min_id],
+    ).fetchall()
+
+    # Walk backwards from each member's live balance, recording the balance
+    # each batch row produced as we pass it.
+    running = dict(balances)
+    balance_after: dict[int, int] = {}
+    for mv in reversed(movements):
+        uid = int(mv["user_id"])
+        mid = int(mv["id"])
+        if mid in batch_ids:
+            balance_after[mid] = running.get(uid, 0)
+        running[uid] = running.get(uid, 0) - int(mv["amount"])
+
+    quests = _resolve_quests(conn, guild_id, rows)
+    periods = _resolve_claim_periods(conn, guild_id, rows)
+
+    entries: list[RegisterEntry] = []
+    for row in rows:
+        uid = int(row["user_id"])
+        meta = _parse_meta(row["meta"])
+        title, target = _quest_display(quests, periods, meta, uid)
+        entries.append(
+            RegisterEntry(
+                ledger_id=int(row["id"]),
+                user_id=uid,
+                amount=int(row["amount"]),
+                kind=str(row["kind"]),
+                actor_id=int(row["actor_id"]) if row["actor_id"] is not None else None,
+                meta=meta,
+                created_at=float(row["created_at"]),
+                balance_after=balance_after.get(int(row["id"]), 0),
+                quest_title=title,
+                quest_target=target,
+            )
+        )
+    return entries
+
+
+def _quest_id_of(meta: dict) -> int:
+    """The meta blob's quest id, or 0 when it carries none."""
+    try:
+        return int(meta.get("quest_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _claim_id_of(meta: dict) -> int:
+    """The meta blob's claim id, or 0 when it carries none."""
+    try:
+        return int(meta.get("claim_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resolve_quests(
+    conn: sqlite3.Connection, guild_id: int, rows: list[sqlite3.Row]
+) -> dict[int, sqlite3.Row]:
+    """Bulk-load the quest rows referenced by the batch's meta blobs.
+
+    This is the Venmo memo: the ledger says "+50", the quest says what earned it.
+    """
+    quest_ids = {
+        qid for qid in (_quest_id_of(_parse_meta(r["meta"])) for r in rows) if qid
+    }
+    if not quest_ids:
+        return {}
+    placeholders = ",".join("?" * len(quest_ids))
+    return {
+        int(r["id"]): r
+        for r in conn.execute(
+            f"SELECT id, title, target_count, target_min, target_max "
+            f"FROM econ_quests WHERE guild_id = ? AND id IN ({placeholders})",
+            [guild_id, *quest_ids],
+        ).fetchall()
+    }
+
+
+def _resolve_claim_periods(
+    conn: sqlite3.Connection, guild_id: int, rows: list[sqlite3.Row]
+) -> dict[int, str]:
+    """Bulk-resolve claim_id → period for the batch's quest rows.
+
+    The period is what makes a banded quest's per-member target reproducible
+    (:func:`quests.effective_target` is seeded on user+quest+period).
+    """
+    claim_ids = {
+        cid for cid in (_claim_id_of(_parse_meta(r["meta"])) for r in rows) if cid
+    }
+    if not claim_ids:
+        return {}
+    placeholders = ",".join("?" * len(claim_ids))
+    return {
+        int(r["id"]): str(r["period"])
+        for r in conn.execute(
+            f"SELECT id, period FROM econ_quest_claims "
+            f"WHERE guild_id = ? AND id IN ({placeholders})",
+            [guild_id, *claim_ids],
+        ).fetchall()
+    }
+
+
+def _quest_display(
+    quests: dict[int, sqlite3.Row],
+    periods: dict[int, str],
+    meta: dict,
+    user_id: int,
+) -> tuple[str, int]:
+    """A quest row's (title, target) for one ledger entry.
+
+    The target is the *member's own* target, not the library's ``target_count``:
+    a banded quest draws each member a different one, so showing the raw column
+    would print a tally the member never actually worked to.
+    """
+    quest = quests.get(_quest_id_of(meta))
+    if quest is None:
+        return "", 1
+    period = periods.get(_claim_id_of(meta))
+    if period is None:
+        # No claim to pin the period on (a hand-written or legacy row): the
+        # fixed count is right unless the quest is banded, where no honest
+        # tally exists — fall back to "no tally".
+        target_count = int(quest["target_count"] or 1)
+        banded = 0 < int(quest["target_min"] or 0) < int(quest["target_max"] or 0)
+        return str(quest["title"]), 1 if banded else target_count
+    return str(quest["title"]), quest_logic.effective_target(
+        int(quest["target_count"] or 1),
+        int(quest["target_min"] or 0),
+        int(quest["target_max"] or 0),
+        user_id=user_id,
+        quest_id=int(quest["id"]),
+        period=period,
+    )
+
+
+def render_memo(entry: RegisterEntry, resolve_name: Callable[[int], str]) -> str:
+    """The "what it was for" line — a human memo built from kind + meta.
+
+    Every ledger kind gets a specific memo where its meta supports one; unknown
+    kinds (a future payout source that predates this map) degrade to a
+    title-cased kind rather than going blank.
+    """
+    kind = entry.kind
+    meta = entry.meta
+
+    if kind == "quest":
+        title = entry.quest_title or "a quest"
+        if entry.quest_target > 1:
+            return f"Quest: **{title}** ({entry.quest_target}/{entry.quest_target})"
+        return f"Quest: **{title}**"
+
+    if kind == "quest_community":
+        return "Community quest payout"
+
+    if kind == "rental":
+        perk = _PERK_LABELS.get(str(meta.get("perk", "")), str(meta.get("perk") or "a perk"))
+        if meta.get("renewal"):
+            return f"Perk renewal: **{perk}**"
+        return f"Perk rental: **{perk}**"
+
+    if kind == "transfer_out":
+        # Consolidated: the counterparty is named in the header, not here. The
+        # sender's memo — the whole point of the note — rides along when set.
+        # Stored raw (economy_service.transfer_currency's docstring puts
+        # escaping on the render-time caller); this is that caller.
+        note = discord.utils.escape_markdown(str(meta.get("memo") or "").strip())
+        return f"Transfer — {note}" if note else "Transfer"
+
+    if kind == "transfer_in":
+        # Not posted (see SKIP_KINDS) — rendered only if something asks.
+        # Escaped anyway: the first caller to wire this up would otherwise
+        # inherit the gap silently, and it is one call away from the
+        # transfer_out case above that does escape.
+        sender = discord.utils.escape_markdown(
+            resolve_name(int(meta.get("from") or 0))
+        )
+        return f"Transfer from {sender}"
+
+    if kind == "login":
+        source = _LOGIN_SOURCE_LABELS.get(str(meta.get("source", "")), "")
+        streak = int(meta.get("streak") or 0)
+        bits = "Daily login"
+        if source:
+            bits += f" ({source})"
+        if streak > 1:
+            bits += f" — {streak}-day streak"
+        return bits
+
+    if kind == "milestone":
+        streak = int(meta.get("streak") or 0)
+        return f"Streak milestone — {streak} days" if streak else "Streak milestone"
+
+    if kind == "conversion":
+        xp = float(meta.get("xp") or 0)
+        return f"XP conversion — {xp:,.0f} XP earned" if xp else "XP conversion"
+
+    if kind == "qotd":
+        return "Answered the question of the day"
+
+    if kind in ("game_participation", "game_win"):
+        return _KIND_DISPLAY[kind][1]
+
+    if kind == "wager_payout":
+        # The credited amount is already net of any rake; say where the
+        # difference went so the feed's arithmetic visibly adds up.
+        rake = int(meta.get("rake") or 0)
+        if rake:
+            return f"Game wager won — house kept {rake:,}"
+        return _KIND_DISPLAY[kind][1]
+
+    if kind in ("casino_stake", "casino_payout", "casino_refund"):
+        # Meta names the table (coinflip/slots/blackjack/roulette) — say it.
+        game = str(meta.get("game") or "").strip().capitalize()
+        label = _KIND_DISPLAY[kind][1]
+        return f"{label} — {game}" if game else label
+
+    if kind == "grant":
+        # The slash-command reason param carries no max_length, so it can
+        # arrive far longer than a display name — escape first, then fit, or
+        # an adversarial reason escapes past the embed description cap and
+        # 400s the whole register post.
+        reason = escape_to_fit(str(meta.get("reason") or "").strip(), FIELD_VALUE_LIMIT)
+        actor = (
+            discord.utils.escape_markdown(resolve_name(entry.actor_id))
+            if entry.actor_id
+            else "staff"
+        )
+        return f"Staff grant by {actor} — {reason}" if reason else f"Staff grant by {actor}"
+
+    label = _KIND_DISPLAY.get(kind, _FALLBACK_DISPLAY)[1]
+    return label if kind in _KIND_DISPLAY else kind.replace("_", " ").capitalize()
+
+
+def build_register_entry_layout(
+    entry: RegisterEntry,
+    settings: EconSettings,
+    resolve_name: Callable[[int], str],
+    *,
+    avatar_url: str | None = None,
+) -> list[discord.ui.Item[Any]]:
+    """One register entry as a compact Venmo-style card. **Paradigm 7 — receipt.**
+
+    Money in vs money out used to be a colour (green/red) on the embed; a V2
+    card carries no accent, so that signal now lives entirely in the glyph
+    and the leading +/− sign already on the amount — nothing here reads as
+    ambiguous without the colour, it was reinforcement, not the only tell.
+    """
+    glyph = _KIND_DISPLAY.get(entry.kind, _FALLBACK_DISPLAY)[0]
+    emoji = settings.currency_emoji
+    credit = entry.amount >= 0
+    magnitude = abs(entry.amount)
+
+    if entry.kind == "transfer_out":
+        # One entry for the whole movement: "Billy → Sam", unsigned (the
+        # currency didn't enter or leave the economy, it moved sideways), and
+        # the footer is explicitly the sender's wallet.
+        recipient = resolve_name(int(entry.meta.get("to") or 0))
+        header = f"{resolve_name(entry.user_id)} → {recipient}"
+        amount_text = f"**{magnitude:,} {emoji}**"
+        footer = (
+            f"{discord.utils.escape_markdown(resolve_name(entry.user_id))}'s "
+            f"{settings.wallet_name.lower()}: "
+        )
+    else:
+        header = resolve_name(entry.user_id)
+        amount_text = f"**{'+' if credit else '−'}{magnitude:,} {emoji}**"
+        footer = f"{settings.wallet_name}: "
+
+    # The currency emoji is guild-settable and may be custom; a custom emoji
+    # renders as raw text outside an embed's icon-bearing footer slot too, so
+    # drop it there the same way the old footer did (it's still on the amount
+    # above). See embed_style_guide.md → Footers.
+    balance_emoji = footer_emoji(emoji)
+    balance_text = f"{entry.balance_after:,} {balance_emoji}".rstrip()
+    text = _text(
+        f"**{discord.utils.escape_markdown(header)}**\n"
+        f"{glyph} {amount_text} · {render_memo(entry, resolve_name)}\n"
+        f"-# {footer}{balance_text} • {_rel(entry.created_at)}"
+    )
+    if avatar_url:
+        return [discord.ui.Section(text, accessory=discord.ui.Thumbnail(avatar_url))]
+    return [text]
+
+
+# ── sign-off outcomes ────────────────────────────────────────────────────────
+#
+# A denied or expired claim writes no ledger row — nothing moved — so neither
+# reaches the feed through the drain above. They are posted directly by the
+# resolving code instead, in the register's own shape, because the register is
+# now the *only* place a member is told what happened to a claim: the
+# per-claim card in the bank channel is gone and nothing DMs.
+#
+# An approval needs none of this. It credits kind ``quest``, so the drain has
+# always posted it.
+
+_SIGNOFF_DISPLAY: dict[str, tuple[str, str]] = {
+    "denied": ("❌", "Quest sign-off denied"),
+    "expired": ("⏳", "Quest claim expired"),
+}
+
+
+def suppress_signoff_notice(trigger_kind: object) -> bool:
+    """True when a claim's outcome must not be posted to the register.
+
+    The same privacy rule the payout drain applies in :func:`_anon_quest_ids`,
+    and for the same reason: "**X**'s claim for *Send a Whisper* was denied"
+    names the whisperer just as surely as the payout would have. A suppressed
+    outcome is posted nowhere at all — the member still sees the claim reopen
+    on their own ``/quests`` board, which is the private surface the whole
+    suppression exists to keep it on.
+    """
+    return str(trigger_kind or "") in quest_logic.ANON_KINDS
+
+
+def build_signoff_notice_layout(
+    state: str,
+    *,
+    member_name: str,
+    quest_title: str,
+    deny_reason: str | None = None,
+    avatar_url: str | None = None,
+) -> list[discord.ui.Item[Any]]:
+    """A denied/expired claim as a register entry. **Paradigm 7 — receipt.**
+
+    Deliberately the same silhouette as :func:`build_register_entry_layout` —
+    a bold name line, then glyph + what happened — so the feed reads as one
+    thing rather than two. It carries no amount and no balance: nothing
+    moved, and printing a wallet total next to a denial would imply it did.
+    """
+    glyph, label = _SIGNOFF_DISPLAY.get(state, _SIGNOFF_DISPLAY["expired"])
+    title = quest_title or "a quest"
+    lines = [
+        f"**{discord.utils.escape_markdown(member_name or 'someone')}**",
+        f"{glyph} **{label}** · {title}",
+    ]
+    reason = (deny_reason or "").strip()
+    if reason:
+        # Blockquoted rather than inlined: the reason is the member's own
+        # copy — the deny modal says "shown to the member" — and it reads as
+        # quoted words rather than as more of the feed's own narration.
+        # Escaped and quoted per line, matching quest_layouts.py's
+        # deny_reason_quote — a TextDisplay renders markdown an embed
+        # title never did, and a multi-line reason must stay one
+        # blockquote per line rather than breaking out.
+        reason_quote = "\n".join(
+            f"> {line}" for line in discord.utils.escape_markdown(reason).splitlines()
+        )
+        lines.append(reason_quote)
+    text = _text("\n".join(lines))
+    if avatar_url:
+        return [discord.ui.Section(text, accessory=discord.ui.Thumbnail(avatar_url))]
+    return [text]

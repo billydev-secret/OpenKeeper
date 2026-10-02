@@ -1,0 +1,44 @@
+# Paths withheld from the public snapshot (scripts/publish_release.py,
+# docs/publishing.md). One entry per line, relative to the repo root: a file,
+# a directory (trailing slash) or a glob over the full path. Everything
+# .gitignore'd is already absent from a commit — this list is for TRACKED
+# files that stay private. The list itself is published, so the public copy
+# can see what it is missing.
+
+# The server's own branding: fonts, quote-card borders, the logo, panel art
+# and the Mahjong tile set. The public copy ships no assets/ at all; what an
+# operator supplies instead is in docs/deployment.md § Assets you supply.
+# tests/tooling/test_public_tree_leaks.py pins this rule and refuses any
+# image, font or audio file anywhere in the snapshot.
+assets/
+
+# The maintainers' Claude Code session tooling: the slash commands and
+# review agent, the tmux-worktree session launcher and the units that
+# snapshot and restore those sessions across reboots, the doc describing
+# that flow, and the tests that read those files. Host-specific by nature
+# (Ben, 2026-10-01: "hide the .claude folder and such"). CLAUDE.md stays:
+# it is the repo's rulebook, and CONTRIBUTING.md points at it.
+.claude/
+scripts/dk_session.py
+scripts/systemd/
+docs/dev_sessions.md
+tests/tooling/test_dk_session.py
+tests/tooling/test_ship_flow_wiring.py
+
+# The DK MCP server is the maintainers' own tooling: it serves this repo's
+# docs and source to claude.ai over their tunnel, and its unit, deploy
+# script and doc carry that host's paths and name. It stays in the private
+# repo (Ben, 2026-10-01: "make the MCP separate"); the bot never imports it.
+src/dk_mcp/
+tests/dk_mcp/
+tests/dk_mcp_fixture.py
+docs/dk_mcp_server.md
+deploy/dk-mcp.service
+scripts/deploy_dk_mcp.sh
+requirements/mcp.lock
+
+# The Claude workflows run with the maintainer's OAuth token: one on every
+# `@claude` issue comment, the other on every pull request. On a public repo
+# that is a paid run any passer-by can trigger, so they stay here.
+.github/workflows/claude.yml
+.github/workflows/claude-code-review.yml

@@ -1,0 +1,145 @@
+import { api, esc } from "../api.js";
+import { rangePicker, withLoading } from "../report-helpers.js";
+import { makeBarChart, renderChartTable } from "../charts.js";
+import { renderSortableTable } from "../table.js";
+
+// `initialParams` is the parsed window.location.hash (see app.js parseHash),
+// so every value in it is attacker-controlled through a link. Anything from it
+// that reaches markup is coerced — these are number inputs, so parseInt is both
+// the guard and the correct read.
+export function mount(container, initialParams) {
+  container.innerHTML = `
+    <div class="panel">
+      <header>
+        <h2>Activity Drops</h2>
+        <div class="subtitle">Members who slowed down or stopped posting</div>
+      </header>
+      <div class="controls">
+        <label>Minimum Previous Messages
+          <input type="number" data-control="min_previous" min="1" max="100" value="${parseInt(initialParams.min_previous) || 5}" />
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" data-control="normalize" />
+          Normalize for server activity
+        </label>
+      </div>
+      <div data-stats class="subtitle" style="margin-bottom:8px;"></div>
+      <div class="chart-caption" data-caption></div>
+      <div class="chart-wrap"><canvas data-chart></canvas></div>
+      <div data-chart-table></div>
+      <div data-table-wrap tabindex="0" style="margin-top:12px; max-height:400px; overflow-y:auto;"></div>
+    </div>
+  `;
+
+  const rangeEl = rangePicker({ value: initialParams.period_days || 3, allowAll: false, label: "Period" });
+  container.querySelector(".controls").prepend(rangeEl);
+  const periodEl = rangeEl.querySelector("select");
+  const minEl = container.querySelector('[data-control="min_previous"]');
+  const normalizeEl = container.querySelector('[data-control="normalize"]');
+  const statsEl = container.querySelector("[data-stats]");
+  const captionEl = container.querySelector("[data-caption]");
+  const chartTableEl = container.querySelector("[data-chart-table]");
+  const tableWrap = container.querySelector("[data-table-wrap]");
+  let chart = null;
+  let cachedData = null;
+
+  function fmtDate(ts) {
+    if (!ts) return "—";
+    return new Date(ts * 1000).toLocaleDateString(undefined, {
+      month: "short", day: "numeric", year: "numeric",
+    });
+  }
+
+  function render(data) {
+    if (chart) { chart.destroy(); chart = null; }
+
+    const normalize = normalizeEl.checked;
+    const dropKey = normalize ? "normalized_drop_pct" : "drop_pct";
+    const serverChg = data.server_activity_change_pct;
+    const normNote = normalize
+      ? ` (normalized — server activity ${serverChg >= 0 ? "+" : ""}${serverChg}%)`
+      : "";
+
+    statsEl.textContent = `${data.total_dropoffs} members with activity drops over ${data.period_days}-day window${normNote}`;
+
+    const sorted = [...data.entries].sort((a, b) => b[dropKey] - a[dropKey]);
+
+    const title = normalize ? "Normalized Activity Drop %" : "Activity Drop %";
+    const wrap = container.querySelector(".chart-wrap");
+    const entries = sorted.slice(0, 20);
+    if (!entries.length) {
+      wrap.innerHTML = `<div class="empty">Nobody slowed down in this window. Shorten the period or lower the minimum-messages bar to widen the search.</div>`;
+      captionEl.textContent = "";
+      chartTableEl.replaceChildren();
+      tableWrap.innerHTML = "";
+      return;
+    }
+    wrap.innerHTML = '<canvas data-chart></canvas>';
+    chart = makeBarChart(container.querySelector("[data-chart]"), {
+      labels: entries.map((e) => e.user_name || e.user_id),
+      data: entries.map((e) => e[dropKey]),
+      title,
+      yLabel: "Drop %",
+      color: "#9E3B2E",
+    });
+
+    // The caption lives in HTML — see activity.js. One series (this chart is
+    // always a single "drop %" bar per member), so no legend: the caption
+    // already names it.
+    captionEl.textContent = title;
+    // Scoped to exactly what's plotted (top 20 by drop), unlike the full
+    // sortable table below which lists every qualifying member with more
+    // columns — a tooltip must never be the only way to read a bar's value.
+    renderChartTable(chartTableEl, {
+      labels: entries.map((e) => e.user_name || e.user_id),
+      datasets: [{ label: "Drop %", data: entries.map((e) => e[dropKey]) }],
+      indexLabel: "Member",
+    });
+
+    renderSortableTable(tableWrap, {
+      columns: [
+        { key: "user_name", label: "Member", format: (v, r) => r.user_name || r.user_id },
+        { key: "msgs_prev", label: "Previous" },
+        { key: "msgs_recent", label: "Recent" },
+        // html: colored numbers, no user-supplied text (see table.js ESCAPING).
+        { key: "drop_pct", label: "Raw Drop %", html: true, format: (v) => `<span style="color:var(--red-text)">${v}%</span>` },
+        { key: "normalized_drop_pct", label: "Normalized Drop %", html: true, format: (v) => `<span style="color:var(--red-text)">${v}%</span>` },
+        { key: "days_active_prev", label: "Active Days (Previous)" },
+        { key: "days_active_recent", label: "Active Days (Recent)" },
+        { key: "last_seen_ts", label: "Last Seen", format: (v) => fmtDate(v) },
+        { key: "level", label: "Level" },
+      ],
+      data: sorted,
+      defaultSort: dropKey,
+      emptyMsg: "Nobody slowed down in this window.",
+      maxRows: 300,
+    });
+  }
+
+  async function refresh() {
+    const params = {
+      period_days: parseInt(periodEl.value) || 3,
+      min_previous: parseInt(minEl.value) || 5,
+    };
+    const qs = new URLSearchParams(params);
+    history.replaceState(null, "", `#/retention?${qs}`);
+
+    try {
+      cachedData = await withLoading(container.querySelector(".chart-wrap"), api("/api/reports/retention", params));
+      render(cachedData);
+    } catch (err) {
+      statsEl.textContent = "";
+      container.querySelector(".chart-wrap").innerHTML = `<div class="error">Couldn’t load activity drops — try again. (${esc(err.message)})</div>`;
+      captionEl.textContent = "";
+      chartTableEl.replaceChildren();
+      tableWrap.innerHTML = "";
+    }
+  }
+
+  periodEl.addEventListener("change", refresh);
+  minEl.addEventListener("change", refresh);
+  normalizeEl.addEventListener("change", () => { if (cachedData) render(cachedData); });
+  refresh();
+
+  return { unmount() { if (chart) { chart.destroy(); chart = null; } } };
+}

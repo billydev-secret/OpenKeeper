@@ -1,0 +1,3256 @@
+"""Economy quests — the DB layer for the quest library and claim machine.
+
+The claim state machine (spec §4) is the money-critical core. The two partial
+unique indexes on ``econ_quest_claims`` — one ``WHERE state='pending'``, one
+``WHERE state='paid'`` — are the race anchors: ``claim_quest`` and
+``resolve_claim`` let those indexes decide the winner (catch IntegrityError →
+distinct ValueErrors) rather than reading before writing.
+
+Every credit rides the caller's connection/transaction alongside its state
+change — no internal commits, matching the stage-0/1 economy functions. The
+caller's ``with open_db(...) as conn`` is the commit boundary, which is what
+makes settlement crash-safe: a partial community sweep rolls back whole and
+the next tick replays it, and the reserve-before-credit payout rows make that
+replay pay only the members it missed.
+
+Ledger kinds added here: ``quest`` (instant claim + approved sign-off) and
+``quest_community`` (community settlement payout).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date
+
+import logging
+
+from bot_modules.core.db_utils import get_tz_offset_hours
+from bot_modules.core.xp_system import apply_xp_award, load_xp_settings
+from bot_modules.economy import live_signal, quests
+from bot_modules.economy.logic import local_day_for
+from bot_modules.feature_rotation.store import (
+    blocked_quest_kinds_on,
+    featured_quest_kinds_on,
+)
+from bot_modules.economy.service import (
+    EconSettings,
+    apply_credit,
+    apply_debit,
+    get_balance,
+    load_econ_settings,
+)
+
+log = logging.getLogger(__name__)
+
+# Quests whose reward the member cannot self-claim (community AND monthly goals
+# are guild-wide and pay via the tier-settlement sweep, not the claim path).
+# Event quests DO go through claim_quest, but only the trigger listener calls it
+# for them — the member views never offer a claim button, and quest_period() has
+# no calendar key for 'event' so a stray self-claim path can't even build a
+# period.
+_CLAIMABLE_TYPES = ("daily", "weekly", "event")
+
+_EXPIRE_SECONDS_PER_DAY = 86400
+
+# Trigger kinds whose occurrence is an ENTITY that recurs within a period (a
+# channel, a day, a voice partner, a message author, a newcomer, a thread), so
+# a counted quest measures DISTINCT entities, not raw fires. Their dynamic
+# target must be sized from a distinct-occurrence count: the undeduped activity
+# stream would pin a member to a mathematically unreachable ceiling (talking to
+# one partner 100× can never satisfy "voice with N different people", yet the
+# raw count would size the band as if it could, while _bump_progress only ever
+# advances on a genuinely new partner). Message-id-keyed kinds (message_sent /
+# reply_sent / reaction_given / …) are 1:1 with their occurrence and correctly
+# sized from raw counts, so they are deliberately absent here. Occurrences for
+# these kinds are logged to econ_kind_activity_occ (in addition to the raw
+# econ_kind_activity count) so the distinct count is available to
+# resolve_member_target's trailing-period sizing.
+_ENTITY_KEYED_KINDS = frozenset(
+    {
+        "conversed",
+        "replied_to",
+        "reacted_to_member",
+        "channel_hop",
+        "active_day",
+        "voice_partner",
+        "welcome",
+        "thread_deep",
+    }
+)
+
+# How many recent period snapshots to retain per (guild, qtype). A board is
+# normally only read for the current period, but a sign-off approved days after
+# it was filed pays that PAST period's clear-the-board set bonus and must read
+# the exact board the member cleared — not a re-freeze of today's (possibly
+# edited) live pool. Retaining a window of recent snapshots keeps the past
+# board reconstructable across the day/week roll; older ones are pruned.
+_SNAPSHOT_RETAIN_PERIODS = 10
+
+# Distinct claim-collision messages (keyed off the state being inserted).
+_PAID_EXISTS_MSG = "You have already completed this quest this period."
+_PENDING_EXISTS_MSG = "You already have a claim awaiting sign-off for this quest."
+
+# Columns update_quest is allowed to write. ``active`` is intentionally NOT
+# here: activation must go through set_quest_active so the slot rule is
+# enforced (id/guild_id/created_* are fixed).
+_UPDATABLE_FIELDS = frozenset(
+    {
+        "title",
+        "description",
+        "qtype",
+        "reward",
+        "signoff",
+        "criteria",
+        "starts_at",
+        "ends_at",
+        "rotate_tag",
+        "community_target",
+        "trigger_words",
+        "trigger_channel_id",
+        "trigger_kind",
+        "target_count",
+        "target_min",
+        "target_max",
+        "reward_xp",
+        "pair_tag",
+    }
+)
+
+
+class SlotLimitError(Exception):
+    """Raised when activating a quest would exceed the library slot rule."""
+
+
+@dataclass(frozen=True)
+class ClaimOutcome:
+    state: str  # 'paid' (instant) or 'pending' (sign-off)
+    claim_id: int
+    paid: int  # post-booster credited amount, 0 when pending
+
+
+@dataclass(frozen=True)
+class ClaimResolution:
+    user_id: int
+    quest_id: int
+    paid: int
+    deny_reason: str | None
+
+
+# ── library CRUD ──────────────────────────────────────────────────────
+
+
+def create_quest(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    title: str,
+    description: str,
+    qtype: str,
+    reward: int,
+    signoff: int,
+    criteria: str,
+    starts_at: float | None,
+    ends_at: float | None,
+    rotate_tag: str,
+    community_target: int | None,
+    created_by: int | None,
+    trigger_words: str = "",
+    trigger_channel_id: int | None = None,
+    trigger_kind: str = "",
+    target_count: int = 1,
+    target_min: int = 0,
+    target_max: int = 0,
+    reward_xp: int = 0,
+    pair_tag: str = "",
+) -> int:
+    """Insert a quest into the guild's library (inactive). Returns its id."""
+    if qtype not in ("daily", "weekly", "monthly", "community", "event"):
+        raise ValueError(f"unknown quest type: {qtype!r}")
+    if reward_xp < 0:
+        raise ValueError("XP reward cannot be negative")
+    _check_trigger_config(qtype, trigger_kind, trigger_words, signoff)
+    _check_target_count(qtype, trigger_kind, target_count, target_min, target_max)
+    cur = conn.execute(
+        """
+        INSERT INTO econ_quests
+            (guild_id, title, description, qtype, reward, signoff, criteria,
+             starts_at, ends_at, active, rotate_tag, community_target,
+             created_by, created_at, trigger_words, trigger_channel_id,
+             trigger_kind, target_count, target_min, target_max, reward_xp,
+             pair_tag)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            guild_id,
+            title,
+            description,
+            qtype,
+            int(reward),
+            1 if signoff else 0,
+            criteria,
+            starts_at,
+            ends_at,
+            rotate_tag,
+            community_target,
+            created_by,
+            time.time(),
+            trigger_words,
+            trigger_channel_id,
+            trigger_kind,
+            int(target_count),
+            int(target_min),
+            int(target_max),
+            int(reward_xp),
+            pair_tag,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _check_trigger_config(
+    qtype: str, trigger_kind: str, trigger_words: str, signoff: int = 0
+) -> None:
+    """Validate the trigger configuration for a quest type.
+
+    Event quests require a known trigger kind (they have no other way to be
+    claimed). Daily/weekly quests may carry one — "do the thing once this
+    period" — or trigger words, but not both (two auto-claim paths racing for
+    one period would be ambiguous to explain, so it's rejected outright).
+
+    Community quests may carry a kind since stage 3 (quest-variety plan):
+    the kind's events then bump the guild-wide counter automatically and the
+    weekly scheduler owns activation/settlement. A kind community quest
+    can't be sign-off (settlement is tiered and automatic; a human gate
+    belongs on manual community quests) and never takes trigger words.
+
+    Monthly quests are guild-wide, community-measured goals (migration 125) and
+    are **auto-tracked only**: they REQUIRE a trigger kind, cannot be sign-off
+    (month-end tier settlement is automatic), and never take trigger words.
+
+    The privacy-suppressed kinds (:data:`quests.ANON_KINDS`) additionally
+    forbid sign-off: a sign-off claim names the claimant on the mods' todo
+    board, which is timing-correlatable against whatever the kind was
+    keeping quiet — exactly the exposure the silent auto-claim and the
+    register-feed suppression exist to avoid. For ``guess_post`` that card
+    would name the answer to a live round.
+    """
+    if trigger_kind and trigger_kind not in quests.TRIGGER_KINDS:
+        raise ValueError(f"unknown trigger kind: {trigger_kind!r}")
+    if trigger_kind == "daily_complete" and qtype == "daily":
+        # A daily that fires on completing dailies would tick itself (the
+        # fire hook also refuses, but reject the config outright).
+        raise ValueError(
+            "daily_complete is the weekly progression over your dailies — "
+            "put it on a weekly (or community/monthly) quest"
+        )
+    if qtype == "event":
+        if not trigger_kind:
+            raise ValueError("event quests need a trigger kind")
+    elif qtype == "community":
+        if trigger_kind and signoff:
+            raise ValueError(
+                "auto-tracking community quests cannot require sign-off "
+                "(tier settlement is automatic)"
+            )
+    elif qtype == "monthly":
+        if not trigger_kind:
+            raise ValueError(
+                "monthly quests are measured guild-wide and need a trigger "
+                "kind (auto-tracked)"
+            )
+        if signoff:
+            raise ValueError(
+                "monthly quests cannot require sign-off "
+                "(month-end tier settlement is automatic)"
+            )
+    if trigger_kind and trigger_words.strip():
+        raise ValueError("a quest takes trigger words or a trigger kind, not both")
+    if trigger_kind in quests.ANON_KINDS and signoff:
+        raise ValueError(
+            f"{trigger_kind} quests cannot require sign-off "
+            "(the pending claim would deanonymize the member)"
+        )
+
+
+def _check_target_count(
+    qtype: str,
+    trigger_kind: str,
+    target_count: int,
+    target_min: int = 0,
+    target_max: int = 0,
+) -> None:
+    """A per-member target above 1 (or a target band) only fits counted
+    daily/weekly trigger quests.
+
+    Manual claims are one-shot per period (nothing increments a count), and
+    an event quest pays *every* occurrence, so neither can carry a target. A
+    band (``0 < target_min < target_max``) draws the per-member target from a
+    Gaussian instead of a fixed count; it lives under the same rules and, like
+    a fixed count > 1, must sit on a counted daily/weekly quest.
+
+    Monthly quests are guild-wide community goals (migration 125): they are
+    measured by a single shared counter, not a per-member count, so they take
+    NO ``target_count`` and NO band — their size is the auto-sized
+    ``community_target``. A monthly quest with a per-member target is rejected.
+
+    The one-shot cadence rule (spec §4): only *daily* quests complete on a
+    single action. A weekly is a per-user push, so a weekly quest that CAN
+    count — i.e. one built on a game trigger — must accumulate progress (count
+    > 1 or a band), never fire-and-done on the first occurrence. A manual or
+    trigger-word weekly has nothing to increment, so it stays a legitimate
+    one-shot; the rule only bites the triggered case that could show a bar.
+    """
+    if target_count < 1:
+        raise ValueError("target count must be at least 1")
+    has_band = target_min != 0 or target_max != 0
+    if has_band and not (0 < target_min < target_max):
+        raise ValueError("target band needs 0 < target_min < target_max")
+    if qtype == "monthly" and (target_count != 1 or has_band):
+        raise ValueError(
+            "monthly quests are measured guild-wide and take no per-user "
+            "target count or band"
+        )
+    if target_count == 1 and not has_band:
+        if trigger_kind and qtype == "weekly":
+            raise ValueError(
+                "a weekly quest with a game trigger needs a target count above "
+                "1 or a target band so it shows progress across the week; only "
+                "daily quests are one-shot"
+            )
+        return
+    if not trigger_kind:
+        raise ValueError("a target count needs a game trigger to count")
+    if qtype not in ("daily", "weekly"):
+        raise ValueError("a target count needs a daily/weekly cadence")
+
+
+def update_quest(
+    conn: sqlite3.Connection, guild_id: int, quest_id: int, values: dict
+) -> None:
+    """Patch a quest's mutable fields; KeyError names any unknown field."""
+    unknown = set(values) - _UPDATABLE_FIELDS
+    if unknown:
+        raise KeyError(f"unknown quest field(s): {sorted(unknown)}")
+    if not values:
+        return
+    # ``signoff`` belongs here even though it isn't trigger-shaped: the
+    # suppressed kinds forbid it, and a patch of nothing but {"signoff": true}
+    # (the API sends only what changed) would otherwise skip the guard and turn
+    # sign-off on for a quest that must never post a claim card.
+    if {
+        "qtype",
+        "trigger_kind",
+        "trigger_words",
+        "target_count",
+        "target_min",
+        "target_max",
+        "signoff",
+    } & set(values):
+        quest = get_quest(conn, guild_id, quest_id)
+        if quest is not None:
+            merged_qtype = str(values.get("qtype", quest["qtype"]))
+            merged_kind = str(values.get("trigger_kind", quest["trigger_kind"]))
+            _check_trigger_config(
+                merged_qtype,
+                merged_kind,
+                str(values.get("trigger_words", quest["trigger_words"])),
+                int(values.get("signoff", quest["signoff"])),
+            )
+            _check_target_count(
+                merged_qtype,
+                merged_kind,
+                int(values.get("target_count", quest["target_count"])),
+                int(values.get("target_min", quest["target_min"])),
+                int(values.get("target_max", quest["target_max"])),
+            )
+    assignments = ", ".join(f"{k} = ?" for k in values)
+    params = [
+        (1 if v else 0) if k == "signoff" and isinstance(v, bool) else v
+        for k, v in values.items()
+    ]
+    conn.execute(
+        f"UPDATE econ_quests SET {assignments} WHERE id = ? AND guild_id = ?",
+        (*params, quest_id, guild_id),
+    )
+
+
+def delete_quest(conn: sqlite3.Connection, guild_id: int, quest_id: int) -> None:
+    """Delete a quest and its claims/progress/payouts.
+
+    Refuses (ValueError) when any 'paid' claim exists — a paid claim is an
+    audit record and must not vanish; callers deactivate such quests instead.
+    """
+    paid = conn.execute(
+        """
+        SELECT 1 FROM econ_quest_claims
+        WHERE quest_id = ? AND guild_id = ? AND state = 'paid' LIMIT 1
+        """,
+        (quest_id, guild_id),
+    ).fetchone()
+    if paid is not None:
+        raise ValueError("cannot delete a quest with paid claims; deactivate it instead")
+    conn.execute(
+        "DELETE FROM econ_quest_claims WHERE quest_id = ? AND guild_id = ?",
+        (quest_id, guild_id),
+    )
+    conn.execute("DELETE FROM econ_community_progress WHERE quest_id = ?", (quest_id,))
+    conn.execute("DELETE FROM econ_community_payouts WHERE quest_id = ?", (quest_id,))
+    conn.execute("DELETE FROM econ_quest_progress WHERE quest_id = ?", (quest_id,))
+    conn.execute(
+        "DELETE FROM econ_quest_progress_marks WHERE quest_id = ?", (quest_id,)
+    )
+    conn.execute(
+        "DELETE FROM econ_quests WHERE id = ? AND guild_id = ?", (quest_id, guild_id)
+    )
+
+
+def get_quest(
+    conn: sqlite3.Connection, guild_id: int, quest_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM econ_quests WHERE id = ? AND guild_id = ?",
+        (quest_id, guild_id),
+    ).fetchone()
+
+
+def list_quests(
+    conn: sqlite3.Connection, guild_id: int, *, active_only: bool = False
+) -> list[sqlite3.Row]:
+    if active_only:
+        return conn.execute(
+            """
+            SELECT * FROM econ_quests
+            WHERE guild_id = ? AND active = 1
+            ORDER BY qtype, id
+            """,
+            (guild_id,),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM econ_quests WHERE guild_id = ? ORDER BY qtype, id",
+        (guild_id,),
+    ).fetchall()
+
+
+def list_trigger_quests(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[sqlite3.Row]:
+    """Active daily/weekly quests with trigger phrases set (spec §4.4).
+
+    These are the quests the on-message listener watches for. Community and
+    monthly quests never appear — they are guild-wide (not member-claimable)
+    and auto-tracked by a trigger *kind*, so a trigger *phrase* on one has
+    nothing to claim.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM econ_quests
+        WHERE guild_id = ? AND active = 1
+          AND qtype IN ('daily', 'weekly') AND trigger_words != ''
+        ORDER BY id
+        """,
+        (guild_id,),
+    ).fetchall()
+
+
+# ── trigger-*word* quests (a member says the phrase) ──────────────────────────
+#
+# The sibling of the trigger-*kind* mechanic below (``fire_trigger_quests``):
+# same board-membership rule, same per-period claim, different evidence — a
+# phrase in a message rather than an event the bot observed. It lived in the
+# cog's on_message listener, which meant the board gate existed in two places,
+# only one of them reachable from a service test.
+
+
+@dataclass(frozen=True)
+class TriggerQuest:
+    """One active trigger-word quest, pre-compiled for the message listener."""
+
+    quest_id: int
+    qtype: str
+    channel_id: int | None  # None = any channel counts
+    pattern: re.Pattern[str]
+
+
+def load_trigger_index(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[TriggerQuest]:
+    """Active trigger quests with compiled patterns ([] when econ is off).
+
+    The caller caches this — recompiling every phrase for every message in the
+    guild would be the listener's dominant cost.
+    """
+    settings = load_econ_settings(conn, guild_id)
+    if not settings.enabled:
+        return []
+    out: list[TriggerQuest] = []
+    for row in list_trigger_quests(conn, guild_id):
+        pattern = quests.compile_trigger_pattern(
+            quests.parse_trigger_words(str(row["trigger_words"]))
+        )
+        if pattern is None:
+            continue
+        channel_id = row["trigger_channel_id"]
+        out.append(
+            TriggerQuest(
+                quest_id=int(row["id"]),
+                qtype=str(row["qtype"]),
+                channel_id=int(channel_id) if channel_id is not None else None,
+                pattern=pattern,
+            )
+        )
+    return out
+
+
+def matching_triggers(
+    triggers: Iterable[TriggerQuest],
+    content: str,
+    channel_ids: tuple[int | None, ...],
+) -> list[TriggerQuest]:
+    """The triggers this message content fires, respecting per-quest channel scope.
+
+    ``channel_ids`` is the message's channel plus its parent, so a phrase said
+    in a thread counts for a quest scoped to the thread's parent channel.
+    """
+    out: list[TriggerQuest] = []
+    for trig in triggers:
+        if trig.channel_id is not None and trig.channel_id not in channel_ids:
+            continue
+        if quests.message_matches_trigger(content, trig.pattern):
+            out.append(trig)
+    return out
+
+
+def claim_trigger_word(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    trig: TriggerQuest,
+    *,
+    booster: bool,
+    now: float,
+) -> tuple[EconSettings, object]:
+    """Claim one matched trigger-word quest: ``(settings, outcome)``.
+
+    Raises ``ValueError`` for the ordinary "nothing to do" cases — already
+    claimed this period, the window closed, the quest was deactivated since
+    the caller's cache load, or it isn't on this member's board this period.
+    Callers stay silent on those; every repeat message would hit one.
+    """
+    settings = load_econ_settings(conn, guild_id)
+    offset = get_tz_offset_hours(conn, guild_id)
+    day = local_day_for(now, offset)
+    period = quests.quest_period(trig.qtype, day)
+    # A trigger-word quest still only pays when it's on the member's personal
+    # board this period (parity with kind triggers). Off-board → treat like an
+    # unclaimable repeat.
+    if quests.has_board(trig.qtype) and trig.quest_id not in assigned_board_ids(
+        conn, guild_id, user_id, trig.qtype, day, settings
+    ):
+        raise ValueError("quest not on member's board this period")
+    outcome = claim_quest(
+        conn, settings, guild_id, trig.quest_id, user_id,
+        period=period, booster=booster,
+    )
+    return settings, outcome
+
+
+def list_kind_triggered_quests(
+    conn: sqlite3.Connection, guild_id: int, trigger_kind: str
+) -> list[sqlite3.Row]:
+    """The guild's active quests auto-paid by a trigger kind (any qtype).
+
+    An event quest pays per occurrence; a daily/weekly quest with the same
+    kind auto-claims its calendar period ("do it once today/this week").
+    """
+    return conn.execute(
+        """
+        SELECT * FROM econ_quests
+        WHERE guild_id = ? AND active = 1 AND trigger_kind = ?
+        ORDER BY id
+        """,
+        (guild_id, trigger_kind),
+    ).fetchall()
+
+
+def has_active_kind_quest(
+    conn: sqlite3.Connection, guild_id: int, trigger_kind: str
+) -> bool:
+    """Whether any active quest is auto-paid by ``trigger_kind``.
+
+    The cheap form of ``list_kind_triggered_quests``, for the per-event gates
+    that only need the yes/no — those run on a hot path and shouldn't
+    materialise rows they immediately discard.
+    """
+    return conn.execute(
+        "SELECT 1 FROM econ_quests WHERE guild_id = ? AND active = 1"
+        " AND trigger_kind = ? LIMIT 1",
+        (guild_id, trigger_kind),
+    ).fetchone() is not None
+
+
+def list_active_pool_ids(
+    conn: sqlite3.Connection, guild_id: int, qtype: str
+) -> list[int]:
+    """Active quest ids of a cadence — the pool the per-user board draws from."""
+    return [
+        int(r["id"])
+        for r in conn.execute(
+            "SELECT id FROM econ_quests "
+            "WHERE guild_id = ? AND active = 1 AND qtype = ? ORDER BY id",
+            (guild_id, qtype),
+        ).fetchall()
+    ]
+
+
+def board_sizes(settings: EconSettings) -> dict[str, int]:
+    """The guild's configured personal-board size per board cadence.
+
+    Only daily/weekly draw a personal board; monthly is a guild-wide goal now,
+    so it has no board size at all (the old ``quest_board_monthly`` dial was
+    dropped rather than left as a number that changed nothing).
+    """
+    return {
+        "daily": settings.quest_board_daily,
+        "weekly": settings.quest_board_weekly,
+    }
+
+
+# Ledger kinds that count as "a shop purchase" for the shop_purchase setup
+# quest: voluntary member spends only. Renewal billing shares the "rental"
+# kind, which is fine here — nobody's FIRST purchase is a renewal. Deliberate
+# omissions: quest_reroll (board mechanics), wager stakes (not a purchase),
+# transfers/gifts, admin adjustments.
+PURCHASE_LEDGER_KINDS: tuple[str, ...] = (
+    "rental",
+    "streak_shield",
+    "emoji_sponsor",
+    "raffle_ticket",
+)
+
+
+def _setup_underlying_done(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, kind: str
+) -> bool:
+    """Whether the member has already done a one-time setup kind's real action.
+
+    A direct existence check against the owning feature's table — a bio row
+    means they filled one out, a birthday row means they set it, a role-menu
+    grant or purchase-kind ledger row means they've picked/bought. Kept as
+    inline SQL (rather than importing the owning modules) so quest assignment
+    stays self-contained; these are stable core tables. Every kind also
+    honours an ``econ_setup_marks`` row — externally-detected completion the
+    hourly sweep records for actions the bot has no table of record for
+    (today: roles picked through Discord's native onboarding "Customize"
+    flow, which never touch ``role_menu_grants``). A mark clears the quest
+    from the board without paying it. role_pick's remaining soft edge:
+    announcement-button grants aren't recorded in ``role_menu_grants``
+    either, but those fire the trigger, so the paid-claim backstop in
+    ``_setup_quest_done`` catches them.
+    """
+    marked = conn.execute(
+        "SELECT 1 FROM econ_setup_marks "
+        "WHERE guild_id = ? AND user_id = ? AND kind = ? LIMIT 1",
+        (guild_id, user_id, kind),
+    ).fetchone()
+    if marked is not None:
+        return True
+    if kind == "bio_set":
+        row = conn.execute(
+            "SELECT 1 FROM bios WHERE guild_id = ? AND user_id = ? LIMIT 1",
+            (guild_id, user_id),
+        ).fetchone()
+    elif kind == "birthday_set":
+        row = conn.execute(
+            "SELECT 1 FROM member_birthdays WHERE guild_id = ? AND user_id = ? "
+            "LIMIT 1",
+            (guild_id, user_id),
+        ).fetchone()
+    elif kind == "role_pick":
+        row = conn.execute(
+            "SELECT 1 FROM role_menu_grants "
+            "WHERE guild_id = ? AND user_id = ? AND action = 'grant' LIMIT 1",
+            (guild_id, user_id),
+        ).fetchone()
+    elif kind == "shop_purchase":
+        placeholders = ",".join("?" * len(PURCHASE_LEDGER_KINDS))
+        row = conn.execute(
+            "SELECT 1 FROM econ_ledger WHERE guild_id = ? AND user_id = ? "
+            f"AND kind IN ({placeholders}) LIMIT 1",
+            (guild_id, user_id, *PURCHASE_LEDGER_KINDS),
+        ).fetchone()
+    else:
+        return False
+    return row is not None
+
+
+def sweep_setup_marks(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    kind: str,
+    user_ids: Iterable[int],
+    *,
+    now: float | None = None,
+) -> int:
+    """Record that these members have already done a setup kind's real action.
+
+    The economy loop's hourly detector calls this with members it observed
+    completing the action outside the bot's own tables (e.g. holders of a
+    Discord-onboarding role for ``role_pick``). A mark only affects board
+    visibility — the quest drops off like any other done setup quest — and
+    never pays: paying on detection would mass-mint on the first sweep over
+    a guild full of long-standing pickers. Idempotent (INSERT OR IGNORE);
+    returns how many members were newly marked.
+    """
+    if kind not in quests.SETUP_QUEST_KINDS:
+        raise ValueError(f"unknown setup kind: {kind!r}")
+    now = time.time() if now is None else now
+    new = 0
+    for user_id in user_ids:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO econ_setup_marks "
+            "(guild_id, user_id, kind, marked_at) VALUES (?, ?, ?, ?)",
+            (guild_id, int(user_id), kind, now),
+        )
+        new += int(cur.rowcount or 0)
+    return new
+
+
+def _setup_quest_done(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    quest_id: int,
+    kind: str,
+) -> bool:
+    """Whether a one-time setup quest should drop off ``user_id``'s board.
+
+    True once they've done the underlying thing (bio/birthday exists) OR
+    already claimed this quest — the latter a backstop for the odd member who
+    deletes their bio after claiming, so a paid-out setup quest never re-shows
+    as a dead nudge that can't re-pay (its claim sits on the constant period).
+    """
+    if _setup_underlying_done(conn, guild_id, user_id, kind):
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM econ_quest_claims "
+        "WHERE quest_id = ? AND user_id = ? AND state = 'paid' LIMIT 1",
+        (quest_id, user_id),
+    ).fetchone()
+    return row is not None
+
+
+def _setup_kinds_by_id(
+    conn: sqlite3.Connection, guild_id: int, quest_ids: set[int]
+) -> dict[int, str]:
+    """Map the setup-kind quest ids among ``quest_ids`` to their trigger kind."""
+    if not quest_ids:
+        return {}
+    placeholders = ",".join("?" * len(quest_ids))
+    rows = conn.execute(
+        f"SELECT id, trigger_kind FROM econ_quests WHERE id IN ({placeholders})",
+        tuple(quest_ids),
+    ).fetchall()
+    return {
+        int(r["id"]): str(r["trigger_kind"])
+        for r in rows
+        if str(r["trigger_kind"] or "") in quests.SETUP_QUEST_KINDS
+    }
+
+
+def _drop_completed_setup(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, board: set[int]
+) -> set[int]:
+    """Remove one-time setup quests the member has already done from a board.
+
+    Deliberately does **not** refill the freed slot: pulling a new quest in
+    mid-period would shift the deterministic window and could strand a counted
+    quest's in-progress work. A completed setup quest simply leaves the board
+    one shorter for that member — rare (few setup quests, drawn occasionally)
+    and self-heals next period.
+    """
+    kinds = _setup_kinds_by_id(conn, guild_id, board)
+    if not kinds:
+        return board
+    done = {
+        qid
+        for qid, kind in kinds.items()
+        if _setup_quest_done(conn, guild_id, user_id, qid, kind)
+    }
+    return board - done
+
+
+def _keep_ordinary_units(
+    ordinary: set[int], pairs: dict[int, int], slots: int
+) -> set[int]:
+    """Pick up to ``slots`` ordinary quests, never splitting a locked pair.
+
+    ``apply_pair_bundles`` deliberately keeps producer/consumer pairs on the
+    board together; eviction has to honour that. Quests are grouped into units
+    (a pair present on both sides is one unit, everything else a singleton),
+    ordered by lowest id for stability, and whole units are kept while they fit.
+    A pair that would overflow the remaining slots is dropped entirely rather
+    than split, so the board can land one short of ``slots`` — better a smaller
+    board than half a pair.
+    """
+    kept: set[int] = set()
+    seen: set[int] = set()
+    for q in sorted(ordinary):
+        if q in seen:
+            continue
+        partner = pairs.get(q)
+        unit = {q, partner} if partner is not None and partner in ordinary else {q}
+        seen |= unit
+        if len(kept) + len(unit) <= slots:
+            kept |= unit
+    return kept
+
+
+def _pin_pending_setup(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    board: set[int],
+    pool_ids: set[int],
+    n: int,
+    pairs: dict[int, int],
+    index: int,
+) -> set[int]:
+    """Pin the member's rotating share of pending setup quests onto a board.
+
+    Setup quests teach the loop (write a bio, set a birthday, pick a role, make
+    a first purchase) but they used to reach a member only if the random draw
+    happened to pick one — with a 20-quest daily pool and a 3-slot board, that
+    is a lottery, and the live data showed the shop-purchase quest reaching 9
+    members in ten days. Onboarding shouldn't be a dice roll, so pending setup
+    quests are *pinned*: they take slots ahead of ordinary draws until done.
+
+    At most ``quests.MAX_SETUP_PINS`` per board (and never more than the board
+    size): pinning shipped unbounded, and three days of live data showed 121
+    of 149 members with all four setups pending — every 3-slot daily board was
+    100% pins and the random roll was invisible. The pinned subset is drawn
+    from the pending set with the same per-user window walk as the board
+    itself (``assigned_quest_ids`` on ``index``), so it rotates: every pending
+    setup quest still surfaces within ~ceil(pending / cap) periods, which
+    answers the original objection to capping (a *ranked* cap would show the
+    lowest-priority nudge to nobody). Pending setup quests outside today's
+    pin window are held off the board entirely — the cap is a ceiling on
+    setup content, and their claim path doesn't need board presence (a setup
+    quest pays on completion regardless of the draw).
+
+    Eviction keeps the lowest ordinary quest ids — stable within a period, so a
+    member's board doesn't churn between calls — but never splits a locked pair
+    (see ``_keep_ordinary_units``). Callers apply reroll overrides *after* this,
+    so a member can still pay to push a pinned quest off their board; honouring
+    the reroll matters more than the nudge.
+    """
+    if n <= 0:
+        return board
+    candidates = _setup_kinds_by_id(conn, guild_id, pool_ids)
+    pending = sorted(
+        qid
+        for qid, kind in candidates.items()
+        if not _setup_quest_done(conn, guild_id, user_id, qid, kind)
+    )
+    if not pending:
+        return board
+    cap = min(quests.MAX_SETUP_PINS, n)
+    pinned = set(quests.assigned_quest_ids(pending, user_id, index, cap))
+    slots = max(0, n - len(pinned))
+    return pinned | _keep_ordinary_units(board - set(pending), pairs, slots)
+
+
+def _rotation_local_day(qtype: str, idx: int) -> str | None:
+    """The ``YYYY-MM-DD`` a daily period index refers to, or ``None``.
+
+    Rotation coupling is **daily-only, on purpose**. A weekly board's period
+    spans seven days, over which every room in the pool is featured at least
+    once; freezing one day's open/shut state into a week-long board would
+    exclude quests that are perfectly playable for six of those days.
+    ``period_index('daily', day)`` is ``date.toordinal()``, so this is its
+    exact inverse.
+    """
+    if qtype != "daily":
+        return None
+    try:
+        return date.fromordinal(idx).isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _rotation_blocked_kinds(
+    conn: sqlite3.Connection, guild_id: int, qtype: str, idx: int
+) -> frozenset[str]:
+    """Trigger kinds unplayable today because their room is hidden.
+
+    Only kinds a hidden room declares channel-bound — a quest reached by slash
+    command or ephemeral panel stays on the board with its room shut, which is
+    most of them. Returns empty (i.e. "behave as before") for every guild with
+    the rotation off, and if the rotation tables aren't there yet: a board read
+    must never be what surfaces a missing migration.
+    """
+    day = _rotation_local_day(qtype, idx)
+    if day is None:
+        return frozenset()
+    try:
+        return blocked_quest_kinds_on(conn, guild_id, day)
+    except sqlite3.Error:
+        return frozenset()
+
+
+def _featured_pin_candidates(
+    conn: sqlite3.Connection, guild_id: int, qtype: str, idx: int, pool_ids: set[int]
+) -> set[int]:
+    """Pool quests belonging to whichever room is open today.
+
+    Restricted to ``pool_ids`` so the pin can only ever surface a quest the
+    frozen pool already contains — the featured room must not be a back door
+    into a deactivated or out-of-cadence quest.
+    """
+    day = _rotation_local_day(qtype, idx)
+    if day is None or not pool_ids:
+        return set()
+    try:
+        kinds = featured_quest_kinds_on(conn, guild_id, day)
+    except sqlite3.Error:
+        return set()
+    if not kinds:
+        return set()
+    return {
+        int(r["id"])
+        for r in conn.execute(
+            "SELECT id, trigger_kind FROM econ_quests "
+            "WHERE guild_id = ? AND active = 1 AND qtype = ?",
+            (guild_id, qtype),
+        )
+        if str(r["trigger_kind"]) in kinds and int(r["id"]) in pool_ids
+    }
+
+
+def _featured_pick(
+    featured_ids: set[int], user_id: int, idx: int, n: int
+) -> set[int]:
+    """The one quest today's open room contributes to this member's board.
+
+    Drawn with the same per-member window walk as the setup pins
+    (``assigned_quest_ids`` on ``idx``), so which of a room's quests a member
+    gets rotates instead of repeating, and two members on the same day get
+    different ones.
+
+    ``n <= 1`` yields nothing deliberately: on a one-slot board the featured
+    pin would be the entire board, evicting a newcomer's only onboarding nudge
+    to advertise a room. The nudge wins at that size.
+
+    Drawn *before* the setup pins so the caller can tell whether a slot needs
+    reserving at all — reserving one for a quest the draw already produced is
+    what left boards a quest short.
+    """
+    if n <= 1 or not featured_ids:
+        return set()
+    return set(quests.assigned_quest_ids(sorted(featured_ids), user_id, idx, 1))
+
+
+def _pin_featured_room(
+    board: set[int], pick: set[int], n: int, pairs: dict[int, int]
+) -> set[int]:
+    """Seat ``pick`` on the board, evicting the lowest ordinary unit for it.
+
+    Never *shrinks* a board: eviction can't split a locked pair, so on a
+    two-slot board whose draw was a single producer/consumer pair there is no
+    room to take without dropping the pair whole and leaving one quest where
+    there were two. Advertising the open room is not worth a smaller board, so
+    in that case the pin stands down.
+    """
+    if not pick or pick & board:
+        return board
+    seated = pick | _keep_ordinary_units(board - pick, pairs, n - 1)
+    return seated if len(seated) >= len(board) else board
+
+
+def _frozen_board_pool(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    qtype: str,
+    idx: int,
+    settings: EconSettings | None,
+) -> tuple[dict[int, str], int, set[int]]:
+    """The cadence pool, board size and featured pins frozen for a period.
+
+    The personal board is a pure function of ``(pool, user, period_idx, n)``.
+    Reading the live active set on every view meant an admin activating or
+    deactivating a quest — or changing a board size — mid-period reshuffled
+    every member's current board, because both ``m = len(pool)`` and ``n`` move
+    the draw window (``start = index * n % m``). We snapshot the live pool and
+    size the first time any member's board of this cadence is computed in the
+    period, and hand every later read that period the same snapshot — so
+    library and size edits only surface at the next roll.
+
+    Returns ``(tagged, n)``: the frozen id→pair_tag map and board size. Rows
+    for older periods are pruned on first insert, but a small retention window
+    (``_SNAPSHOT_RETAIN_PERIODS``) is kept so a past period's board stays
+    reconstructable for a late sign-off's set bonus — pruning all older rows
+    meant a later-period board read deleted the snapshot the set bonus needed,
+    so it silently re-froze today's live pool into a wrong board.
+    """
+    row = conn.execute(
+        "SELECT pool_json, board_size, featured_json FROM econ_quest_pool_snapshots "
+        "WHERE guild_id = ? AND qtype = ? AND period_idx = ?",
+        (guild_id, qtype, idx),
+    ).fetchone()
+    if row is None:
+        # Rotation exclusion lands HERE, before the freeze, so a day's
+        # open/shut state is captured in the snapshot the whole day reads
+        # from — the same reason the pool is frozen at all.
+        blocked = _rotation_blocked_kinds(conn, guild_id, qtype, idx)
+        live_tagged = {
+            int(r["id"]): str(r["pair_tag"])
+            for r in conn.execute(
+                "SELECT id, pair_tag, trigger_kind FROM econ_quests "
+                "WHERE guild_id = ? AND active = 1 AND qtype = ? ORDER BY id",
+                (guild_id, qtype),
+            )
+            if str(r["trigger_kind"]) not in blocked
+        }
+        sizes = board_sizes(settings) if settings is not None else None
+        live_n = quests.board_size(qtype, sizes)
+        # The featured-room candidates are frozen here for the same reason the
+        # pool is: they are read from live rotation config, and an admin
+        # editing a room at noon would otherwise move the reserved slot under
+        # every member who reloaded.
+        live_featured = _featured_pin_candidates(
+            conn, guild_id, qtype, idx, set(live_tagged)
+        )
+        # INSERT OR IGNORE: under concurrency a sibling read may win the freeze;
+        # we re-select below so both sides draw from the same snapshot.
+        conn.execute(
+            "INSERT OR IGNORE INTO econ_quest_pool_snapshots "
+            "(guild_id, qtype, period_idx, pool_json, board_size, featured_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                guild_id,
+                qtype,
+                idx,
+                json.dumps({str(k): v for k, v in live_tagged.items()}),
+                live_n,
+                json.dumps(sorted(live_featured)),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM econ_quest_pool_snapshots "
+            "WHERE guild_id = ? AND qtype = ? AND period_idx < ?",
+            (guild_id, qtype, idx - _SNAPSHOT_RETAIN_PERIODS),
+        )
+        row = conn.execute(
+            "SELECT pool_json, board_size, featured_json "
+            "FROM econ_quest_pool_snapshots "
+            "WHERE guild_id = ? AND qtype = ? AND period_idx = ?",
+            (guild_id, qtype, idx),
+        ).fetchone()
+    tagged = {int(k): str(v) for k, v in json.loads(row["pool_json"]).items()}
+    # Rows frozen before the column existed read as "no featured pin", which is
+    # both the safe default and the pre-rotation behaviour.
+    featured = {int(q) for q in json.loads(row["featured_json"] or "[]")}
+    return tagged, int(row["board_size"]), featured
+
+
+def assigned_board_ids(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    qtype: str,
+    local_day: str,
+    settings: EconSettings | None = None,
+) -> set[int]:
+    """The quest ids on ``user_id``'s personal board for ``qtype`` this period.
+
+    A per-member subset of the cadence pool (the guild's configured
+    ``board_size`` of them), stable within the period and spaced so repeats
+    stay ~a week apart. The pool and size are frozen per period (see
+    ``_frozen_board_pool``): an admin editing the library or a board size
+    mid-period doesn't move anyone's current board, only next period's. Only
+    daily/weekly have a board; other cadences (community/monthly guild-wide,
+    event per-occurrence) return an empty set, as does a cadence sized to 0.
+    One-time setup quests the member has already
+    completed are dropped (see ``_drop_completed_setup``), so only members who
+    haven't done them see them — and the ones they *haven't* done are pinned
+    onto the board ahead of ordinary draws (see ``_pin_pending_setup``), so
+    onboarding reaches everyone instead of depending on the draw.
+    """
+    if not quests.has_board(qtype):
+        return set()
+    idx = quests.period_index(qtype, local_day)
+    tagged, n, featured_ids = _frozen_board_pool(conn, guild_id, qtype, idx, settings)
+    if n <= 0:
+        return set()
+    pool = sorted(tagged)
+    picked = quests.assigned_quest_ids(pool, user_id, idx, n)
+    # Paired quests land together: a drawn quest pulls its partner into the
+    # remaining slot (producer/consumer pairs — hosts and players prompted
+    # the same period). Rerolls apply after, so a member can still opt out.
+    board = set(quests.apply_pair_bundles(picked, quests.pair_map(tagged)))
+    # Reroll overrides sit on top of the pure draw: from → to per slot, this
+    # period only. A replacement that has since left the active pool falls
+    # back to the pure slot rather than dropping the board below size.
+    pool_set = set(pool)
+    # Setup pins resolve BEFORE rerolls: a pinned quest has to be on the board
+    # for an override to be able to move it off, or a member could pay to
+    # reroll a pin and watch it land straight back.
+    board = _drop_completed_setup(conn, guild_id, user_id, board)
+    # The featured room gets a reserved slot, so setup pins are capped at n-1
+    # for the day rather than being allowed to fill the board and crowd it out.
+    # A member with pending setups therefore sees 1 setup + 1 featured instead
+    # of 2 setups; every setup still surfaces, just over more days.
+    #
+    # The slot is only reserved when the pin actually needs one: if the plain
+    # draw already produced today's featured quest, holding a slot open for it
+    # would hand the member a board one quest short all day.
+    pairs = quests.pair_map(tagged)
+    pick = _featured_pick(featured_ids & pool_set, user_id, idx, n)
+    reserve = 1 if pick and not pick <= board else 0
+    board = _pin_pending_setup(
+        conn, guild_id, user_id, board, pool_set, n - reserve, pairs, idx,
+    )
+    board = _pin_featured_room(board, pick, n, pairs)
+    for row in conn.execute(
+        "SELECT from_quest_id, to_quest_id FROM econ_board_overrides "
+        "WHERE guild_id = ? AND user_id = ? AND qtype = ? AND period_idx = ?",
+        (guild_id, user_id, qtype, idx),
+    ):
+        frm, to = int(row["from_quest_id"]), int(row["to_quest_id"])
+        if frm in board and to in pool_set:
+            board.discard(frm)
+            board.add(to)
+    return board
+
+
+def reroll_board_slot(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    quest_id: int,
+    local_day: str,
+) -> tuple[sqlite3.Row, int]:
+    """Swap one personal-board quest for a different pool quest (stage 5).
+
+    One free reroll per member per guild-local day, across all cadences,
+    then up to ``quest_reroll_daily_cap`` more at ``price_quest_reroll``
+    each. The slot must be untouched this period (no claim, no counted
+    progress). The replacement is the first pool quest in the member's own
+    shuffle order that isn't on their board, preferring a **different
+    trigger kind** — the reroll exists for "this quest doesn't fit how I use
+    the server", so same-kind swaps are the last resort.
+
+    Returns ``(new_quest_row, cost)`` where cost is 0 for the free reroll;
+    raises ValueError with a member-facing message otherwise.
+    """
+    quest = get_quest(conn, guild_id, quest_id)
+    if quest is None or not quest["active"]:
+        raise ValueError("That quest is no longer active.")
+    qtype = str(quest["qtype"])
+    if qtype not in quests.BOARD_CADENCES:
+        raise ValueError("Only board quests (daily/weekly/monthly) reroll.")
+    board = assigned_board_ids(conn, guild_id, user_id, qtype, local_day, settings)
+    if quest_id not in board:
+        raise ValueError("That quest isn't on your board this period.")
+    period = quests.quest_period(qtype, local_day)
+    touched = conn.execute(
+        "SELECT 1 FROM econ_quest_claims WHERE quest_id = ? AND user_id = ? "
+        "AND period = ? AND state IN ('paid', 'pending') LIMIT 1",
+        (quest_id, user_id, period),
+    ).fetchone()
+    if touched is None and get_progress(conn, quest_id, user_id, period) > 0:
+        touched = True
+    if touched:
+        raise ValueError(
+            "You've already made progress on that quest this period — "
+            "rerolls only swap untouched quests."
+        )
+
+    idx = quests.period_index(qtype, local_day)
+    # Draw candidates from the SAME frozen pool the board uses, not the live
+    # active set: a quest activated mid-period isn't in this period's snapshot,
+    # so rerolling into it would be silently dropped by the ``to in pool_set``
+    # guard in ``assigned_board_ids`` and waste the reroll.
+    frozen_tagged, _, _ = _frozen_board_pool(conn, guild_id, qtype, idx, settings)
+    pool = sorted(frozen_tagged)
+    ordered = quests.assigned_quest_ids(pool, user_id, idx, len(pool))
+    # Never swap a member INTO a one-time setup quest they've already done —
+    # it would drop straight back off their board (_drop_completed_setup) and
+    # waste the reroll on an invisible slot.
+    done_setup = {
+        qid
+        for qid, kind in _setup_kinds_by_id(conn, guild_id, set(ordered)).items()
+        if _setup_quest_done(conn, guild_id, user_id, qid, kind)
+    }
+    candidates = [q for q in ordered if q not in board and q not in done_setup]
+    if not candidates:
+        raise ValueError("The pool has nothing else to swap in.")
+    old_kind = str(quest["trigger_kind"] or "")
+    different = [
+        q for q in candidates
+        if str((get_quest(conn, guild_id, q) or {})["trigger_kind"] or "")
+        != old_kind
+    ]
+    new_id = (different or candidates)[0]
+
+    # Spend the reroll LAST, so validation failures never consume the free
+    # allowance or charge the wallet. Free first: the row's existence is the
+    # "free one is gone" flag, so a successful INSERT *is* the free reroll.
+    cost = 0
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO econ_rerolls (guild_id, user_id, local_day) "
+        "VALUES (?, ?, ?)",
+        (guild_id, user_id, local_day),
+    )
+    if (cur.rowcount or 0) == 0:
+        cost = _charge_paid_reroll(conn, settings, guild_id, user_id, local_day)
+
+    # If the outgoing quest was itself a replacement, update that override
+    # in place — application then never has to chain from→to→to.
+    updated = conn.execute(
+        "UPDATE econ_board_overrides SET to_quest_id = ? "
+        "WHERE guild_id = ? AND user_id = ? AND qtype = ? AND period_idx = ? "
+        "AND to_quest_id = ?",
+        (new_id, guild_id, user_id, qtype, idx, quest_id),
+    )
+    if (updated.rowcount or 0) == 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO econ_board_overrides "
+            "(guild_id, user_id, qtype, period_idx, from_quest_id, to_quest_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, qtype, idx, quest_id, new_id),
+        )
+    new_quest = get_quest(conn, guild_id, new_id)
+    assert new_quest is not None
+    return new_quest, cost
+
+
+def _paid_rerolls_today(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, local_day: str
+) -> int:
+    row = conn.execute(
+        "SELECT paid_count FROM econ_rerolls WHERE guild_id = ? AND user_id = ? "
+        "AND local_day = ?",
+        (guild_id, user_id, local_day),
+    ).fetchone()
+    return int(row["paid_count"]) if row is not None else 0
+
+
+def _charge_paid_reroll(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    local_day: str,
+) -> int:
+    """Debit one paid reroll and count it, or raise a member-facing ValueError.
+
+    Only reached once the free reroll is gone. Every failure raises before any
+    write, so a capped-out or broke member loses nothing.
+    """
+    price = int(settings.price_quest_reroll)
+    cap = int(settings.quest_reroll_daily_cap)
+    if price < 1 or cap < 1:
+        raise ValueError("You've already used today's free reroll.")
+    used = _paid_rerolls_today(conn, guild_id, user_id, local_day)
+    if used >= cap:
+        raise ValueError(
+            f"You've used today's free reroll and all {cap} paid ones — "
+            "your board refreshes tomorrow."
+        )
+    unit = settings.currency_plural or "coins"
+    if not apply_debit(
+        conn,
+        guild_id,
+        user_id,
+        price,
+        "quest_reroll",
+        meta={"local_day": local_day},
+    ):
+        have = get_balance(conn, guild_id, user_id)
+        raise ValueError(
+            f"Another reroll costs {price} {unit} — you have {have}."
+        )
+    conn.execute(
+        "UPDATE econ_rerolls SET paid_count = paid_count + 1 "
+        "WHERE guild_id = ? AND user_id = ? AND local_day = ?",
+        (guild_id, user_id, local_day),
+    )
+    return price
+
+
+def reroll_available(
+    conn: sqlite3.Connection, guild_id: int, user_id: int, local_day: str
+) -> bool:
+    """Whether the member still has today's free reroll."""
+    row = conn.execute(
+        "SELECT 1 FROM econ_rerolls WHERE guild_id = ? AND user_id = ? "
+        "AND local_day = ?",
+        (guild_id, user_id, local_day),
+    ).fetchone()
+    return row is None
+
+
+def reroll_quote(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    local_day: str,
+) -> int | None:
+    """What the member's next reroll would cost: 0 free, >0 paid, None if none left.
+
+    Affordability is deliberately *not* checked here — the shop tells you the
+    price and lets you find out you're short, rather than hiding the option
+    and leaving you wondering where the reroll went.
+    """
+    if reroll_available(conn, guild_id, user_id, local_day):
+        return 0
+    price = int(settings.price_quest_reroll)
+    cap = int(settings.quest_reroll_daily_cap)
+    if price < 1 or cap < 1:
+        return None
+    if _paid_rerolls_today(conn, guild_id, user_id, local_day) >= cap:
+        return None
+    return price
+
+
+# A spotlight kind must be claimable by at least this fraction of 30-day
+# active members during its week to qualify for the pick (see
+# _reachable_spotlight_kinds). 25% keeps the double meaningful without
+# demanding universal reach — weekly-board kinds top out well under 100%.
+_SPOTLIGHT_REACH_FRACTION = 0.25
+
+
+def _reachable_spotlight_kinds(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    iso_week: str,
+    kinds: list[str],
+) -> list[str]:
+    """The candidate spotlight kinds enough members can actually earn.
+
+    A spotlight on a kind nobody's board carries is a dead week: the flip
+    announcement advertises a double that almost nobody can claim (2026-W31
+    would have doubled a kind that landed on zero boards, every daily slot
+    being setup-pinned). A kind qualifies when at least
+    ``_SPOTLIGHT_REACH_FRACTION`` of 30-day-active members could claim a
+    quest of it some time during ``iso_week``: event-cadence kinds reach
+    everyone (no board gate), and board kinds are measured by simulating
+    each member's weekly board plus all seven daily boards of the week —
+    the same pure draw, pair bundling, done-setup drops and setup pins as
+    the real thing, but against the LIVE pools and without freezing any
+    snapshot (the week's later periods must stay editable until their real
+    roll, so this must never call ``assigned_board_ids``). Reroll overrides
+    are ignored — they don't exist yet for periods that haven't started.
+    With no active members there is nothing to measure, so every kind
+    qualifies. Preserves the order of ``kinds``.
+    """
+    members = active_member_ids(conn, guild_id, days=30)
+    if not members:
+        return list(kinds)
+    event_kinds = {
+        str(r["trigger_kind"])
+        for r in conn.execute(
+            "SELECT DISTINCT trigger_kind FROM econ_quests "
+            "WHERE guild_id = ? AND active = 1 AND qtype = 'event' "
+            "AND trigger_kind != ''",
+            (guild_id,),
+        )
+    }
+    board_kinds = [k for k in kinds if k not in event_kinds]
+    if not board_kinds:
+        return list(kinds)
+    from datetime import date, timedelta
+
+    settings = load_econ_settings(conn, guild_id)
+    sizes = board_sizes(settings)
+    monday = date.fromisoformat(local_day_for_period("weekly", iso_week))
+    week_days = [(monday + timedelta(days=i)).isoformat() for i in range(7)]
+    reach: dict[str, set[int]] = {k: set() for k in board_kinds}
+    for qtype in sorted(quests.BOARD_CADENCES):
+        n = quests.board_size(qtype, sizes)
+        if n <= 0:
+            continue
+        rows = conn.execute(
+            "SELECT id, pair_tag, trigger_kind FROM econ_quests "
+            "WHERE guild_id = ? AND active = 1 AND qtype = ? ORDER BY id",
+            (guild_id, qtype),
+        ).fetchall()
+        if not rows:
+            continue
+        tagged = {int(r["id"]): str(r["pair_tag"]) for r in rows}
+        kind_by_id = {int(r["id"]): str(r["trigger_kind"] or "") for r in rows}
+        pool = sorted(tagged)
+        pairs = quests.pair_map(tagged)
+        setup_kinds = _setup_kinds_by_id(conn, guild_id, set(pool))
+        # The weekly board holds all week; daily boards re-draw each day, so
+        # a daily kind counts if ANY of the week's seven boards carries it.
+        days = week_days if qtype == "daily" else week_days[:1]
+        idxs = [quests.period_index(qtype, d) for d in days]
+        for user_id in members:
+            done = {
+                qid
+                for qid, kind in setup_kinds.items()
+                if _setup_quest_done(conn, guild_id, user_id, qid, kind)
+            }
+            pending = set(setup_kinds) - done
+            seen: set[int] = set()
+            for idx in idxs:
+                board = set(
+                    quests.apply_pair_bundles(
+                        quests.assigned_quest_ids(pool, user_id, idx, n), pairs
+                    )
+                )
+                board -= done
+                if pending:
+                    cap = min(quests.MAX_SETUP_PINS, n)
+                    pinned = set(
+                        quests.assigned_quest_ids(
+                            sorted(pending), user_id, idx, cap
+                        )
+                    )
+                    slots = max(0, n - len(pinned))
+                    board = pinned | _keep_ordinary_units(
+                        board - pending, pairs, slots
+                    )
+                seen |= board
+            for qid in seen:
+                kind = kind_by_id.get(qid, "")
+                if kind in reach:
+                    reach[kind].add(user_id)
+    floor = max(1, math.ceil(len(members) * _SPOTLIGHT_REACH_FRACTION))
+    return [
+        k for k in kinds if k in event_kinds or len(reach.get(k, ())) >= floor
+    ]
+
+
+def spotlight_kind(
+    conn: sqlite3.Connection, guild_id: int, iso_week: str
+) -> str | None:
+    """This ISO week's ⚡ spotlight trigger kind — quest payouts double.
+
+    Chosen deterministically on (guild, week) over the kinds with at least one
+    active quest, then FROZEN for the week: the choice is persisted the first
+    time it is resolved (normally the week-roll announcement) and every later
+    read returns the stored value. Without that store the underlying kind list
+    drifts mid-week (dashboard toggles, rotate_pool) and both the modulo and the
+    chosen kind move — so the claim-credit path would silently double a kind the
+    once-posted announcement never advertised. Candidates are narrowed to the
+    kinds enough members can actually claim this week (see
+    ``_reachable_spotlight_kinds``) whenever at least two qualify — a spotlight
+    that almost nobody can earn is a dead announcement. None when fewer than 2
+    kinds are active — a "rotating featured activity" is meaningless with
+    nothing to rotate, and it would otherwise be a permanent silent 2× on a
+    tiny library; that off state is NOT frozen, so a second kind added later
+    can still switch the spotlight on.
+    """
+    stored = conn.execute(
+        "SELECT kind FROM econ_spotlight_kind WHERE guild_id = ? AND iso_week = ?",
+        (guild_id, iso_week),
+    ).fetchone()
+    if stored is not None:
+        return str(stored["kind"])
+    kinds = sorted(
+        str(r["trigger_kind"])
+        for r in conn.execute(
+            "SELECT DISTINCT trigger_kind FROM econ_quests "
+            "WHERE guild_id = ? AND active = 1 AND trigger_kind != '' "
+            "AND qtype NOT IN ('community', 'monthly')",
+            (guild_id,),
+        )
+    )
+    if len(kinds) < 2:
+        return None
+    reachable = _reachable_spotlight_kinds(conn, guild_id, iso_week, kinds)
+    if len(reachable) >= 2:
+        kinds = reachable
+    digest = hashlib.sha256(f"{guild_id}:{iso_week}".encode()).hexdigest()
+    chosen = kinds[int(digest, 16) % len(kinds)]
+    # INSERT OR IGNORE: a concurrent sibling read may win the freeze; either
+    # way the row now pins the week's kind for every later surface.
+    conn.execute(
+        "INSERT OR IGNORE INTO econ_spotlight_kind (guild_id, iso_week, kind) "
+        "VALUES (?, ?, ?)",
+        (guild_id, iso_week, chosen),
+    )
+    return chosen
+
+
+def load_member_quest_board(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    day: str,
+) -> list[dict]:
+    """Active quests for a member on ``day``, with progress/claim state.
+
+    Shared by the ``/bank quests`` panel and the daily-login DM's quest
+    recap — one place computing "what does this member still have to do".
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM econ_quests
+        WHERE guild_id = ? AND active = 1
+        ORDER BY qtype, id
+        """,
+        (guild_id,),
+    ).fetchall()
+    spot = spotlight_kind(conn, guild_id, quests.iso_week_for(day))
+    boards: dict[str, set[int]] = {}
+    out: list[dict] = []
+    for row in rows:
+        qtype = str(row["qtype"])
+        quest_id = int(row["id"])
+        if quests.has_board(qtype):
+            if qtype not in boards:
+                boards[qtype] = assigned_board_ids(
+                    conn, guild_id, user_id, qtype, day, settings
+                )
+            if quest_id not in boards[qtype]:
+                continue  # not on this member's board this period
+        entry: dict = {
+            "id": quest_id,
+            "title": row["title"],
+            "description": row["description"],
+            "qtype": qtype,
+            "reward": int(row["reward"]),
+            "reward_xp": int(row["reward_xp"]),
+            "signoff": bool(row["signoff"]),
+            "criteria": row["criteria"],
+            # Surfaced so the login digest can link a channel-scoped quest to
+            # its channel (<#id>); NULL for server-wide / any-channel quests.
+            "trigger_channel_id": (
+                int(row["trigger_channel_id"])
+                if row["trigger_channel_id"] is not None
+                else None
+            ),
+            "spotlight": bool(
+                spot and str(row["trigger_kind"] or "") == spot
+            ),
+        }
+        if qtype in ("community", "monthly"):
+            # Guild-wide goals (weekly community + monthly): a shared counter
+            # and a bar, not a per-member claim state.
+            prog = conn.execute(
+                "SELECT current FROM econ_community_progress WHERE quest_id = ?",
+                (quest_id,),
+            ).fetchone()
+            target = row["community_target"]
+            entry["state"] = "community"
+            entry["current"] = int(prog["current"]) if prog else 0
+            entry["target"] = int(target) if target is not None else 0
+        elif qtype == "event":
+            # No calendar period — the trigger listener pays per
+            # occurrence (e.g. per photo card), so the list shows the
+            # standing how-to instead of a per-period claim state.
+            entry["state"] = str(row["trigger_kind"]) or "trigger"
+        else:
+            period = quests.quest_period(qtype, day)
+            claim = conn.execute(
+                """
+                SELECT state FROM econ_quest_claims
+                WHERE quest_id = ? AND user_id = ? AND period = ?
+                  AND state IN ('paid', 'pending')
+                ORDER BY CASE state WHEN 'paid' THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (quest_id, user_id, period),
+            ).fetchone()
+            kind = str(row["trigger_kind"] or "")
+            has_trigger = bool(str(row["trigger_words"] or "").strip())
+            # Resolves (and stores) the member's dynamic target on first
+            # sight, so the wallet shows the same number the fire path
+            # will enforce all period.
+            target = resolve_member_target(
+                conn, guild_id, user_id, row,
+                period=period, local_day=day,
+            )
+            if kind and target > 1:
+                entry["progress_current"] = get_progress(
+                    conn, quest_id, user_id, period
+                )
+                entry["progress_target"] = target
+            if claim is None:
+                # Trigger quests never enter the claim select — the
+                # phrase/game event IS the verification, so a manual
+                # claim would bypass it.
+                entry["state"] = kind or (
+                    "trigger" if has_trigger else "claimable"
+                )
+            elif claim["state"] == "paid":
+                entry["state"] = "done"
+            else:
+                entry["state"] = "pending"
+        out.append(entry)
+    return out
+
+
+def snapshot_community_progress(
+    conn: sqlite3.Connection, guild_id: int, day: str
+) -> None:
+    """Record every active community quest's running total for ``day``.
+
+    Called once at the guild-local day roll, keyed to the day that just ended
+    and taken *before* any weekly settlement zeroes ``current`` — so two
+    consecutive days' snapshots diff into that day's gain (see
+    :func:`community_gains_for_day`). Idempotent: a replayed roll overwrites
+    the same ``(quest_id, day)`` row rather than double-counting.
+    """
+    rows = conn.execute(
+        "SELECT id FROM econ_quests "
+        "WHERE guild_id = ? AND qtype = 'community' AND active = 1",
+        (guild_id,),
+    ).fetchall()
+    for row in rows:
+        quest_id = int(row["id"])
+        prog = conn.execute(
+            "SELECT current FROM econ_community_progress WHERE quest_id = ?",
+            (quest_id,),
+        ).fetchone()
+        current = int(prog["current"]) if prog else 0
+        conn.execute(
+            "INSERT OR REPLACE INTO econ_community_progress_snapshots "
+            "(guild_id, quest_id, day, current) VALUES (?, ?, ?, ?)",
+            (guild_id, quest_id, day, current),
+        )
+
+
+def community_gains_for_day(
+    conn: sqlite3.Connection, guild_id: int, day: str, *, limit: int = 3
+) -> list[dict]:
+    """The community goals that advanced the most on ``day``.
+
+    Gain = ``snapshot(day).current − snapshot(previous_day).current`` per
+    quest, keeping only positive movers, sorted biggest-first, capped at
+    ``limit``. Returns ``[]`` until both days' snapshots exist (e.g. a member
+    logging in before the hourly day roll has recorded yesterday) and skips
+    quests whose total reset across a weekly settlement (a negative diff).
+    """
+    prev = quests.previous_local_day(day)
+    rows = conn.execute(
+        """
+        SELECT q.title AS title, s.current AS cur, p.current AS prev
+        FROM econ_community_progress_snapshots s
+        JOIN econ_community_progress_snapshots p
+          ON p.quest_id = s.quest_id AND p.day = ?
+        JOIN econ_quests q ON q.id = s.quest_id
+        WHERE s.guild_id = ? AND s.day = ?
+        """,
+        (prev, guild_id, day),
+    ).fetchall()
+    gains = [
+        {"title": r["title"], "gain": int(r["cur"]) - int(r["prev"])}
+        for r in rows
+    ]
+    gains = [g for g in gains if g["gain"] > 0]
+    gains.sort(key=lambda g: g["gain"], reverse=True)
+    return gains[:limit]
+
+
+def local_day_for_period(qtype: str, period: str) -> str:
+    """A representative guild-local day inside a cadence period key."""
+    from datetime import date
+
+    if qtype == "daily":
+        return period
+    if qtype == "weekly":
+        year, week = period.split("-W")
+        return date.fromisocalendar(int(year), int(week), 1).isoformat()
+    return f"{period}-01"  # monthly
+
+
+def maybe_pay_set_bonus(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    qtype: str,
+    period: str,
+    *,
+    anon: bool = False,
+) -> int:
+    """Pay the clear-the-board bonus if this claim finished the set.
+
+    Called after any claim pays (instant or approved sign-off). The board is
+    resolved for the CLAIM's period — a sign-off approved days later still
+    completes that period's set. That past period's board snapshot survives the
+    intervening day/week rolls because ``_frozen_board_pool`` now prunes only
+    beyond a retention window (``_SNAPSHOT_RETAIN_PERIODS``), wider than the
+    7-day sign-off expiry — so the bonus reads the exact board the member
+    cleared rather than a re-freeze of today's (possibly edited) live pool,
+    which would misjudge the set (silently skip, or overpay if the board size
+    changed). Exactly-once via the econ_set_bonus reservation row; flat, no
+    booster multiplier. Returns the amount paid.
+    """
+    bonus = {
+        "daily": settings.quest_set_bonus_daily,
+        "weekly": settings.quest_set_bonus_weekly,
+    }.get(qtype, 0)
+    if bonus <= 0:
+        return 0
+    # A one-time setup quest (bio/birthday) is a daily by cadence but claims on
+    # a constant occurrence period ("<kind>:set", not a calendar day). Such a
+    # claim isn't part of any day's board set, and feeding its period to the
+    # calendar math below would raise — so it never triggers a set bonus.
+    if ":" in period:
+        return 0
+    day = local_day_for_period(qtype, period)
+    board = assigned_board_ids(conn, guild_id, user_id, qtype, day, settings)
+    # One-time setup quests never gate the clear-the-board bonus: they claim on
+    # a constant period (not this calendar period), so their claim could never
+    # appear in the per-period ``paid`` set below, and a member shouldn't have
+    # to do their once-ever bio to earn today's daily set bonus.
+    board -= set(_setup_kinds_by_id(conn, guild_id, board))
+    if not board:
+        return 0
+    paid = {
+        int(r["quest_id"])
+        for r in conn.execute(
+            "SELECT DISTINCT quest_id FROM econ_quest_claims "
+            "WHERE user_id = ? AND period = ? AND state = 'paid' "
+            f"AND quest_id IN ({','.join('?' * len(board))})",
+            (user_id, period, *board),
+        )
+    }
+    if paid < board:
+        return 0
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO econ_set_bonus (guild_id, user_id, qtype, period) "
+        "VALUES (?, ?, ?, ?)",
+        (guild_id, user_id, qtype, period),
+    )
+    if (cur.rowcount or 0) == 0:
+        return 0
+    return apply_credit(
+        conn,
+        guild_id,
+        user_id,
+        bonus,
+        "quest_bonus",
+        meta=(
+            {"qtype": qtype, "period": period, "anon": 1}
+            if anon
+            else {"qtype": qtype, "period": period}
+        ),
+        booster=False,
+        multiplier=settings.booster_multiplier,
+    )
+
+
+def source_enabled(conn: sqlite3.Connection, guild_id: int, source: str) -> bool:
+    """Whether a custom income source (trigger kind) is on for this guild.
+
+    Absent row = enabled: sources default ON so a newly shipped kind works
+    without a dashboard visit.
+    """
+    row = conn.execute(
+        "SELECT enabled FROM econ_income_sources WHERE guild_id = ? AND source = ?",
+        (guild_id, source),
+    ).fetchone()
+    return True if row is None else bool(row["enabled"])
+
+
+def list_income_sources(conn: sqlite3.Connection, guild_id: int) -> dict[str, bool]:
+    """Enabled state for every known trigger kind (absent = enabled)."""
+    stored = {
+        str(r["source"]): bool(r["enabled"])
+        for r in conn.execute(
+            "SELECT source, enabled FROM econ_income_sources WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchall()
+    }
+    return {kind: stored.get(kind, True) for kind in quests.TRIGGER_KINDS}
+
+
+def set_income_source(
+    conn: sqlite3.Connection, guild_id: int, source: str, enabled: bool
+) -> None:
+    if source not in quests.TRIGGER_KINDS:
+        raise ValueError(f"unknown income source: {source!r}")
+    conn.execute(
+        """
+        INSERT INTO econ_income_sources (guild_id, source, enabled, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (guild_id, source) DO UPDATE SET
+            enabled = excluded.enabled, updated_at = excluded.updated_at
+        """,
+        (guild_id, source, 1 if enabled else 0, time.time()),
+    )
+
+
+def _trailing_period_counts(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    kind: str,
+    qtype: str,
+    local_day: str,
+) -> list[int]:
+    """The member's kind-activity totals for the trailing completed periods.
+
+    daily → previous 4 days, weekly → previous 4 ISO weeks, monthly →
+    previous 2 calendar months (the ledger window can't hold 4).
+    Quiet periods count as 0 — the median should reflect real pace.
+
+    ENTITY-keyed kinds (a partner/channel/day id per occurrence) count DISTINCT
+    occurrences from ``econ_kind_activity_occ``, mirroring what counted progress
+    measures — sizing them off the raw ``econ_kind_activity`` count would pin a
+    member to an unreachable ceiling. Message-id-keyed kinds are 1:1 with their
+    occurrence, so the raw count is already their distinct count.
+    """
+    from datetime import date, timedelta
+
+    day = date.fromisoformat(local_day)
+    entity_keyed = kind in _ENTITY_KEYED_KINDS
+
+    def _range_sum(start: date, end: date) -> int:
+        if entity_keyed:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT occurrence) AS s "
+                "FROM econ_kind_activity_occ "
+                "WHERE guild_id = ? AND user_id = ? AND kind = ? "
+                "AND local_day >= ? AND local_day < ?",
+                (guild_id, user_id, kind, start.isoformat(), end.isoformat()),
+            ).fetchone()
+            return int(row["s"])
+        row = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) AS s FROM econ_kind_activity "
+            "WHERE guild_id = ? AND user_id = ? AND kind = ? "
+            "AND local_day >= ? AND local_day < ?",
+            (guild_id, user_id, kind, start.isoformat(), end.isoformat()),
+        ).fetchone()
+        return int(row["s"])
+
+    if qtype == "daily":
+        return [
+            _range_sum(day - timedelta(days=n), day - timedelta(days=n - 1))
+            for n in range(1, 5)
+        ]
+    if qtype == "weekly":
+        monday = day - timedelta(days=day.weekday())
+        return [
+            _range_sum(monday - timedelta(weeks=n), monday - timedelta(weeks=n - 1))
+            for n in range(1, 5)
+        ]
+    # monthly
+    first = day.replace(day=1)
+    out: list[int] = []
+    end = first
+    for _ in range(2):
+        start = (end - timedelta(days=1)).replace(day=1)
+        out.append(_range_sum(start, end))
+        end = start
+    return out
+
+
+def resolve_member_target(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    quest: sqlite3.Row,
+    *,
+    period: str,
+    local_day: str,
+) -> int:
+    """A member's target for a counted quest this period (spec: dynamic).
+
+    Fixed ``target_count`` quests pass straight through. Band quests resolve
+    once per (quest, member, period) and the result is STORED on the
+    progress row — stable all period, and the wallet shows exactly what the
+    fire path enforces. Resolution prefers the member's own pace (trailing
+    period median of the kind × DYNAMIC_STRETCH, clamped to the band; kinds
+    in PERSONAL_P25_KINDS use the member's trailing p25 instead, unstretched)
+    and falls back to the deterministic Gaussian draw when they have fewer
+    than 2 active trailing periods of that kind.
+    """
+    target_count = int(quest["target_count"])
+    tmin, tmax = int(quest["target_min"]), int(quest["target_max"])
+    if not (0 < tmin < tmax):
+        return target_count
+    qid = int(quest["id"])
+    row = conn.execute(
+        "SELECT target FROM econ_quest_progress "
+        "WHERE quest_id = ? AND user_id = ? AND period = ?",
+        (qid, user_id, period),
+    ).fetchone()
+    if row is not None and row["target"]:
+        return int(row["target"])
+
+    import statistics as _stats
+
+    kind = str(quest["trigger_kind"])
+    counts = _trailing_period_counts(
+        conn, guild_id, user_id, kind, str(quest["qtype"]), local_day,
+    )
+    if sum(1 for c in counts if c > 0) >= 2:
+        if kind in quests.PERSONAL_P25_KINDS:
+            target = quests.p25_target(counts, tmin, tmax)
+        else:
+            median = float(_stats.median(counts))
+            # Channel-scoped quest on a message-shaped kind: the member's
+            # kind activity is all-channel, so scale their median by THEIR
+            # share of traffic in the scoped channel — "send N messages in
+            # #the-meadow" sizes to their meadow pace, not their
+            # whole-server pace. The band clamp still bounds the result.
+            # (PERSONAL_P25_KINDS and CHANNEL_SHARE_KINDS are disjoint, so
+            # the p25 branch never needs the scaling.)
+            scope = quest["trigger_channel_id"]
+            if scope is not None and kind in quests.CHANNEL_SHARE_KINDS:
+                median *= channel_message_share(
+                    conn, guild_id, int(scope), local_day, user_id=user_id
+                )
+            target = quests.dynamic_target(median, tmin, tmax)
+    else:
+        target = quests.effective_target(
+            target_count, tmin, tmax,
+            user_id=user_id, quest_id=qid, period=period,
+        )
+    conn.execute(
+        """
+        INSERT INTO econ_quest_progress (quest_id, user_id, period, current, target)
+        VALUES (?, ?, ?, 0, ?)
+        ON CONFLICT (quest_id, user_id, period) DO UPDATE SET
+            target = COALESCE(econ_quest_progress.target, excluded.target)
+        """,
+        (qid, user_id, period, target),
+    )
+    return target
+
+
+def record_kind_activity(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    kind: str,
+    local_day: str,
+    occurrence: str | None = None,
+) -> None:
+    """Count one occurrence of a trigger kind for a member's guild-local day.
+
+    Fires for EVERY occurrence — before the income-source switch and the
+    personal-board filter — because ``econ_kind_activity`` measures what
+    members actually do, not what happened to pay. Dynamic target sizing
+    (personal trailing-period medians, community guild sums) reads it.
+
+    For ENTITY-keyed kinds (``_ENTITY_KEYED_KINDS`` — voice_partner, channel_hop,
+    …), the ``occurrence`` (the partner/channel/day id) is ALSO logged to
+    ``econ_kind_activity_occ`` so trailing sizing can count DISTINCT entities.
+    Sizing those kinds off the raw count would pin a member to an unreachable
+    ceiling, since counted progress only advances on a distinct occurrence.
+    """
+    conn.execute(
+        """
+        INSERT INTO econ_kind_activity (guild_id, user_id, kind, local_day, count)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT (guild_id, user_id, kind, local_day) DO UPDATE SET
+            count = count + 1
+        """,
+        (guild_id, user_id, kind, local_day),
+    )
+    if occurrence is not None and kind in _ENTITY_KEYED_KINDS:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO econ_kind_activity_occ
+                (guild_id, user_id, kind, local_day, occurrence)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (guild_id, user_id, kind, local_day, occurrence),
+        )
+
+
+def prune_kind_activity(
+    conn: sqlite3.Connection, guild_id: int, today: str, *, keep_days: int = 95
+) -> None:
+    """Drop activity rows older than the trailing window (day-roll hygiene).
+
+    95 days must exceed the widest read window: the monthly sizing path
+    (``_trailing_period_counts``) walks back two whole calendar months from the
+    first of the current month, which reaches ~92 days on a late-in-month roll
+    — 70 would prune data that read still wants. Weekly (4 ISO weeks) and daily
+    (4 days) fit comfortably inside. Lexicographic compare works because
+    local_day is zero-padded ISO.
+    """
+    from datetime import date, timedelta
+
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+    conn.execute(
+        "DELETE FROM econ_kind_activity WHERE guild_id = ? AND local_day < ?",
+        (guild_id, cutoff),
+    )
+    conn.execute(
+        "DELETE FROM econ_kind_activity_occ WHERE guild_id = ? AND local_day < ?",
+        (guild_id, cutoff),
+    )
+    # Same hygiene pass: conversation_starter's reply-count rows only need a
+    # couple of weeks — a message drawing its third reply later than that is
+    # conversation necromancy we're happy to miss.
+    conn.execute(
+        "DELETE FROM econ_msg_replies WHERE guild_id = ? AND created_at < ?",
+        (guild_id, time.time() - 14 * 86400),
+    )
+
+
+def fire_trigger_inline(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    trigger_kind: str,
+    user_id: int,
+    *,
+    occurrence: str | None,
+    booster: bool = False,
+    channel_ids: tuple[int, ...] | None = None,
+) -> list[tuple[sqlite3.Row, ClaimOutcome]]:
+    """Fire a trigger from a call site that already holds the main-DB conn.
+
+    One-stop wrapper for module hooks (voice tick, starboard insert, invite
+    record, bio save, pen-pal pairing, QOTD award): loads settings (no-op
+    when the economy is off), derives the guild-local day, and fires inside
+    a savepoint. Never raises, and a failure rolls back only the quest work —
+    economy trouble must not break or dirty the host module's transaction.
+    Sign-off claims filed here get no board repaint (no bot object); they
+    still surface in the Bank Manager pending-claims table, and on the board
+    at its next repaint.
+    """
+    try:
+        settings = load_econ_settings(conn, guild_id)
+        if not settings.enabled:
+            return []
+        offset = get_tz_offset_hours(conn, guild_id)
+        day = local_day_for(time.time(), offset)
+        conn.execute("SAVEPOINT quest_fire")
+        try:
+            fired = fire_trigger_quests(
+                conn,
+                settings,
+                guild_id,
+                trigger_kind,
+                user_id,
+                local_day=day,
+                occurrence=occurrence,
+                booster=booster,
+                channel_ids=channel_ids,
+            )
+        except Exception:
+            conn.execute("ROLLBACK TO quest_fire")
+            raise
+        finally:
+            conn.execute("RELEASE quest_fire")
+        return fired
+    except Exception:
+        log.exception(
+            "inline trigger %s failed for user %s in guild %s",
+            trigger_kind, user_id, guild_id,
+        )
+        return []
+
+
+def _fire_daily_completion(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    user_id: int,
+    quest: sqlite3.Row,
+    period: str,
+    booster: bool,
+    *,
+    anon: bool = False,
+) -> None:
+    """One paid daily claim = one tick of the ``daily_complete`` meta kind.
+
+    Dailies are the check-offs; a weekly ``daily_complete`` counted quest is
+    the progression over them ("complete N dailies this week", rendered with
+    the ordinary progress bar). Called from the two places a claim reaches
+    'paid' (instant ``claim_quest`` and sign-off approval in
+    ``resolve_claim``); the occurrence is the completed daily's
+    ``(quest_id, period)``, so a replayed fire can't double-count. Setup
+    quests count too — their once-ever claim IS completing a daily-cadence
+    quest — but their ``kind:set`` period carries no calendar day, so the
+    tick stamps to today.
+
+    No recursion: only daily-cadence claims fire, the meta quest is
+    weekly/monthly/community by construction (``_check_trigger_config``
+    rejects daily), and a claimed quest that is itself ``daily_complete``-
+    triggered is refused here as a second guard. Outcomes of the nested fire
+    aren't returned to the outer caller, so a weekly that completes this way
+    pays without a cog announcement — the register feed narrates the credit
+    and the board/digest/live panel show it done.
+    """
+    if str(quest["qtype"]) != "daily":
+        return
+    if str(quest["trigger_kind"] or "") == "daily_complete":
+        return
+    if ":" in period:
+        local_day = local_day_for(time.time(), get_tz_offset_hours(conn, guild_id))
+    else:
+        local_day = period
+    fire_trigger_quests(
+        conn,
+        settings,
+        guild_id,
+        "daily_complete",
+        user_id,
+        local_day=local_day,
+        occurrence=f"{int(quest['id'])}:{period}",
+        booster=booster,
+        anon=anon,
+    )
+
+
+def fire_trigger_quests(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    trigger_kind: str,
+    user_id: int,
+    *,
+    local_day: str,
+    occurrence: str | None,
+    booster: bool,
+    channel_ids: tuple[int, ...] | None = None,
+    anon: bool = False,
+) -> list[tuple[sqlite3.Row, ClaimOutcome]]:
+    """Claim every active quest with this trigger kind for one member.
+
+    The claim period comes from the quest's own cadence: daily/weekly use the
+    calendar period for ``local_day``; event quests use the per-occurrence key
+    (skipped when the firing site has no stable ``occurrence`` id — paying an
+    unkeyed event would be unbounded). Per-period repeats fall out silently
+    via the claim collision; anything paid or filed is returned so the caller
+    can announce or post sign-off cards.
+
+    ``channel_ids`` is the firing message's channel (and thread parent) for
+    kinds with channel context: a quest with ``trigger_channel_id`` set only
+    fires when it matches, and never fires from a caller with no channel
+    context. Returns nothing when the source is disabled on the Income
+    Sources page.
+    """
+    record_kind_activity(
+        conn, guild_id, user_id, trigger_kind, local_day, occurrence
+    )
+    if not source_enabled(conn, guild_id, trigger_kind):
+        return []
+    out: list[tuple[sqlite3.Row, ClaimOutcome]] = []
+    # A member only earns a daily/weekly quest when it's on *their* personal
+    # board this period — compute each cadence's board once.
+    boards: dict[str, set[int]] = {}
+    for quest in list_kind_triggered_quests(conn, guild_id, trigger_kind):
+        scope = quest["trigger_channel_id"]
+        if scope is not None and (
+            channel_ids is None or int(scope) not in channel_ids
+        ):
+            continue
+        qtype = str(quest["qtype"])
+        if qtype in ("community", "monthly"):
+            # Guild-wide goals: not member-claimed here — the shared counter is
+            # bumped once, below, by _bump_community_kind.
+            continue
+        if trigger_kind in quests.SETUP_QUEST_KINDS and qtype in quests.BOARD_CADENCES:
+            # One-time setup quest living in a board pool (bio/birthday): claim
+            # once ever, keyed to a constant period, and independent of the
+            # board draw. A lifetime action can't wait for a lucky daily roll,
+            # so the completing member always gets paid even if it wasn't drawn
+            # today; and re-saving must not re-earn it — claim_quest's collision
+            # on this constant key makes the second save a silent no-op. (The
+            # board draw still controls *visibility* via _drop_completed_setup.)
+            period = quests.occurrence_period(trigger_kind, occurrence or "set")
+        elif qtype == "event":
+            if occurrence is None:
+                continue
+            period = quests.occurrence_period(trigger_kind, occurrence)
+        else:
+            if qtype not in boards:
+                boards[qtype] = assigned_board_ids(
+                    conn, guild_id, user_id, qtype, local_day, settings
+                )
+            if int(quest["id"]) not in boards[qtype]:
+                continue  # not on this member's board this period
+            period = quests.quest_period(qtype, local_day)
+            target = resolve_member_target(
+                conn, guild_id, user_id, quest,
+                period=period, local_day=local_day,
+            )
+            if target > 1:
+                # Counted quest: each distinct occurrence bumps the period's
+                # progress; the claim only fires when the target is reached.
+                if occurrence is None:
+                    continue
+                if not _bump_progress(
+                    conn, int(quest["id"]), user_id, period, occurrence, target
+                ):
+                    continue
+        try:
+            outcome = claim_quest(
+                conn,
+                settings,
+                guild_id,
+                int(quest["id"]),
+                user_id,
+                period=period,
+                booster=booster,
+                anon=anon,
+            )
+        except ValueError:
+            continue  # already claimed this period/occurrence, or window closed
+        out.append((quest, outcome))
+    _bump_community_kind(conn, guild_id, trigger_kind, user_id, channel_ids)
+    return out
+
+
+def _bump_community_kind(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    trigger_kind: str,
+    user_id: int,
+    channel_ids: tuple[int, ...] | None,
+) -> None:
+    """Advance any active auto-tracking guild-wide quest of this kind.
+
+    Covers both the weekly ``community`` cadence and the monthly one — both
+    accrue a shared counter that settles in tiers. Guild-wide by design —
+    deliberately NOT filtered by personal boards, so every member's action
+    counts toward the shared goal even when the kind isn't on their board this
+    period. Per-member contribution rows feed the top-contributor bonus and the
+    "N members contributed" line. A single occurrence can bump both a running
+    weekly community goal and a running monthly goal on the same kind — they are
+    independent counters keyed by quest_id.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, trigger_channel_id, community_target
+        FROM econ_quests
+        WHERE guild_id = ? AND qtype IN ('community', 'monthly') AND active = 1
+          AND trigger_kind = ?
+        """,
+        (guild_id, trigger_kind),
+    ).fetchall()
+    now = time.time()
+    for quest in rows:
+        scope = quest["trigger_channel_id"]
+        if scope is not None and (
+            channel_ids is None or int(scope) not in channel_ids
+        ):
+            continue
+        target = int(quest["community_target"] or 0)
+        if target <= 0:
+            continue  # not activated through the scheduler yet
+        qid = int(quest["id"])
+        conn.execute(
+            """
+            INSERT INTO econ_community_progress (quest_id, current)
+            VALUES (?, 1)
+            ON CONFLICT(quest_id) DO UPDATE SET current = current + 1
+            """,
+            (qid,),
+        )
+        conn.execute(
+            """
+            INSERT INTO econ_community_contrib (quest_id, user_id, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(quest_id, user_id) DO UPDATE SET count = count + 1
+            """,
+            (qid, user_id),
+        )
+        conn.execute(
+            """
+            UPDATE econ_community_progress
+            SET completed_at = ?
+            WHERE quest_id = ? AND completed_at IS NULL AND current >= ?
+            """,
+            (now, qid, target),
+        )
+        # Progress moved without a payout — still worth a live-panel repaint.
+        live_signal.mark_dirty(guild_id)
+
+
+def _bump_progress(
+    conn: sqlite3.Connection,
+    quest_id: int,
+    user_id: int,
+    period: str,
+    occurrence: str,
+    target: int,
+) -> bool:
+    """Count one occurrence toward a counted quest; True when target reached.
+
+    The marks table dedupes occurrences (a gateway replay or repeat event
+    can't double-count), so the progress row only moves on genuinely new
+    ones. Progress past the target keeps a mark but stops incrementing —
+    the paid-claim index is the real payout guard either way.
+    """
+    marked = conn.execute(
+        """
+        INSERT OR IGNORE INTO econ_quest_progress_marks
+            (quest_id, user_id, period, occurrence)
+        VALUES (?, ?, ?, ?)
+        """,
+        (quest_id, user_id, period, occurrence),
+    )
+    if (marked.rowcount or 0) == 0:
+        # Same occurrence seen before: it may have been the one that hit the
+        # target (claim path could still be pending sign-off) — never re-pay,
+        # never re-count.
+        return False
+    conn.execute(
+        """
+        INSERT INTO econ_quest_progress (quest_id, user_id, period, current)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT (quest_id, user_id, period) DO UPDATE SET
+            current = current + 1
+        """,
+        (quest_id, user_id, period),
+    )
+    row = conn.execute(
+        """
+        SELECT current FROM econ_quest_progress
+        WHERE quest_id = ? AND user_id = ? AND period = ?
+        """,
+        (quest_id, user_id, period),
+    ).fetchone()
+    return row is not None and int(row["current"]) >= target
+
+
+def get_progress(
+    conn: sqlite3.Connection, quest_id: int, user_id: int, period: str
+) -> int:
+    """A member's progress count for a counted quest's period (0 if none)."""
+    row = conn.execute(
+        """
+        SELECT current FROM econ_quest_progress
+        WHERE quest_id = ? AND user_id = ? AND period = ?
+        """,
+        (quest_id, user_id, period),
+    ).fetchone()
+    return int(row["current"]) if row else 0
+
+
+def _active_qtypes(
+    conn: sqlite3.Connection, guild_id: int, *, exclude_id: int
+) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT qtype FROM econ_quests
+        WHERE guild_id = ? AND active = 1 AND id != ?
+        """,
+        (guild_id, exclude_id),
+    ).fetchall()
+    return [row["qtype"] for row in rows]
+
+
+def set_quest_active(
+    conn: sqlite3.Connection, guild_id: int, quest_id: int, active: bool
+) -> None:
+    """Activate/deactivate a quest; SlotLimitError if activation over-fills."""
+    quest = get_quest(conn, guild_id, quest_id)
+    if quest is None:
+        raise ValueError("quest not found")
+    if active:
+        if quest["qtype"] == "event":
+            kinds = [
+                str(r["trigger_kind"])
+                for r in conn.execute(
+                    """
+                    SELECT trigger_kind FROM econ_quests
+                    WHERE guild_id = ? AND active = 1 AND qtype = 'event'
+                      AND id != ?
+                    """,
+                    (guild_id, quest_id),
+                ).fetchall()
+            ]
+            if not quests.can_activate_event(kinds, str(quest["trigger_kind"])):
+                raise SlotLimitError(
+                    "an event quest with this trigger is already active"
+                )
+        else:
+            existing = _active_qtypes(conn, guild_id, exclude_id=quest_id)
+            if not quests.can_activate(existing, quest["qtype"]):
+                raise SlotLimitError(f"too many active {quest['qtype']} quests")
+    conn.execute(
+        "UPDATE econ_quests SET active = ? WHERE id = ? AND guild_id = ?",
+        (1 if active else 0, quest_id, guild_id),
+    )
+
+
+# ── claim state machine ───────────────────────────────────────────────
+
+
+def claim_quest(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    quest_id: int,
+    user_id: int,
+    *,
+    period: str,
+    booster: bool,
+    anon: bool = False,
+) -> ClaimOutcome:
+    """Claim a daily/weekly/event quest for a member in a given period.
+
+    Daily/weekly callers pass the calendar period from ``quest_period``;
+    event-quest callers (the trigger listeners) pass their per-occurrence
+    key (e.g. ``occurrence_period(kind, game_id)``).
+
+    Instant (signoff=0): inserts a 'paid' claim and credits kind="quest" in
+    the same transaction. Sign-off (signoff=1): inserts a 'pending' claim (no
+    credit). The partial unique index for the inserted state is the authority
+    on collisions — a caught IntegrityError maps to a distinct message.
+
+    ValueError when the quest is missing/inactive/out of date-range, when it
+    is a community quest (those pay via settlement, never a self-claim), or
+    when a 'paid'/'pending' claim already exists for this period.
+    """
+    quest = get_quest(conn, guild_id, quest_id)
+    if quest is None:
+        raise ValueError("quest not found")
+    if quest["qtype"] not in _CLAIMABLE_TYPES:
+        raise ValueError("this quest cannot be claimed directly")
+    if not quest["active"]:
+        raise ValueError("quest is not active")
+    now = time.time()
+    if quest["starts_at"] is not None and now < float(quest["starts_at"]):
+        raise ValueError("quest has not started yet")
+    if quest["ends_at"] is not None and now > float(quest["ends_at"]):
+        raise ValueError("quest has ended")
+
+    signoff = bool(quest["signoff"])
+    # UX pre-check: a paid claim this period blocks re-claiming. This is not
+    # the money guard (a race could still slip a pending through) — the guard
+    # is the paid index enforced at approve time in resolve_claim.
+    if signoff:
+        already_paid = conn.execute(
+            """
+            SELECT 1 FROM econ_quest_claims
+            WHERE quest_id = ? AND user_id = ? AND period = ? AND state = 'paid'
+            LIMIT 1
+            """,
+            (quest_id, user_id, period),
+        ).fetchone()
+        if already_paid is not None:
+            raise ValueError(_PAID_EXISTS_MSG)
+
+    state = "pending" if signoff else "paid"
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO econ_quest_claims
+                (quest_id, guild_id, user_id, period, state, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (quest_id, guild_id, user_id, period, state, now),
+        )
+    except sqlite3.IntegrityError as exc:
+        # Only the index for the inserted state can fire, so the state maps
+        # the collision to its message unambiguously.
+        if state == "pending":
+            raise ValueError(_PENDING_EXISTS_MSG) from exc
+        raise ValueError(_PAID_EXISTS_MSG) from exc
+
+    claim_id = int(cur.lastrowid or 0)
+    if signoff:
+        return ClaimOutcome(state="pending", claim_id=claim_id, paid=0)
+
+    # Everything this claim writes inherits the suppression, not just the
+    # payout row: the board-clear bonus carries no quest id for the drain's
+    # filter to match on, and the daily_complete tick carries the *other*
+    # quest's id. Both land in this transaction, so an unstamped one posts at
+    # the second the anonymous action happened — the leak itself, one hop out.
+    anon = anon or str(quest["trigger_kind"] or "") in quests.ANON_KINDS
+    paid = _credit_reward(
+        conn, settings, quest, user_id, booster=booster, claim_id=claim_id, anon=anon
+    )
+    maybe_pay_set_bonus(
+        conn, settings, guild_id, user_id, str(quest["qtype"]), period, anon=anon
+    )
+    _fire_daily_completion(
+        conn, settings, guild_id, user_id, quest, period, booster, anon=anon
+    )
+    return ClaimOutcome(state="paid", claim_id=claim_id, paid=paid)
+
+
+def _credit_reward(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    quest: sqlite3.Row,
+    user_id: int,
+    *,
+    booster: bool,
+    claim_id: int,
+    anon: bool = False,
+) -> int:
+    guild_id = int(quest["guild_id"])
+    reward_xp = int(quest["reward_xp"])
+    if reward_xp > 0:
+        # XP rides every quest payout (instant + approved sign-off — both
+        # come through here). No booster multiplier: the ×1.5 is a currency
+        # patron bonus, and minting XP would distort the level curve. Level
+        # progression lands in the DB; the announcement, if any, happens on
+        # the member's next ordinary XP award.
+        apply_xp_award(
+            conn,
+            guild_id,
+            user_id,
+            float(reward_xp),
+            event_source="quest",
+            event_timestamp=time.time(),
+            settings=load_xp_settings(conn, guild_id),
+        )
+    reward = int(quest["reward"])
+    if reward < 1:
+        return 0
+    meta: dict[str, object] = {"quest_id": int(quest["id"]), "claim_id": claim_id}
+    if anon:
+        # Belt and braces over the quest_id filter, which resolves anon quests
+        # live: delete the quest and its undrained rows would suddenly post.
+        # The stamp travels with the row.
+        meta["anon"] = 1
+    kind = str(quest["trigger_kind"] or "")
+    if kind:
+        # ⚡ Weekly spotlight: this week's featured kind pays double. Checked
+        # at credit time, so a sign-off approved after the week flips pays at
+        # the approval week's rate — acceptable drift for an advisory boost.
+        offset = get_tz_offset_hours(conn, guild_id)
+        week = quests.iso_week_for(local_day_for(time.time(), offset))
+        if spotlight_kind(conn, guild_id, week) == kind:
+            reward *= 2
+            meta["spotlight"] = True
+    return apply_credit(
+        conn,
+        guild_id,
+        user_id,
+        reward,
+        "quest",
+        meta=meta,
+        booster=booster,
+        multiplier=settings.booster_multiplier,
+    )
+
+
+def set_claim_card(
+    conn: sqlite3.Connection, claim_id: int, channel_id: int, message_id: int
+) -> None:
+    """Record the bank-channel sign-off card so views can find the claim."""
+    conn.execute(
+        """
+        UPDATE econ_quest_claims
+        SET card_channel_id = ?, card_message_id = ?
+        WHERE id = ?
+        """,
+        (channel_id, message_id, claim_id),
+    )
+
+
+def resolve_claim(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    claim_id: int,
+    *,
+    approve: bool,
+    resolver_id: int,
+    deny_reason: str | None = None,
+    booster: bool,
+) -> ClaimResolution:
+    """Approve or deny a pending sign-off claim (ValueError if not pending).
+
+    Approve: transition to 'paid' first — the paid index fires if this period
+    already paid, so the IntegrityError becomes a ValueError before any credit
+    (the double-pay backstop) — then credit kind="quest". Deny: transition to
+    'denied' with the reason (the claim stays re-claimable for the period).
+    """
+    claim = conn.execute(
+        "SELECT * FROM econ_quest_claims WHERE id = ?", (claim_id,)
+    ).fetchone()
+    if claim is None:
+        raise ValueError("claim not found")
+    if claim["state"] != "pending":
+        raise ValueError("claim is not pending")
+
+    now = time.time()
+    quest_id = int(claim["quest_id"])
+    user_id = int(claim["user_id"])
+
+    if not approve:
+        conn.execute(
+            """
+            UPDATE econ_quest_claims
+            SET state = 'denied', resolved_at = ?, resolver_id = ?, deny_reason = ?
+            WHERE id = ?
+            """,
+            (now, resolver_id, deny_reason, claim_id),
+        )
+        return ClaimResolution(
+            user_id=user_id, quest_id=quest_id, paid=0, deny_reason=deny_reason
+        )
+
+    try:
+        conn.execute(
+            """
+            UPDATE econ_quest_claims
+            SET state = 'paid', resolved_at = ?, resolver_id = ?
+            WHERE id = ?
+            """,
+            (now, resolver_id, claim_id),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError(_PAID_EXISTS_MSG) from exc
+
+    quest = get_quest(conn, int(claim["guild_id"]), quest_id)
+    if quest is None:
+        raise ValueError("quest not found")
+    paid = _credit_reward(conn, settings, quest, user_id, booster=booster, claim_id=claim_id)
+    maybe_pay_set_bonus(
+        conn, settings, int(claim["guild_id"]), user_id,
+        str(quest["qtype"]), str(claim["period"]),
+    )
+    _fire_daily_completion(
+        conn, settings, int(claim["guild_id"]), user_id, quest,
+        str(claim["period"]), booster,
+    )
+    return ClaimResolution(
+        user_id=user_id, quest_id=quest_id, paid=paid, deny_reason=None
+    )
+
+
+def expire_stale_claims(
+    conn: sqlite3.Connection, now_ts: float, max_age_days: int = 7
+) -> list[sqlite3.Row]:
+    """Expire pending claims older than ``max_age_days`` and return them once.
+
+    The UPDATE ... RETURNING is atomic: rows transition out of 'pending' as
+    they are returned, so a replay never re-emits the same expired claim (the
+    caller DMs each returned claimant exactly once).
+    """
+    cutoff = now_ts - max_age_days * _EXPIRE_SECONDS_PER_DAY
+    return conn.execute(
+        """
+        UPDATE econ_quest_claims
+        SET state = 'expired', resolved_at = ?
+        WHERE state = 'pending' AND created_at < ?
+        RETURNING *
+        """,
+        (now_ts, cutoff),
+    ).fetchall()
+
+
+def list_claims(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    state: str | None = None,
+    quest_id: int | None = None,
+    limit: int = 100,
+) -> list[sqlite3.Row]:
+    """List claims for a guild, newest first (addition beyond the frozen
+    contract for the dashboard's pending-claims view). Optionally filter by
+    state and quest."""
+    where = ["guild_id = ?"]
+    params: list[object] = [guild_id]
+    if state is not None:
+        where.append("state = ?")
+        params.append(state)
+    if quest_id is not None:
+        where.append("quest_id = ?")
+        params.append(quest_id)
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT * FROM econ_quest_claims
+        WHERE {" AND ".join(where)}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def deny_history(
+    conn: sqlite3.Connection, quest_id: int, user_id: int
+) -> list[sqlite3.Row]:
+    """Prior denied/expired claims for a member on a quest, newest first."""
+    return conn.execute(
+        """
+        SELECT * FROM econ_quest_claims
+        WHERE quest_id = ? AND user_id = ? AND state IN ('denied', 'expired')
+        ORDER BY resolved_at DESC, id DESC
+        """,
+        (quest_id, user_id),
+    ).fetchall()
+
+
+def pending_signoff_rows(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    limit: int = 25,
+    *,
+    since_ts: float | None = None,
+) -> list[sqlite3.Row]:
+    """Pending sign-off claims for a guild, longest-waiting first.
+
+    What the todo board's sign-off section renders and what its Sign-Offs
+    button offers, so both read one query and can never disagree about what is
+    outstanding. Oldest-first for the same reason the task list is: position
+    says who has waited longest, and the mod works down from the top.
+
+    Joined to the quest rather than resolved per row — the section needs the
+    title and the reward, and the button's detail view needs the criteria on
+    top of that, which is the whole point of asking a human.
+
+    ``since_ts`` narrows to claims filed after a moment, for the todo board's
+    change cards. It stacks with ``state = 'pending'`` rather than replacing it,
+    so a claim a mod signed off inside the polling window is never announced as
+    still waiting.
+    """
+    where = "c.guild_id = ? AND c.state = 'pending'"
+    params: list[object] = [guild_id]
+    if since_ts is not None:
+        where += " AND c.created_at > ?"
+        params.append(float(since_ts))
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT c.id, c.user_id, c.quest_id, c.period, c.created_at,
+               q.title AS quest_title, q.reward, q.criteria, q.trigger_kind
+        FROM econ_quest_claims c
+        JOIN econ_quests q ON q.id = c.quest_id
+        WHERE {where}
+        ORDER BY c.created_at ASC, c.id ASC
+        LIMIT ?
+        """,
+        tuple(params),
+    ).fetchall()
+
+
+def pending_signoff_count(conn: sqlite3.Connection, guild_id: int) -> int:
+    """How many claims are waiting on a mod overall.
+
+    The board reads a bounded slice, so the count it reports in the footer
+    can't be inferred from the rows it rendered.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM econ_quest_claims "
+        "WHERE guild_id = ? AND state = 'pending'",
+        (guild_id,),
+    ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
+# ── community quests ──────────────────────────────────────────────────
+
+
+def set_community_progress(
+    conn: sqlite3.Connection, quest_id: int, current: int, *, target: int
+) -> bool:
+    """Set a community quest's running total; True on the completion crossing.
+
+    ``completed_at`` is stamped exactly once — the first time progress reaches
+    ``target`` — and never cleared afterward even if ``current`` later drops.
+    Returns True only on the call that stamps it.
+    """
+    row = conn.execute(
+        "SELECT current, completed_at FROM econ_community_progress WHERE quest_id = ?",
+        (quest_id,),
+    ).fetchone()
+    now = time.time()
+    already_complete = row is not None and row["completed_at"] is not None
+    crossing = not already_complete and current >= target
+    completed_at = now if crossing else (row["completed_at"] if row else None)
+    conn.execute(
+        """
+        INSERT INTO econ_community_progress (quest_id, current, completed_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(quest_id) DO UPDATE SET
+            current = excluded.current,
+            completed_at = excluded.completed_at
+        """,
+        (quest_id, current, completed_at),
+    )
+    owner = conn.execute(
+        "SELECT guild_id FROM econ_quests WHERE id = ?", (quest_id,)
+    ).fetchone()
+    if owner is not None:
+        live_signal.mark_dirty(int(owner["guild_id"]))
+    return crossing
+
+
+def settle_community_quest(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    quest_id: int,
+    member_boosters: dict[int, bool],
+) -> int:
+    """Pay a completed community quest to its members, once each.
+
+    Per member: INSERT OR IGNORE the payout reservation row, then credit
+    kind="quest_community" only when that insert actually reserved (rowcount
+    1). Re-invocation — a manual dashboard settle after the auto-sweep, or a
+    replay after a rolled-back crash — pays only the members not yet reserved.
+    ``settled_at`` is stamped last, after the whole sweep, so a mid-sweep crash
+    rolls back cleanly and the next run resumes. Returns the count paid here.
+    """
+    quest = get_quest(conn, guild_id, quest_id)
+    reward = int(quest["reward"]) if quest is not None else 0
+    paid_count = 0
+    for user_id, booster in member_boosters.items():
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO econ_community_payouts (quest_id, user_id) VALUES (?, ?)",
+            (quest_id, user_id),
+        )
+        if (cur.rowcount or 0) == 0:
+            continue
+        if reward >= 1:
+            apply_credit(
+                conn,
+                guild_id,
+                user_id,
+                reward,
+                "quest_community",
+                meta={"quest_id": quest_id},
+                booster=booster,
+                multiplier=settings.booster_multiplier,
+            )
+        paid_count += 1
+    conn.execute(
+        """
+        INSERT INTO econ_community_progress (quest_id, current, settled_at)
+        VALUES (?, 0, ?)
+        ON CONFLICT(quest_id) DO UPDATE SET settled_at = excluded.settled_at
+        """,
+        (quest_id, time.time()),
+    )
+    return paid_count
+
+
+def list_settleable_community_quests(
+    conn: sqlite3.Connection, guild_id: int
+) -> list[sqlite3.Row]:
+    """Completed-but-unsettled community quests the loop may auto-settle.
+
+    Addition beyond the frozen contract, for Agent B's sweep. Enforces spec
+    §4.3 "sign-off gates settlement": ``signoff=1`` quests are excluded here
+    so the auto-sweep never pays them — the dashboard's manual
+    ``settle_community_quest`` is the human sign-off and bypasses this filter.
+    """
+    return conn.execute(
+        """
+        SELECT q.* FROM econ_quests q
+        JOIN econ_community_progress p ON p.quest_id = q.id
+        WHERE q.guild_id = ? AND q.qtype = 'community' AND q.signoff = 0
+          AND q.trigger_kind = ''
+          AND p.completed_at IS NOT NULL AND p.settled_at IS NULL
+        ORDER BY q.id
+        """,
+        (guild_id,),
+    ).fetchall()
+
+
+def list_active_community_kind_quests(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    slot: int | None = None,
+    qtype: str = "community",
+) -> list[sqlite3.Row]:
+    """Active auto-tracking (kind-carrying) guild-wide quests for a guild.
+
+    ``qtype`` selects the cadence: ``"community"`` (weekly, the default) or
+    ``"monthly"`` — both accrue a shared counter and settle in tiers.
+    ``slot`` narrows to one concurrency lane (1 or 2, see
+    ``activate_community_weekly``); omitted, returns both lanes.
+    """
+    clause = ""
+    params: list[object] = [guild_id, qtype]
+    if slot is not None:
+        clause = "AND q.community_slot = ?"
+        params.append(slot)
+    return conn.execute(
+        f"""
+        SELECT q.*, p.current, p.completed_at, p.settled_at,
+               p.notified_tier, p.final_notice_sent
+        FROM econ_quests q
+        LEFT JOIN econ_community_progress p ON p.quest_id = q.id
+        WHERE q.guild_id = ? AND q.qtype = ? AND q.active = 1
+          AND q.trigger_kind != '' {clause}
+        ORDER BY q.id
+        """,
+        params,
+    ).fetchall()
+
+
+def _next_community_run(
+    conn: sqlite3.Connection, guild_id: int, qtype: str
+) -> sqlite3.Row | None:
+    """The library's next guild-wide goal of ``qtype`` to activate: inactive,
+    kind-carrying, least recently run ('' sorts first, so never-run quests lead
+    the rotation). ``last_run_week`` holds an ISO-week token for community and a
+    'YYYY-MM' token for monthly; selection is qtype-scoped, so they never mix."""
+    return conn.execute(
+        """
+        SELECT * FROM econ_quests
+        WHERE guild_id = ? AND qtype = ? AND active = 0
+          AND trigger_kind != ''
+        ORDER BY last_run_week ASC, id ASC
+        LIMIT 1
+        """,
+        (guild_id, qtype),
+    ).fetchone()
+
+
+def next_community_weekly(
+    conn: sqlite3.Connection, guild_id: int
+) -> sqlite3.Row | None:
+    """The library's next community weekly (see :func:`_next_community_run`)."""
+    return _next_community_run(conn, guild_id, "community")
+
+
+def next_community_monthly(
+    conn: sqlite3.Connection, guild_id: int
+) -> sqlite3.Row | None:
+    """The library's next monthly community goal (see :func:`_next_community_run`)."""
+    return _next_community_run(conn, guild_id, "monthly")
+
+
+def channel_message_share(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    channel_id: int,
+    local_day: str,
+    *,
+    user_id: int | None = None,
+) -> float:
+    """The channel's fraction of messages over the trailing 28 days.
+
+    Guild-wide by default; pass ``user_id`` for the member's own share.
+    Read from ``processed_messages`` (the permanent archive — kind activity
+    has no channel dimension). Zero traffic in the window returns 1.0: no
+    data means no scaling, and the band/floor clamps still protect. Soft
+    edge: thread messages archive under the thread's id while scoped fires
+    credit the parent, so thready channels read slightly LOW — targets err
+    forgiving, never impossible.
+    """
+    from datetime import date, timezone
+    from datetime import datetime as dt
+
+    end_d = date.fromisoformat(local_day)
+    end_ts = dt(end_d.year, end_d.month, end_d.day, tzinfo=timezone.utc).timestamp()
+    start_ts = end_ts - 28 * 86400
+    member_clause = "AND user_id = ?" if user_id is not None else ""
+    member_args: tuple = (user_id,) if user_id is not None else ()
+    total = conn.execute(
+        f"SELECT COUNT(*) AS n FROM processed_messages "
+        f"WHERE guild_id = ? {member_clause} "
+        f"AND created_at >= ? AND created_at < ?",
+        (guild_id, *member_args, start_ts, end_ts),
+    ).fetchone()
+    if int(total["n"]) == 0:
+        return 1.0
+    in_channel = conn.execute(
+        f"SELECT COUNT(*) AS n FROM processed_messages "
+        f"WHERE guild_id = ? AND channel_id = ? {member_clause} "
+        f"AND created_at >= ? AND created_at < ?",
+        (guild_id, channel_id, *member_args, start_ts, end_ts),
+    ).fetchone()
+    return int(in_channel["n"]) / int(total["n"])
+
+
+def auto_size_community_target(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    kind: str,
+    local_day: str,
+    *,
+    channel_id: int | None = None,
+    cadence: str = "weekly",
+) -> int:
+    """Target from the guild's trailing 28 full days of this kind's activity.
+
+    Fully automatic by design decision (2026-07-18 Q&A) — no manual override.
+    ``cadence`` sizes the goal for its period: ``"weekly"`` (the default, 28d ≈
+    4 weeks) or ``"monthly"`` (28d ≈ one month → a target reflecting a full
+    month of activity). Cold kinds fall to the floor target
+    (quests.community_auto_target), which keeps a first-period goal achievable
+    rather than impossible. A channel-scoped quest on a message-shaped kind
+    (quests.CHANNEL_SHARE_KINDS) scales the guild total by the channel's
+    message share first — kind activity has no channel dimension, and an
+    unscaled target would make the top tiers mathematically unreachable
+    (e.g. a 43%-of-traffic channel sized against 100% of the activity).
+    """
+    from datetime import date, timedelta
+
+    end = date.fromisoformat(local_day)  # exclusive: today is partial
+    start = end - timedelta(days=28)
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(count), 0) AS total FROM econ_kind_activity
+        WHERE guild_id = ? AND kind = ? AND local_day >= ? AND local_day < ?
+        """,
+        (guild_id, kind, start.isoformat(), end.isoformat()),
+    ).fetchone()
+    total = int(row["total"])
+    if channel_id is not None and kind in quests.CHANNEL_SHARE_KINDS:
+        total = round(
+            total * channel_message_share(conn, guild_id, channel_id, local_day)
+        )
+    periods = 1.0 if cadence == "monthly" else 4.0
+    return quests.community_auto_target(total, periods_in_window=periods)
+
+
+def activate_community_weekly(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    quest_id: int,
+    *,
+    target: int,
+    week: str,
+    slot: int = 1,
+) -> None:
+    """Open a community weekly's run: size it, reset per-run state, activate.
+
+    Contribution and tier-payout rows are per-run — cleared here (same
+    transaction) so a library quest can re-run in a later week and pay
+    again. Exactly-once only has to hold *within* a run, where settlement
+    replays share the reservation rows.
+
+    ``slot`` tags which concurrency lane this run belongs to (1 = the
+    original one-week-on/one-week-off lane, 2 = the no-gap lane added
+    2026-07-22) so each lane's roll only ever settles its own quest.
+    """
+    conn.execute(
+        """
+        UPDATE econ_quests
+        SET active = 1, community_target = ?, last_run_week = ?,
+            community_slot = ?
+        WHERE id = ? AND guild_id = ?
+        """,
+        (target, week, slot, quest_id, guild_id),
+    )
+    conn.execute("DELETE FROM econ_community_contrib WHERE quest_id = ?", (quest_id,))
+    conn.execute(
+        "DELETE FROM econ_community_tier_payouts WHERE quest_id = ?", (quest_id,)
+    )
+    conn.execute(
+        """
+        INSERT INTO econ_community_progress
+            (quest_id, current, completed_at, settled_at, notified_tier,
+             final_notice_sent)
+        VALUES (?, 0, NULL, NULL, 0, 0)
+        ON CONFLICT(quest_id) DO UPDATE SET
+            current = 0, completed_at = NULL, settled_at = NULL,
+            notified_tier = 0, final_notice_sent = 0
+        """,
+        (quest_id,),
+    )
+
+
+def community_contrib_summary(
+    conn: sqlite3.Connection, quest_id: int, *, top_n: int = 3
+) -> tuple[int, list[tuple[int, int]]]:
+    """(contributor count, top-N [(user_id, count)]) for a community run."""
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM econ_community_contrib "
+        "WHERE quest_id = ? AND count > 0",
+        (quest_id,),
+    ).fetchone()
+    top = conn.execute(
+        """
+        SELECT user_id, count FROM econ_community_contrib
+        WHERE quest_id = ? AND count > 0
+        ORDER BY count DESC, user_id ASC
+        LIMIT ?
+        """,
+        (quest_id, top_n),
+    ).fetchall()
+    return int(total["n"]), [(int(r["user_id"]), int(r["count"])) for r in top]
+
+
+def settle_community_weekly(
+    conn: sqlite3.Connection,
+    settings: EconSettings,
+    guild_id: int,
+    quest: sqlite3.Row,
+    member_boosters: dict[int, bool],
+) -> dict[str, object]:
+    """Close a community weekly's run: pay crossed tiers + bonus, deactivate.
+
+    Each crossed tier pays the quest's flat ``reward`` to every member in
+    ``member_boosters`` (the loop passes 30d-actives), exactly-once via the
+    per-(quest, tier, user) reservation rows — the settle_community_quest
+    pattern. Tier 0 rows reserve the top-contributor bonus (reward // 2,
+    top 3 by contribution). Returns the resolution summary for the beat
+    sheet. Idempotent: a replay pays only what it missed.
+    """
+    qid = int(quest["id"])
+    reward = int(quest["reward"])
+    target = int(quest["community_target"] or 0)
+    row = conn.execute(
+        "SELECT current FROM econ_community_progress WHERE quest_id = ?", (qid,)
+    ).fetchone()
+    current = int(row["current"]) if row else 0
+    crossed = quests.community_tiers_crossed(current, target)
+
+    paid_members = 0
+    for tier in range(1, crossed + 1):
+        for user_id, booster in member_boosters.items():
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO econ_community_tier_payouts "
+                "(quest_id, tier, user_id) VALUES (?, ?, ?)",
+                (qid, tier, user_id),
+            )
+            if (cur.rowcount or 0) == 0:
+                continue
+            if reward >= 1:
+                apply_credit(
+                    conn,
+                    guild_id,
+                    user_id,
+                    reward,
+                    "quest_community",
+                    meta={"quest_id": qid, "tier": tier},
+                    booster=booster,
+                    multiplier=settings.booster_multiplier,
+                )
+            paid_members += 1
+
+    # Privacy-suppressed kinds pay flat tiers only: surfacing the top
+    # confessors / whisperers / askers (in the bonus ledger or the paste-ready
+    # beat sheet) would deanonymize the feed the kind exists to protect, and a
+    # top-`guess_post` list would spoil several live rounds in one card.
+    anonymous = str(quest["trigger_kind"] or "") in quests.ANON_KINDS
+    contributors, top = community_contrib_summary(conn, qid)
+    if anonymous:
+        top = []
+    bonus = 0 if anonymous else reward // 2
+    bonus_paid: list[int] = []
+    if crossed > 0 and bonus >= 1:
+        for user_id, _count in top:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO econ_community_tier_payouts "
+                "(quest_id, tier, user_id) VALUES (?, 0, ?)",
+                (qid, user_id),
+            )
+            if (cur.rowcount or 0) == 0:
+                continue
+            apply_credit(
+                conn,
+                guild_id,
+                user_id,
+                bonus,
+                "quest_community_bonus",
+                meta={"quest_id": qid},
+                booster=member_boosters.get(user_id, False),
+                multiplier=settings.booster_multiplier,
+            )
+            bonus_paid.append(user_id)
+
+    now = time.time()
+    conn.execute(
+        "UPDATE econ_community_progress SET settled_at = ? WHERE quest_id = ?",
+        (now, qid),
+    )
+    conn.execute(
+        "UPDATE econ_quests SET active = 0 WHERE id = ? AND guild_id = ?",
+        (qid, guild_id),
+    )
+    return {
+        "quest_id": qid,
+        "title": str(quest["title"]),
+        "current": current,
+        "target": target,
+        "tiers_crossed": crossed,
+        "reward_per_tier": reward,
+        "paid_member_tiers": paid_members,
+        "contributors": contributors,
+        "top_contributors": top,
+        "bonus": bonus,
+        "bonus_paid": bonus_paid,
+        "anonymous": anonymous,
+    }
+
+
+def active_member_ids(
+    conn: sqlite3.Connection, guild_id: int, days: int = 30
+) -> list[int]:
+    """Members active in the last ``days`` (member_activity.last_message_at)."""
+    cutoff = time.time() - days * _EXPIRE_SECONDS_PER_DAY
+    rows = conn.execute(
+        """
+        SELECT user_id FROM member_activity
+        WHERE guild_id = ? AND last_message_at >= ?
+        """,
+        (guild_id, cutoff),
+    ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+# ── rotation ──────────────────────────────────────────────────────────
+
+
+def rotate_pool(
+    conn: sqlite3.Connection, guild_id: int, qtype: str
+) -> int | None:
+    """Advance a rotate-tag pool of the given type by one slot.
+
+    No-op (None) unless EXACTLY ONE quest of the tag's pool is active: under
+    the all-active board model every pool quest is normally live at once, and
+    the pool is already fully on show — there is nothing to "rotate to", so
+    deactivating one would just shrink the pool a member draws from every day
+    roll (3 active dailies sharing a tag would collapse to 1 after two rolls).
+    Rotation is for the one-active-at-a-time cadence: deactivate that quest and
+    activate the next by ``pick_rotation``, honoring the slot rule. Returns the
+    newly-activated quest id, or None.
+    """
+    active_rows = conn.execute(
+        """
+        SELECT id, rotate_tag FROM econ_quests
+        WHERE guild_id = ? AND qtype = ? AND active = 1 AND rotate_tag != ''
+        ORDER BY id
+        """,
+        (guild_id, qtype),
+    ).fetchall()
+    if not active_rows:
+        return None
+    current = active_rows[0]
+    tag = current["rotate_tag"]
+    current_id = int(current["id"])
+    # More than one pool member already active ⇒ the pool is on show; rotating
+    # would only drop one. Guard BEFORE any write so no deactivation leaks.
+    if sum(1 for r in active_rows if r["rotate_tag"] == tag) > 1:
+        return None
+    pool = conn.execute(
+        """
+        SELECT id FROM econ_quests
+        WHERE guild_id = ? AND qtype = ? AND rotate_tag = ?
+        ORDER BY id
+        """,
+        (guild_id, qtype, tag),
+    ).fetchall()
+    pool_ids = [int(row["id"]) for row in pool]
+    next_id = quests.pick_rotation(pool_ids, current_id)
+    if next_id is None or next_id == current_id:
+        return None
+
+    # Check the slot rule as it would stand after the 1-for-1 swap (current
+    # deactivated, next activated) BEFORE writing, so a failed can_activate
+    # never strands a deactivation. current is an active quest of this qtype
+    # and will step aside, so drop one of its qtype from the live set.
+    existing = _active_qtypes(conn, guild_id, exclude_id=next_id)
+    existing.remove(qtype)
+    if not quests.can_activate(existing, qtype):
+        return None
+    conn.execute(
+        "UPDATE econ_quests SET active = 0 WHERE id = ? AND guild_id = ?",
+        (current_id, guild_id),
+    )
+    conn.execute(
+        "UPDATE econ_quests SET active = 1 WHERE id = ? AND guild_id = ?",
+        (next_id, guild_id),
+    )
+    return next_id

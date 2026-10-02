@@ -1,0 +1,5749 @@
+"""Config endpoints — read and update bot configuration from the dashboard."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import ipaddress
+import json
+import logging
+import re
+import socket
+import time
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse, urlunparse
+from uuid import uuid4
+
+import httpx
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from bot_modules.moderation.settings import staff_ping_service
+from bot_modules.bump_tracker.cog import (
+    _add_site as _bump_add_site,
+)
+from bot_modules.bump_tracker.cog import (
+    _get_all_logs as _bump_get_all_logs,
+)
+from bot_modules.bump_tracker.cog import (
+    _get_config as _bump_get_config,
+)
+from bot_modules.bump_tracker.cog import (
+    _list_sites as _bump_list_sites,
+)
+from bot_modules.bump_tracker.cog import (
+    _log_bump as _bump_log_bump,
+)
+from bot_modules.bump_tracker.cog import (
+    _remove_site as _bump_remove_site,
+)
+from bot_modules.bump_tracker.cog import (
+    _set_detector as _bump_set_detector,
+)
+from bot_modules.bump_tracker.cog import (
+    _upsert_config as _bump_upsert_config,
+)
+from bot_modules.needle.cog import (
+    _bot_can_manage_messages as _needle_bot_can_manage_messages,
+)
+from bot_modules.needle.cog import (
+    _delete_channel as _needle_delete_channel,
+)
+from bot_modules.needle.cog import (
+    _get_global_config as _needle_get_global_config,
+)
+from bot_modules.needle.cog import (
+    _list_channels as _needle_list_channels,
+)
+from bot_modules.needle.cog import (
+    _upsert_channel as _needle_upsert_channel,
+)
+from bot_modules.needle.logic import (
+    DEFAULT_AUTO_ARCHIVE_MINUTES as _NEEDLE_DEFAULT_AUTO_ARCHIVE,
+)
+from bot_modules.pen_pals.cog import (
+    DEFAULT_MATCH_MODE as _PP_DEFAULT_MATCH_MODE,
+)
+from bot_modules.pen_pals.cog import (
+    DEFAULT_ROOM_VISIBILITY as _PP_DEFAULT_ROOM_VISIBILITY,
+)
+from bot_modules.pen_pals.cog import (
+    DEFAULT_ROUND_DOW as _PP_DEFAULT_ROUND_DOW,
+)
+from bot_modules.pen_pals.cog import (
+    DEFAULT_ROUND_HOUR as _PP_DEFAULT_ROUND_HOUR,
+)
+from bot_modules.pen_pals.cog import (
+    _get_admin_separations as _pp_get_admin_separations,
+)
+from bot_modules.pen_pals.cog import (
+    _get_config as _pp_get_config,
+)
+from bot_modules.pen_pals.cog import (
+    _get_opt_outs as _pp_get_opt_outs,
+)
+from bot_modules.pen_pals.cog import (
+    _get_pool as _pp_get_pool,
+)
+from bot_modules.pen_pals.cog import (
+    _normalize_match_mode as _pp_normalize_match_mode,
+)
+from bot_modules.pen_pals.cog import (
+    _normalize_room_visibility as _pp_normalize_room_visibility,
+)
+from bot_modules.pen_pals.cog import (
+    _recent_pool_events as _pp_recent_pool_events,
+)
+from bot_modules.pen_pals.cog import (
+    _round_dow as _pp_round_dow,
+)
+from bot_modules.pen_pals.cog import (
+    _round_hour as _pp_round_hour,
+)
+from bot_modules.pen_pals.cog import (
+    _set_admin_separations as _pp_set_admin_separations,
+)
+from bot_modules.pen_pals.cog import (
+    _set_config as _pp_set_config,
+)
+from bot_modules.pen_pals.cog import (
+    _set_timers as _pp_set_timers,
+)
+from bot_modules.core.branding import invalidate_accent_cache, safe_resolve_accent
+from bot_modules.core.db_utils import (
+    add_grant_permission,
+    delete_config_value,
+    delete_grant_role,
+    get_config_id_set,
+    get_config_value,
+    get_grant_permissions,
+    get_grant_roles,
+    get_tz_offset_hours,
+    parse_bool,
+    remove_grant_permission,
+    replace_config_id_bucket,
+    set_config_value,
+    upsert_grant_role,
+)
+from bot_modules.core.xp_system import _XP_COEFF_PREFIX, DEFAULT_XP_SETTINGS
+from bot_modules.onboarding.intake import reference_service as intake_ref
+from bot_modules.onboarding.intake import service as intake_svc
+from bot_modules.casino import pools_metrics
+from bot_modules.auto_delete.service import (
+    format_duration_seconds as _fmt_dur,
+)
+from bot_modules.auto_delete.service import (
+    list_auto_delete_rules_for_guild_with_conn,
+    remove_auto_delete_rule,
+    upsert_auto_delete_rule,
+)
+from bot_modules.auto_react.service import (
+    list_auto_react_rules_for_guild_with_conn,
+    parse_emojis,
+    remove_auto_react_rule,
+    upsert_auto_react_rule,
+)
+from bot_modules.birthday.service import (
+    ANNOUNCE_HOUR_KEY,
+)
+from bot_modules.birthday.service import (
+    announce_hour as _announce_hour,
+)
+from bot_modules.birthday.service import (
+    delete_channel as _birthday_delete_channel,
+)
+from bot_modules.birthday.service import (
+    list_channels as _birthday_list_channels,
+)
+from bot_modules.birthday.service import (
+    upsert_channel as _birthday_upsert_channel,
+)
+from bot_modules.core.branding_service import (
+    ACCENT_HEX_UNSET,
+    ACCENT_MODE_AVATAR,
+    ACCENT_MODE_CUSTOM,
+    DEFAULT_ASSISTANT_NAME,
+    DEFAULT_CASINO_NAME,
+    MAX_NAME_LEN,
+    PANEL_ART_DIR,
+    PANEL_ART_URL_PATH,
+    get_branding_conn,
+    upsert_branding,
+)
+from bot_modules.confessions.service import (
+    GuildConfig as _ConfessionsGuildConfig,
+)
+from bot_modules.confessions.service import (
+    get_config as _confessions_get_config,
+)
+from bot_modules.confessions.service import (
+    get_config_conn as _confessions_get_config_conn,
+)
+from bot_modules.confessions.service import (
+    upsert_config as _confessions_upsert_config,
+)
+from bot_modules.dm.perms.service import (
+    MAX_MAX_PENDING,
+    MAX_REQUEST_EXPIRY_HOURS,
+    MIN_MAX_PENDING,
+    MIN_REQUEST_EXPIRY_HOURS,
+    get_dm_mode_role_ids,
+    get_dms_config_with_conn,
+    set_audit_channel,
+    set_dm_mode_role_ids,
+    set_panel_settings,
+    set_request_limits,
+)
+from bot_modules.event_echo.service import (
+    CONFIG_CHANNEL_KEY as EVENT_ECHO_CHANNEL_KEY,
+)
+from bot_modules.onboarding.greeting_watch.service import (
+    parse_extra_words,
+)
+from bot_modules.games.guess.repo import get_guess_config as _get_guess_config
+from bot_modules.inactive.prune_service import (
+    add_prune_exception,
+    get_prune_exception_ids,
+    get_prune_exception_ids_with_conn,
+    get_member_last_voice_map,
+    members_in_voice,
+    merge_voice_activity,
+    remove_prune_exception,
+)
+from bot_modules.inactive.prune_service import (
+    get_prune_rule_with_conn as _get_prune_rule_with_conn,
+)
+from bot_modules.panels.title_service import delete_titled_variants
+from bot_modules.shared.quote_renderer import (
+    BorderStyle,
+    analyze_border_opening,
+    card_size_for_border,
+    guild_border_path,
+)
+from bot_modules.economy.reaction_tip_service import (
+    get_rungs_for_guild_with_conn,
+    min_rung_amount,
+    replace_rungs,
+)
+
+# The two Risky Rolls payoff dials (docs/specs/risky_roll_spec.md, "Chasing the
+# payoff"): keys and bound come from the module that reads them, so the
+# route cannot drift from the chaser.
+from bot_modules.games.risky_roll.logic import (
+    PAYOFF_CHASE_HOURS_KEY as _RISKY_CHASE_KEY,
+)
+from bot_modules.games.risky_roll.logic import (
+    PAYOFF_FALLBACK_HOURS_KEY as _RISKY_FALLBACK_KEY,
+)
+from bot_modules.games.risky_roll.logic import (
+    PAYOFF_HOURS_MAX as _RISKY_HOURS_MAX,
+)
+from bot_modules.games.risky_roll.logic import (
+    SPECIAL_ODDS_DEFAULT as _RISKY_ODDS_DEFAULT,
+)
+from bot_modules.games.risky_roll.logic import (
+    SPECIAL_ODDS_KEYS as _RISKY_ODDS_KEYS,
+)
+from bot_modules.games.risky_roll.logic import (
+    SPECIAL_ODDS_MAX as _RISKY_ODDS_MAX,
+)
+from bot_modules.games.risky_roll.logic import (
+    SPECIAL_ODDS_MIN as _RISKY_ODDS_MIN,
+)
+from bot_modules.games.risky_roll.logic import (
+    normalize_payoff_hours as _risky_hours,
+)
+from bot_modules.games.risky_roll.logic import (
+    normalize_special_odds as _risky_odds,
+)
+from bot_modules.games.risky_roll.logic import (
+    special_odds_valid as _risky_odds_valid,
+)
+from bot_modules.starboard.service import (
+    get_starboard_config as _get_starboard_config,
+)
+from bot_modules.starboard.service import (
+    upsert_starboard_config as _upsert_starboard_config,
+)
+from bot_modules.voice.transcription.service import (
+    DEFAULT_MODEL as _VT_DEFAULT_MODEL,
+)
+from bot_modules.voice.transcription.service import (
+    VALID_MODELS as _VT_VALID_MODELS,
+)
+from bot_modules.voice.transcription.service import (
+    download_model_to_cache as _vt_download_model,
+)
+from bot_modules.voice.transcription.service import (
+    get_config as _vt_get_config,
+)
+from bot_modules.voice.transcription.service import (
+    is_available as _vt_is_available,
+)
+from bot_modules.voice.transcription.service import (
+    model_is_cached as _vt_model_is_cached,
+)
+from bot_modules.voice.transcription.service import (
+    set_config as _vt_set_config,
+)
+from bot_modules.whisper.repo import get_whisper_config as _get_whisper_config
+from bot_modules.starboard.filters import validate_emoji as _starboard_validate_emoji
+
+# presets only — importing word_cloud.render here would pull matplotlib
+# into the web process for two dropdown values.
+from bot_modules.word_cloud import logic as word_cloud_logic
+from bot_modules.word_cloud.presets import PRESETS as WORD_CLOUD_PRESETS
+from web_server.auth import AuthenticatedUser
+from web_server.deps import (
+    get_active_guild_id,
+    get_ctx,
+    require_game_host,
+    require_perms,
+    run_query,
+)
+from web_server.helpers import (
+    public_base_url,
+    refuse_ungrantable_role,
+    require_in_range,
+    sniff_image_ext,
+)
+from web_server.routes.panel_posting import (
+    ChannelIdBody,
+    guild_or_503,
+    require_post_permissions,
+    sticky_conflict,
+    text_channel_or_400,
+)
+
+WORD_CLOUD_PRESET_KEYS = {p.key for p in WORD_CLOUD_PRESETS}
+WORD_CLOUD_DEFAULT_PRESET = WORD_CLOUD_PRESETS[0].key
+
+_STARBOARD_EXCLUDED_BUCKET = "starboard_excluded_channels"
+_RISKY_PING_KEY = "risky_ping_role_id"
+_RISKY_MIN_GAME_KEY = "risky_min_game_seconds"
+_RISKY_MAX_GAMES_KEY = "risky_max_games_per_channel"
+_POLICY_VOTE_TIMEOUT_KEY = "policy_vote_timeout_hours"
+_POLICY_VOTE_TIMEOUT_DEFAULT = 72
+
+router = APIRouter()
+
+_log = logging.getLogger("dungeonkeeper.web.config")
+
+
+# ── Read helpers ───────────────────────────────────────────────────────
+
+
+# ``allow_legacy_fallback=False`` means "this guild's row or the default" —
+# no falling back to the legacy guild_id=0 row. Features added after configs
+# went per-guild use it so a home-guild value never leaks into a second guild.
+
+
+def _id_set_list(
+    conn, bucket: str, guild_id: int, allow_legacy_fallback: bool = True
+) -> list[int]:
+    return sorted(
+        get_config_id_set(
+            conn, bucket, guild_id, allow_legacy_fallback=allow_legacy_fallback
+        )
+    )
+
+
+def _int_val(
+    conn,
+    key: str,
+    default: int = 0,
+    guild_id: int = 0,
+    allow_legacy_fallback: bool = True,
+) -> int:
+    raw = get_config_value(
+        conn, key, str(default), guild_id,
+        allow_legacy_fallback=allow_legacy_fallback,
+    )
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_val(
+    conn,
+    key: str,
+    default: str = "",
+    guild_id: int = 0,
+    allow_legacy_fallback: bool = True,
+) -> str:
+    return get_config_value(
+        conn, key, default, guild_id,
+        allow_legacy_fallback=allow_legacy_fallback,
+    )
+
+
+def _float_val(
+    conn,
+    key: str,
+    default: float = 0.0,
+    guild_id: int = 0,
+    allow_legacy_fallback: bool = True,
+) -> float:
+    raw = get_config_value(
+        conn, key, str(default), guild_id,
+        allow_legacy_fallback=allow_legacy_fallback,
+    )
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_val(conn, key: str, default: bool = False, guild_id: int = 0) -> bool:
+    raw = get_config_value(conn, key, "1" if default else "0", guild_id)
+    return parse_bool(raw)
+
+
+def _raw(value):
+    """Store the value exactly as sent (it already arrives as a string)."""
+    return value
+
+
+def _flag(value) -> str:
+    """Bool -> the "1"/"0" the config table stores."""
+    return "1" if value else "0"
+
+
+def _apply_config_fields(conn, guild_id: int, body, spec: dict) -> None:
+    """Write each field of ``spec`` the caller actually sent.
+
+    ``spec`` maps a body attribute to ``(config_key, coerce)``, where
+    ``coerce`` produces the string the config table stores. A field left unset
+    — or sent as an explicit null — is skipped, which is what "no change"
+    means on these every-field-optional PUTs.
+    """
+    for field, (key, coerce) in spec.items():
+        value = getattr(body, field, None)
+        if value is not None:
+            set_config_value(conn, key, coerce(value), guild_id)
+
+
+def _id_str(conn, key: str, guild_id: int = 0, default: int = 0) -> str:
+    """Read a snowflake config value as a decimal STRING.
+
+    Discord ids exceed 2**53, so a bare JSON number loses precision in the
+    browser — every id the dashboard reads must travel as a string, and a
+    repo-wide sweep enforces it. Going through ``_int_val`` keeps the
+    normalisation ("007" -> "7", junk -> the default) these call sites have
+    always had.
+    """
+    return str(_int_val(conn, key, default, guild_id))
+
+
+def _id_str_list(
+    conn, bucket: str, guild_id: int, allow_legacy_fallback: bool = True
+) -> list[str]:
+    """The same string-not-number rule, for a whole id bucket."""
+    return [
+        str(i)
+        for i in _id_set_list(conn, bucket, guild_id, allow_legacy_fallback)
+    ]
+
+
+# The XP coefficient names, each with the reader that coerces it. This is the
+# single list — the write path in update_xp iterates the same table, and the
+# storage key is always the name behind _XP_COEFF_PREFIX.
+_XP_COEFF_READERS: dict = {
+    "message_word_xp": _float_val,
+    "reply_bonus_xp": _float_val,
+    "image_reaction_received_xp": _float_val,
+    "reaction_given_xp": _float_val,
+    "cooldown_thresholds_seconds": _str_val,
+    "cooldown_multipliers": _str_val,
+    "duplicate_multiplier": _float_val,
+    "pair_streak_threshold": _int_val,
+    "pair_streak_multiplier": _float_val,
+    "voice_award_xp": _float_val,
+    "voice_interval_seconds": _int_val,
+    "voice_min_humans": _int_val,
+    "manual_grant_xp": _float_val,
+    "level_curve_factor": _float_val,
+}
+
+
+def _xp_coefficients(conn, guild_id: int = 0) -> dict:
+    """Read XP algorithm coefficients from the config table, with defaults.
+
+    Guild-scoped rows take precedence; falls back to ``guild_id=0`` legacy rows
+    via ``get_config_value``. The two sequence-valued defaults are stored (and
+    returned) as the CSV the panel edits, not as a list.
+    """
+    d = DEFAULT_XP_SETTINGS
+    out: dict = {}
+    for name, read in _XP_COEFF_READERS.items():
+        default = getattr(d, name)
+        if isinstance(default, (list, tuple)):
+            default = ",".join(str(v) for v in default)
+        out[name] = read(conn, f"{_XP_COEFF_PREFIX}{name}", default, guild_id)
+    return out
+
+
+def _lookup_member_name(uid: int, guild, conn, guild_id: int) -> str:
+    if guild:
+        m = guild.get_member(uid)
+        if m:
+            return m.display_name
+    row = conn.execute(
+        "SELECT display_name, username FROM known_users WHERE guild_id = ? AND user_id = ?",
+        (guild_id, uid),
+    ).fetchone()
+    return (row["display_name"] or row["username"] or str(uid)) if row else str(uid)
+
+
+# ── DM perms config helper ────────────────────────────────────────────
+
+
+def _dms_section_with_conn(conn, guild_id: int) -> dict:
+    cfg = get_dms_config_with_conn(conn, guild_id)
+    # Ids go out as strings (snowflake precision); the two lifecycle dials are
+    # small counts and stay numbers so the panel's number inputs get numbers.
+    numeric = {"request_expiry_hours", "max_pending_requests"}
+    return {k: (v if k in numeric else str(v)) for k, v in cfg.items()}
+
+
+# ── Starboard config helper ──────────────────────────────────────────
+
+
+def _bulk_cleanup_section(conn, guild_id: int) -> dict:
+    from bot_modules.moderation.bulk_cleanup_service import (
+        _AGE_DAYS_KEY,
+        _ENABLED_KEY,
+        _LAST_RUN_KEY,
+        DEFAULT_AGE_DAYS,
+        EXCLUDED_BUCKET,
+    )
+
+    # Strictly "1", not parse_bool — this key is only ever written as 1/0.
+    return {
+        "enabled": _str_val(
+            conn, _ENABLED_KEY, "0", guild_id, allow_legacy_fallback=False
+        )
+        == "1",
+        "age_days": _int_val(
+            conn, _AGE_DAYS_KEY, DEFAULT_AGE_DAYS, guild_id,
+            allow_legacy_fallback=False,
+        ),
+        "last_run_ts": _float_val(
+            conn, _LAST_RUN_KEY, 0.0, guild_id, allow_legacy_fallback=False
+        ),
+        "excluded_channels": _id_str_list(
+            conn, EXCLUDED_BUCKET, guild_id, allow_legacy_fallback=False
+        ),
+    }
+
+
+_STARBOARD_DEFAULTS: dict = {
+    "channel_id": 0,
+    "threshold": 3,
+    "emoji": "\u2b50",
+    "enabled": 1,
+}
+
+
+def _starboard_row_or_defaults(conn, guild_id: int) -> dict:
+    """The stored starboard row, or the defaults when there is none.
+
+    ``enabled`` comes back exactly as stored — the read path presents it as a
+    bool, the write path keeps it as the 1/0 int it persists.
+    """
+    row = _get_starboard_config(conn, guild_id)
+    if not row:
+        return dict(_STARBOARD_DEFAULTS)
+    return {
+        "channel_id": int(row["channel_id"]),
+        "threshold": int(row["threshold"]),
+        "emoji": row["emoji"],
+        "enabled": row["enabled"],
+    }
+
+
+def _starboard_section(conn, guild_id: int) -> dict:
+    import sqlite3
+
+    try:
+        cur = _starboard_row_or_defaults(conn, guild_id)
+    except sqlite3.OperationalError:
+        cur = dict(_STARBOARD_DEFAULTS)
+    return {
+        "channel_id": str(cur["channel_id"]),
+        "threshold": cur["threshold"],
+        "emoji": cur["emoji"],
+        "enabled": bool(cur["enabled"]),
+        "excluded_channels": _id_str_list(conn, _STARBOARD_EXCLUDED_BUCKET, guild_id),
+    }
+
+
+# ── Birthday config helper ────────────────────────────────────────────
+
+
+def _birthday_section(conn, guild_id: int) -> dict:
+    channels = _birthday_list_channels(conn, guild_id)
+    return {
+        "channels": [
+            {"channel_id": str(c.channel_id), "message": c.message, "pin": c.pin}
+            for c in channels
+        ],
+        # Guild-local hour the announcement goes out (0–23).
+        "birthday_announce_hour": _announce_hour(conn, guild_id),
+    }
+
+
+# ── Bot identity section ─────────────────────────────────────────
+
+
+def _bot_identity_section(guild) -> dict:
+    if guild is None:
+        return {"nick": "", "avatar_url": ""}
+    return {
+        "nick": guild.me.nick or "",
+        "avatar_url": str(guild.me.display_avatar.url),
+    }
+
+
+def _branding_section(conn, guild_id: int) -> dict:
+    cfg = get_branding_conn(conn, guild_id)
+    accent_hex = f"#{cfg.accent_hex:06X}" if cfg.has_custom_color() else ""
+    return {
+        "accent_mode": cfg.normalized_mode(),
+        "accent_hex": accent_hex,
+        # Raw stored values ("" = using the default) plus the defaults, so the
+        # panel can show the built-in as a placeholder rather than a value.
+        "casino_name": cfg.casino_name,
+        "assistant_name": cfg.assistant_name,
+        "default_casino_name": DEFAULT_CASINO_NAME,
+        "default_assistant_name": DEFAULT_ASSISTANT_NAME,
+        "panel_banner_url": cfg.panel_banner_url,
+        "panel_footer_url": cfg.panel_footer_url,
+        "panel_header_url": cfg.panel_header_url,
+        "panel_card_header_url": cfg.panel_card_header_url,
+        "panel_card_footer_url": cfg.panel_card_footer_url,
+        "panel_banner_title": cfg.panel_banner_title,
+    }
+
+
+def _guess_section(conn, guild_id: int) -> dict:
+    gc = _get_guess_config(conn, guild_id)
+    return {
+        "channel_id": str(gc.guess_channel_id),
+        "role_id": str(gc.guess_role_id),
+        "crop_difficulty": gc.crop_difficulty,
+        "guess_cooldown_seconds": gc.guess_cooldown_seconds,
+        "min_image_dimension_px": gc.min_image_dimension_px,
+        "max_image_size_mb": gc.max_image_size_mb,
+        "submit_max_per_window": gc.submit_max_per_window,
+        "submit_window_seconds": gc.submit_window_seconds,
+        "max_guesses_per_round": gc.max_guesses_per_round,
+        "round_lifetime_days": gc.round_lifetime_days,
+    }
+
+
+def _needle_removal_blocked(bot, guild_id: int, channel_id: int, require: bool) -> bool:
+    """The Auto-Thread card's warning: the box is ticked where the bot can't
+    delete. Read from the bot's cache; a bot that is down warns about nothing."""
+    from bot_modules.needle.logic import removal_blocked
+
+    guild = bot.get_guild(guild_id) if bot is not None else None
+    return removal_blocked(
+        require_attachment=require,
+        bot_can_manage_messages=_needle_bot_can_manage_messages(guild, channel_id),
+    )
+
+
+def _needle_section(conn, guild_id: int, bot=None) -> dict:
+    channels = _needle_list_channels(conn, guild_id)
+    gcfg = _needle_get_global_config(conn, guild_id)
+    return {
+        "channels": [
+            {
+                "channel_id": str(c.channel_id),
+                "title_type": c.title_type,
+                "custom_title": c.custom_title,
+                "include_bots": c.include_bots,
+                "slowmode": c.slowmode,
+                "delete_behavior": c.delete_behavior,
+                "reply_type": c.reply_type,
+                "custom_reply": c.custom_reply,
+                "default_reactions": c.default_reactions,
+                "notify_op_on_reply": c.notify_op_on_reply,
+                "require_attachment": c.require_attachment,
+                "auto_archive_minutes": c.auto_archive_minutes,
+                "removal_blocked": _needle_removal_blocked(
+                    bot, guild_id, c.channel_id, c.require_attachment
+                ),
+            }
+            for c in channels
+        ],
+        "default_reply": gcfg.default_reply,
+    }
+
+
+def _event_echo_section(conn, guild_id: int) -> dict:
+    """Event Echo's one knob: where echoes land (empty string = feature off).
+
+    A string, not a number — a channel snowflake exceeds 2^53 and would lose
+    precision as a bare JSON number (docs/web_testing.md's snowflake sweep).
+    """
+    return {"channel_id": _str_val(conn, EVENT_ECHO_CHANNEL_KEY, "", guild_id)}
+
+
+def _whisper_section(conn, guild_id: int) -> dict:
+    wc = _get_whisper_config(conn, guild_id)
+    return {
+        "channel_id": str(wc.channel_id),
+        "role_id": str(wc.role_id),
+        "log_channel_id": str(wc.log_channel_id),
+        "cooldown_seconds": wc.cooldown_seconds,
+        "hourly_cap_per_target": wc.hourly_cap_per_target,
+        "guesses_per_whisper": wc.guesses_per_whisper,
+        "sender_feedback": wc.sender_feedback,
+    }
+
+
+def _risky_section(conn, guild_id: int) -> dict:
+    ping_role = get_config_value(conn, _RISKY_PING_KEY, "0", guild_id=guild_id)
+    min_secs = get_config_value(conn, _RISKY_MIN_GAME_KEY, "0", guild_id=guild_id)
+    # Default "10" mirrors risky_roll.store.MAX_GAMES_PER_CHANNEL.
+    max_games = get_config_value(conn, _RISKY_MAX_GAMES_KEY, "10", guild_id=guild_id)
+    # Both payoff dials ship at 0 (off); a guild that never set them chases nothing.
+    chase = get_config_value(conn, _RISKY_CHASE_KEY, "0", guild_id=guild_id)
+    fallback = get_config_value(conn, _RISKY_FALLBACK_KEY, "0", guild_id=guild_id)
+    return {
+        "ping_role_id": ping_role,
+        "min_game_seconds": int(min_secs),
+        "max_games_per_channel": int(max_games),
+        "chase_hours": _risky_hours(chase),
+        "fallback_hours": _risky_hours(fallback),
+        # Special-roll odds, each the N of "1 in N rolls"; 0 = never. Unset
+        # reads as 1 in 100, the flat die. No guild-0 fallback: the Roll
+        # button reads only the guild's own rows, and the panel must match.
+        **{
+            f"odds_{face}": _risky_odds(
+                get_config_value(
+                    conn, key, str(_RISKY_ODDS_DEFAULT),
+                    guild_id=guild_id, allow_legacy_fallback=False,
+                )
+            )
+            for face, key in _RISKY_ODDS_KEYS.items()
+        },
+    }
+
+
+def _casino_section(conn, guild_id: int) -> dict:
+    """Casino settings (docs/specs/casino_spec.md).
+
+    panel_* bookkeeping fields are deliberately absent — bot-managed, never
+    dashboard-editable. Ids go out as strings (the snowflake rule).
+    """
+    from bot_modules.casino.service import (
+        load_casino_settings,  # noqa: PLC0415
+    )
+
+    s = load_casino_settings(conn, guild_id)
+    return {
+        "channel_id": str(s.channel_id),
+        "min_bet": s.min_bet,
+        "max_bet": s.max_bet,
+        "daily_wager_cap": s.daily_wager_cap,
+        "max_payout": s.max_payout,
+        "daily_comp": s.daily_comp,
+        "coinflip_enabled": s.coinflip_enabled,
+        "slots_enabled": s.slots_enabled,
+        "blackjack_enabled": s.blackjack_enabled,
+        "roulette_enabled": s.roulette_enabled,
+        "derby_enabled": s.derby_enabled,
+        "baccarat_enabled": s.baccarat_enabled,
+        "dice_enabled": s.dice_enabled,
+        "war_enabled": s.war_enabled,
+        "keno_enabled": s.keno_enabled,
+        "mines_enabled": s.mines_enabled,
+        "pools_enabled": s.pools_enabled,
+        "pools_channel_id": str(s.pools_channel_id),
+        "pools_close_hour": s.pools_close_hour,
+        "pools_takeout_pct": s.pools_takeout_pct,
+        # The stored roster (empty = all), plus the catalogue the panel
+        # renders its checkboxes from, so the metric list lives in one
+        # place rather than being duplicated in JS.
+        "pools_metrics": s.pools_metrics,
+        "pools_metric_catalog": [
+            {"key": m.key, "label": m.label, "cap_note": m.cap_note}
+            for m in pools_metrics.SPECS.values()
+        ],
+        "round_idle_seconds": s.round_idle_seconds,
+        "blackjack_idle_seconds": s.blackjack_idle_seconds,
+        "jackpot_enabled": s.jackpot_enabled,
+        "jackpot_cut_pct": s.jackpot_cut_pct,
+        "jackpot_seed": s.jackpot_seed,
+        "broadcast_min_payout": s.broadcast_min_payout,
+        "broadcast_min_mult": s.broadcast_min_mult,
+        "broadcast_ping_enabled": s.broadcast_ping_enabled,
+    }
+
+
+def _policy_section(conn, guild_id: int) -> dict:
+    return {
+        "vote_timeout_hours": _int_val(
+            conn,
+            _POLICY_VOTE_TIMEOUT_KEY,
+            _POLICY_VOTE_TIMEOUT_DEFAULT,
+            guild_id=guild_id,
+        ),
+    }
+
+
+def _greeting_watch_section(conn, guild_id: int) -> dict:
+    # Read the same keys the ingest hook (GuildConfig) and the monitor loop act
+    # on, so the panel never disagrees with what actually fires. channel_ids is
+    # a CSV of ids (same shape as mod_role_ids).
+    return {
+        "enabled": _bool_val(conn, "greeting_watch_enabled", guild_id=guild_id),
+        "channel_ids": _str_val(
+            conn, "greeting_watch_channel_ids", guild_id=guild_id
+        ),
+        "window_minutes": _int_val(
+            conn, "greeting_watch_window_minutes", 10, guild_id=guild_id
+        ),
+        "extra_words": _str_val(
+            conn, "greeting_watch_extra_words", guild_id=guild_id
+        ),
+    }
+
+
+# ── Inactive-sweep config helper ────────────────────────────────────────
+
+
+def _inactive_section(conn, guild_id: int, guild) -> dict:
+    from bot_modules.inactive.store import list_sweep_exemptions
+
+    exemptions = [
+        {
+            "id": str(row["user_id"]),
+            "name": _lookup_member_name(row["user_id"], guild, conn, guild_id),
+        }
+        for row in list_sweep_exemptions(conn, guild_id)
+    ]
+    return {
+        "threshold_days": _int_val(
+            conn, "inactive_threshold_days", 30, guild_id=guild_id
+        ),
+        "auto_sweep": _bool_val(conn, "inactive_auto_sweep", guild_id=guild_id),
+        "sweep_cap": _int_val(conn, "inactive_sweep_cap", 25, guild_id=guild_id),
+        # The panel's channel picker preselects this, so a re-point starts from
+        # where the channel currently is rather than from blank.
+        "inactive_channel_id": _id_str(conn, "inactive_channel_id", guild_id),
+        "exemptions": exemptions,
+    }
+
+
+# ── Duel/group-games config helpers ─────────────────────────────────────
+# Every game's settings are split shared-tier (the ``duel_config`` table,
+# one row per guild+game_type — cooldowns, sentence duration, the channel
+# allowlist, nickname/stakes length caps) and game-tier (a dedicated
+# ``<game>_config`` table with that game's own mechanics knobs; Pressure
+# Cooker has no game-tier table, it only uses the shared one). The bot's own
+# db.py modules for these tables are async (built for its aiosqlite-style
+# GamesDb wrapper) — the web server's ``ctx.open_db()`` connection is sync
+# sqlite3, so reads/writes here are hand-rolled rather than reusing them.
+#
+# ``channel_allowlist`` and the two length caps are enforced generically for
+# all six games in bot_modules/duels/base_duel.py and base_game.py, even
+# though historically only Pressure Cooker's Discord command ever exposed
+# them — every panel below surfaces them, closing that gap.
+
+_DUEL_SHARED_DEFAULTS: dict = {
+    # 0 = play again straight away. Enforced on all six games since 2026-09-04
+    # (nickname games only); 48 was what the group games imposed and what the
+    # duels ignored. Kept in step with duels/db.py _CONFIG_DEFAULTS.
+    "cooldown_hours": 0,
+    "sentence_hours": 24,
+    "channel_allowlist": "[]",
+    # Extra banned words on top of the bot's built-in nickname denylist. The
+    # bot has always enforced these on nicknames and stakes text; until now
+    # nothing could set them, so every guild ran on the built-in list alone.
+    "nick_denylist": "[]",
+    "max_nick_length": 32,
+    "max_stakes_length": 200,
+    # 0 = no limit. Was a hardcoded 3 in the bot, which is a spam brake set at
+    # the pace of an idle channel — a busy games channel ran into it repeatedly.
+    "challenge_limit_per_hour": 30,
+}
+
+# game_key == duel_config.game_type for every game (no renaming needed).
+_DUEL_GAMES: dict = {
+    "pressure": {"table": None, "defaults": {}, "fields": {}},
+    "quickdraw": {
+        "table": "quickdraw_config",
+        "defaults": {"min_delay": 3.0, "max_delay": 8.0, "draw_window": 5.0},
+        "fields": {
+            "min_delay": (0.5, None),
+            "max_delay": (1.0, None),
+            "draw_window": (1.0, None),
+        },
+    },
+    "hot_potato": {
+        "table": "hot_potato_config",
+        # min_hold: the group cog's anti-ping-pong wait, adopted by the duel
+        # (migration 208) so a pass is a decision rather than a click race.
+        "defaults": {"min_timer": 10.0, "max_timer": 45.0, "min_hold": 2.0},
+        "fields": {
+            "min_timer": (5.0, None),
+            "max_timer": (10.0, None),
+            "min_hold": (0.0, None),
+        },
+    },
+    "hot_potato_group": {
+        "table": "hp_group_config",
+        "defaults": {
+            "min_fuse": 20.0, "max_fuse": 60.0, "min_hold": 2.0,
+            "min_players": 2, "max_players": 10,
+        },
+        "fields": {
+            "min_fuse": (5.0, None),
+            "max_fuse": (10.0, None),
+            "min_hold": (0.0, None),
+            "min_players": (2, None),
+            "max_players": (2, None),
+        },
+    },
+    "chicken": {
+        "table": "chicken_config",
+        # The crash point is rolled per game in [min_climb, max_climb] and
+        # hidden; the meter is drawn over max_climb. Replaced the fixed,
+        # public climb_duration in migration 208.
+        "defaults": {"min_climb": 10.0, "max_climb": 25.0, "min_players": 2, "max_players": 8},
+        "fields": {
+            "min_climb": (5.0, None),
+            "max_climb": (5.0, None),
+            "min_players": (2, None),
+            "max_players": (2, None),
+        },
+    },
+    "musical_chairs": {
+        "table": "mc_config",
+        "defaults": {
+            "min_music": 5.0, "max_music": 15.0, "scramble_window": 8.0,
+            "false_start_elim": 1, "min_players": 3, "max_players": 10,
+        },
+        # Insertion order is the order the UPDATE's SET clause is built in.
+        "fields": {
+            "min_music": (2.0, None),
+            "max_music": (3.0, None),
+            "scramble_window": (2.0, None),
+            "false_start_elim": "bool",
+            "min_players": (3, None),
+            "max_players": (3, None),
+        },
+    },
+}
+
+
+def _duel_shared_row(conn, guild_id: int, game_type: str) -> dict:
+    row = conn.execute(
+        "SELECT * FROM duel_config WHERE guild_id = ? AND game_type = ?",
+        (guild_id, game_type),
+    ).fetchone()
+    if row:
+        return dict(row)
+    return {"guild_id": guild_id, "game_type": game_type, **_DUEL_SHARED_DEFAULTS}
+
+
+def _duel_game_table_row(conn, guild_id: int, table: str | None, defaults: dict) -> dict:
+    merged = dict(defaults)
+    if not table:
+        return merged
+    row = conn.execute(f"SELECT * FROM {table} WHERE guild_id = ?", (guild_id,)).fetchone()
+    if row:
+        merged.update({k: v for k, v in dict(row).items() if k != "guild_id"})
+    return merged
+
+
+def _duel_game_section(conn, guild_id: int, game_key: str) -> dict:
+    spec = _DUEL_GAMES[game_key]
+    shared = _duel_shared_row(conn, guild_id, game_key)
+    out = {f: shared[f] for f in _DUEL_SHARED_DEFAULTS}
+    out["channel_allowlist"] = [
+        str(i) for i in json.loads(out["channel_allowlist"] or "[]")
+    ]
+    out["nick_denylist"] = [str(w) for w in json.loads(out["nick_denylist"] or "[]")]
+    out.update(_duel_game_table_row(conn, guild_id, spec["table"], spec["defaults"]))
+    return out
+
+
+def _duel_shared_updates(body) -> dict:
+    """The knobs every duel game shares.
+
+    The numeric bounds live on ``DuelSharedConfigUpdate`` — anything reaching
+    here has already been range-checked. The two list fields are still
+    normalised rather than refused: an over-long allowlist is a paste, not a
+    typo, and truncating it is what the panel has always shown back.
+    """
+    out: dict = {}
+    for field in ("cooldown_hours", "sentence_hours", "max_nick_length",
+                  "max_stakes_length", "challenge_limit_per_hour"):
+        value = getattr(body, field)
+        if value is not None:
+            out[field] = value
+    allowlist = _clamp_channel_allowlist(body.channel_allowlist)
+    if allowlist is not None:
+        out["channel_allowlist"] = allowlist
+    denylist = _clamp_nick_denylist(body.nick_denylist)
+    if denylist is not None:
+        out["nick_denylist"] = denylist
+    return out
+
+
+def _duel_game_updates(body, game_key: str) -> dict:
+    """The per-game knobs, range-checked per ``_DUEL_GAMES[game_key]["fields"]``.
+
+    The rule table stays the one place a bound is written — it already carries
+    each game's defaults and the insertion order the UPDATE is built in, so
+    restating the bounds on six body models would be two places to change.
+    A value outside its rule is refused, not pulled to the edge: a fuse dial
+    silently rewritten from 1s to 5s is a game that plays differently from the
+    number on the screen, and nothing tells the admin which.
+    """
+    out: dict = {}
+    for field, rule in _DUEL_GAMES[game_key]["fields"].items():
+        value = getattr(body, field, None)
+        if value is None:
+            continue
+        if rule == "bool":
+            out[field] = 1 if value else 0
+        else:
+            low, high = rule
+            out[field] = require_in_range(value, low, high, field=field)
+    return out
+
+
+# Dial pairs that only mean anything in one order. Each entry is
+# (low field, high field, strict?, message), and the labels are the panel's own
+# so the refusal names what the admin is looking at. The panels check these in
+# the browser too, but a direct PUT — or a tab left open while another admin
+# saved — went straight past that and stored a game nobody can play, so the
+# rules live here as well and the browser is only the fast feedback.
+_PLAYER_COUNT_RULE = (
+    "min_players", "max_players", False,
+    "Fewest Players to Start ({low}) cannot be more than Most Players Per "
+    "Lobby ({high}) — a lobby that full would never be allowed to start.",
+)
+
+_DUEL_DIAL_RULES: dict[str, list[tuple]] = {
+    # A holder who may not pass until after the shortest fuse has burned is
+    # never allowed to pass at all: the bomb is a coin toss on whoever caught it.
+    "hot_potato": [
+        (
+            "min_hold", "min_timer", True,
+            "Shortest Hold ({low}s) has to be shorter than Shortest Fuse "
+            "({high}s), or nobody is ever allowed to pass the potato.",
+        ),
+    ],
+    "hot_potato_group": [
+        (
+            "min_hold", "min_fuse", True,
+            "Must Hold For ({low}s) has to be shorter than Shortest Fuse "
+            "({high}s), or nobody is ever allowed to pass the bomb.",
+        ),
+        _PLAYER_COUNT_RULE,
+    ],
+    "chicken": [
+        # New on 2026-09: migration 208 split the single climb duration into a
+        # range, so an inverted pair is a state this branch made reachable.
+        (
+            "min_climb", "max_climb", False,
+            "Earliest Crash ({low}s) cannot be later than Latest Crash "
+            "({high}s) — there would be no moment left for the plane to fall.",
+        ),
+        _PLAYER_COUNT_RULE,
+    ],
+    "musical_chairs": [_PLAYER_COUNT_RULE],
+}
+
+# The fuse ranges: same shape, same reason. The browser has always checked
+# these; the route checks them too so a direct PUT, or a tab left open while
+# another admin saved, cannot store the pair the panel refuses.
+_DUEL_DIAL_RULES["hot_potato"].append(
+    (
+        "min_timer", "max_timer", False,
+        "Shortest Fuse ({low}s) cannot be longer than Longest Fuse ({high}s).",
+    )
+)
+_DUEL_DIAL_RULES["hot_potato_group"].append(
+    (
+        "min_fuse", "max_fuse", False,
+        "Shortest Fuse ({low}s) cannot be longer than Longest Fuse ({high}s).",
+    )
+)
+
+
+def _duel_dial_conflict(game_key: str, values: dict) -> str | None:
+    """The first broken ordering rule for this game, as a message, or None."""
+    for low_field, high_field, strict, message in _DUEL_DIAL_RULES.get(game_key, []):
+        low, high = values.get(low_field), values.get(high_field)
+        if low is None or high is None:
+            continue
+        if low > high or (strict and low == high):
+            return message.format(low=_dial_num(low), high=_dial_num(high))
+    return None
+
+
+def _dial_num(value) -> str:
+    """Render a dial for a message: 2 rather than 2.0, 2.5 kept as 2.5."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+async def _save_duel_game(request, game_key: str, body) -> dict:
+    """Shared body of the six /config/games-* handlers."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        shared = _duel_shared_updates(body)
+        game = _duel_game_updates(body, game_key)
+        with ctx.open_db() as conn:
+            if game:
+                # Judge the *effective* dials — stored values overlaid with this
+                # save — because every field is independently optional, so half
+                # a pair can arrive on its own.
+                spec = _DUEL_GAMES[game_key]
+                effective = _duel_game_table_row(
+                    conn, guild_id, spec["table"], spec["defaults"]
+                )
+                effective.update(game)
+                conflict = _duel_dial_conflict(game_key, effective)
+                if conflict:
+                    raise HTTPException(422, conflict)
+            _duel_game_upsert(conn, guild_id, game_key, shared, game)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+def _duel_game_upsert(
+    conn, guild_id: int, game_key: str, shared_updates: dict, game_updates: dict
+) -> None:
+    spec = _DUEL_GAMES[game_key]
+    if shared_updates:
+        # The column's own DEFAULT is still the historical 48; seed a fresh
+        # row with the code default so a partial save can't inherit it.
+        conn.execute(
+            "INSERT OR IGNORE INTO duel_config (guild_id, game_type, cooldown_hours)"
+            " VALUES (?, ?, ?)",
+            (guild_id, game_key, _DUEL_SHARED_DEFAULTS["cooldown_hours"]),
+        )
+        set_clause = ", ".join(f"{k} = ?" for k in shared_updates)
+        conn.execute(
+            f"UPDATE duel_config SET {set_clause} WHERE guild_id = ? AND game_type = ?",
+            (*shared_updates.values(), guild_id, game_key),
+        )
+    if game_updates and spec["table"]:
+        table = spec["table"]
+        conn.execute(f"INSERT OR IGNORE INTO {table} (guild_id) VALUES (?)", (guild_id,))
+        set_clause = ", ".join(f"{k} = ?" for k in game_updates)
+        conn.execute(
+            f"UPDATE {table} SET {set_clause} WHERE guild_id = ?",
+            (*game_updates.values(), guild_id),
+        )
+
+
+# ── Auto-react config helper ──────────────────────────────────────────
+
+
+def _auto_react_section(conn, guild_id: int) -> list:
+    # One query for every channel's ladder rather than one per rule.
+    rungs = get_rungs_for_guild_with_conn(conn, guild_id)
+    return [
+        {
+            "channel_id": str(r["channel_id"]),
+            "emojis": parse_emojis(r["emojis"]),
+            "enabled": bool(r["enabled"]),
+            "tips_enabled": bool(r["tips_enabled"]),
+            # Per-emoji prices; the emoji set doubles as the price ladder.
+            "rungs": rungs.get(int(r["channel_id"]), {}),
+        }
+        for r in list_auto_react_rules_for_guild_with_conn(conn, guild_id)
+    ]
+
+
+def _pen_pals_section(conn, guild_id: int) -> dict:
+    cfg = _pp_get_config(conn, guild_id)
+    pool_size = len(_pp_get_pool(conn, guild_id))
+    # Snowflake ids cross to the browser as strings so JS float math can't
+    # round them into non-existent members.
+    separations = [
+        {"user_a": str(a), "user_b": str(b)}
+        for a, b in _pp_get_admin_separations(conn, guild_id)
+    ]
+    if cfg is None:
+        return {
+            "enabled": False,
+            "category_id": None,
+            "opt_in_role_id": None,
+            "question_category": "sfw",
+            "log_channel_id": None,
+            "panel_channel_id": None,
+            "room_visibility": _PP_DEFAULT_ROOM_VISIBILITY,
+            "intro_message": "",
+            "match_mode": _PP_DEFAULT_MATCH_MODE,
+            "auto_round_dow": _PP_DEFAULT_ROUND_DOW,
+            "auto_round_hour": _PP_DEFAULT_ROUND_HOUR,
+            "pool_size": pool_size,
+            "session_seconds": 86400,
+            "match_cooldown_seconds": 2592000,
+            "max_question_swaps": 3,
+            "warn_seconds": 3600,
+            "question_suppress_seconds": 7200,
+            "reply_reminder_seconds": 0,
+            "separations": separations,
+        }
+    return {
+        "enabled": bool(cfg["enabled"]),
+        "category_id": str(cfg["category_id"]) if cfg["category_id"] else None,
+        "opt_in_role_id": str(cfg["opt_in_role_id"]) if cfg["opt_in_role_id"] else None,
+        "question_category": cfg["question_category"] or "sfw",
+        "log_channel_id": str(cfg["log_channel_id"]) if cfg["log_channel_id"] else None,
+        "panel_channel_id": str(cfg["panel_channel_id"]) if cfg["panel_channel_id"] else None,
+        "room_visibility": _pp_normalize_room_visibility(
+            cfg["room_visibility"] if "room_visibility" in cfg.keys() else None
+        ),
+        "intro_message": cfg["intro_message"] if "intro_message" in cfg.keys() else "",
+        "match_mode": _pp_normalize_match_mode(
+            cfg["match_mode"] if "match_mode" in cfg.keys() else None
+        ),
+        # The scheduled round's day (-1 = every day) and hour, in guild-local
+        # time — dead columns until 2026-08-29, now the dial the round reads.
+        "auto_round_dow": _pp_round_dow(cfg),
+        "auto_round_hour": _pp_round_hour(cfg),
+        "pool_size": pool_size,
+        "session_seconds": int(cfg["session_seconds"]),
+        "match_cooldown_seconds": int(cfg["match_cooldown_seconds"]),
+        "max_question_swaps": int(cfg["max_question_swaps"]),
+        "warn_seconds": int(cfg["warn_seconds"]),
+        "question_suppress_seconds": int(cfg["question_suppress_seconds"]),
+        "reply_reminder_seconds": int(cfg["reply_reminder_seconds"]),
+        "separations": separations,
+    }
+
+
+def _vt_models_status() -> list[dict]:
+    return [{"name": m, "cached": _vt_model_is_cached(m)} for m in _VT_VALID_MODELS]
+
+
+def _voice_transcription_section(conn, guild_id: int) -> dict:
+    cfg = _vt_get_config(conn, guild_id)
+    if cfg is None:
+        return {
+            "enabled": False,
+            "model_name": _VT_DEFAULT_MODEL,
+            "channel_ids": [],
+            "delete_after_transcribe": False,
+            "available": _vt_is_available(),
+            "models": _vt_models_status(),
+        }
+    return {
+        "enabled": cfg.enabled,
+        "model_name": cfg.model_name,
+        "channel_ids": [str(c) for c in cfg.channel_ids],
+        "delete_after_transcribe": cfg.delete_after_transcribe,
+        "available": _vt_is_available(),
+        "models": _vt_models_status(),
+    }
+
+
+def _bump_tracker_section(conn, guild_id: int) -> dict:
+    cfg = _bump_get_config(conn, guild_id)
+    site_rows = _bump_list_sites(conn, guild_id)
+    logs = _bump_get_all_logs(conn, guild_id)
+    now = time.time()
+
+    detector_by_name = {
+        r["site_name"]: {
+            "detector_bot_id": str(r["detector_bot_id"]) if r["detector_bot_id"] else None,
+            "detector_pattern": r["detector_pattern"] or "",
+            "failure_pattern": r["failure_pattern"] or "",
+        }
+        for r in site_rows
+    }
+
+    sites = []
+    for r in logs:
+        bumped_at = r["bumped_at"]
+        cooldown = r["cooldown_seconds"]
+        if bumped_at is None:
+            ready = True
+            seconds_remaining = 0
+        else:
+            elapsed = now - bumped_at
+            ready = elapsed >= cooldown
+            seconds_remaining = max(0, int(cooldown - elapsed))
+        det = detector_by_name.get(r["site_name"], {})
+        sites.append({
+            "site_name": r["site_name"],
+            "cooldown_seconds": cooldown,
+            "bumped_at": bumped_at,
+            "ready": ready,
+            "seconds_remaining": seconds_remaining,
+            "notified": bool(r["notified"]) if r["notified"] is not None else False,
+            "detector_bot_id": det.get("detector_bot_id"),
+            "detector_pattern": det.get("detector_pattern", ""),
+            "failure_pattern": det.get("failure_pattern", ""),
+        })
+    if cfg is None:
+        return {"configured": False, "enabled": False, "channel_id": None, "role_id": None, "sites": sites}
+    return {
+        "configured": True,
+        "enabled": bool(cfg["enabled"]),
+        "channel_id": str(cfg["channel_id"]) if cfg["channel_id"] else None,
+        "role_id": str(cfg["role_id"]) if cfg["role_id"] else None,
+        "sites": sites,
+    }
+
+
+# ── Confessions config helper ─────────────────────────────────────────
+
+
+def _confessions_section(guild_id: int, bot, conn) -> dict:
+    cfg = _confessions_get_config_conn(conn, guild_id)
+    if cfg is None:
+        return {"configured": False}
+    guild = bot.get_guild(guild_id) if bot is not None else None
+
+    return {
+        "configured": True,
+        "dest_channel_id": str(cfg.dest_channel_id),
+        "log_channel_id": str(cfg.log_channel_id),
+        "cooldown_seconds": cfg.cooldown_seconds,
+        "max_chars": cfg.max_chars,
+        "panic": cfg.panic,
+        "replies_enabled": cfg.replies_enabled,
+        "notify_op_on_reply": cfg.notify_op_on_reply,
+        "notify_op_on_typed_reply": cfg.notify_op_on_typed_reply,
+        "per_day_limit": cfg.per_day_limit,
+        "require_approval": cfg.require_approval,
+        "launcher_channel_id": str(cfg.launcher_channel_id),
+        "launcher_message_id": str(cfg.launcher_message_id),
+        "blocked_users": [
+            {"id": str(uid), "name": _lookup_member_name(uid, guild, conn, guild_id)}
+            for uid in sorted(cfg.blocked_set())
+        ],
+    }
+
+
+# ── GET: full config snapshot ──────────────────────────────────────────
+
+
+def _global_section(conn, guild_id: int) -> dict:
+    return {
+            "guild_id": _int_val(conn, "guild_id", guild_id=guild_id),
+            "tz_offset_hours": _float_val(
+                conn, "tz_offset_hours", guild_id=guild_id
+            ),
+            "mod_channel_id": _id_str(conn, "mod_channel_id", guild_id),
+            "bypass_role_ids": _id_str_list(conn, "bypass_role_ids", guild_id),
+            "recorded_bot_user_ids": _id_str_list(conn, "recorded_bot_user_ids", guild_id),
+            "booster_swatch_dir": _str_val(
+                conn, "booster_swatch_dir", guild_id=guild_id
+            ),
+        }
+
+
+def _privacy_section(conn, guild_id: int, is_primary: bool = True) -> dict:
+    from bot_modules.privacy import guild_purge_service, retention_service
+
+    purge_days = guild_purge_service.purge_delay_days(conn)
+    return {
+            # Shown everywhere but editable only from the primary guild, which
+            # is where the write refuses from too. A second guild's admin who
+            # cannot see the value would have no way to tell that the erasure
+            # applying to their own server is armed.
+            "guild_removal_purge_editable": is_primary,
+            # Instance-wide, not per-guild: it governs what happens to a
+            # guild's data *after* the bot is gone from it, and the guild's own
+            # config rows are part of what gets deleted. Empty string means
+            # unset, which means nothing is ever purged.
+            "guild_removal_purge_days": (
+                "" if purge_days is None else str(purge_days)
+            ),
+            # Absent means off.
+            "behavioural_retention_enabled": (
+                "1"
+                if retention_service.behavioural_retention_enabled(conn, guild_id)
+                else "0"
+            ),
+            "behavioural_retention_days": str(
+                retention_service.BEHAVIOURAL_RETENTION_DAYS
+            ),
+        }
+
+
+def _welcome_section(conn, guild_id: int) -> dict:
+    from bot_modules.onboarding.welcome.service import (
+        DEFAULT_ARRIVAL_MESSAGE,
+        DEFAULT_LEAVE_MESSAGE,
+        DEFAULT_WELCOME_MESSAGE,
+    )
+
+    return {
+            "welcome_channel_id": _id_str(conn, "welcome_channel_id", guild_id),
+            "welcome_message": _str_val(
+                conn,
+                "welcome_message",
+                DEFAULT_WELCOME_MESSAGE,
+                guild_id=guild_id,
+            ),
+            "welcome_ping_role_id": _id_str(conn, "welcome_ping_role_id", guild_id),
+            "welcome_ping_member": _bool_val(
+                conn, "welcome_ping_member", guild_id=guild_id
+            ),
+            "welcome_trigger": _str_val(
+                conn, "welcome_trigger", "join", guild_id=guild_id
+            ),
+            "unverified_role_id": _id_str(conn, "unverified_role_id", guild_id),
+            "leave_channel_id": _id_str(conn, "leave_channel_id", guild_id),
+            "leave_message": _str_val(
+                conn,
+                "leave_message",
+                DEFAULT_LEAVE_MESSAGE,
+                guild_id=guild_id,
+            ),
+            "greeter_role_id": _id_str(conn, "greeter_role_id", guild_id),
+            "greeter_chat_channel_id": _id_str(conn, "greeter_chat_channel_id", guild_id),
+            "greeter_arrival_message": _str_val(
+                conn,
+                "greeter_arrival_message",
+                DEFAULT_ARRIVAL_MESSAGE,
+                guild_id=guild_id,
+            ),
+            "server_guide_channel_id": _id_str(conn, "server_guide_channel_id", guild_id),
+            "join_leave_log_channel_id": _id_str(
+                conn,
+                "join_leave_log_channel_id",
+                guild_id,
+                default=_int_val(conn, "leave_channel_id", guild_id=guild_id),
+            ),
+        }
+
+
+def _intake_steps_out(steps) -> list[dict]:
+    return [
+        {
+            "key": s.key,
+            "label": s.label,
+            "auto": s.auto_kind,
+            "role_id": str(s.auto_role_id),
+            "code": s.code,
+        }
+        for s in steps
+    ]
+
+
+def _intake_section(conn, guild_id: int) -> dict:
+    return {
+            "enabled": _bool_val(conn, "intake_enabled", guild_id=guild_id),
+            "channel_id": _id_str(conn, "intake_channel_id", guild_id),
+            "completion_code": _str_val(
+                conn, "intake_completion_code", guild_id=guild_id
+            ),
+            "verified_role_id": str(
+                intake_svc.verified_role_id(conn, guild_id)
+            ),
+            # Derived, read-only: where a greeting counts (greeter
+            # chat, else the welcome channel) so the panel can name it
+            # instead of implying the card channel is watched.
+            "greet_channel_id": str(
+                intake_svc.greet_channel_id(conn, guild_id)
+            ),
+            "stale_hours": intake_svc.stale_hours(conn, guild_id),
+            # Effective step list (config, or defaults when unset) —
+            # what a card created right now would snapshot.
+            "steps": _intake_steps_out(intake_svc.step_config(conn, guild_id)),
+            "stage2_enabled": _bool_val(
+                conn, intake_svc.STAGE2_ENABLED_KEY, guild_id=guild_id
+            ),
+            "stage2_optin_role_id": _id_str(
+                conn, intake_svc.STAGE2_OPTIN_ROLE_KEY, guild_id
+            ),
+            "stage2_steps": _intake_steps_out(
+                intake_svc.step_config(conn, guild_id, intake_svc.STAGE_LEVEL5)
+            ),
+            "reference_channel_id": str(
+                intake_ref.reference_channel_id(conn, guild_id)
+            ),
+            "reference_blocks": [
+                {"kind": b.kind, "title": b.title, "body": b.body}
+                for b in intake_ref.blocks_config(conn, guild_id)
+            ],
+        }
+
+
+def _xp_section(conn, guild_id: int) -> dict:
+    return {
+            "level_5_role_id": _id_str(conn, "xp_level_5_role_id", guild_id),
+            "promotion_review_grant_role_id": _id_str(conn, "promotion_review_grant_role_id", guild_id),
+            "promotion_review_ping_role_id": _id_str(conn, "promotion_review_ping_role_id", guild_id),
+            "level_5_log_channel_id": _id_str(conn, "xp_level_5_log_channel_id", guild_id),
+            "level_up_log_channel_id": _id_str(conn, "xp_level_up_log_channel_id", guild_id),
+            "xp_grant_allowed_user_ids": _id_str_list(conn, "xp_grant_allowed_user_ids", guild_id),
+            "xp_excluded_channel_ids": _id_str_list(conn, "xp_excluded_channel_ids", guild_id),
+            # Algorithm coefficients (loaded with defaults)
+            **_xp_coefficients(conn, guild_id),
+        }
+
+
+def _prune_section(conn, guild_id: int, guild) -> dict:
+    prune_rule = _get_prune_rule_with_conn(conn, guild_id)
+    exempt_users = [
+        {"id": str(uid), "name": _lookup_member_name(uid, guild, conn, guild_id)}
+        for uid in sorted(get_prune_exception_ids_with_conn(conn, guild_id))
+    ]
+
+    return {
+            "role_id": str(prune_rule["role_id"]) if prune_rule else "0",
+            "inactivity_days": prune_rule["inactivity_days"]
+            if prune_rule
+            else 0,
+            "exemptions": exempt_users,
+        }
+
+
+def _moderation_section(conn, guild_id: int) -> dict:
+    return {
+            "jailed_role_id": _id_str(conn, "jailed_role_id", guild_id),
+            "jail_category_id": _id_str(conn, "jail_category_id", guild_id),
+            "ticket_category_id": _id_str(conn, "ticket_category_id", guild_id),
+            "log_channel_id": _id_str(conn, "log_channel_id", guild_id),
+            "transcript_channel_id": _id_str(conn, "transcript_channel_id", guild_id),
+            "mod_role_ids": _str_val(
+                conn, "mod_role_ids", guild_id=guild_id
+            ),
+            "admin_role_ids": _str_val(
+                conn, "admin_role_ids", guild_id=guild_id
+            ),
+            "ticket_notify_on_create": _str_val(
+                conn,
+                "ticket_notify_on_create",
+                "1",
+                guild_id=guild_id,
+            ),
+            "warning_threshold": _int_val(
+                conn, "warning_threshold", 3, guild_id=guild_id
+            ),
+            # Staff job pings (docs/specs/staff_pings_spec.md): one channel, and the
+            # role each job mentions. Moderators opt in on the Mod Settings panel.
+            "staff_ping_channel_id": _id_str(conn, staff_ping_service.CHANNEL_KEY, guild_id),
+            # "" = off: the QOTD ping isn't offered until a deadline is set.
+            "staff_ping_qotd_deadline_hour": (
+                "" if (h := staff_ping_service.qotd_deadline_hour(conn, guild_id)) is None
+                else str(h)
+            ),
+            "staff_pings": [
+                {
+                    "key": entry.key,
+                    "label": entry.spec.name,
+                    "emoji": entry.emoji,
+                    "blurb": entry.blurb,
+                    "role_id": _id_str(conn, entry.key, guild_id),
+                }
+                for entry in staff_ping_service.CHANNEL_PINGS
+            ],
+        }
+
+
+def _roles_section(conn, guild_id: int) -> dict:
+    grant_roles = get_grant_roles(conn, guild_id)
+
+    return {
+            name: {
+                "label": cfg["label"],
+                "role_id": str(cfg["role_id"]),
+                "log_channel_id": str(cfg["log_channel_id"]),
+                "announce_channel_id": str(cfg["announce_channel_id"]),
+                "grant_message": cfg["grant_message"],
+                "required_role_id": str(cfg["required_role_id"]),
+                "permissions": [
+                    {"entity_type": et, "entity_id": str(eid)}
+                    for et, eid in get_grant_permissions(
+                        conn, guild_id, name
+                    )
+                ],
+            }
+            for name, cfg in grant_roles.items()
+        }
+
+
+def _auto_delete_section(conn, guild_id: int) -> list:
+    return [
+        {
+            "channel_id": str(r["channel_id"]),
+            "max_age_seconds": int(r["max_age_seconds"]),
+            "interval_seconds": int(r["interval_seconds"]),
+            "last_run_ts": float(r["last_run_ts"]),
+            "media_only": bool(r["media_only"]),
+            "max_age_display": _fmt_dur(int(r["max_age_seconds"])),
+            "interval_display": _fmt_dur(int(r["interval_seconds"])),
+        }
+        for r in list_auto_delete_rules_for_guild_with_conn(conn, guild_id)
+    ]
+
+
+@router.get("/config")
+async def get_config(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            # Only what more than one section below needs; everything else
+            # each section reads for itself.
+            bot = getattr(ctx, "bot", None)
+            prune_guild = bot.get_guild(guild_id) if bot is not None else None
+
+            return {
+                "global": _global_section(conn, guild_id),
+                "privacy": _privacy_section(
+                    conn, guild_id, int(guild_id) == int(ctx.guild_id)
+                ),
+                "welcome": _welcome_section(conn, guild_id),
+                "intake": _intake_section(conn, guild_id),
+                "xp": _xp_section(conn, guild_id),
+                "prune": _prune_section(conn, guild_id, prune_guild),
+                # So the auto-react panel's own guard reads the same number the
+                # tip service enforces.
+                "reaction_tips": {"min_rung": min_rung_amount()},
+                # Read strictly, like the cog's GuildConfig: an unconfigured
+                # guild guards nothing rather than inheriting home's list.
+                "gif_guard": {
+                    "channel_ids": _id_str_list(
+                        conn,
+                        "gif_guard_channel_ids",
+                        guild_id,
+                        allow_legacy_fallback=False,
+                    ),
+                },
+                # Read strictly: the cog does too, so a guild that never saved
+                # these sees the same defaults on the panel and in Discord
+                # instead of the home guild's rows.
+                "word_cloud": {
+                    "message_cap": _int_val(
+                        conn,
+                        word_cloud_logic.CAP_KEY,
+                        word_cloud_logic.DEFAULT_CAP,
+                        guild_id,
+                        allow_legacy_fallback=False,
+                    ),
+                    "default_preset": _str_val(
+                        conn,
+                        word_cloud_logic.PRESET_KEY,
+                        WORD_CLOUD_DEFAULT_PRESET,
+                        guild_id,
+                        allow_legacy_fallback=False,
+                    ),
+                    # The panel renders its own bounds from these rather than
+                    # re-typing the numbers, so the ceiling lives in one place.
+                    "min_cap": word_cloud_logic.MIN_CAP,
+                    "max_cap": word_cloud_logic.MAX_CAP,
+                    "presets": [
+                        {"key": p.key, "label": p.label} for p in WORD_CLOUD_PRESETS
+                    ],
+                },
+                "auto_role": {
+                    "auto_role_ids": _id_str_list(conn, "auto_role_ids", guild_id),
+                },
+                "moderation": _moderation_section(conn, guild_id),
+                "roles": _roles_section(conn, guild_id),
+                "auto_delete": _auto_delete_section(conn, guild_id),
+                "bulk_cleanup": _bulk_cleanup_section(conn, guild_id),
+                "confessions": _confessions_section(guild_id, bot, conn),
+                "dms": _dms_section_with_conn(conn, guild_id),
+                "starboard": _starboard_section(conn, guild_id),
+                "birthday": _birthday_section(conn, guild_id),
+                "bot_identity": _bot_identity_section(prune_guild),
+                "branding": _branding_section(conn, guild_id),
+                "guess": _guess_section(conn, guild_id),
+                "whisper": _whisper_section(conn, guild_id),
+                "needle": _needle_section(conn, guild_id, bot),
+                "event_echo": _event_echo_section(conn, guild_id),
+                "risky": _risky_section(conn, guild_id),
+                "casino": _casino_section(conn, guild_id),
+                "policy": _policy_section(conn, guild_id),
+                "inactive": _inactive_section(conn, guild_id, prune_guild),
+                "games_pressure": _duel_game_section(conn, guild_id, "pressure"),
+                "games_quickdraw": _duel_game_section(conn, guild_id, "quickdraw"),
+                "games_hot_potato": _duel_game_section(conn, guild_id, "hot_potato"),
+                "games_hot_potato_group": _duel_game_section(
+                    conn, guild_id, "hot_potato_group"
+                ),
+                "games_chicken": _duel_game_section(conn, guild_id, "chicken"),
+                "games_musical_chairs": _duel_game_section(
+                    conn, guild_id, "musical_chairs"
+                ),
+                "greeting_watch": _greeting_watch_section(conn, guild_id),
+                "auto_react": _auto_react_section(conn, guild_id),
+                "bump_tracker": _bump_tracker_section(conn, guild_id),
+                "pen_pals": _pen_pals_section(conn, guild_id),
+                "voice_transcription": _voice_transcription_section(conn, guild_id),
+            }
+
+    return await run_query(_q)
+
+
+# ── PUT: update a config section ───────────────────────────────────────
+
+
+class GlobalConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tz_offset_hours: float | None = None
+    mod_channel_id: str | None = None
+    bypass_role_ids: list[str] | None = None
+    recorded_bot_user_ids: list[str] | None = None
+    booster_swatch_dir: str | None = None
+
+
+_GLOBAL_FIELDS = {
+    "tz_offset_hours": ("tz_offset_hours", str),
+    "mod_channel_id": ("mod_channel_id", _raw),
+}
+
+
+@router.put("/config/global")
+async def update_global(
+    request: Request,
+    body: GlobalConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    # booster_swatch_dir is bot-global (stored and read at guild 0), so only
+    # the primary guild's panel may write it — accepting it from any guild let
+    # a secondary guild's admin overwrite the shared value, and showed them
+    # the host filesystem path.
+    if body.booster_swatch_dir is not None and guild_id != ctx.guild_id:
+        raise HTTPException(
+            403, "booster_swatch_dir is bot-global — edit it from the primary guild"
+        )
+
+    def _q():
+        with ctx.open_db() as conn:
+            _apply_config_fields(conn, guild_id, body, _GLOBAL_FIELDS)
+            if body.bypass_role_ids is not None:
+                replace_config_id_bucket(
+                    conn, "bypass_role_ids", body.bypass_role_ids, guild_id
+                )
+            if body.recorded_bot_user_ids is not None:
+                replace_config_id_bucket(
+                    conn, "recorded_bot_user_ids", body.recorded_bot_user_ids, guild_id
+                )
+            if body.booster_swatch_dir is not None:
+                # booster_swatch_dir is a single host filesystem path read
+                # globally (guild_id=0); pin the write there to avoid a
+                # write-to-active / read-from-0 mismatch.
+                set_config_value(conn, "booster_swatch_dir", body.booster_swatch_dir, 0)
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # tz_offset_hours, mod_channel_id, bypass_role_ids, recorded_bot_user_ids are
+    # read per-guild (guild_config snapshot or fresh tz read); refresh the cache.
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+@router.get("/config/support-access")
+async def get_support_access(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            val = get_config_value(conn, "support_access_enabled", "0", guild_id, allow_legacy_fallback=False)
+            return {"enabled": val == "1"}
+
+    return await run_query(_q)
+
+
+class SupportAccessUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+@router.put("/config/support-access")
+async def update_support_access(
+    request: Request,
+    body: SupportAccessUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            set_config_value(conn, "support_access_enabled", "1" if body.enabled else "0", guild_id)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+def _set_guild_removal_purge(ctx, guild_id: int, raw: str) -> None:
+    """Store the instance-wide grace period before a departed guild is erased.
+
+    ``require_perms({"admin"})`` only proves the caller administers whichever
+    guild they currently have selected, and this dial governs every guild the
+    bot is in — so it is restricted to the primary guild the same way the
+    bot-global AI prompts are. Without that, a second guild's admin could arm
+    the erasure of a server they have nothing to do with.
+
+    An empty value clears the row rather than storing ``""``: absence is what
+    the service reads as "off", and a blank string sitting in ``config`` looks
+    like a setting someone chose.
+    """
+    from bot_modules.privacy import guild_purge_service
+
+    if int(guild_id) != int(ctx.guild_id):
+        raise HTTPException(
+            403,
+            "Server-removal erasure is bot-wide — set it from the primary guild",
+        )
+
+    value = raw.strip()
+    key = guild_purge_service.PURGE_DELAY_CONFIG_KEY
+    with ctx.open_db() as conn:
+        if not value:
+            conn.execute(
+                "DELETE FROM config WHERE guild_id = ? AND key = ?",
+                (guild_purge_service.GLOBAL_GUILD_ID, key),
+            )
+            return
+        try:
+            days = int(value)
+        except ValueError:
+            raise HTTPException(400, "Erasure delay must be a whole number of days") from None
+        if days < 0 or days > 365:
+            raise HTTPException(400, "Erasure delay must be between 0 and 365 days")
+        set_config_value(conn, key, str(days), guild_purge_service.GLOBAL_GUILD_ID)
+
+
+class PrivacyConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    behavioural_retention_enabled: str | None = None
+    guild_removal_purge_days: str | None = None
+
+
+@router.put("/config/privacy")
+async def update_privacy(
+    request: Request,
+    body: PrivacyConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Set the behavioural retention switch and the server-removal purge delay.
+
+    The message-text storage level and its redaction switch lived here until
+    2026-09-13, when the bot stopped storing message text.
+    """
+    from bot_modules.privacy import retention_service
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    purge_days = body.guild_removal_purge_days
+    if purge_days is not None:
+        await run_query(
+            lambda: _set_guild_removal_purge(ctx, guild_id, purge_days)
+        )
+
+    switches = (
+        (body.behavioural_retention_enabled,
+         retention_service.BEHAVIOURAL_RETENTION_CONFIG_KEY),
+    )
+    if any(value is not None for value, _ in switches):
+        # Written whichever way it goes, so switching back off leaves an
+        # explicit "0" rather than relying on the row's absence and looking
+        # like it was never set.
+        def _set_retention():
+            with ctx.open_db() as conn:
+                for value, key in switches:
+                    if value is None:
+                        continue
+                    set_config_value(
+                        conn, key, "1" if value.strip() == "1" else "0", guild_id
+                    )
+
+        await run_query(_set_retention)
+
+    return {"ok": True}
+
+
+class WelcomeConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    welcome_channel_id: str | None = None
+    welcome_message: str | None = None
+    welcome_ping_role_id: str | None = None
+    welcome_ping_member: bool | None = None
+    welcome_trigger: str | None = None
+    unverified_role_id: str | None = None
+    leave_channel_id: str | None = None
+    leave_message: str | None = None
+    greeter_role_id: str | None = None
+    greeter_chat_channel_id: str | None = None
+    greeter_arrival_message: str | None = None
+    server_guide_channel_id: str | None = None
+    join_leave_log_channel_id: str | None = None
+
+
+@router.put("/config/welcome")
+async def update_welcome(
+    request: Request,
+    body: WelcomeConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    _FIELDS = {
+        "welcome_channel_id": "welcome_channel_id",
+        "welcome_message": "welcome_message",
+        "welcome_ping_role_id": "welcome_ping_role_id",
+        "welcome_trigger": "welcome_trigger",
+        "unverified_role_id": "unverified_role_id",
+        "leave_channel_id": "leave_channel_id",
+        "leave_message": "leave_message",
+        "greeter_role_id": "greeter_role_id",
+        "greeter_chat_channel_id": "greeter_chat_channel_id",
+        # Stored verbatim, blank included: an empty line is the "post nothing"
+        # setting, so it must not be coerced back to the default.
+        "greeter_arrival_message": "greeter_arrival_message",
+        "server_guide_channel_id": "server_guide_channel_id",
+        "join_leave_log_channel_id": "join_leave_log_channel_id",
+    }
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.welcome_ping_member is not None:
+                set_config_value(
+                    conn,
+                    "welcome_ping_member",
+                    "1" if body.welcome_ping_member else "0",
+                    guild_id,
+                )
+            for field_name, config_key in _FIELDS.items():
+                val = getattr(body, field_name)
+                if val is not None:
+                    set_config_value(conn, config_key, val, guild_id)
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # Welcome/leave handlers read these via ctx.guild_config(guild_id); drop the
+    # cached snapshot so the next event reloads the edited values.
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+class IntakeStepIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = ""
+    label: str
+    auto: str = ""
+    role_id: str = "0"
+    code: str = ""
+
+
+class IntakeConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    channel_id: str | None = None
+    verified_role_id: str | None = None
+    completion_code: str | None = None
+    stale_hours: float | None = Field(default=None, ge=1, le=720)
+    steps: list[IntakeStepIn] | None = None
+    stage2_enabled: bool | None = None
+    stage2_optin_role_id: str | None = None
+    stage2_steps: list[IntakeStepIn] | None = None
+
+
+def _canonical_intake_steps(steps: list[IntakeStepIn]) -> str:
+    """Validate the dashboard's step list and serialize it for storage.
+
+    Strict where parse_steps is tolerant: the editor should hear about a bad
+    row instead of silently losing it at snapshot time. Keys are kept when
+    provided (stable across re-saves) and slugged from the label for new
+    rows, deduped with a numeric suffix.
+    """
+    if not steps:
+        raise HTTPException(422, "The step list can't be empty.")
+    if len(steps) > 20:
+        raise HTTPException(422, "At most 20 steps.")
+    out = []
+    seen: set[str] = set()
+    for s in steps:
+        label = s.label.strip()
+        if not label:
+            raise HTTPException(422, "Every step needs a label.")
+        auto = s.auto.strip()
+        if auto not in intake_svc.AUTO_KINDS:
+            raise HTTPException(422, f"Step '{label}': unknown auto kind '{auto}'.")
+        try:
+            role_id = int(s.role_id or "0")
+        except ValueError:
+            raise HTTPException(422, f"Step '{label}': invalid role id.")
+        if auto == intake_svc.AUTO_ROLE_GAINED and role_id <= 0:
+            raise HTTPException(
+                422, f"Step '{label}': a role-gained step needs a role."
+            )
+        if auto == intake_svc.AUTO_GRANT and role_id <= 0:
+            raise HTTPException(
+                422, f"Step '{label}': a grant step needs a role to grant."
+            )
+        # Keys end up inside persistent-button custom_ids and must fullmatch
+        # the dispatch template [\w-]{1,64} — normalize charset and cap at 60
+        # so the dedupe suffix below can never push past 64.
+        key = re.sub(r"[^\w-]+", "_", s.key.strip() or label.lower())
+        key = key.strip("_")[:60].rstrip("_")
+        if not key:
+            key = "step"
+        base, n = key, 2
+        while key in seen:
+            key, n = f"{base}_{n}", n + 1
+        code = s.code.strip()
+        if len(code) > 80:
+            raise HTTPException(422, f"Step '{label}': the code is too long.")
+        seen.add(key)
+        out.append(
+            {
+                "key": key,
+                "label": label,
+                "auto": auto,
+                "role_id": role_id,
+                "code": code,
+            }
+        )
+    return json.dumps(out)
+
+
+def _code_clash_message(clash: tuple[tuple[str, str], tuple[str, str]]) -> str:
+    """Both codes are quoted: step labels aren't unique, so naming them alone
+    can read as a step conflicting with itself."""
+    (outer_label, outer_code), (inner_label, inner_code) = clash
+    return (
+        f"Code '{outer_code}' for '{outer_label}' contains '{inner_code}' for "
+        f"'{inner_label}' — posting it would fire both. Make them distinct."
+    )
+
+
+_INTAKE_FIELDS = {
+    "enabled": ("intake_enabled", _flag),
+    "channel_id": ("intake_channel_id", _raw),
+    "verified_role_id": (intake_svc.VERIFIED_ROLE_KEY, _raw),
+    "completion_code": ("intake_completion_code", lambda v: v.strip()),
+    "stale_hours": ("intake_stale_hours", str),
+    "stage2_enabled": (intake_svc.STAGE2_ENABLED_KEY, _flag),
+    "stage2_optin_role_id": (intake_svc.STAGE2_OPTIN_ROLE_KEY, _raw),
+}
+
+
+@router.put("/config/intake")
+async def update_intake(
+    request: Request,
+    body: IntakeConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    steps_json = (
+        _canonical_intake_steps(body.steps) if body.steps is not None else None
+    )
+    stage2_json = (
+        _canonical_intake_steps(body.stage2_steps)
+        if body.stage2_steps is not None
+        else None
+    )
+    # A grant step's button hands its role to members, so it gets the same
+    # save-time refusal as every other config-sourced grant; the press
+    # re-checks for a role that gains permissions later.
+    for raw in (steps_json, stage2_json):
+        for step in json.loads(raw) if raw is not None else ():
+            if step["auto"] == intake_svc.AUTO_GRANT:
+                refuse_ungrantable_role(
+                    ctx, guild_id, step["role_id"], setting=f"Step '{step['label']}'"
+                )
+
+    def _q():
+        with ctx.open_db() as conn:
+            # Codes match by containment, so one sitting inside another fires
+            # both. Checked whenever this request touches EITHER side: the
+            # step codes and the completion code are writable independently,
+            # so guarding only the steps path lets a completion-code-only
+            # save walk a clash in. Whichever side the body doesn't carry is
+            # read from storage. Before any write, so a rejected save leaves
+            # nothing half-stored for the editor to disagree with.
+            if (
+                steps_json is not None
+                or stage2_json is not None
+                or body.completion_code is not None
+            ):
+                clash = intake_svc.config_code_conflict(
+                    conn,
+                    guild_id,
+                    completion=body.completion_code,
+                    steps=(
+                        intake_svc.parse_steps(steps_json)
+                        if steps_json is not None
+                        else None
+                    ),
+                    stage2_steps=(
+                        intake_svc.parse_steps(
+                            stage2_json, intake_svc.DEFAULT_STAGE2_STEPS
+                        )
+                        if stage2_json is not None
+                        else None
+                    ),
+                )
+                if clash is not None:
+                    raise HTTPException(422, _code_clash_message(clash))
+            _apply_config_fields(conn, guild_id, body, _INTAKE_FIELDS)
+            if steps_json is not None:
+                set_config_value(conn, "intake_steps", steps_json, guild_id)
+            if stage2_json is not None:
+                set_config_value(
+                    conn, intake_svc.STAGE2_STEPS_KEY, stage2_json, guild_id
+                )
+        return {"ok": True}
+
+    # Intake reads config straight from the DB on every event, so no guild-
+    # config cache invalidation is needed — the next join sees the new values.
+    return await run_query(_q)
+
+
+class IntakeReferenceBlockIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    title: str = ""
+    body: str = ""
+
+
+class IntakeReferenceUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None
+    blocks: list[IntakeReferenceBlockIn] | None = None
+
+
+@router.put("/config/intake/reference")
+async def update_intake_reference(
+    request: Request,
+    body: IntakeReferenceUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Save the procedure-reference blocks and sync the channel in place."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    blocks_json = None
+    if body.blocks is not None:
+        try:
+            blocks_json = intake_ref.validate_blocks(
+                [b.model_dump() for b in body.blocks]
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.channel_id is not None:
+                set_config_value(
+                    conn, intake_ref.CHANNEL_KEY, body.channel_id, guild_id
+                )
+            if blocks_json is not None:
+                set_config_value(conn, intake_ref.BLOCKS_KEY, blocks_json, guild_id)
+
+    await run_query(_q)
+
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+    if guild is None:
+        return {"ok": True, "sync": {"synced": False, "reason": "bot offline"}}
+    sync = await intake_ref.sync_channel(ctx, guild)
+    return {"ok": True, "sync": sync}
+
+
+@router.post("/config/intake/reference/import")
+async def import_intake_reference(
+    request: Request,
+    body: ChannelIdBody,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """One-time seed: read a channel's existing messages into draft blocks.
+
+    Generic to any guild/channel; refuses to overwrite a non-empty editor.
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+    if guild is None:
+        raise HTTPException(503, "Bot is not connected to this guild.")
+    try:
+        channel_id = int(body.channel_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid channel id.")
+    try:
+        blocks = await intake_ref.import_channel(ctx, guild, channel_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {"ok": True, "blocks": blocks}
+
+
+class WelcomePreviewBody(BaseModel):
+    """Optional on-screen field values to preview instead of the stored config.
+
+    Any field left as None falls back to the saved value, so the endpoint still
+    works with an empty body (previewing the stored config).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    welcome_message: str | None = None
+    leave_message: str | None = None
+    server_guide_channel_id: str | None = None
+
+
+@router.post("/config/welcome/preview")
+async def welcome_preview(
+    request: Request,
+    body: WelcomePreviewBody | None = None,
+    user: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    """Render welcome and leave embeds for the calling admin (used as a sample member).
+
+    POSTed field values (the form's current, possibly-unsaved edits) take
+    precedence over stored config so the preview shows what the user typed.
+    """
+    from bot_modules.onboarding.welcome.service import (
+        DEFAULT_LEAVE_MESSAGE,
+        DEFAULT_WELCOME_MESSAGE,
+        build_leave_embed,
+        build_welcome_embed,
+    )
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot else None
+    if guild is None:
+        raise HTTPException(503, "Guild not available")
+
+    member = guild.get_member(int(user.user_id))
+    if member is None:
+        # Fall back to bot user as a stand-in
+        member = guild.me  # type: ignore[assignment]
+    if member is None:
+        raise HTTPException(503, "No member context available for preview")
+
+    from bot_modules.bios.resurrect import resolve_member_bio_link
+    from bot_modules.bios.trigger import resolve_bio_placeholders
+    from bot_modules.onboarding.welcome.service import server_guide_mention_for
+
+    overrides = body or WelcomePreviewBody()
+
+    def _q():
+        with ctx.open_db() as conn:
+            wm = (
+                overrides.welcome_message
+                if overrides.welcome_message is not None
+                else get_config_value(
+                    conn, "welcome_message", DEFAULT_WELCOME_MESSAGE, guild_id
+                )
+            )
+            lm = (
+                overrides.leave_message
+                if overrides.leave_message is not None
+                else get_config_value(
+                    conn, "leave_message", DEFAULT_LEAVE_MESSAGE, guild_id
+                )
+            )
+            bl, bcm = resolve_bio_placeholders(conn, guild_id)
+            raw_sgcid = (
+                overrides.server_guide_channel_id
+                if overrides.server_guide_channel_id is not None
+                else get_config_value(conn, "server_guide_channel_id", "0", guild_id)
+            )
+            try:
+                sgcid = int(raw_sgcid)
+            except (TypeError, ValueError):
+                sgcid = 0
+            return wm, lm, bl, bcm, sgcid
+
+    welcome_msg, leave_msg, bio_link, bios_channel_mention, server_guide_channel_id = (
+        await run_query(_q)
+    )
+    server_guide_mention = server_guide_mention_for(server_guide_channel_id)
+
+    try:
+        member_bio_link = await resolve_member_bio_link(ctx, member)
+    except Exception:  # noqa: BLE001 — a welcome/leave preview render must never fail the caller; a missing bio link just omits the link
+        member_bio_link = ""
+
+    accent = await safe_resolve_accent(ctx, guild, log_label="config")
+
+    welcome_embed = build_welcome_embed(
+        member,
+        welcome_msg,
+        bio_link=bio_link,
+        bios_channel_mention=bios_channel_mention,
+        member_bio_link=member_bio_link,
+        server_guide_mention=server_guide_mention,
+        color=accent,
+    )
+    leave_embed = build_leave_embed(
+        member,
+        leave_msg,
+        bio_link=bio_link,
+        bios_channel_mention=bios_channel_mention,
+        member_bio_link=member_bio_link,
+        server_guide_mention=server_guide_mention,
+        color=accent,
+    )
+
+    def _to_dict(e) -> dict:
+        return {
+            "title": e.title or "",
+            "description": e.description or "",
+            "color": e.color.value if e.color else None,
+            "thumbnail_url": e.thumbnail.url if e.thumbnail and e.thumbnail.url else None,
+            "footer": e.footer.text if e.footer and e.footer.text else "",
+        }
+
+    return {
+        "welcome": _to_dict(welcome_embed),
+        "leave": _to_dict(leave_embed),
+        "sample_user_name": member.display_name,
+    }
+
+
+class XpConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    level_5_role_id: str | None = None
+    promotion_review_grant_role_id: str | None = None
+    promotion_review_ping_role_id: str | None = None
+    level_5_log_channel_id: str | None = None
+    level_up_log_channel_id: str | None = None
+    xp_grant_allowed_user_ids: list[str] | None = None
+    xp_excluded_channel_ids: list[str] | None = None
+    # Algorithm coefficients
+    message_word_xp: float | None = None
+    reply_bonus_xp: float | None = None
+    image_reaction_received_xp: float | None = None
+    reaction_given_xp: float | None = None
+    cooldown_thresholds_seconds: str | None = None
+    cooldown_multipliers: str | None = None
+    duplicate_multiplier: float | None = None
+    pair_streak_threshold: int | None = None
+    pair_streak_multiplier: float | None = None
+    voice_award_xp: float | None = None
+    # Floor at 1: a 0-second interval divides by zero in
+    # completed_voice_intervals and kills voice XP guild-wide.
+    voice_interval_seconds: int | None = Field(default=None, ge=1)
+    voice_min_humans: int | None = None
+    manual_grant_xp: float | None = None
+    level_curve_factor: float | None = None
+
+
+_XP_ID_FIELDS = {
+    "level_5_role_id": ("xp_level_5_role_id", _raw),
+    "promotion_review_grant_role_id": ("promotion_review_grant_role_id", _raw),
+    "promotion_review_ping_role_id": ("promotion_review_ping_role_id", _raw),
+    "level_5_log_channel_id": ("xp_level_5_log_channel_id", _raw),
+    "level_up_log_channel_id": ("xp_level_up_log_channel_id", _raw),
+}
+
+
+@router.put("/config/xp")
+async def update_xp(
+    request: Request,
+    body: XpConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    # All three are handed out: the Level 5 and Grant roles to members, the
+    # ping role to moderators (the Mod Settings panel).
+    refuse_ungrantable_role(ctx, guild_id, body.level_5_role_id, setting="Level 5 Role")
+    refuse_ungrantable_role(
+        ctx, guild_id, body.promotion_review_ping_role_id, setting="Ping Role"
+    )
+    refuse_ungrantable_role(
+        ctx, guild_id, body.promotion_review_grant_role_id, setting="Grant Role"
+    )
+
+    def _q():
+        with ctx.open_db() as conn:
+            _apply_config_fields(conn, guild_id, body, _XP_ID_FIELDS)
+            if body.xp_grant_allowed_user_ids is not None:
+                replace_config_id_bucket(
+                    conn,
+                    "xp_grant_allowed_user_ids",
+                    body.xp_grant_allowed_user_ids,
+                    guild_id,
+                )
+            if body.xp_excluded_channel_ids is not None:
+                replace_config_id_bucket(
+                    conn,
+                    "xp_excluded_channel_ids",
+                    body.xp_excluded_channel_ids,
+                    guild_id,
+                )
+
+            # Persist algorithm coefficients
+            for field_name in _XP_COEFF_READERS:
+                val = getattr(body, field_name, None)
+                if val is not None:
+                    set_config_value(
+                        conn,
+                        f"{_XP_COEFF_PREFIX}{field_name}",
+                        str(val),
+                        guild_id,
+                    )
+
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # XP config is read per-guild via ctx.guild_config(gid); drop the snapshot so
+    # the next message/voice tick reloads the edited values.
+    ctx.invalidate_guild_config(guild_id)
+    # The promotion-reviews channel decides whether the Mod Settings panel
+    # offers Promotion Reviewers.
+    if body.level_5_log_channel_id is not None:
+        staff_ping_service.announce_change(ctx.bot, guild_id)
+    return result
+
+
+class PruneConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role_id: str | None = None
+    inactivity_days: int | None = None
+
+
+@router.put("/config/prune")
+async def update_prune(
+    request: Request,
+    body: PruneConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        from bot_modules.inactive.prune_service import (
+            remove_prune_rule,
+            upsert_prune_rule,
+        )
+
+        if (
+            body.role_id
+            and body.inactivity_days
+            and body.inactivity_days > 0
+            and body.role_id != "0"
+        ):
+            upsert_prune_rule(
+                ctx.db_path, guild_id, int(body.role_id), body.inactivity_days
+            )
+        elif body.role_id == "0" or (
+            body.inactivity_days is not None and body.inactivity_days <= 0
+        ):
+            remove_prune_rule(ctx.db_path, guild_id)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/prune/exemptions/{user_id}")
+async def add_prune_exemption(
+    user_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        add_prune_exception(ctx.db_path, guild_id, int(user_id))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/prune/exemptions/{user_id}")
+async def delete_prune_exemption(
+    user_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        remove_prune_exception(ctx.db_path, guild_id, int(user_id))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+class PrunePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role_id: str
+    inactivity_days: int
+    exempt_user_ids: list[str] | None = None
+
+
+@router.post("/config/prune/preview")
+async def preview_prune(
+    request: Request,
+    body: PrunePreviewRequest,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Return the members who would be pruned with the given settings.
+
+    Does not perform any role changes. Uses saved exemptions unless
+    ``exempt_user_ids`` is provided (allows preview of unsaved changes).
+    """
+    from bot_modules.core.xp_system import get_member_last_activity_map
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if not body.role_id or body.role_id == "0" or body.inactivity_days <= 0:
+        return {"role_name": None, "candidates": []}
+
+    role_id = int(body.role_id)
+    inactivity_days = int(body.inactivity_days)
+
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+    if guild is None:
+        raise HTTPException(503, "Discord guild not available")
+
+    role = guild.get_role(role_id)
+    if role is None:
+        raise HTTPException(404, "Role not found")
+
+    if body.exempt_user_ids is None:
+        exempt_ids = get_prune_exception_ids(ctx.db_path, guild_id)
+    else:
+        exempt_ids = {int(u) for u in body.exempt_user_ids}
+
+    candidates = [m for m in role.members if not m.bot and m.id not in exempt_ids]
+    candidate_ids = [m.id for m in candidates]
+
+    def _q():
+        with ctx.open_db() as conn:
+            return (
+                get_member_last_activity_map(conn, guild_id, candidate_ids),
+                get_member_last_voice_map(conn, guild_id, candidate_ids),
+            )
+
+    activity_map, voice_last = await run_query(_q)
+
+    now_ts = time.time()
+    # Same evidence as the daily run (run_prune_for_guild): the later of the
+    # last message and the last voice time, so the dry run never lists a member
+    # the real run would keep.
+    activity_map = merge_voice_activity(
+        activity_map, voice_last, members_in_voice(candidates), now_ts
+    )
+    cutoff_ts = now_ts - inactivity_days * 86400
+
+    to_prune: list[dict] = []
+    for member in candidates:
+        activity = activity_map.get(member.id)
+        if activity is None:
+            continue
+        if activity.created_at < cutoff_ts:
+            days = (now_ts - activity.created_at) / 86400.0
+            to_prune.append(
+                {
+                    "id": str(member.id),
+                    "name": member.display_name,
+                    "last_activity_ts": activity.created_at,
+                    "days_inactive": round(days, 1),
+                }
+            )
+
+    to_prune.sort(key=lambda x: x["last_activity_ts"])
+
+    return {
+        "role_name": role.name,
+        "role_member_count": len(role.members),
+        "considered_count": len(candidates),
+        "candidates": to_prune,
+    }
+
+
+class ModerationConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    jailed_role_id: str | None = None
+    jail_category_id: str | None = None
+    ticket_category_id: str | None = None
+    log_channel_id: str | None = None
+    transcript_channel_id: str | None = None
+    mod_role_ids: str | None = None
+    admin_role_ids: str | None = None
+    ticket_notify_on_create: str | None = None
+    warning_threshold: int | None = None
+    staff_ping_channel_id: str | None = None
+    #: Registry key -> role id, for the staff pings the panel changed. Sent
+    #: only on a real change: a whole-form "0" would read as "(none)" and
+    #: take the ping off the Mod Settings panel.
+    staff_ping_roles: dict[str, str] | None = None
+    #: Guild-local hour 0-23, or "" to switch the QOTD ping off.
+    staff_ping_qotd_deadline_hour: str | None = None
+
+
+@router.put("/config/moderation")
+async def update_moderation(
+    request: Request,
+    body: ModerationConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    _FIELDS = {
+        "jailed_role_id": "jailed_role_id",
+        "jail_category_id": "jail_category_id",
+        "ticket_category_id": "ticket_category_id",
+        "log_channel_id": "log_channel_id",
+        "transcript_channel_id": "transcript_channel_id",
+        "mod_role_ids": "mod_role_ids",
+        "admin_role_ids": "admin_role_ids",
+        "ticket_notify_on_create": "ticket_notify_on_create",
+        "staff_ping_channel_id": staff_ping_service.CHANNEL_KEY,
+    }
+
+    staff_roles = body.staff_ping_roles or {}
+    allowed = {entry.key: entry for entry in staff_ping_service.CHANNEL_PINGS}
+    for key, role_id in staff_roles.items():
+        entry = allowed.get(key)
+        if entry is None:
+            raise HTTPException(400, f"Not a staff ping: {key}")
+        if not (str(role_id).isascii() and str(role_id).isdigit()):
+            raise HTTPException(400, f"{entry.spec.name}: malformed role id.")
+        # The Mod Settings panel hands this role to moderators.
+        refuse_ungrantable_role(ctx, guild_id, role_id, setting=entry.spec.name)
+    deadline = body.staff_ping_qotd_deadline_hour
+    if deadline is not None:
+        deadline = deadline.strip()
+        if deadline and staff_ping_service.parse_deadline_hour(deadline) is None:
+            raise HTTPException(400, "QOTD deadline must be an hour from 0 to 23, or blank.")
+
+    def _q():
+        with ctx.open_db() as conn:
+            for key, role_id in staff_roles.items():
+                set_config_value(conn, key, str(int(role_id)), guild_id)
+            if deadline is not None:
+                set_config_value(
+                    conn, staff_ping_service.QOTD_DEADLINE_KEY,
+                    str(int(deadline)) if deadline else "", guild_id,
+                )
+            for field_name, config_key in _FIELDS.items():
+                val = getattr(body, field_name)
+                if val is not None:
+                    set_config_value(conn, config_key, val, guild_id)
+            if body.warning_threshold is not None:
+                set_config_value(
+                    conn,
+                    "warning_threshold",
+                    str(body.warning_threshold),
+                    guild_id,
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # Permission checks read mod/admin roles via ctx.guild_config(guild_id); drop
+    # the cached snapshot so the next check reloads the edited roles.
+    ctx.invalidate_guild_config(guild_id)
+    # The posted Mod Settings panel lists the staff jobs that are set up;
+    # redraw it in place so this save shows without a restart.
+    if (
+        staff_roles
+        or deadline is not None
+        or body.staff_ping_channel_id is not None
+        or body.ticket_notify_on_create is not None
+    ):
+        staff_ping_service.announce_change(ctx.bot, guild_id)
+    return result
+
+
+class InactiveConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    threshold_days: int | None = Field(default=None, ge=1, le=3650)
+    auto_sweep: bool | None = None
+    sweep_cap: int | None = Field(default=None, ge=1, le=200)
+
+
+# Bounds live on ``InactiveConfigUpdate``/``InactivePreviewRequest``, so these
+# only have to stringify. Both models carry the same numbers because the
+# preview and the save are the same two dials read twice.
+_INACTIVE_FIELDS = {
+    "threshold_days": ("inactive_threshold_days", str),
+    "auto_sweep": ("inactive_auto_sweep", _flag),
+    "sweep_cap": ("inactive_sweep_cap", str),
+}
+
+
+@router.put("/config/inactive")
+async def update_inactive(
+    request: Request,
+    body: InactiveConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Set the inactive-sweep threshold/cap and toggle the 6-hourly auto sweep.
+
+    Ranges mirror the retired ``/inactive config`` command:
+    threshold_days 1-3650, sweep_cap 1-200.
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            _apply_config_fields(conn, guild_id, body, _INACTIVE_FIELDS)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/inactive/exemptions/{user_id}")
+async def add_inactive_exemption(
+    user_id: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Exempt a member from inactivity holds — both sweeps and `/inactive mark`."""
+    from bot_modules.inactive.store import add_sweep_exemption
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    added_by = user.user_id
+
+    def _q():
+        with ctx.open_db() as conn:
+            add_sweep_exemption(
+                conn, guild_id=guild_id, user_id=int(user_id), added_by=added_by
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/inactive/exemptions/{user_id}")
+async def delete_inactive_exemption(
+    user_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    from bot_modules.inactive.store import remove_sweep_exemption
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            remove_sweep_exemption(conn, guild_id, int(user_id))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.post("/config/inactive/channel")
+async def setup_inactive_channel_route(
+    request: Request,
+    body: ChannelIdBody,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Point the inactive system at a channel and publish its info panel.
+
+    Replaced ``/inactive panel`` (2026-07-28) — which this page used to tell
+    admins to go and run, the one place the dashboard depended on a Discord
+    command. More than a config write: it also creates the ``@Inactive`` role if
+    needed, grants it access here, and revokes it from the previous channel so
+    that one doesn't stay visible to inactive members forever.
+    """
+
+    from bot_modules.inactive.sweep_service import setup_inactive_channel
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    guild = guild_or_503(ctx, guild_id)
+    channel = text_channel_or_400(guild, body.channel_id)
+
+    ok, note = await setup_inactive_channel(ctx, guild, channel)
+    if not ok:
+        raise HTTPException(400, note)
+    return {"ok": True, "note": note}
+
+
+@router.post("/config/inactive/sweep")
+async def run_inactive_sweep_route(
+    request: Request,
+    user: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Actually move the members the preview lists.
+
+    Replaced ``/inactive sweep apply:true`` (2026-07-28). The dry run already
+    lived here; only the "and do it" half was still a command. Both run through
+    the same ``compute_candidates``, so this can't move a different set than the
+    preview showed.
+    """
+    from bot_modules.inactive.sweep_service import (
+        read_inactive_channel_id,
+        run_inactive_sweep,
+    )
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    guild = guild_or_503(ctx, guild_id)
+    if not read_inactive_channel_id(ctx, guild_id):
+        raise HTTPException(
+            400, "No inactive channel is set up yet — set one above first."
+        )
+
+    actor = guild.get_member(int(getattr(user, "user_id", 0) or 0)) or guild.me
+    moved, considered, overflow = await run_inactive_sweep(ctx, guild, actor)
+    return {"ok": True, "moved": moved, "considered": considered, "overflow": overflow}
+
+
+class InactivePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    threshold_days: int | None = Field(default=None, ge=1, le=3650)
+    sweep_cap: int | None = Field(default=None, ge=1, le=200)
+
+
+@router.post("/config/inactive/preview")
+async def preview_inactive_sweep(
+    request: Request,
+    body: InactivePreviewRequest,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Return who the sweep would move right now, and what they'd lose.
+
+    A dry run: nothing is written and no role is created. Selection runs through
+    the very same ``compute_candidates`` the real sweeps use, so the listing
+    can't drift from what enabling the auto-sweep would actually do — only the
+    cap differs, because this lists every eligible member rather than one run's
+    worth, and reports the cap separately so the panel can say how many of them a
+    single run would reach.
+
+    ``threshold_days`` and ``sweep_cap`` override the saved settings so unsaved
+    values can be tried before committing to them. The threshold changes who is
+    selected; the cap only changes the "one run reaches N of these" note, since
+    the listing is deliberately uncapped.
+    """
+    from bot_modules.inactive.logic import (
+        PreviewMember,
+        PreviewRole,
+        build_sweep_preview,
+    )
+    from bot_modules.inactive.sweep_service import compute_candidates
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    # Member and role state is gateway state, not DB state — without the bot
+    # connected there is nothing truthful to show.
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+    if guild is None:
+        raise HTTPException(503, "Discord guild not available")
+
+    # Without the bot's own member object there is no role position to compare
+    # against, and defaulting it would file every candidate under "the bot can't
+    # strip them" — a confidently wrong report is worse than refusing.
+    bot_member = guild.me
+    if bot_member is None:
+        raise HTTPException(503, "Discord guild not available")
+
+    threshold_days = body.threshold_days
+    cap_override = body.sweep_cap
+
+    selection = await compute_candidates(
+        ctx, guild, threshold_days=threshold_days, cap=None
+    )
+
+    members: dict[int, PreviewMember] = {}
+    for candidate in selection.candidates:
+        m = guild.get_member(candidate.user_id)
+        if m is None:
+            continue
+        members[m.id] = PreviewMember(
+            display_name=m.display_name,
+            roles=[PreviewRole(r.id, r.name, r.managed, r.position) for r in m.roles],
+        )
+
+    # The @Inactive role id is read plainly rather than through
+    # apply.ensure_inactive_role: a preview must never create a role as a side
+    # effect of being looked at.
+    def _read_settings() -> tuple[int, int]:
+        with ctx.open_db() as conn:
+            return (
+                _int_val(conn, "inactive_role_id", guild_id=guild_id),
+                _int_val(conn, "inactive_channel_id", guild_id=guild_id),
+            )
+
+    inactive_role_id, channel_id = await run_query(_read_settings)
+
+    sweepable, blocked = build_sweep_preview(
+        candidates=selection.candidates,
+        members=members,
+        default_role_id=guild.default_role.id,
+        inactive_role_id=inactive_role_id,
+        bot_top_role_position=bot_member.top_role.position,
+        tracked_user_ids=selection.tracked_user_ids,
+    )
+
+    def _row(row) -> dict:
+        return {
+            "user_id": str(row.user_id),
+            "display_name": row.display_name,
+            "days_idle": round(row.idle_seconds / 86400.0, 1),
+            "last_seen_ts": row.last_seen,
+            "has_tracked_messages": row.has_tracked_messages,
+            "removed_role_count": len(row.removed_role_names),
+            "removed_role_names": row.removed_role_names,
+            "kept_managed_role_names": row.kept_managed_role_names,
+        }
+
+    # How many of the listed members one run actually reaches. The cap applies to
+    # the whole most-idle-first candidate list *before* anyone is set aside as
+    # unstrippable, so this can't be derived from the sweepable count alone —
+    # comparing that against the cap would over-promise whenever the top of the
+    # list contains members the bot is outranked by.
+    cap = cap_override if cap_override is not None else selection.saved_cap
+    sweepable_ids = {r.user_id for r in sweepable}
+    first_run_reach = sum(
+        1 for c in selection.candidates[:cap] if c.user_id in sweepable_ids
+    )
+
+    return {
+        "threshold_days": selection.threshold_days,
+        "sweep_cap": cap,
+        "first_run_reach": first_run_reach,
+        "inactive_channel_configured": bool(channel_id),
+        "eligible_count": len(sweepable),
+        "blocked_count": len(blocked),
+        "members": [_row(r) for r in sweepable],
+        "blocked": [_row(r) for r in blocked],
+    }
+
+
+# ── Duel/group-games config writes ──────────────────────────────────────
+# One small update model per game (field sets differ), all delegating to the
+# shared `_duel_game_upsert` helper defined above.
+
+
+def _clamp_channel_allowlist(values: list[str] | None) -> str | None:
+    if values is None:
+        return None
+    return json.dumps(sorted({int(v) for v in values if str(v).strip()}))
+
+
+# Matched case-insensitively as substrings by duels/filters.py, so they are
+# stored lowercased and de-duplicated. The 40-entry / 64-character bounds are
+# sanity limits: this is a small list of words, not a content filter.
+_MAX_DENYLIST_WORDS = 40
+_MAX_DENYLIST_WORD_LEN = 64
+
+
+def _clamp_nick_denylist(values: list[str] | None) -> str | None:
+    if values is None:
+        return None
+    words = []
+    for raw in values:
+        word = str(raw).strip().lower()[:_MAX_DENYLIST_WORD_LEN]
+        if word and word not in words:
+            words.append(word)
+    return json.dumps(words[:_MAX_DENYLIST_WORDS])
+
+
+class DuelSharedConfigUpdate(BaseModel):
+    """The knobs every duel game shares. Enforced for all six in
+    bot_modules/duels/base_duel.py and base_game.py.
+
+    The bounds are declared here rather than clamped in the handler: a typed
+    value outside them is refused with a 422 naming the field, so the panel
+    can say which box is wrong instead of saving a different number than the
+    admin typed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cooldown_hours: int | None = Field(default=None, ge=0)
+    sentence_hours: int | None = Field(default=None, ge=1)
+    channel_allowlist: list[str] | None = None
+    nick_denylist: list[str] | None = None
+    max_nick_length: int | None = Field(default=None, ge=1, le=32)
+    max_stakes_length: int | None = Field(default=None, ge=1, le=2000)
+    # 0 means unlimited; the ceiling is a sanity bound, not a policy.
+    challenge_limit_per_hour: int | None = Field(default=None, ge=0, le=999)
+
+
+class PressureConfigUpdate(DuelSharedConfigUpdate):
+    pass
+
+
+class QuickdrawConfigUpdate(DuelSharedConfigUpdate):
+    min_delay: float | None = None
+    max_delay: float | None = None
+    draw_window: float | None = None
+
+
+class HotPotatoConfigUpdate(DuelSharedConfigUpdate):
+    min_timer: float | None = None
+    max_timer: float | None = None
+    min_hold: float | None = None
+
+
+class HotPotatoGroupConfigUpdate(DuelSharedConfigUpdate):
+    min_fuse: float | None = None
+    max_fuse: float | None = None
+    min_hold: float | None = None
+    min_players: int | None = None
+    max_players: int | None = None
+
+
+class ChickenConfigUpdate(DuelSharedConfigUpdate):
+    min_climb: float | None = None
+    max_climb: float | None = None
+    min_players: int | None = None
+    max_players: int | None = None
+
+
+class MusicalChairsConfigUpdate(DuelSharedConfigUpdate):
+    min_music: float | None = None
+    max_music: float | None = None
+    scramble_window: float | None = None
+    false_start_elim: bool | None = None
+    min_players: int | None = None
+    max_players: int | None = None
+
+
+@router.put("/config/games-pressure")
+async def update_games_pressure(
+    request: Request,
+    body: PressureConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "pressure", body)
+
+
+@router.put("/config/games-quickdraw")
+async def update_games_quickdraw(
+    request: Request,
+    body: QuickdrawConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "quickdraw", body)
+
+
+@router.put("/config/games-hot-potato")
+async def update_games_hot_potato(
+    request: Request,
+    body: HotPotatoConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "hot_potato", body)
+
+
+@router.put("/config/games-hot-potato-group")
+async def update_games_hot_potato_group(
+    request: Request,
+    body: HotPotatoGroupConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "hot_potato_group", body)
+
+
+@router.put("/config/games-chicken")
+async def update_games_chicken(
+    request: Request,
+    body: ChickenConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "chicken", body)
+
+
+@router.put("/config/games-musical-chairs")
+async def update_games_musical_chairs(
+    request: Request,
+    body: MusicalChairsConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _save_duel_game(request, "musical_chairs", body)
+
+
+class GreetingWatchConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    channel_ids: str | None = None
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+    # CSV of server-specific greeting words ("henlo, good yawn"). Empty string
+    # clears the list.
+    extra_words: str | None = None
+
+
+@router.put("/config/greeting-watch")
+async def update_greeting_watch(
+    request: Request,
+    body: GreetingWatchConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Configure Greeting Watch — which channels to watch and how long to wait
+    before flagging a greeting as unanswered. Who hears about one is each
+    moderator's own choice on the Mod Settings panel (Staff · Greetings)."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.enabled is not None:
+                set_config_value(
+                    conn,
+                    "greeting_watch_enabled",
+                    "1" if body.enabled else "0",
+                    guild_id,
+                )
+            if body.channel_ids is not None:
+                set_config_value(
+                    conn, "greeting_watch_channel_ids", body.channel_ids, guild_id
+                )
+            if body.window_minutes is not None:
+                set_config_value(
+                    conn,
+                    "greeting_watch_window_minutes",
+                    str(body.window_minutes),
+                    guild_id,
+                )
+            if body.extra_words is not None:
+                # Normalize (trim/lowercase/dedupe) so the stored value matches
+                # what the ingest hook parses back out.
+                set_config_value(
+                    conn,
+                    "greeting_watch_extra_words",
+                    ", ".join(parse_extra_words(body.extra_words)),
+                    guild_id,
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # The ingest hook reads these off the cached GuildConfig snapshot; drop it so
+    # the next message picks up the change without a restart.
+    ctx.invalidate_guild_config(guild_id)
+    # Greeting Watch on with a watched channel is what puts Staff · Greetings
+    # on the Mod Settings panel.
+    staff_ping_service.announce_change(ctx.bot, guild_id)
+    return result
+
+
+class RoleGrantUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = None
+    role_id: str | None = None
+    log_channel_id: str | None = None
+    announce_channel_id: str | None = None
+    grant_message: str | None = None
+    required_role_id: str | None = None
+    permissions: list[dict] | None = None
+
+
+@router.put("/config/roles/{grant_name}")
+async def update_role_grant(
+    grant_name: str,
+    request: Request,
+    body: RoleGrantUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    # required_role_id is only checked for, never granted.
+    refuse_ungrantable_role(ctx, guild_id, body.role_id, setting="This grant")
+
+    def _q():
+        with ctx.open_db() as conn:
+            existing = get_grant_roles(conn, guild_id)
+            if grant_name in existing:
+                cur = existing[grant_name]
+                upsert_grant_role(
+                    conn,
+                    guild_id,
+                    grant_name,
+                    label=body.label if body.label is not None else cur["label"],
+                    role_id=int(body.role_id)
+                    if body.role_id is not None
+                    else cur["role_id"],
+                    log_channel_id=int(body.log_channel_id)
+                    if body.log_channel_id is not None
+                    else cur["log_channel_id"],
+                    announce_channel_id=int(body.announce_channel_id)
+                    if body.announce_channel_id is not None
+                    else cur["announce_channel_id"],
+                    grant_message=body.grant_message
+                    if body.grant_message is not None
+                    else cur["grant_message"],
+                    required_role_id=int(body.required_role_id)
+                    if body.required_role_id is not None
+                    else cur["required_role_id"],
+                )
+            else:
+                upsert_grant_role(
+                    conn,
+                    guild_id,
+                    grant_name,
+                    label=body.label or grant_name.replace("_", " ").title(),
+                    role_id=int(body.role_id) if body.role_id else 0,
+                    log_channel_id=int(body.log_channel_id)
+                    if body.log_channel_id
+                    else 0,
+                    announce_channel_id=int(body.announce_channel_id)
+                    if body.announce_channel_id
+                    else 0,
+                    grant_message=body.grant_message or "",
+                    required_role_id=int(body.required_role_id)
+                    if body.required_role_id
+                    else 0,
+                )
+            if body.permissions is not None:
+                for et, eid in get_grant_permissions(conn, guild_id, grant_name):
+                    remove_grant_permission(conn, guild_id, grant_name, et, eid)
+                for perm in body.permissions:
+                    add_grant_permission(
+                        conn,
+                        guild_id,
+                        grant_name,
+                        perm["entity_type"],
+                        int(perm["entity_id"]),
+                    )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+@router.delete("/config/roles/{grant_name}")
+async def delete_role_grant(
+    grant_name: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            delete_grant_role(conn, guild_id, grant_name)
+        return {"ok": True}
+
+    result = await run_query(_q)
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+class GifGuardConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_ids: list[str] | None = None
+
+
+@router.put("/config/gif-guard")
+async def update_gif_guard(
+    request: Request,
+    body: GifGuardConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """The channels GIF Guard deletes GIFs in. An empty list turns it off."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    if body.channel_ids is not None and not all(
+        str(v).isdigit() for v in body.channel_ids
+    ):
+        raise HTTPException(400, "Channel ids must be numeric.")
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.channel_ids is not None:
+                replace_config_id_bucket(
+                    conn, "gif_guard_channel_ids", body.channel_ids, guild_id
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # on_message reads the list off the cached GuildConfig snapshot.
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+class WordCloudConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_cap: int | None = None
+    default_preset: str | None = None
+
+
+@router.put("/config/word-cloud")
+async def update_word_cloud(
+    request: Request,
+    body: WordCloudConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Dials for the moderator-only ``/wordcloud`` command.
+
+    The cap is clamped rather than rejected: it is a performance guard, not a
+    correctness one, and a moderator typing a large number should get the
+    ceiling rather than an error they have to decode.
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.message_cap is not None:
+                cap = max(
+                    word_cloud_logic.MIN_CAP,
+                    min(word_cloud_logic.MAX_CAP, int(body.message_cap)),
+                )
+                set_config_value(
+                    conn, word_cloud_logic.CAP_KEY, str(cap), guild_id
+                )
+            if body.default_preset is not None:
+                preset = body.default_preset.strip().lower()
+                if preset not in WORD_CLOUD_PRESET_KEYS:
+                    raise HTTPException(400, "Unknown word cloud preset.")
+                set_config_value(
+                    conn, word_cloud_logic.PRESET_KEY, preset, guild_id
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+class AutoRoleConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auto_role_ids: list[str] | None = None
+
+
+@router.put("/config/auto-role")
+async def update_auto_role(
+    request: Request,
+    body: AutoRoleConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    for role_id in body.auto_role_ids or ():
+        refuse_ungrantable_role(ctx, guild_id, role_id, setting="Auto-roles")
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.auto_role_ids is not None:
+                replace_config_id_bucket(
+                    conn, "auto_role_ids", body.auto_role_ids, guild_id
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    ctx.invalidate_guild_config(guild_id)
+    return result
+
+
+# ── Booster roles ─────────────────────────────────────────────────────
+
+
+# ── Quote card border (per-guild uploaded frame) ─────────────────────
+#
+# A guild can upload one PNG/WEBP frame that becomes its default quote-card
+# border. The renderer composites it over the whole card using its own alpha
+# channel, so an opaque upload would hide the quote entirely — the upload path
+# therefore requires a real, partly-transparent alpha channel and re-encodes to
+# a clean RGBA PNG at the exact path the bot renderer reads
+# (``quote_borders/<guild_id>/border.png`` beside the DB, ``var/`` once the runtime
+# data moves there; ``core.paths.data_dir``).
+
+_MAX_QUOTE_BORDER_BYTES = 8 * 1024 * 1024
+_QUOTE_BORDER_MAX_DIM = 2000
+
+
+def _quote_border_meta(db_path, guild_id: int) -> dict:
+    path = guild_border_path(db_path, guild_id)
+    if not path.is_file():
+        return {"exists": False, "width": None, "height": None}
+    width = height = None
+    try:
+        from PIL import Image  # noqa: PLC0415
+
+        with Image.open(path) as im:
+            width, height = im.size
+    except Exception:  # noqa: BLE001 — PIL's raise set on a bad file is open-ended (DecompressionBombError isn't an OSError); the size is optional metadata, never worth a 500
+        pass
+    return {"exists": True, "width": width, "height": height}
+
+
+# Quote Tool renders read-only for moderators — the border image and its
+# settings. The writes below stay admin.
+@router.get("/config/quote-border")
+async def get_quote_border(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    """Metadata about this guild's uploaded quote-card border."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    return await run_query(lambda: _quote_border_meta(ctx.db_path, guild_id))
+
+
+@router.get("/config/quote-border/image")
+async def get_quote_border_image(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    """Serve the raw border PNG for preview (staff only, guild-scoped)."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    path = guild_border_path(ctx.db_path, guild_id)
+    if not path.is_file():
+        raise HTTPException(404, "No quote border set")
+    return FileResponse(path, media_type="image/png")
+
+
+def _install_quote_border(content: bytes, target) -> None:
+    """Decode, validate, downscale and install an uploaded border. Blocking.
+
+    Pure bytes-in / file-out: 0.5–2 s of PIL CPU for an 8 MB source, so the
+    handler runs this in a worker thread — the dashboard shares the bot's event
+    loop and doing this inline stalls the Discord gateway for the duration.
+    Raises ``HTTPException`` for every rejection, which propagates unchanged out
+    of ``asyncio.to_thread``.
+    """
+    from PIL import Image, UnidentifiedImageError  # noqa: PLC0415
+
+    try:
+        with Image.open(io.BytesIO(content)) as im:
+            im.load()
+            fmt = (im.format or "").upper()
+            img = im.convert("RGBA")
+    except (UnidentifiedImageError, OSError):
+        raise HTTPException(400, "Unsupported or corrupt image.")
+
+    # SVG can't reach here (PIL won't open it) and JPEG/GIF lack a usable alpha
+    # channel for a see-through frame, so restrict to the two formats that do.
+    if fmt not in ("PNG", "WEBP"):
+        raise HTTPException(
+            400, "Use a PNG or WEBP with transparency (JPEG/GIF have no usable alpha)."
+        )
+
+    # getextrema() on the single-band alpha returns (min, max); min>=250 means
+    # effectively no transparency. (Guard the union type the stubs declare.)
+    alpha_min = img.getchannel("A").getextrema()[0]
+    if isinstance(alpha_min, tuple):
+        alpha_min = alpha_min[0]
+    if alpha_min >= 250:
+        raise HTTPException(
+            400,
+            "This image has no transparent areas — it would cover the whole quote. "
+            "Upload a frame PNG with a see-through center.",
+        )
+
+    img.thumbnail(
+        (_QUOTE_BORDER_MAX_DIM, _QUOTE_BORDER_MAX_DIM), Image.Resampling.LANCZOS
+    )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a temp sibling and confirm the frame leaves a usable opening at the
+    # render canvas before replacing any existing border — this is the real guard:
+    # the renderer fits the quote into this opening, so "no opening" is the failure
+    # mode, catching center-covered frames the opaque check misses. The canvas is
+    # derived from the frame the same way the renderer derives it (the card takes
+    # the frame's aspect ratio), so the probe measures the geometry the card will
+    # actually have — probing a fixed 900×500 would test a stretched frame.
+    tmp = target.with_name("border.tmp.png")
+    img.save(tmp, format="PNG")
+    probe = BorderStyle(
+        name="pending", path=tmp, flip=False, luma_key=False, mask_fit=True
+    )
+    if analyze_border_opening(probe, *card_size_for_border(900, 500, probe)) is None:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(
+            400,
+            "The frame leaves no clear opening for the quote — use a border with a "
+            "larger see-through center.",
+        )
+    tmp.replace(target)
+
+
+@router.post("/config/quote-border")
+async def upload_quote_border(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Upload + normalize a per-guild quote-card border.
+
+    Rejects opaque images (they would cover the whole card) and re-encodes to a
+    clean RGBA PNG so the renderer always gets a safe, alpha-carrying frame.
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    content = await file.read(_MAX_QUOTE_BORDER_BYTES + 1)
+    if len(content) > _MAX_QUOTE_BORDER_BYTES:
+        raise HTTPException(413, "Border image must be 8 MB or smaller.")
+    if not content:
+        raise HTTPException(400, "Empty file.")
+
+    target = guild_border_path(ctx.db_path, guild_id)
+    await asyncio.to_thread(_install_quote_border, content, target)
+
+    return await run_query(lambda: _quote_border_meta(ctx.db_path, guild_id))
+
+
+@router.delete("/config/quote-border")
+async def delete_quote_border(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Remove this guild's uploaded quote border."""
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    path = guild_border_path(ctx.db_path, guild_id)
+
+    def _delete() -> dict:
+        if path.is_file():
+            path.unlink()
+        # Re-opens the (now absent) file with PIL — off the loop like the rest.
+        return _quote_border_meta(ctx.db_path, guild_id)
+
+    return await run_query(_delete)
+
+
+# ── Auto-delete schedules ────────────────────────────────────────────
+
+
+class AutoDeleteRuleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Both floors are server-side as well as in the panel: a 0 (or negative)
+    # age makes every tracked message eligible and a 0 interval makes the rule
+    # due on every poll tick, so a direct PUT past the panel's own `min=1`
+    # would empty a channel. The panel is the only caller and never sends
+    # anything below 1.
+    max_age_seconds: int = Field(ge=1)
+    interval_seconds: int = Field(ge=1)
+    media_only: bool = False
+
+
+@router.put("/config/auto-delete/{channel_id}")
+async def update_auto_delete(
+    channel_id: str,
+    request: Request,
+    body: AutoDeleteRuleUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        upsert_auto_delete_rule(
+            ctx.db_path,
+            guild_id,
+            int(channel_id),
+            body.max_age_seconds,
+            body.interval_seconds,
+            media_only=body.media_only,
+        )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/auto-delete/{channel_id}")
+async def remove_auto_delete(
+    channel_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        remove_auto_delete_rule(ctx.db_path, guild_id, int(channel_id))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Auto-react config ────────────────────────────────────────────────
+
+
+class AutoReactRuleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    emojis: list[str]
+    enabled: bool = True
+    # Per-rule, so Auto React stays usable as plain decoration on channels
+    # nobody wants monetised. Defaults off — turning a channel into a tipping
+    # channel is always an explicit act.
+    tips_enabled: bool = False
+    # emoji -> price. An emoji with no rung (or 0) is placed but free.
+    rungs: dict[str, int] | None = None
+
+
+@router.put("/config/auto-react/{channel_id}")
+async def update_auto_react(
+    channel_id: str,
+    request: Request,
+    body: AutoReactRuleUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if body.rungs:
+        # Anything below this delivers the poster nothing once the rake floor
+        # is taken, so it's refused rather than silently declining every tap.
+        # Derived from the rake constants, not restated here.
+        minimum = min_rung_amount()
+        for emoji, amount in body.rungs.items():
+            if amount < 0:
+                raise HTTPException(
+                    status_code=400, detail=f"rung for {emoji} cannot be negative"
+                )
+            if 0 < amount < minimum:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rung for {emoji} must be at least {minimum} "
+                    "(anything less is entirely consumed by the rake)",
+                )
+
+    def _q():
+        upsert_auto_react_rule(
+            ctx.db_path,
+            guild_id,
+            int(channel_id),
+            body.emojis,
+            body.enabled,
+            tips_enabled=body.tips_enabled,
+        )
+        if body.rungs is not None:
+            # Only emoji still on the rule get a price; everything else is
+            # cleared, so a dropped emoji can't linger as chargeable.
+            replace_rungs(
+                ctx.db_path,
+                guild_id,
+                int(channel_id),
+                {e: body.rungs.get(e, 0) for e in body.emojis},
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/auto-react/{channel_id}")
+async def remove_auto_react(
+    channel_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        remove_auto_react_rule(ctx.db_path, guild_id, int(channel_id))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Bump tracker config ──────────────────────────────────────────────
+
+
+class BumpTrackerConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None
+    role_id: str | None = None
+    enabled: bool | None = None
+
+
+# A pattern of None means "not supplied, leave it alone"; "" clears it. A stale
+# dashboard tab still running the pre-137 JS omits failure_pattern entirely, and
+# must not wipe the veto that migration seeded.
+class BumpTrackerSiteUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cooldown_hours: float
+    detector_bot_id: str | None = None
+    detector_pattern: str | None = Field(default=None, max_length=200)
+    failure_pattern: str | None = Field(default=None, max_length=200)
+
+
+class BumpTrackerDetectorUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detector_bot_id: str
+    detector_pattern: str = Field(default="", max_length=200)
+    failure_pattern: str | None = Field(default=None, max_length=200)
+
+
+@router.put("/config/bump-tracker")
+async def update_bump_tracker(
+    request: Request,
+    body: BumpTrackerConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            _bump_upsert_config(
+                conn,
+                guild_id,
+                channel_id=int(body.channel_id) if body.channel_id else None,
+                role_id=int(body.role_id) if body.role_id else None,
+                enabled=body.enabled,
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/bump-tracker/sites/{site_name}")
+async def update_bump_tracker_site(
+    site_name: str,
+    request: Request,
+    body: BumpTrackerSiteUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            _bump_add_site(
+                conn,
+                guild_id,
+                site_name,
+                int(body.cooldown_hours * 3600),
+                detector_bot_id=int(body.detector_bot_id) if body.detector_bot_id else 0,
+                detector_pattern=body.detector_pattern,
+                failure_pattern=body.failure_pattern,
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/bump-tracker/sites/{site_name}/detector")
+async def update_bump_tracker_detector(
+    site_name: str,
+    request: Request,
+    body: BumpTrackerDetectorUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            updated = _bump_set_detector(
+                conn,
+                guild_id,
+                site_name,
+                int(body.detector_bot_id),
+                body.detector_pattern,
+                body.failure_pattern,
+            )
+            if not updated:
+                raise HTTPException(status_code=404, detail="Site not found")
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/bump-tracker/sites/{site_name}")
+async def delete_bump_tracker_site(
+    site_name: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            _bump_remove_site(conn, guild_id, site_name)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.post("/config/bump-tracker/sites/{site_name}/log")
+async def log_bump_tracker_bump(
+    site_name: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            sites = [r["site_name"] for r in _bump_list_sites(conn, guild_id)]
+            if site_name not in sites:
+                raise HTTPException(status_code=404, detail="Site not found")
+            _bump_log_bump(conn, guild_id, site_name)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Pen Pals config ──────────────────────────────────────────────────
+
+
+class PenPalsConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    category_id: str | None = None
+    opt_in_role_id: str | None = None
+    question_category: str = "sfw"
+    log_channel_id: str | None = None
+    panel_channel_id: str | None = None
+    room_visibility: str = _PP_DEFAULT_ROOM_VISIBILITY
+    intro_message: str = ""
+    match_mode: str = _PP_DEFAULT_MATCH_MODE
+    # Optional so a client that doesn't send them (an older cached panel)
+    # leaves the stored schedule alone instead of resetting it.
+    auto_round_dow: int | None = None
+    auto_round_hour: int | None = None
+
+
+# Pen Pals settings are moderator-level, unlike the rest of this module's
+# writes. The question bank they sit beside was already moderator-reachable, and
+# splitting one feature across two permission levels meant a mod who curates the
+# prompts couldn't set the channel they post in. Deliberate widening, not drift.
+@router.put("/config/pen-pals")
+async def update_pen_pals_config(
+    request: Request,
+    body: PenPalsConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    new_channel_id = int(body.panel_channel_id) if body.panel_channel_id else 0
+    intro_message = body.intro_message.strip()
+    if len(intro_message) > 1000:
+        raise HTTPException(400, "Message must be 1000 characters or fewer")
+    if body.auto_round_dow is not None and not -1 <= body.auto_round_dow <= 6:
+        raise HTTPException(400, "auto_round_dow must be -1 (every day) or 0-6")
+    if body.auto_round_hour is not None and not 0 <= body.auto_round_hour <= 23:
+        raise HTTPException(400, "auto_round_hour must be an hour from 0 to 23")
+
+    def _q() -> tuple[int, int]:
+        with ctx.open_db() as conn:
+            existing = _pp_get_config(conn, guild_id)
+            old_channel_id = int(existing["panel_channel_id"]) if existing and existing["panel_channel_id"] else 0
+            old_message_id = int(existing["panel_message_id"]) if existing and existing["panel_message_id"] else 0
+            _pp_set_config(
+                conn,
+                guild_id,
+                enabled=body.enabled,
+                category_id=int(body.category_id) if body.category_id else 0,
+                opt_in_role_id=int(body.opt_in_role_id) if body.opt_in_role_id else 0,
+                question_category=body.question_category,
+                log_channel_id=int(body.log_channel_id) if body.log_channel_id else 0,
+                panel_channel_id=new_channel_id,
+                room_visibility=_pp_normalize_room_visibility(body.room_visibility),
+                intro_message=intro_message,
+                match_mode=_pp_normalize_match_mode(body.match_mode),
+                auto_round_dow=(
+                    body.auto_round_dow if body.auto_round_dow is not None
+                    else _pp_round_dow(existing) if existing is not None
+                    else _PP_DEFAULT_ROUND_DOW
+                ),
+                auto_round_hour=(
+                    body.auto_round_hour if body.auto_round_hour is not None
+                    else _pp_round_hour(existing) if existing is not None
+                    else _PP_DEFAULT_ROUND_HOUR
+                ),
+            )
+            return old_channel_id, old_message_id
+
+    old_channel_id, old_message_id = await run_query(_q)
+
+    if ctx.bot:
+        ctx.bot.dispatch(
+            "pen_pals_panel_refresh",
+            guild_id, new_channel_id, old_channel_id, old_message_id,
+        )
+
+    return {"ok": True}
+
+
+class PenPalsTimersUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_seconds: int
+    match_cooldown_seconds: int
+    max_question_swaps: int
+    warn_seconds: int
+    question_suppress_seconds: int
+    reply_reminder_seconds: int = 0
+
+
+@router.put("/config/pen-pals/timers")
+async def update_pen_pals_timers(
+    request: Request,
+    body: PenPalsTimersUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if body.session_seconds < 1:
+        raise HTTPException(400, "session_seconds must be at least 1")
+    if body.match_cooldown_seconds < 0:
+        raise HTTPException(400, "match_cooldown_seconds cannot be negative")
+    if body.max_question_swaps < 0:
+        raise HTTPException(400, "max_question_swaps cannot be negative")
+    if body.warn_seconds < 0:
+        raise HTTPException(400, "warn_seconds cannot be negative")
+    if body.question_suppress_seconds < 0:
+        raise HTTPException(400, "question_suppress_seconds cannot be negative")
+    if body.reply_reminder_seconds < 0:
+        raise HTTPException(400, "reply_reminder_seconds cannot be negative")
+
+    def _q():
+        with ctx.open_db() as conn:
+            _pp_set_timers(
+                conn,
+                guild_id,
+                session_seconds=body.session_seconds,
+                match_cooldown_seconds=body.match_cooldown_seconds,
+                max_question_swaps=body.max_question_swaps,
+                warn_seconds=body.warn_seconds,
+                question_suppress_seconds=body.question_suppress_seconds,
+                reply_reminder_seconds=body.reply_reminder_seconds,
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.get("/config/pen-pals/pool-events")
+async def pen_pals_pool_events(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    """Recent movement in and out of the matching pool.
+
+    The pool table itself is current-state only, so a pool that has gone flat
+    is indistinguishable from one nobody ever joined — which is exactly how a
+    five-day stall in The Golden Meadow went unnoticed (2026-08-14). This is
+    the history that answers "were they matched, or did they drop out?".
+
+    Its own endpoint rather than a field on ``/config`` because that payload is
+    fetched by every panel on the dashboard, and none of the others want fifty
+    rows of pen pal history.
+
+    Carries the current opt-outs (migration 174) alongside the log, because
+    the two answer one question between them: the events say a member stopped
+    being re-pooled, and only the opt-out list says they will stay that way.
+    Read-only by design — a member's opt-out is their own decision, so there
+    is no route here for staff to reverse it.
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            return (
+                [
+                    {
+                        # Snowflakes cross as strings — see _pen_pals_section.
+                        "user_id": str(r["user_id"]),
+                        "at": float(r["at"]),
+                        "action": r["action"],
+                        "reason": r["reason"],
+                    }
+                    for r in _pp_recent_pool_events(conn, guild_id)
+                ],
+                [
+                    {"user_id": str(r["user_id"]), "at": float(r["at"])}
+                    for r in _pp_get_opt_outs(conn, guild_id)
+                ],
+            )
+
+    events, optouts = await run_query(_q)
+    return {"events": events, "optouts": optouts}
+
+
+class PenPalsSeparation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_a: str
+    user_b: str
+
+
+class PenPalsSeparationsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    separations: list[PenPalsSeparation] = []
+
+
+@router.put("/config/pen-pals/separations")
+async def update_pen_pals_separations(
+    request: Request,
+    body: PenPalsSeparationsUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    pairs: list[tuple[int, int]] = []
+    for sep in body.separations:
+        try:
+            a, b = int(sep.user_a), int(sep.user_b)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "separation user ids must be numeric")
+        if a == b:
+            raise HTTPException(400, "a separation must be between two different members")
+        pairs.append((a, b))
+
+    def _q():
+        with ctx.open_db() as conn:
+            _pp_set_admin_separations(conn, guild_id, pairs)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Voice transcription config ───────────────────────────────────────
+
+
+class VoiceTranscriptionConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    model_name: str = _VT_DEFAULT_MODEL
+    channel_ids: list[str] = []
+    delete_after_transcribe: bool = False
+
+
+class VoiceTranscriptionDownloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = _VT_DEFAULT_MODEL
+
+
+@router.put("/config/voice-transcription")
+async def update_voice_transcription_config(
+    request: Request,
+    body: VoiceTranscriptionConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    model = body.model_name if body.model_name in _VT_VALID_MODELS else _VT_DEFAULT_MODEL
+    channel_ids = tuple(int(c) for c in body.channel_ids if c)
+    # The panel promises a model has to read "Downloaded" before it can be used,
+    # and the bot loads models offline (local_files_only), so an un-downloaded
+    # one fails silently on every voice message. Refuse to switch transcription
+    # on with a model that isn't there yet — but never block turning it *off*,
+    # or a wiped cache would trap an admin in a broken setting. Only meaningful
+    # when faster-whisper is installed; without it nothing is cached and the
+    # panel already says nothing gets transcribed.
+    if body.enabled and _vt_is_available() and not _vt_model_is_cached(model):
+        raise HTTPException(
+            400,
+            f"{model} isn't downloaded yet — download it under Model Files first.",
+        )
+
+    def _q() -> dict:
+        with ctx.open_db() as conn:
+            _vt_set_config(
+                conn,
+                guild_id,
+                enabled=body.enabled,
+                model_name=model,
+                channel_ids=channel_ids,
+                delete_after_transcribe=body.delete_after_transcribe,
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.post("/config/voice-transcription/download")
+async def download_voice_transcription_model(
+    request: Request,
+    body: VoiceTranscriptionDownloadRequest,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    if not _vt_is_available():
+        raise HTTPException(400, "faster-whisper isn't installed on the bot host.")
+    if body.model_name not in _VT_VALID_MODELS:
+        raise HTTPException(400, f"Unknown model {body.model_name!r}.")
+
+    try:
+        # Network fetch — can take a while; keep it off the event loop.
+        await run_query(_vt_download_model, body.model_name)
+    except Exception as exc:
+        raise HTTPException(502, f"Download failed: {exc}") from exc
+
+    return {"ok": True, "cached": _vt_model_is_cached(body.model_name)}
+
+
+# ── Confessions config ───────────────────────────────────────────────
+
+
+class ConfessionsConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dest_channel_id: str | None = None
+    log_channel_id: str | None = None
+    cooldown_seconds: int | None = None
+    max_chars: int | None = None
+    panic: bool | None = None
+    replies_enabled: bool | None = None
+    notify_op_on_reply: bool | None = None
+    notify_op_on_typed_reply: bool | None = None
+    per_day_limit: int | None = None
+    require_approval: bool | None = None
+
+
+@router.put("/config/confessions")
+async def update_confessions(
+    request: Request,
+    body: ConfessionsConfigUpdate,
+    # Admin-only: this payload carries log_channel_id, and the confessions log
+    # records the author beside their confession. A game-host role holder must
+    # not be able to point the de-anonymisation log at a channel they can read.
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        cfg = _confessions_get_config(ctx.db_path, guild_id)
+        if cfg is None:
+            dest = int(body.dest_channel_id or 0)
+            log = int(body.log_channel_id or 0)
+            cfg = _ConfessionsGuildConfig(guild_id=guild_id, dest_channel_id=dest, log_channel_id=log)
+        if body.dest_channel_id is not None:
+            cfg.dest_channel_id = int(body.dest_channel_id)
+        if body.log_channel_id is not None:
+            cfg.log_channel_id = int(body.log_channel_id)
+        if body.cooldown_seconds is not None:
+            cfg.cooldown_seconds = body.cooldown_seconds
+        if body.max_chars is not None:
+            cfg.max_chars = body.max_chars
+        if body.panic is not None:
+            cfg.panic = body.panic
+        if body.replies_enabled is not None:
+            cfg.replies_enabled = body.replies_enabled
+        if body.notify_op_on_reply is not None:
+            cfg.notify_op_on_reply = body.notify_op_on_reply
+        if body.notify_op_on_typed_reply is not None:
+            cfg.notify_op_on_typed_reply = body.notify_op_on_typed_reply
+        if body.per_day_limit is not None:
+            cfg.per_day_limit = body.per_day_limit
+        if body.require_approval is not None:
+            cfg.require_approval = body.require_approval
+        _confessions_upsert_config(ctx.db_path, cfg)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+async def _set_confessions_block(ctx, guild_id: int, user_id: str, blocked: bool):
+    """Add to or remove from the confessions blocklist — the two routes below
+    are the same read-modify-write with one set operation swapped."""
+
+    def _q():
+        cfg = _confessions_get_config(ctx.db_path, guild_id)
+        if cfg is None:
+            raise HTTPException(404, "Confessions not configured for this guild")
+        s = cfg.blocked_set()
+        if blocked:
+            s.add(int(user_id))
+        else:
+            s.discard(int(user_id))
+        cfg.blocked_user_ids = sorted(s)
+        _confessions_upsert_config(ctx.db_path, cfg)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/confessions/block/{user_id}")
+async def block_confessions_user(
+    user_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _set_confessions_block(
+        get_ctx(request), get_active_guild_id(request), user_id, True
+    )
+
+
+@router.delete("/config/confessions/block/{user_id}")
+async def unblock_confessions_user(
+    user_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _set_confessions_block(
+        get_ctx(request), get_active_guild_id(request), user_id, False
+    )
+
+
+# ── DM perms config ──────────────────────────────────────────────────
+
+
+class DmsConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    audit_channel_id: str | None = None
+    open_role_id: str | None = None
+    ask_role_id: str | None = None
+    closed_role_id: str | None = None
+    # The service still clamps on the way in — it parses stored strings too,
+    # and a corrupt row should degrade to a usable number rather than break
+    # the DM loop. What is refused here is a *typed* value: the admin gets
+    # told, instead of being shown 9999 and served 50.
+    #
+    # The bounds are the service's own constants, not copies of its numbers:
+    # ``set_request_limits`` clamps to exactly these, so a literal here would
+    # be free to drift and start refusing values the enforcing reader accepts.
+    # These two keys are not in the settings registry, so the registry
+    # contract test cannot catch that drift the way it does for the nine that
+    # are — importing the constant is what keeps the pair honest.
+    request_expiry_hours: int | None = Field(
+        default=None, ge=MIN_REQUEST_EXPIRY_HOURS, le=MAX_REQUEST_EXPIRY_HOURS
+    )
+    max_pending_requests: int | None = Field(
+        default=None, ge=MIN_MAX_PENDING, le=MAX_MAX_PENDING
+    )
+
+
+@router.put("/config/dms")
+async def update_dms(
+    request: Request,
+    body: DmsConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    role_fields = (body.open_role_id, body.ask_role_id, body.closed_role_id)
+    for role_id in role_fields:
+        refuse_ungrantable_role(ctx, guild_id, role_id, setting="DM mode roles")
+
+    def _q():
+        if body.request_expiry_hours is not None or body.max_pending_requests is not None:
+            with ctx.open_db() as conn:
+                set_request_limits(
+                    conn,
+                    guild_id,
+                    expiry_hours=body.request_expiry_hours,
+                    max_pending=body.max_pending_requests,
+                )
+        if body.audit_channel_id is not None:
+            set_audit_channel(ctx.db_path, guild_id, int(body.audit_channel_id))
+        if any(f is not None for f in role_fields):
+            current = get_dm_mode_role_ids(ctx.db_path, guild_id)
+            merged = {
+                "open": int(body.open_role_id) if body.open_role_id is not None else current["open"],
+                "ask": int(body.ask_role_id) if body.ask_role_id is not None else current["ask"],
+                "closed": int(body.closed_role_id) if body.closed_role_id is not None else current["closed"],
+            }
+            set_dm_mode_role_ids(
+                ctx.db_path, guild_id,
+                open_role_id=merged["open"],
+                ask_role_id=merged["ask"],
+                closed_role_id=merged["closed"],
+            )
+            return merged
+        return None
+
+    merged = await run_query(_q)
+
+    # Poke the cog's in-memory cache so the new roles apply without a restart.
+    if merged is not None:
+        bot = getattr(ctx, "bot", None)
+        cog = bot.get_cog("DmPermsCog") if bot is not None else None
+        if cog is not None:
+            cog.mode_role_ids[guild_id] = merged
+    return {"ok": True}
+
+
+@router.post("/config/dms/post-panel")
+async def post_dms_panel(
+    request: Request,
+    body: ChannelIdBody,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    import discord
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    bot = getattr(ctx, "bot", None)
+    if bot is None:
+        raise HTTPException(503, "Bot not available")
+    cog = bot.get_cog("DmPermsCog")
+    if cog is None:
+        raise HTTPException(503, "DmPermsCog not loaded")
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        raise HTTPException(503, "Discord guild not available")
+
+    channel_id = int(body.channel_id)
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        raise HTTPException(400, "Channel not found or not a text channel")
+    require_post_permissions(
+        guild, channel, "view_channel", "send_messages", "embed_links"
+    )
+    # One bottom slot per channel — refuse the resident that would bury this
+    # panel outright, warn about the one it would merely trade places with.
+    warning = await sticky_conflict(ctx, guild_id, channel_id, excluding="dm-perms")
+
+    message_id = await cog.post_panel(guild, channel_id)
+    if message_id is None:
+        raise HTTPException(
+            502, f"Discord rejected the post in #{channel.name} — panel was not posted"
+        )
+    set_panel_settings(ctx.db_path, guild_id, channel_id, message_id)
+    cog.panel_settings[guild_id] = {"panel_channel_id": channel_id, "panel_message_id": message_id}
+    return {"ok": True, "warning": warning}
+
+
+# ── Starboard config ─────────────────────────────────────────────────
+
+
+class StarboardConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None
+    threshold: int | None = None
+    emoji: str | None = None
+    enabled: bool | None = None
+    excluded_channels: list[str] | None = None
+
+
+@router.put("/config/starboard")
+async def update_starboard(
+    request: Request,
+    body: StarboardConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            cur = _starboard_row_or_defaults(conn, guild_id)
+            channel_id = cur["channel_id"]
+            threshold = cur["threshold"]
+            emoji = cur["emoji"]
+            enabled = int(cur["enabled"])
+
+            if body.channel_id is not None:
+                channel_id = int(body.channel_id)
+            if body.threshold is not None:
+                if body.threshold < 1:
+                    raise HTTPException(400, "Threshold must be at least 1")
+                threshold = body.threshold
+            if body.emoji is not None:
+                ok, error_message = _starboard_validate_emoji(body.emoji)
+                if not ok:
+                    raise HTTPException(400, error_message)
+                emoji = body.emoji.strip()
+            if body.enabled is not None:
+                enabled = 1 if body.enabled else 0
+
+            _upsert_starboard_config(
+                conn,
+                guild_id,
+                channel_id=channel_id,
+                threshold=threshold,
+                emoji=emoji,
+                enabled=enabled,
+            )
+
+            if body.excluded_channels is not None:
+                replace_config_id_bucket(
+                    conn, _STARBOARD_EXCLUDED_BUCKET, body.excluded_channels, guild_id
+                )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+class BulkCleanupUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    age_days: int | None = None
+    excluded_channels: list[str] | None = None
+
+
+@router.put("/config/bulk-cleanup")
+async def update_bulk_cleanup(
+    request: Request,
+    body: BulkCleanupUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    from bot_modules.moderation.bulk_cleanup_service import (
+        _AGE_DAYS_KEY,
+        _ENABLED_KEY,
+        EXCLUDED_BUCKET,
+        MIN_AGE_DAYS,
+    )
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.age_days is not None and body.age_days < MIN_AGE_DAYS:
+                raise HTTPException(
+                    400, f"Age must be at least {MIN_AGE_DAYS} day(s)"
+                )
+            if body.enabled is not None:
+                set_config_value(
+                    conn, _ENABLED_KEY, "1" if body.enabled else "0", guild_id
+                )
+            if body.age_days is not None:
+                set_config_value(conn, _AGE_DAYS_KEY, str(int(body.age_days)), guild_id)
+            if body.excluded_channels is not None:
+                replace_config_id_bucket(
+                    conn, EXCLUDED_BUCKET, body.excluded_channels, guild_id
+                )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Birthday config ──────────────────────────────────────────────────
+#
+# Any number of announcement channels (migration 200), same shape as Auto-
+# Thread's needle_channels: a settings endpoint for the one guild-wide dial
+# (the announce hour) plus upsert/delete on a per-channel id, rather than the
+# old fixed main+second PUT.
+
+
+class BirthdaySettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Hour of the local day, so 0-23 — the panel offers a 24-entry picker and
+    # the route used to take 25 from anything else.
+    birthday_announce_hour: int | None = Field(default=None, ge=0, le=23)
+
+
+@router.put("/config/birthday/settings")
+async def update_birthday_settings(
+    request: Request,
+    body: BirthdaySettingsUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.birthday_announce_hour is not None:
+                hour = int(body.birthday_announce_hour)
+                set_config_value(conn, ANNOUNCE_HOUR_KEY, str(hour), guild_id)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+class BirthdayChannelUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    pin: bool = False
+
+
+@router.put("/config/birthday/{channel_id}")
+async def upsert_birthday_channel(
+    channel_id: str,
+    request: Request,
+    body: BirthdayChannelUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    msg = body.message.strip()
+    if not msg:
+        raise HTTPException(400, "Message cannot be empty")
+
+    def _q():
+        with ctx.open_db() as conn:
+            _birthday_upsert_channel(
+                conn,
+                guild_id=guild_id,
+                channel_id=int(channel_id),
+                message=msg,
+                pin=body.pin,
+            )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.delete("/config/birthday/{channel_id}")
+async def remove_birthday_channel(
+    channel_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            removed = _birthday_delete_channel(conn, guild_id, int(channel_id))
+        if not removed:
+            raise HTTPException(404, "Channel not configured for birthday announcements")
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Risky Rolls config ───────────────────────────────────────────────
+
+
+class RiskyConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ping_role_id: str | None = None
+    min_game_seconds: int | None = None
+    max_games_per_channel: int | None = None
+    # Hours; 0 = off. Read fresh by the chaser each tick, so no in-memory
+    # cache to update below.
+    chase_hours: int | None = None
+    fallback_hours: int | None = None
+    # Special-roll odds: the N of "1 in N rolls", 0 = never. Read fresh on
+    # every Roll press, so no in-memory cache either.
+    odds_69: int | None = None
+    odds_100: int | None = None
+    odds_1: int | None = None
+
+
+@router.put("/config/risky")
+async def update_risky(
+    request: Request,
+    body: RiskyConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if body.min_game_seconds is not None and body.min_game_seconds < 0:
+        raise HTTPException(400, "min_game_seconds cannot be negative")
+    if body.max_games_per_channel is not None and body.max_games_per_channel < 1:
+        raise HTTPException(400, "max_games_per_channel must be at least 1")
+    for name, hours in (("chase_hours", body.chase_hours), ("fallback_hours", body.fallback_hours)):
+        if hours is not None and not (0 <= hours <= _RISKY_HOURS_MAX):
+            raise HTTPException(400, f"{name} must be between 0 and {_RISKY_HOURS_MAX}")
+    odds_updates = {
+        face: getattr(body, f"odds_{face}") for face in _RISKY_ODDS_KEYS
+    }
+    for face, n in odds_updates.items():
+        if n is not None and not _risky_odds_valid(n):
+            raise HTTPException(
+                400,
+                f"odds_{face} must be 0 (never) or between {_RISKY_ODDS_MIN} and {_RISKY_ODDS_MAX}",
+            )
+
+    new_ping_role: int | None = None
+    clear_ping_role = False
+    new_min_secs: int | None = None
+    clear_min_secs = False
+    new_max_games: int | None = None
+
+    def _q():
+        nonlocal new_ping_role, clear_ping_role, new_min_secs, clear_min_secs, new_max_games
+        with ctx.open_db() as conn:
+            if body.ping_role_id is not None:
+                role_id = int(body.ping_role_id)
+                if role_id == 0:
+                    delete_config_value(conn, _RISKY_PING_KEY, guild_id)
+                    clear_ping_role = True
+                else:
+                    set_config_value(conn, _RISKY_PING_KEY, str(role_id), guild_id)
+                    new_ping_role = role_id
+            if body.min_game_seconds is not None:
+                secs = body.min_game_seconds
+                if secs == 0:
+                    delete_config_value(conn, _RISKY_MIN_GAME_KEY, guild_id)
+                    clear_min_secs = True
+                else:
+                    set_config_value(conn, _RISKY_MIN_GAME_KEY, str(secs), guild_id)
+                    new_min_secs = secs
+            if body.max_games_per_channel is not None:
+                set_config_value(conn, _RISKY_MAX_GAMES_KEY, str(body.max_games_per_channel), guild_id)
+                new_max_games = body.max_games_per_channel
+            for key, hours in ((_RISKY_CHASE_KEY, body.chase_hours), (_RISKY_FALLBACK_KEY, body.fallback_hours)):
+                if hours is None:
+                    continue
+                if hours == 0:
+                    delete_config_value(conn, key, guild_id)
+                else:
+                    set_config_value(conn, key, str(hours), guild_id)
+            for face, n in odds_updates.items():
+                if n is None:
+                    continue
+                # The flat die stores nothing, so a guild left at 1 in 100
+                # carries no row at all.
+                if n == _RISKY_ODDS_DEFAULT:
+                    delete_config_value(conn, _RISKY_ODDS_KEYS[face], guild_id)
+                else:
+                    set_config_value(conn, _RISKY_ODDS_KEYS[face], str(n), guild_id)
+        return {"ok": True}
+
+    result = await run_query(_q)
+
+    # Update in-memory cache on the event loop, not from the thread.
+    from bot_modules.games.risky_roll import state as rr_state  # noqa: PLC0415
+
+    if clear_ping_role:
+        rr_state.ping_roles.pop(guild_id, None)
+    elif new_ping_role is not None:
+        rr_state.ping_roles[guild_id] = new_ping_role
+    if clear_min_secs:
+        rr_state.min_game_seconds.pop(guild_id, None)
+    elif new_min_secs is not None:
+        rr_state.min_game_seconds[guild_id] = new_min_secs
+    if new_max_games is not None:
+        rr_state.max_games_per_channel[guild_id] = new_max_games
+
+    return result
+
+
+class CasinoConfigUpdate(BaseModel):
+    """PUT /config/casino — every field optional, unknown fields rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None  # "0" turns the whole casino off
+    min_bet: int | None = Field(default=None, ge=1, le=1_000_000)
+    max_bet: int | None = Field(default=None, ge=0, le=10_000_000)  # 0 = no max
+    daily_wager_cap: int | None = Field(default=None, ge=0, le=10_000_000)
+    max_payout: int | None = Field(default=None, ge=0, le=100_000_000)  # 0 = no ceiling
+    # The daily comp: a house-funded slots spin of this many coins, once a
+    # day per member, from the hub. 0 = off, which is how every guild ships.
+    daily_comp: int | None = Field(default=None, ge=0, le=100_000)
+    coinflip_enabled: bool | None = None
+    slots_enabled: bool | None = None
+    blackjack_enabled: bool | None = None
+    roulette_enabled: bool | None = None
+    derby_enabled: bool | None = None
+    baccarat_enabled: bool | None = None
+    dice_enabled: bool | None = None
+    war_enabled: bool | None = None
+    keno_enabled: bool | None = None
+    mines_enabled: bool | None = None
+    pools_enabled: bool | None = None
+    # A snowflake, so it travels as a string like channel_id. "0" means
+    # "put the market in the casino channel".
+    pools_channel_id: str | None = None
+    # Guild-local hour betting shuts on the day being measured. Late
+    # enough that most of the day's mint is visible, early enough that
+    # the night's casino play is still unwritten.
+    pools_close_hour: int | None = Field(default=None, ge=0, le=23)
+    # Burned, not fed to the jackpot — the pot re-mints what it holds.
+    pools_takeout_pct: int | None = Field(default=None, ge=0, le=50)
+    # Comma-separated pools_metrics keys the daily draw may pick from.
+    # Empty = the whole roster. Validated against the registry on save so
+    # a typo cannot quietly shrink the roster to nothing.
+    pools_metrics: str | None = None
+    # Abandonment TTL for a private round, not a betting window — the
+    # player paces their own round and resolves it when ready. Capped at
+    # 840s for the same reason blackjack_idle_seconds is: the round lives
+    # in an ephemeral message whose webhook token dies at 15 min, and a
+    # longer TTL would resolve rounds nobody can be shown the result of.
+    round_idle_seconds: int | None = Field(default=None, ge=60, le=840)
+    # Capped at 840s: an ephemeral hand message is editable only through
+    # its interaction webhook, whose token Discord expires after 15 min —
+    # a longer idle window would auto-stand hands nobody can repaint.
+    blackjack_idle_seconds: int | None = Field(default=None, ge=30, le=840)
+    jackpot_enabled: bool | None = None
+    jackpot_cut_pct: int | None = Field(default=None, ge=0, le=100)
+    jackpot_seed: int | None = Field(default=None, ge=0, le=1_000_000)
+    broadcast_min_payout: int | None = Field(default=None, ge=0, le=10_000_000)
+    # The bar's other half: a card also needs payout >= this × stake. 1 is
+    # the floor (amount only) — 0 would read as "off" and there is already
+    # an off switch, the bar itself.
+    broadcast_min_mult: int | None = Field(default=None, ge=1, le=1_000)
+    # Mutes the @here on the loudest broadcast tier. Nothing else pings,
+    # so this is the whole ping surface.
+    broadcast_ping_enabled: bool | None = None
+
+
+@router.put("/config/casino")
+async def update_casino(
+    request: Request,
+    body: CasinoConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    from bot_modules.casino.service import (  # noqa: PLC0415
+        load_casino_settings,
+        save_casino_settings,
+    )
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    # exclude_unset keeps fields sent as EXPLICIT null; dropping them here
+    # means "no change" — otherwise str(None) would be persisted and read
+    # back as the string "None" (booleans silently parse to False, and the
+    # min/max cross-check below would TypeError on None).
+    values = {
+        k: v for k, v in body.model_dump(exclude_unset=True).items()
+        if v is not None
+    }
+    for key in ("channel_id", "pools_channel_id"):
+        if key in values:
+            try:
+                values[key] = int(values[key] or 0)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    400, f"{key} must be a snowflake or 0"
+                ) from None
+    if "pools_metrics" in values:
+        raw = str(values["pools_metrics"])
+        chosen = [part.strip() for part in raw.split(",") if part.strip()]
+        unknown = [key for key in chosen if key not in pools_metrics.SPECS]
+        if unknown:
+            raise HTTPException(400, f"unknown pools metric(s): {unknown}")
+        # An explicit empty roster would open no market at all, which is
+        # what pools_enabled is for — so it is stored as "all", matching
+        # what an untouched guild already gets.
+        values["pools_metrics"] = ",".join(chosen)
+
+    def _q():
+        with ctx.open_db() as conn:
+            current = load_casino_settings(conn, guild_id)
+            merged_min = values.get("min_bet", current.min_bet)
+            merged_max = values.get("max_bet", current.max_bet)
+            if merged_max and merged_min > merged_max:
+                raise HTTPException(400, "min_bet cannot exceed max_bet")
+            save_casino_settings(conn, guild_id, values)
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # Let the cog refresh (or tear down) the hub panel without a restart.
+    if ctx.bot:
+        ctx.bot.dispatch("casino_config_change", guild_id)
+    return result
+
+
+class PolicyConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vote_timeout_hours: int | None = None
+
+
+@router.put("/config/policy")
+async def update_policy(
+    request: Request,
+    body: PolicyConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if body.vote_timeout_hours is not None and body.vote_timeout_hours < 1:
+        raise HTTPException(400, "vote_timeout_hours must be at least 1")
+
+    def _q():
+        with ctx.open_db() as conn:
+            if body.vote_timeout_hours is not None:
+                set_config_value(
+                    conn,
+                    _POLICY_VOTE_TIMEOUT_KEY,
+                    str(body.vote_timeout_hours),
+                    guild_id,
+                )
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.get("/birthday/calendar")
+async def birthday_calendar(
+    request: Request,
+    days: int = 90,
+    _: AuthenticatedUser = Depends(require_perms({"moderator"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+
+    def _q():
+        with ctx.open_db() as conn:
+            # "Today" must be the guild's local date, not the host's — otherwise
+            # a birthday flips days_until at host midnight, not the guild's.
+            tz = get_tz_offset_hours(conn, guild_id)
+            today = (datetime.now(timezone.utc) + timedelta(hours=tz)).date()
+            rows = conn.execute(
+                "SELECT user_id, birth_month, birth_day, preference FROM member_birthdays"
+                " WHERE guild_id = ? ORDER BY birth_month, birth_day",
+                (guild_id,),
+            ).fetchall()
+            result = []
+            for row in rows:
+                uid = row["user_id"]
+                m, d = row["birth_month"], row["birth_day"]
+                pref = row["preference"]
+                try:
+                    bday_this_year = date(today.year, m, d)
+                except ValueError:
+                    bday_this_year = date(today.year, m, 28)
+                next_bday = bday_this_year if bday_this_year >= today else (
+                    date(today.year + 1, m, d)
+                    if m != 2 or d <= 28
+                    else date(today.year + 1, m, 28)
+                )
+                days_until = (next_bday - today).days
+                if days_until > days:
+                    continue
+                name = _lookup_member_name(uid, guild, conn, guild_id)
+                result.append({
+                    "user_id": str(uid),
+                    "name": name,
+                    "birth_month": m,
+                    "birth_day": d,
+                    "next_date": next_bday.isoformat(),
+                    "days_until": days_until,
+                    "preference": pref,
+                })
+        result.sort(key=lambda x: x["days_until"])
+        return result
+
+    return await run_query(_q)
+
+
+_GUESS_VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+_GUESS_AUDIT_ACTIONS = {
+    "submit", "delete", "solve", "guess_cap_hit", "confess", "post_failed", "expire",
+}
+
+
+@router.get("/guess/audit")
+async def list_guess_audit(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+    action: str | None = None,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """List recent Guess audit events for the active guild.
+
+    Query params:
+        limit: max rows (1-500, default 100)
+        action: optional filter — submit | delete | solve | guess_cap_hit | confess | post_failed | expire
+    """
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if action is not None and action not in _GUESS_AUDIT_ACTIONS:
+        raise HTTPException(400, f"action must be one of {sorted(_GUESS_AUDIT_ACTIONS)}")
+
+    def _q():
+        from bot_modules.games.guess.repo import list_audit_events
+        with ctx.open_db() as conn:
+            events = list_audit_events(
+                conn, guild_id, limit=limit, action=action
+            )
+        return {
+            "events": [
+                {
+                    "id": e.id,
+                    "ts": e.ts,
+                    "actor_id": str(e.actor_id),
+                    "action": e.action,
+                    "round_id": e.round_id,
+                    "details": e.details,
+                }
+                for e in events
+            ],
+        }
+
+    return await run_query(_q)
+
+
+class GuessConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None
+    role_id: str | None = None
+    crop_difficulty: str | None = None
+    # 0-3600 is the range the AI advisor's settings registry has always
+    # published for this key; the route accepted anything at all.
+    guess_cooldown_seconds: int | None = Field(default=None, ge=0, le=3600)
+    # Both gate images submitted through Discord, not through the dashboard, so
+    # the body ceiling and the docs upload cap are not what bounds them. What
+    # bounds them is that zero is destructive in opposite directions: a 0 MB
+    # ceiling refuses every upload (`byte_count <= 0`), and a 0 px minimum
+    # disables the too-small check silently. 4096 px is a 4K short side, and
+    # 100 MB is Discord's own highest boost-tier attachment limit — past that
+    # the dial would be advertising a ceiling Discord enforces first.
+    min_image_dimension_px: int | None = Field(default=None, ge=1, le=4096)
+    max_image_size_mb: int | None = Field(default=None, ge=1, le=100)
+    submit_max_per_window: int | None = Field(default=None, ge=1)
+    submit_window_seconds: int | None = Field(default=None, ge=1)
+    max_guesses_per_round: int | None = Field(default=None, ge=1)
+    # 0 = rounds never time out (the dark default). A year is the ceiling: past
+    # that the dial is just "never" with extra steps.
+    round_lifetime_days: int | None = Field(default=None, ge=0, le=365)
+
+
+@router.put("/config/guess")
+async def update_guess_config(
+    request: Request,
+    body: GuessConfigUpdate,
+    _: AuthenticatedUser = Depends(require_game_host),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    # Validation failures must be HTTP 400 — the panel treats any 2xx as a
+    # successful save (green "Saved"), so a 200 {"ok": false} would falsely
+    # report success while silently discarding every field.
+    if body.crop_difficulty is not None and body.crop_difficulty not in _GUESS_VALID_DIFFICULTIES:
+        raise HTTPException(
+            400, f"crop_difficulty must be one of {sorted(_GUESS_VALID_DIFFICULTIES)}"
+        )
+
+    # Guess accepts SFW and NSFW submissions alike, so the channel is not
+    # required to be age-gated — placement is a moderator call, matching the
+    # runtime, which has had no is_nsfw() recheck since 47ca6a5. Only the
+    # channel's existence is validated. "0" is the "(disabled)" sentinel and
+    # skips the check; resolution is best-effort and skipped when the bot's
+    # cache can't see the guild.
+    if body.channel_id and body.channel_id != "0":
+        try:
+            new_channel_id = int(body.channel_id)
+        except ValueError:
+            raise HTTPException(400, "channel_id must be a numeric channel ID")
+        bot = getattr(ctx, "bot", None)
+        guild = bot.get_guild(guild_id) if bot else None
+        if guild is not None and guild.get_channel(new_channel_id) is None:
+            raise HTTPException(400, "Channel not found in this guild")
+
+    refuse_ungrantable_role(ctx, guild_id, body.role_id, setting="The Guess Who role")
+
+    def _q():
+        from bot_modules.games.guess.repo import set_guess_config_value
+        with ctx.open_db() as conn:
+            if body.channel_id is not None:
+                set_guess_config_value(conn, guild_id, "guess_channel_id", body.channel_id)
+            if body.role_id is not None:
+                set_guess_config_value(conn, guild_id, "guess_role_id", body.role_id)
+            if body.crop_difficulty is not None:
+                set_guess_config_value(conn, guild_id, "guess_crop_difficulty", body.crop_difficulty)
+            if body.guess_cooldown_seconds is not None:
+                set_guess_config_value(conn, guild_id, "guess_guess_cooldown_seconds", str(body.guess_cooldown_seconds))
+            if body.min_image_dimension_px is not None:
+                set_guess_config_value(conn, guild_id, "guess_min_image_dimension_px", str(body.min_image_dimension_px))
+            if body.max_image_size_mb is not None:
+                set_guess_config_value(conn, guild_id, "guess_max_image_size_mb", str(body.max_image_size_mb))
+            if body.submit_max_per_window is not None:
+                set_guess_config_value(conn, guild_id, "guess_submit_max_per_window", str(body.submit_max_per_window))
+            if body.submit_window_seconds is not None:
+                set_guess_config_value(conn, guild_id, "guess_submit_window_seconds", str(body.submit_window_seconds))
+            if body.max_guesses_per_round is not None:
+                set_guess_config_value(conn, guild_id, "guess_max_guesses_per_round", str(body.max_guesses_per_round))
+            if body.round_lifetime_days is not None:
+                set_guess_config_value(conn, guild_id, "guess_round_lifetime_days", str(body.round_lifetime_days))
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+class WhisperConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str | None = None
+    role_id: str | None = None
+    log_channel_id: str | None = None
+    cooldown_seconds: int | None = Field(default=None, ge=0)
+    hourly_cap_per_target: int | None = Field(default=None, ge=1)
+    # At least one guess: a whisper nobody can guess at is a different game,
+    # and the game is the point.
+    guesses_per_whisper: int | None = Field(default=None, ge=1, le=10)
+    # DM the sender after each guess on their whisper. Ships off (2026-09
+    # review, rotation-rooms-159) so whispers already in flight don't start
+    # DMing their senders until an admin opts the server in.
+    sender_feedback: bool | None = None
+
+
+@router.put("/config/whisper")
+async def update_whisper_config(
+    request: Request,
+    body: WhisperConfigUpdate,
+    # Admin-only for the same reason as confessions: log_channel_id points at
+    # the audit log that records the sender behind an anonymous whisper.
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    refuse_ungrantable_role(ctx, guild_id, body.role_id, setting="The Whisper role")
+
+    def _q():
+        from bot_modules.whisper.repo import set_whisper_config_value
+        with ctx.open_db() as conn:
+            if body.channel_id is not None:
+                set_whisper_config_value(conn, guild_id, "whisper_channel_id", body.channel_id)
+            if body.role_id is not None:
+                set_whisper_config_value(conn, guild_id, "whisper_role_id", body.role_id)
+            if body.log_channel_id is not None:
+                set_whisper_config_value(conn, guild_id, "whisper_log_channel_id", body.log_channel_id)
+            if body.cooldown_seconds is not None:
+                set_whisper_config_value(
+                    conn, guild_id, "whisper_cooldown_seconds", str(body.cooldown_seconds)
+                )
+            if body.hourly_cap_per_target is not None:
+                set_whisper_config_value(
+                    conn, guild_id, "whisper_hourly_cap_per_target", str(body.hourly_cap_per_target)
+                )
+            if body.guesses_per_whisper is not None:
+                set_whisper_config_value(
+                    conn, guild_id, "whisper_guesses_per_whisper",
+                    str(body.guesses_per_whisper),
+                )
+            if body.sender_feedback is not None:
+                set_whisper_config_value(
+                    conn, guild_id, "whisper_sender_feedback",
+                    "1" if body.sender_feedback else "0",
+                )
+        return {"ok": True}
+
+    result = await run_query(_q)
+    # Let the cog republish its launcher-guild set and post (or move) the
+    # launcher without a restart — its on_message fast path only knows the
+    # guilds it read at boot.
+    if ctx.bot:
+        ctx.bot.dispatch("whisper_config_change", guild_id)
+    return result
+
+
+# ── Bot identity (per-guild) ─────────────────────────────────────────
+
+_MAX_AVATAR_BYTES = 8 * 1024 * 1024
+_AVATAR_MAX_REDIRECTS = 5
+
+
+def _reject_unsafe_avatar_url(url: str) -> str:
+    """Guard against SSRF: allow only http(s) to public hosts.
+
+    Rejects non-http schemes (``file://`` etc.) and any host that resolves to a
+    loopback / private / link-local / reserved / multicast / unspecified address
+    (127.0.0.1, 169.254.169.254, 10.x, …). Raises HTTPException(400) on failure.
+
+    Returns the **validated address** so the caller can connect to exactly the
+    IP that was checked — see ``_download_avatar_bytes``.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, "avatar_url must be an http(s) URL")
+    host = parsed.hostname or ""
+    if not host:
+        raise HTTPException(400, "avatar_url has no host")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            addr = ipaddress.ip_address(socket.gethostbyname(host))
+        except socket.gaierror:
+            raise HTTPException(400, "avatar_url host could not be resolved")
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    ):
+        raise HTTPException(400, "avatar_url resolves to a disallowed address")
+    return str(addr)
+
+
+def _authority(host: str, port: int | None) -> str:
+    """``host[:port]``, bracketing an IPv6 literal."""
+    bare = f"[{host}]" if ":" in host else host
+    return f"{bare}:{port}" if port else bare
+
+
+def _pin_url_to_ip(url: str, ip: str) -> tuple[str, str, str]:
+    """Rewrite *url* to dial *ip* directly.
+
+    Returns ``(connect_url, host_header, sni_hostname)``. The name stays in the
+    ``Host`` header (so virtual hosts still route) and in the TLS SNI /
+    certificate check (so HTTPS still verifies against the real hostname) —
+    only the address the socket connects to is frozen.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    authority = _authority(host, parsed.port)
+    connect = urlunparse(parsed._replace(netloc=_authority(ip, parsed.port)))
+    return connect, authority, host
+
+
+async def _download_avatar_bytes(url: str) -> bytes:
+    """Fetch a caller-supplied avatar URL safely.
+
+    Follows redirects manually, re-validating each hop against
+    ``_reject_unsafe_avatar_url`` so a public URL can't 302 to an internal one,
+    and streams the body with a hard 8 MB cap (parity with the file-upload paths).
+
+    Each hop is then **pinned to the address that was validated**. Validating a
+    hostname and handing the hostname to httpx leaves a DNS-rebinding TOCTOU:
+    httpx resolves the name a second time at connect, and an attacker-controlled
+    nameserver can answer the first lookup with a public IP and the second with
+    127.0.0.1 or 169.254.169.254. Connecting by IP with the original name in the
+    ``Host`` header and in TLS SNI closes that window while leaving virtual
+    hosting and certificate verification intact.
+    """
+    async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
+        current = url
+        for _ in range(_AVATAR_MAX_REDIRECTS + 1):
+            # gethostbyname blocks, and the dashboard shares the bot's loop.
+            ip = await asyncio.to_thread(_reject_unsafe_avatar_url, current)
+            connect_url, host_header, sni = _pin_url_to_ip(current, ip)
+            try:
+                async with client.stream(
+                    "GET",
+                    connect_url,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": sni},
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise HTTPException(400, "avatar_url redirect had no location")
+                        # Resolve against the logical URL, not the IP-pinned one,
+                        # so a relative Location keeps the hostname (and gets
+                        # re-validated + re-pinned on the next pass).
+                        current = str(httpx.URL(current).join(location))
+                        continue
+                    response.raise_for_status()
+                    buf = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > _MAX_AVATAR_BYTES:
+                            raise HTTPException(400, "avatar_url exceeds the 8 MB limit")
+                    return bytes(buf)
+            except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+                raise HTTPException(400, f"Failed to fetch avatar URL: {exc}")
+    raise HTTPException(400, "avatar_url had too many redirects")
+
+
+@router.post("/config/bot-identity")
+async def update_bot_identity(
+    request: Request,
+    nick: str | None = Form(default=None),
+    avatar_url: str | None = Form(default=None),
+    avatar_file: UploadFile | None = File(default=None),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    import discord
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    guild = guild_or_503(ctx, guild_id)
+
+    # Resolve avatar bytes: file takes priority over URL
+    avatar_bytes: bytes | None = None
+    if avatar_file is not None:
+        content = await avatar_file.read()
+        if content:
+            avatar_bytes = content
+    elif avatar_url:
+        avatar_bytes = await _download_avatar_bytes(avatar_url)
+
+    edit_kwargs: dict = {}
+    if nick is not None:
+        edit_kwargs["nick"] = nick
+    if avatar_bytes is not None:
+        edit_kwargs["avatar"] = avatar_bytes
+
+    if edit_kwargs:
+        try:
+            await guild.me.edit(**edit_kwargs)
+        except discord.HTTPException as exc:
+            raise HTTPException(400, f"Discord rejected the update: {exc}")
+
+    return {
+        "ok": True,
+        "nick": guild.me.nick or "",
+        "avatar_url": str(guild.me.display_avatar.url),
+    }
+
+
+# ── Branding (embed accent color) ────────────────────────────────────
+
+
+class BrandingConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    accent_mode: str | None = None
+    accent_hex: str | None = None
+    # Blank string = clear the override and fall back to the built-in default.
+    casino_name: str | None = None
+    assistant_name: str | None = None
+    # Draw each hub's title into the banner (panel_title_service).
+    panel_banner_title: bool | None = None
+
+
+def _parse_hex_color(raw: str) -> int:
+    """Parse a ``#RRGGBB`` (or ``RRGGBB``) string to an int, raising ValueError."""
+    s = raw.strip().lstrip("#")
+    if len(s) != 6:
+        raise ValueError("expected 6-digit hex color")
+    return int(s, 16)
+
+
+@router.put("/config/branding")
+async def update_branding(
+    request: Request,
+    body: BrandingConfigUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    new_mode: str | None = None
+    if body.accent_mode is not None:
+        new_mode = body.accent_mode.strip().lower()
+        if new_mode not in (ACCENT_MODE_AVATAR, ACCENT_MODE_CUSTOM):
+            raise HTTPException(400, "accent_mode must be 'avatar' or 'custom'")
+
+    hex_provided = body.accent_hex is not None
+    new_hex = ACCENT_HEX_UNSET
+    if hex_provided:
+        raw = (body.accent_hex or "").strip()
+        if raw:
+            try:
+                new_hex = _parse_hex_color(raw)
+            except ValueError:
+                raise HTTPException(400, "accent_hex must be a #RRGGBB color")
+
+    def _clean_name(raw: str | None, label: str) -> str:
+        name = (raw or "").strip()
+        if len(name) > MAX_NAME_LEN:
+            raise HTTPException(400, f"{label} must be {MAX_NAME_LEN} characters or fewer")
+        return name
+
+    casino_name = (
+        _clean_name(body.casino_name, "casino_name")
+        if body.casino_name is not None
+        else None
+    )
+    assistant_name = (
+        _clean_name(body.assistant_name, "assistant_name")
+        if body.assistant_name is not None
+        else None
+    )
+
+    def _q():
+        with ctx.open_db() as conn:
+            cfg = get_branding_conn(conn, guild_id)
+        if new_mode is not None:
+            cfg.accent_mode = new_mode
+        if hex_provided:
+            cfg.accent_hex = new_hex
+        if casino_name is not None:
+            cfg.casino_name = casino_name
+        if assistant_name is not None:
+            cfg.assistant_name = assistant_name
+        if body.panel_banner_title is not None:
+            cfg.panel_banner_title = body.panel_banner_title
+        upsert_branding(ctx.db_path, cfg)
+        return {
+            "ok": True,
+            "accent_mode": cfg.normalized_mode(),
+            "accent_hex": f"#{cfg.accent_hex:06X}" if cfg.has_custom_color() else "",
+            "casino_name": cfg.casino_name,
+            "assistant_name": cfg.assistant_name,
+            "panel_banner_title": cfg.panel_banner_title,
+        }
+
+    result = await run_query(_q)
+    invalidate_accent_cache(guild_id)
+    # The casino hub panel prints the casino's name — refresh it in place so a
+    # rename shows up without waiting for a restart (same seam the Casino panel
+    # uses for its own settings).
+    if casino_name is not None and ctx.bot:
+        ctx.bot.dispatch("casino_config_change", guild_id)
+    # The hubs swap their text heading for the titled banner (or back).
+    if body.panel_banner_title is not None and ctx.bot:
+        ctx.bot.dispatch("panel_art_change", guild_id)
+    return result
+
+
+# ── Branding: panel art (hub banner + footer, lobby header, card strips) ──
+#
+# The images that frame this guild's channel-resident hub panels (the Perk
+# Shop and DM Requests posters) — a banner across the top and a footer strip
+# closing the card — never an ephemeral card; see ``core.layout.hub_banner``
+# and ``hub_footer``. Stored verbatim (no portrait padding, unlike doc images:
+# the art is meant to be wide, and an animated GIF/WebP must keep its frames)
+# under the public /static mount, because a sticky panel reposts on channel
+# activity and a URL is fetched once by Discord's media proxy where an
+# attachment would be re-uploaded on every repost. Same surface rules as the
+# doc-image upload: raster only, sniffed from the bytes, uuid filenames. Both
+# slots share one directory; the column each URL lives in says which it is.
+# The third slot, the lobby header, is a small strip the footer's height that
+# tops the public game lobbies (``core.layout.lobby_art``), which then close
+# with the same footer. The last two, the card header and footer, are thinner
+# still and untitled: they frame the other public cards
+# (``core.layout.card_strips``), and the footer shows only beneath a header.
+# The bot draws the titled banners into its ``titled/`` subdirectory
+# (``panel_title_service``), and deleting an upload deletes those too.
+
+_BANNER_DIR = PANEL_ART_DIR
+_BANNER_URL_PATH = PANEL_ART_URL_PATH
+_MAX_BANNER_BYTES = 8 * 1024 * 1024  # Discord's display limit
+_BANNER_NAME = re.compile(r"^[0-9a-f]{32}\.(?:png|jpg|gif|webp)$")
+
+#: slot → the BrandingConfig field holding its URL.
+_ART_FIELDS = {
+    "banner": "panel_banner_url",
+    "footer": "panel_footer_url",
+    "header": "panel_header_url",
+    "card_header": "panel_card_header_url",
+    "card_footer": "panel_card_footer_url",
+}
+
+
+def _delete_banner_file(url: str) -> None:
+    """Remove a replaced/cleared art file — only one this route wrote."""
+    name = url.rsplit("/", 1)[-1]
+    if _BANNER_URL_PATH in url and _BANNER_NAME.match(name):
+        (_BANNER_DIR / name).unlink(missing_ok=True)
+        delete_titled_variants(_BANNER_DIR, name)
+
+
+def _set_panel_art(ctx, guild_id: int, slot: str, url: str) -> str:
+    """Store ``url`` in ``slot`` ("" clears) and return the URL it replaced."""
+    field = _ART_FIELDS[slot]
+    with ctx.open_db() as conn:
+        cfg = get_branding_conn(conn, guild_id)
+    old = getattr(cfg, field)
+    setattr(cfg, field, url)
+    upsert_branding(ctx.db_path, cfg)
+    return old
+
+
+async def _upload_panel_art(request: Request, file: UploadFile, slot: str) -> dict:
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+    data = await file.read(_MAX_BANNER_BYTES + 1)
+    if len(data) > _MAX_BANNER_BYTES:
+        raise HTTPException(413, f"The {slot} must be 8 MB or smaller.")
+    ext = sniff_image_ext(data)
+    if ext is None:
+        raise HTTPException(400, "Unsupported image (use PNG, JPG, GIF, or WEBP).")
+    fname = f"{uuid4().hex}.{ext}"
+
+    def _q() -> str:
+        _BANNER_DIR.mkdir(parents=True, exist_ok=True)
+        (_BANNER_DIR / fname).write_bytes(data)
+        url = f"{public_base_url()}{_BANNER_URL_PATH}{fname}"
+        old = _set_panel_art(ctx, guild_id, slot, url)
+        if old:
+            _delete_banner_file(old)
+        return url
+
+    url = await run_query(_q)
+    if ctx.bot:
+        ctx.bot.dispatch("panel_art_change", guild_id)
+    return {"ok": True, _ART_FIELDS[slot]: url}
+
+
+async def _clear_panel_art(request: Request, slot: str) -> dict:
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q() -> None:
+        old = _set_panel_art(ctx, guild_id, slot, "")
+        if old:
+            _delete_banner_file(old)
+
+    await run_query(_q)
+    if ctx.bot:
+        ctx.bot.dispatch("panel_art_change", guild_id)
+    return {"ok": True, _ART_FIELDS[slot]: ""}
+
+
+@router.post("/config/branding/banner")
+async def upload_panel_banner(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _upload_panel_art(request, file, "banner")
+
+
+@router.delete("/config/branding/banner")
+async def clear_panel_banner(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _clear_panel_art(request, "banner")
+
+
+@router.post("/config/branding/footer")
+async def upload_panel_footer(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _upload_panel_art(request, file, "footer")
+
+
+@router.delete("/config/branding/footer")
+async def clear_panel_footer(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _clear_panel_art(request, "footer")
+
+
+@router.post("/config/branding/header")
+async def upload_lobby_header(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _upload_panel_art(request, file, "header")
+
+
+@router.delete("/config/branding/header")
+async def clear_lobby_header(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _clear_panel_art(request, "header")
+
+
+@router.post("/config/branding/card_header")
+async def upload_card_header(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _upload_panel_art(request, file, "card_header")
+
+
+@router.delete("/config/branding/card_header")
+async def clear_card_header(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _clear_panel_art(request, "card_header")
+
+
+@router.post("/config/branding/card_footer")
+async def upload_card_footer(
+    request: Request,
+    file: UploadFile = File(...),
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _upload_panel_art(request, file, "card_footer")
+
+
+@router.delete("/config/branding/card_footer")
+async def clear_card_footer(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    return await _clear_panel_art(request, "card_footer")
+
+
+# ── Needle (auto-thread) config ──────────────────────────────────────────────
+
+
+_NEEDLE_VALID_TITLE_TYPES   = {"first_fifty", "first_line", "user_date", "custom"}
+_NEEDLE_VALID_DELETE_BEHAVIORS = {"archive_if_empty", "archive", "delete", "nothing"}
+_NEEDLE_VALID_REPLY_TYPES   = {"default", "custom", "none"}
+
+
+class NeedleChannelUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title_type:          str  = "first_fifty"
+    custom_title:        str  = ""
+    include_bots:        bool = False
+    slowmode:            int  = 0
+    delete_behavior:     str  = "archive_if_empty"
+    reply_type:          str  = "default"
+    custom_reply:        str  = ""
+    default_reactions:   str  = ""
+    notify_op_on_reply:  bool = False
+    require_attachment:  bool = False
+    # One of Discord's four (60 / 1440 / 4320 / 10080); anything else is
+    # stored as 1440 by the upsert (needle.logic.auto_archive_minutes), never
+    # rejected, so the route passes it through unclamped.
+    auto_archive_minutes: int = _NEEDLE_DEFAULT_AUTO_ARCHIVE
+
+
+class EventEchoUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # "" clears the key, which is how the feature is turned off — there is no
+    # separate enable flag to drift out of step with the channel.
+    channel_id: str = ""
+
+
+@router.put("/config/event-echo")
+async def update_event_echo(
+    request: Request,
+    body: EventEchoUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    raw = (body.channel_id or "").strip()
+    if raw and not raw.isdigit():
+        raise HTTPException(400, "channel_id must be a channel id or empty")
+
+    def _q():
+        with ctx.open_db() as conn:
+            set_config_value(conn, EVENT_ECHO_CHANNEL_KEY, raw, guild_id)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+class NeedleGlobalUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_reply:    str | None = None
+
+
+_NEEDLE_FIELDS = {
+    "default_reply": ("needle_default_reply", _raw),
+}
+
+
+@router.put("/config/needle/settings")
+async def update_needle_settings(
+    request: Request,
+    body: NeedleGlobalUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            _apply_config_fields(conn, guild_id, body, _NEEDLE_FIELDS)
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+@router.put("/config/needle/{channel_id}")
+async def upsert_needle_channel(
+    channel_id: str,
+    request: Request,
+    body: NeedleChannelUpdate,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    if body.title_type not in _NEEDLE_VALID_TITLE_TYPES:
+        raise HTTPException(400, f"title_type must be one of {sorted(_NEEDLE_VALID_TITLE_TYPES)}")
+    if body.delete_behavior not in _NEEDLE_VALID_DELETE_BEHAVIORS:
+        raise HTTPException(400, f"delete_behavior must be one of {sorted(_NEEDLE_VALID_DELETE_BEHAVIORS)}")
+    if body.reply_type not in _NEEDLE_VALID_REPLY_TYPES:
+        raise HTTPException(400, f"reply_type must be one of {sorted(_NEEDLE_VALID_REPLY_TYPES)}")
+    if body.slowmode < 0 or body.slowmode > 21600:
+        raise HTTPException(400, "slowmode must be between 0 and 21600 seconds")
+
+    def _q():
+        with ctx.open_db() as conn:
+            _needle_upsert_channel(
+                conn,
+                guild_id=guild_id,
+                channel_id=int(channel_id),
+                title_type=body.title_type,  # type: ignore[arg-type]
+                custom_title=body.custom_title,
+                include_bots=body.include_bots,
+                slowmode=body.slowmode,
+                delete_behavior=body.delete_behavior,
+                reply_type=body.reply_type,
+                custom_reply=body.custom_reply,
+                default_reactions=body.default_reactions,
+                notify_op_on_reply=body.notify_op_on_reply,
+                require_attachment=body.require_attachment,
+                auto_archive_minutes=body.auto_archive_minutes,
+            )
+        # Answered with the save, so the card can show or clear its warning
+        # the moment the box changes rather than on the next page load.
+        return {
+            "ok": True,
+            "removal_blocked": _needle_removal_blocked(
+                getattr(ctx, "bot", None),
+                guild_id,
+                int(channel_id),
+                body.require_attachment,
+            ),
+        }
+
+    return await run_query(_q)
+
+
+@router.delete("/config/needle/{channel_id}")
+async def remove_needle_channel(
+    channel_id: str,
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    def _q():
+        with ctx.open_db() as conn:
+            removed = _needle_delete_channel(conn, guild_id, int(channel_id))
+        if not removed:
+            raise HTTPException(404, "Channel not configured for auto-threading")
+        return {"ok": True}
+
+    return await run_query(_q)
+
+
+# ── Configured-channel health ──────────────────────────────────────────
+
+
+@router.get("/config/channel-health")
+async def config_channel_health(
+    request: Request,
+    _: AuthenticatedUser = Depends(require_perms({"admin"})),
+):
+    """Every configured channel that is set up but doesn't actually work.
+
+    The complement of ``/help/suggestions``: that answers "what isn't set up?",
+    this answers "what is set up and silently broken?". Discord offers no
+    signal for the latter — deleting a role takes its channel permission
+    overwrites with it, so a members-only channel can go dark with no config
+    change, no error, and nothing in the audit log naming the channel.
+
+    Also carries ``system`` — faults that are not a channel's configuration:
+    backup staleness (finding B3), a background loop the restart supervisor
+    gave up on, and a delivery into this guild paused after repeated failures
+    (``services/delivery_health_logic``). They ride on this endpoint rather
+    than a new widget because an existing dashboard layout would never gain a
+    brand-new widget on its own, and "set up but silently broken" is exactly
+    what a backup, a loop or a panel that stopped is.
+    """
+    from bot_modules.core.background import gave_up, stalled_deliveries
+    from bot_modules.analytics.channel_health import snapshot_configured_channels
+    from bot_modules.analytics.channel_health_logic import (
+        diagnose_all,
+        group_by_channel,
+        grouped_issue_to_dict,
+    )
+    from bot_modules.admin.db_backup import gather_backup_health
+    from bot_modules.analytics.delivery_health_logic import delivery_problems
+
+    ctx = get_ctx(request)
+    guild_id = get_active_guild_id(request)
+
+    try:
+        system = (await run_query(lambda: gather_backup_health(ctx.db_path)))["problems"]
+    except Exception:  # noqa: BLE001 — pragma: no cover — defensive: this route must still answer with the rest of the health snapshot; already logged via _log.exception (ruff's default logger-objects doesn't match `_log`)
+        _log.exception("Backup health check failed")
+        system = []
+
+    bot = getattr(ctx, "bot", None)
+    guild = bot.get_guild(guild_id) if bot is not None else None
+
+    def _channel_name(channel_id: int) -> str | None:
+        channel = guild.get_channel(channel_id) if guild is not None else None
+        return getattr(channel, "name", None)
+
+    # In-memory state of this process, which the bot shares: no Discord call.
+    system = system + delivery_problems(
+        gave_up(), stalled_deliveries(guild_id), _channel_name
+    )
+    if guild is None:
+        # Bot down or guild uncached — an unknown state is not a fault. The
+        # backup check still stands, though: it reads the filesystem and the
+        # database, neither of which needs Discord. A bot that is down is
+        # precisely when its backup loop has stopped running.
+        return {"available": False, "issues": [], "system": system}
+
+    def _snapshot():
+        with ctx.open_db() as conn:
+            return snapshot_configured_channels(conn, guild)
+
+    snaps = await run_query(_snapshot)
+    groups = group_by_channel(diagnose_all(snaps))
+    return {
+        "available": True,
+        "checked": len(snaps),
+        "issues": [grouped_issue_to_dict(g) for g in groups],
+        "system": system,
+    }

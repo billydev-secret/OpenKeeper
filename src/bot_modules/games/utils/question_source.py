@@ -1,0 +1,399 @@
+"""Every game's prompt draw from ``games_question_bank``, and the NSFW verdict.
+
+Owns: the least-recently-served draw (each row stamps when it was served, ties
+broken at random, so a small pool doesn't repeat until every row has come up),
+tag normalisation (``normalise_tags``, the one rule the dashboard and the draw
+share), the ``nsfw`` tag gate, and ``channel_allows_nsfw`` — the single answer
+to "may this channel see adult prompts", delegated to
+``age_gate.is_age_gated_channel``. ``has_matching_questions`` is
+the read-only check the launch guard uses to refuse an empty bank.
+
+Leaves to callers: whether a game runs at all, host-supplied prompts, and what
+to do when nothing matches — a getter returns ``None`` and the game decides
+(``get_ffa_prompt`` alone falls back to FFA's built-in prompts, and only when
+the draw is unfiltered and nothing is excluded).
+The bank is global across guilds; nothing here filters by guild.
+"""
+
+import json
+import random
+import re
+from typing import Any
+
+from bot_modules.shared.age_gate import is_age_gated_channel
+
+
+
+# ── Public API ──────────────────────────────────────────────────────
+#
+# Every game here is bank-only. The AI generation fallback that used to back
+# wyr/nhie/mlt/rushmore/price/clapback was removed along with the dashboard's
+# "Prompts & AI" studios: an empty bank now means the game has no question to
+# serve, exactly as photo/traditional/ffa have always behaved.
+
+
+def channel_allows_nsfw(channel) -> bool:
+    """NSFW prompts are gated on Discord's own age restriction.
+
+    One line of glue over :func:`age_gate.is_age_gated_channel`,
+    which is the single source of that verdict — this used to be a second
+    implementation of it, and the two could disagree about a channel sitting
+    in an age-restricted category. Threads inherit their parent channel's
+    flag, a category's flag counts for the channels inside it, and any channel
+    we can't resolve is treated as SFW (fail safe).
+    """
+    return is_age_gated_channel(channel)
+
+
+# "Would you rather" / "would you rather:" — the prose lead-in a dashboard
+# curator types. Stripped so the option shown as 🅰️ doesn't start with it.
+_WYR_PREFIX = re.compile(r"^\s*would\s+you\s+rather\b\s*[:,\-–—]?\s*", re.IGNORECASE)
+
+
+def split_wyr_options(text: str | None) -> tuple[str, str] | None:
+    """Split one Would You Rather bank row into ``(option_a, option_b)``.
+
+    The canonical shape is ``a | b``. Every prod row was typed as prose —
+    "Would you rather X, or Y?" — with no separator, and a bank-fed game
+    marked one row served and ended in the same second (vote-games-49). So a
+    row with no ``|`` is split on its **last** ``, or `` (else its last
+    `` or ``), after the "Would you rather" lead-in and a trailing ``?`` are
+    dropped; the same rule feeds the dashboard validator, which stores what
+    it can split as ``a | b``. Two or more ``|`` is ambiguous and a miss, as
+    is a row with an empty side or no ``or`` at all.
+    """
+    if not text:
+        return None
+    body = _WYR_PREFIX.sub("", text.strip()).strip().rstrip("?").strip()
+    if not body:
+        return None
+    if "|" in body:
+        if body.count("|") != 1:
+            return None
+        a, b = body.split("|", 1)
+    else:
+        lowered = body.lower()
+        cut = lowered.rfind(", or ")
+        width = 5
+        if cut < 0:
+            cut = lowered.rfind(" or ")
+            width = 4
+        if cut < 0:
+            return None
+        a, b = body[:cut], body[cut + width:]
+    a, b = a.strip().rstrip(","), b.strip()
+    if not a or not b:
+        return None
+    return a, b
+
+
+async def get_wyr_question(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> tuple[str, str] | None:
+    """Returns (option_a, option_b) from the bank, or None when it has no match.
+
+    Bank rows store the two options as ``a | b``; a prose row is split on its
+    last "or" (see :func:`split_wyr_options`). A row that can't be split is
+    malformed and treated as a miss.
+    """
+    result = await _get_bank_question(db, "wyr", tags=tags, allow_nsfw=allow_nsfw)
+    return split_wyr_options(result)
+
+
+async def get_nhie_statement(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> str | None:
+    return await _get_bank_question(db, "nhie", tags=tags, allow_nsfw=allow_nsfw)
+
+
+async def get_mlt_prompt(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> str | None:
+    return await _get_bank_question(db, "mlt", tags=tags, allow_nsfw=allow_nsfw)
+
+
+async def get_rushmore_topic(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> str | None:
+    return await _get_bank_question(db, "rushmore", tags=tags, allow_nsfw=allow_nsfw)
+
+
+async def get_price_scenario(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> str | None:
+    return await _get_bank_question(db, "price", tags=tags, allow_nsfw=allow_nsfw)
+
+
+async def get_clapback_prompt(
+    db, exclude: list[str] | None = None, tags: list[str] | None = None,
+    allow_nsfw: bool = False,
+) -> str | None:
+    """Returns a Clapback prompt from the bank, or None when it has no match."""
+    return await _get_bank_question(
+        db, "clapback", exclude=exclude, tags=tags, allow_nsfw=allow_nsfw,
+    )
+
+
+async def get_photo_prompt(
+    db, tags: list[str] | None = None, allow_nsfw: bool = False
+) -> str | None:
+    """Return a random Photo Challenge prompt from the bank, or None if empty.
+
+    Photo prompts are curated on the dashboard's Photo Challenge page. The cog
+    logs and skips the round when this returns None — nothing is posted to the
+    channel.
+    """
+    return await _get_bank_question(db, "photo", tags=tags, allow_nsfw=allow_nsfw)
+
+
+async def has_clapback_prompts(db) -> bool:
+    """Returns True if at least 1 Clapback prompt exists in the bank.
+
+    Clapback is bank-only, so an empty bank means the game cannot run.
+    """
+    row = await db.fetchone(
+        "SELECT 1 FROM games_question_bank WHERE game_type = 'clapback' LIMIT 1",
+    )
+    return row is not None
+
+
+def normalise_tags(raw) -> list[str]:
+    """The one tag-normalisation rule: strip, lowercase, drop empties, dedupe
+    (first-seen order kept). ``None`` is an empty list.
+
+    Every tag reader and writer goes through here — the bank draw
+    (:func:`_parse_tags`), the dashboard's save/read/filter paths and the
+    one-off prod fix script — because the NSFW gate in
+    :func:`_filter_bank_rows` compares against the literal ``"nsfw"``, and a
+    row stored as ``"Nsfw"`` (as one bulk import once wrote it) must still be
+    recognised as adult wherever it is read.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in (raw or []):
+        t = str(tag).strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _parse_tags(tags_json) -> set[str]:
+    """Parse a row's JSON tags column into a normalised set, tolerating bad
+    data (see :func:`normalise_tags` for the rule and why)."""
+    try:
+        raw = json.loads(tags_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return set(normalise_tags(raw))
+
+
+def _recency_key(last_served_at: str | None) -> tuple[int, str]:
+    """Sort key that puts never-served rows (NULL) before any timestamp."""
+    return (0, "") if last_served_at is None else (1, last_served_at)
+
+
+def _pick_least_recently_served(
+    candidates: list[tuple[int, Any, str | None]], rng: random.Random | None = None,
+) -> tuple[int, Any] | None:
+    """Pick a round-robin candidate: least-recently-served first, ties random.
+
+    *candidates* is a list of ``(question_id, payload, last_served_at)``
+    triples; returns the ``(question_id, payload)`` chosen, or ``None`` if
+    *candidates* is empty. Never-served rows (``last_served_at is None``)
+    are always preferred over any previously-served row, so a fresh bank
+    addition gets served before the pool starts repeating.
+    """
+    if not candidates:
+        return None
+    chooser = rng if rng is not None else random
+    min_key = min(_recency_key(c[2]) for c in candidates)
+    tied = [(qid, payload) for qid, payload, last in candidates if _recency_key(last) == min_key]
+    return chooser.choice(tied)
+
+
+async def _mark_served(db, question_id: int) -> None:
+    await db.execute(
+        "UPDATE games_question_bank SET last_served_at = CURRENT_TIMESTAMP WHERE question_id = ?",
+        (question_id,),
+    )
+
+
+def _filter_bank_rows(
+    rows, requested: set[str], allow_nsfw: bool,
+) -> list[tuple[int, str, str | None]]:
+    """Apply the shared nsfw/tag rules to raw bank rows.
+
+    Tag rules (in precedence order; all tag comparisons are case-insensitive):
+      1. Rows tagged 'nsfw' are excluded unless *allow_nsfw* is True. NSFW is
+         gated on the Discord channel's age-restriction flag (see
+         :func:`channel_allows_nsfw`); a requested tag cannot re-enable it.
+      2. If a non-empty tag filter is requested: keep rows whose tags intersect it
+         (ANY-match).
+      3. If no tag filter: keep all remaining rows.
+
+    Returns ``(question_id, question_text, last_served_at)`` triples.
+    """
+    requested = set(normalise_tags(requested))
+    out: list[tuple[int, str, str | None]] = []
+    for qid, text, tags_json, last_served_at in rows:
+        row_tags = _parse_tags(tags_json)
+        if "nsfw" in row_tags and not allow_nsfw:      # rule 1 — wins over intersection
+            continue
+        if requested and not (row_tags & requested):   # rule 2 — ANY-match
+            continue
+        out.append((qid, text, last_served_at))         # rule 3 — keep
+    return out
+
+
+async def _get_bank_question(
+    db,
+    game_type: str,
+    exclude: list[str] | None = None,
+    tags: list[str] | None = None,
+    allow_nsfw: bool = False,
+) -> str | None:
+    """Serve a round-robin bank question for game_type, applying tag rules.
+
+    Prefers the least-recently-served matching row (see
+    :func:`_pick_least_recently_served`) and marks it served, so a small pool
+    doesn't repeat a question until every row in it has been served once —
+    including across separate game sessions.
+    """
+    rows = await db.fetchall(
+        "SELECT question_id, question_text, tags, last_served_at FROM games_question_bank WHERE game_type = ?",
+        (game_type,),
+    )
+    filtered = _filter_bank_rows(rows, set(tags or []), allow_nsfw)
+    if exclude:
+        filtered = [(qid, text, last) for qid, text, last in filtered if text not in exclude]
+
+    picked = _pick_least_recently_served(filtered)
+    if picked is None:
+        return None
+    qid, text = picked
+    await _mark_served(db, qid)
+    return text
+
+
+# The four Traditional Truth-or-Dare categories double as the reserved bank
+# tags: every traditional question carries exactly one of these (enforced by
+# the web dashboard). The tag *is* the category, so selection is an exact match
+# — an sfw category never serves an nsfw question and vice versa.
+TRADITIONAL_CATEGORIES: tuple[str, ...] = (
+    "sfw_truth", "sfw_dare", "nsfw_truth", "nsfw_dare",
+)
+
+
+async def get_traditional_question(
+    db, category: str, exclude: list[str] | None = None,
+) -> str | None:
+    """Return a round-robin Traditional Truth-or-Dare bank question for *category*.
+
+    *category* is one of :data:`TRADITIONAL_CATEGORIES`; a question matches
+    only if its single category tag equals it exactly. *exclude* holds
+    question texts already served this game so a bank round doesn't repeat.
+    Among the remaining candidates, the least-recently-served row wins (see
+    :func:`_pick_least_recently_served`), so a small pool doesn't repeat a
+    question across separate games until every row has been served once.
+
+    Bank-only by design (no AI fallback): returns None when the bank has no
+    matching, unexcluded question — the cog reports the player as unserved.
+    """
+    if category not in TRADITIONAL_CATEGORIES:
+        return None
+    rows = await db.fetchall(
+        "SELECT question_id, question_text, tags, last_served_at FROM games_question_bank WHERE game_type = ?",
+        ("traditional",),
+    )
+    seen = set(exclude or ())
+    candidates = [
+        (qid, text, last)
+        for qid, text, tags_json, last in rows
+        if category in _parse_tags(tags_json) and text not in seen
+    ]
+    picked = _pick_least_recently_served(candidates)
+    if picked is None:
+        return None
+    qid, text = picked
+    await _mark_served(db, qid)
+    return text
+
+
+async def has_matching_questions(
+    db, game_type: str, tags: list[str] | None, allow_nsfw: bool = False,
+    *, kind: str | None = None,
+) -> bool:
+    """True if at least one bank row matches the tag filter (same rules as
+    _get_bank_question). Used by slash commands to refuse-on-empty-filtered-pool.
+
+    ``kind`` is FFA's required dimension (``"truth"`` / ``"dare"``): a row
+    must also carry that reserved tag, the way :func:`get_ffa_prompt` demands
+    it — so ``kind:dare tags:wren`` where every wren row is a truth reads as
+    no match here, at the command, rather than passing and having the launch
+    come back empty (anon-tail-76: the host was told the bot lacked channel
+    permissions). ``"random"`` / ``None`` places no kind requirement.
+
+    Read-only: unlike the get_* serving functions, this must not mark a
+    question served — it's just an existence check.
+    """
+    rows = await db.fetchall(
+        "SELECT question_id, question_text, tags, last_served_at FROM games_question_bank WHERE game_type = ?",
+        (game_type,),
+    )
+    if kind in ("truth", "dare"):
+        rows = [r for r in rows if kind in _parse_tags(r[2])]
+    return bool(_filter_bank_rows(rows, set(tags or []), allow_nsfw))
+
+
+async def get_ffa_prompt(db, kind: str = "random", tags: list[str] | None = None,
+                         allow_nsfw: bool = False, exclude: list[str] | None = None):
+    """Return (label, text) for an FFA Truth-or-Dare card, or None on a filtered miss.
+
+    'truth'/'dare'/'nsfw' are reserved tags. *kind* ('truth'|'dare'|'random') is a
+    required dimension; the host's remaining (free) tags are ANY-match. NSFW cards
+    are included by default (*allow_nsfw*); pass ``allow_nsfw=False`` for a clean
+    game. Falls back to the code prompt bank only when no tag filter was supplied.
+
+    *exclude* holds prompt texts already shown this game (the "Next" button's
+    seen-set); matching bank rows are dropped so a game walks its selected set
+    without repeats. Among the remaining candidates, the least-recently-served
+    row wins so a small pool doesn't repeat across separate games. When every
+    match is excluded the set is exhausted and this returns None — the caller
+    resets the seen-set and re-rolls.
+    """
+    from bot_modules.games.ffa.prompts import pick_prompt, TRUTH, DARE
+
+    rows = await db.fetchall(
+        "SELECT question_id, question_text, tags, last_served_at FROM games_question_bank WHERE game_type = ?",
+        ("ffa",),
+    )
+    requested = set(tags or [])
+    opted_nsfw = allow_nsfw  # channel age-restriction is authoritative
+    free = requested - {"truth", "dare", "nsfw"}    # host's non-reserved filter terms
+    want = {"truth"} if kind == "truth" else {"dare"} if kind == "dare" else set()
+    seen = set(exclude or ())
+
+    candidates: list[tuple[int, tuple[str, str], str | None]] = []
+    for qid, text, tags_json, last_served_at in rows:
+        row_tags = _parse_tags(tags_json)
+        if "nsfw" in row_tags and not opted_nsfw:
+            continue
+        if want and not (want & row_tags):           # kind requirement (AND)
+            continue
+        if free and not (free & row_tags):           # host free tags (ANY-match)
+            continue
+        if text in seen:                             # already shown this game
+            continue
+        candidates.append((qid, (DARE if "dare" in row_tags else TRUTH, text), last_served_at))
+
+    picked = _pick_least_recently_served(candidates)
+    if picked is not None:
+        qid, label_text = picked
+        await _mark_served(db, qid)
+        return label_text
+    if requested or seen:            # tag filter OR exhausted seen-set → refuse (no code fallback)
+        return None
+    return pick_prompt(kind, False)                  # unfiltered empty → code fallback

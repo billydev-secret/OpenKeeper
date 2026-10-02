@@ -1,0 +1,1524 @@
+"""Compute functions for the 12 community health dashboard tiles.
+
+Every function is synchronous, touches only the SQLite database (no discord.py
+objects), and returns a plain ``dict`` suitable for JSON serialisation.  Callers
+run them via ``asyncio.to_thread`` / ``run_query``.
+"""
+
+from __future__ import annotations
+
+import datetime
+import sqlite3
+import statistics
+import time
+from collections import defaultdict
+from collections.abc import Sequence
+
+from bot_modules.core.bot_exclusion import bot_filter_clause, bot_ids_subquery
+from bot_modules.moderation.service import NOT_VOICE_CONTROL
+from bot_modules.core.channel_rollup import ChannelResolver, build_resolver
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_DAY = 86400
+_WEEK = 7 * _DAY
+_MONTH = 30 * _DAY
+
+
+def _ts(days_ago: int = 0, *, now: float | None = None) -> int:
+    return int((now or time.time()) - days_ago * _DAY)
+
+
+def _gini(values: Sequence[float]) -> float:
+    """Compute the Gini coefficient for a list of non-negative values."""
+    if not values or max(values) == 0:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    total = sum(sorted_vals)
+    cum = 0.0
+    weighted_sum = 0.0
+    for i, v in enumerate(sorted_vals):
+        cum += v
+        weighted_sum += (2 * (i + 1) - n - 1) * v
+    return weighted_sum / (n * total) if total else 0.0
+
+
+def _lorenz_points(values: list[float], num_points: int = 20) -> list[dict]:
+    """Return Lorenz curve points as [{x: pct_population, y: pct_value}]."""
+    if not values:
+        return [{"x": 0.0, "y": 0.0}, {"x": 100.0, "y": 100.0}]
+    sorted_vals = sorted(values)
+    total = sum(sorted_vals)
+    if total == 0:
+        return [{"x": 0.0, "y": 0.0}, {"x": 100.0, "y": 100.0}]
+    n = len(sorted_vals)
+    points: list[dict[str, float]] = [{"x": 0.0, "y": 0.0}]
+    step = max(1, n // num_points)
+    indices = list(range(0, n, step))
+    if indices[-1] < n - 1:
+        indices.append(n - 1)
+    cum = 0.0
+    prev = 0
+    for i in indices:
+        cum += sum(sorted_vals[prev : i + 1])
+        prev = i + 1
+        points.append(
+            {
+                "x": round((i + 1) / n * 100, 1),
+                "y": round(cum / total * 100, 1),
+            }
+        )
+    if points[-1]["x"] != 100.0:
+        points.append({"x": 100.0, "y": 100.0})
+    return points
+
+
+def _badge(value: float, thresholds: list[tuple[float, str]]) -> str:
+    """Return a badge label based on value crossing thresholds (ascending)."""
+    for threshold, label in thresholds:
+        if value <= threshold:
+            return label
+    return thresholds[-1][1] if thresholds else "unknown"
+
+
+def _pct(num: float, den: float) -> float:
+    return round(num / den * 100, 1) if den else 0.0
+
+
+# ---------------------------------------------------------------------------
+# 1. DAU / MAU stickiness
+# ---------------------------------------------------------------------------
+
+
+def _dau_sparkline(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    days: int,
+    now: float,
+    bot_clause: str,
+    bot_params: tuple,
+) -> list[int]:
+    """Daily distinct-author counts for the trailing ``days`` days, oldest first.
+
+    ``messages`` has no retention purge (see docs/data_register.md), so in
+    principle there's no upper bound on ``days`` — but a guild that only
+    started being logged N days ago has nothing before that. Zero-filling the
+    gap would draw a trend line that trails off to zero and reads as activity
+    collapsing, so the window is capped to the guild's actual message history:
+    when the requested ``days`` exceeds it, fewer buckets come back and the
+    caller compares the returned length against what was asked for.
+
+    One grouped query rather than a query-per-day loop (the previous shape)
+    — the day-per-query version doesn't scale to a year-long window, and this
+    scans the same rows either way.
+    """
+    earliest = conn.execute(
+        f"SELECT MIN(ts) FROM messages WHERE guild_id=?{bot_clause}",
+        (guild_id, *bot_params),
+    ).fetchone()[0]
+    # No message ever seen under this filter: nothing to cap against, so hand
+    # back the full requested (zero-filled) window. In practice the caller
+    # never reaches here for a guild with zero history — the deep-dive route
+    # only renders the trend chart once MAU is nonzero.
+    available_days = None if earliest is None else int((now - earliest) // _DAY) + 1
+    span = days if available_days is None else max(0, min(days, available_days))
+
+    counts = [0] * span
+    if span:
+        day_start = _ts(span, now=now)
+        now_int = int(now)
+        rows = conn.execute(
+            f"SELECT (ts - ?) / {_DAY} AS day_idx, COUNT(DISTINCT author_id) AS cnt "
+            f"FROM messages WHERE guild_id=? AND ts>=? AND ts<?{bot_clause} "
+            f"GROUP BY day_idx",
+            (day_start, guild_id, day_start, now_int, *bot_params),
+        ).fetchall()
+        for r in rows:
+            idx = r["day_idx"]
+            if 0 <= idx < span:
+                counts[idx] = r["cnt"]
+    return counts
+
+
+def compute_dau_mau(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    member_count: int = 0,
+    voice_active_count: int = 0,
+    include_bots: bool = False,
+    days: int = 30,
+) -> dict:
+    """``days`` sizes only the trend chart (``sparkline``) — the dashboard's
+    range control. DAU/WAU/MAU keep their fixed 1/7/30-day definitions
+    regardless of it; scaling those with a UI range would make the tile
+    labels lie about what they show.
+    """
+    now = now or time.time()
+    bot_clause, bot_params = bot_filter_clause(guild_id, include_bots=include_bots)
+
+    # DAU / WAU / MAU counts
+    dau = conn.execute(
+        f"SELECT COUNT(DISTINCT author_id) FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause}",
+        (guild_id, _ts(1, now=now), *bot_params),
+    ).fetchone()[0]
+    wau = conn.execute(
+        f"SELECT COUNT(DISTINCT author_id) FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause}",
+        (guild_id, _ts(7, now=now), *bot_params),
+    ).fetchone()[0]
+    mau = conn.execute(
+        f"SELECT COUNT(DISTINCT author_id) FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause}",
+        (guild_id, _ts(30, now=now), *bot_params),
+    ).fetchone()[0]
+
+    dau_mau = _pct(dau, mau)
+    wau_mau = _pct(wau, mau)
+
+    # Trend sparkline — see _dau_sparkline for the history-cap behavior.
+    sparkline = _dau_sparkline(
+        conn, guild_id, days=days, now=now, bot_clause=bot_clause, bot_params=bot_params
+    )
+
+    # Voice active: unique users with voice XP events in last 7 days
+    voice_7d = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) FROM xp_events "
+        "WHERE guild_id = ? AND source = 'voice' AND created_at >= ?",
+        (guild_id, now - 7 * _DAY),
+    ).fetchone()[0]
+
+    # Engagement depth funnel
+    funnel = {
+        "total_members": member_count,
+        "mau": mau,
+        "wau": wau,
+        "dau": dau,
+        "voice_active": voice_7d or voice_active_count,
+    }
+
+    # Active user composition: returning vs reactivated vs new (first 7 days)
+    seven_days_ago = _ts(7, now=now)
+    thirty_days_ago = _ts(30, now=now)
+
+    # Users active today
+    todays_authors = conn.execute(
+        f"SELECT DISTINCT author_id FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause}",
+        (guild_id, _ts(1, now=now), *bot_params),
+    ).fetchall()
+    today_ids = {r[0] for r in todays_authors}
+
+    # First-ever message timestamp per user (within 90 days to limit scan)
+    first_msg = {}
+    rows = conn.execute(
+        f"SELECT author_id, MIN(ts) AS first_ts FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause} GROUP BY author_id",
+        (guild_id, _ts(90, now=now), *bot_params),
+    ).fetchall()
+    for r in rows:
+        first_msg[r["author_id"]] = r["first_ts"]
+
+    new_count = 0
+    reactivated_count = 0
+    returning_count = 0
+    for uid in today_ids:
+        ft = first_msg.get(uid)
+        if ft and ft >= seven_days_ago:
+            new_count += 1
+        else:
+            # Was active in previous 8-30 day window?
+            prev = conn.execute(
+                "SELECT 1 FROM messages WHERE guild_id=? AND author_id=? "
+                "AND ts>=? AND ts<? LIMIT 1",
+                (guild_id, uid, _ts(30, now=now), _ts(7, now=now)),
+            ).fetchone()
+            if prev:
+                returning_count += 1
+            else:
+                reactivated_count += 1
+
+    composition = {
+        "returning": returning_count,
+        "reactivated": reactivated_count,
+        "new": new_count,
+    }
+
+    # Lurker activation rate: users whose first message is within last 30 days
+    # out of total members
+    first_timers_30d = conn.execute(
+        f"""SELECT COUNT(*) FROM (
+            SELECT author_id, MIN(ts) AS first_ts FROM messages
+            WHERE guild_id=?{bot_clause} GROUP BY author_id
+            HAVING first_ts >= ?
+        )""",
+        (guild_id, *bot_params, thirty_days_ago),
+    ).fetchone()[0]
+    lurker_activation = _pct(first_timers_30d, member_count) if member_count else 0
+
+    # Day-of-week breakdown (avg DAU per weekday, 0=Mon)
+    dow_rows = conn.execute(
+        f"""SELECT CAST(((ts % 604800) + 259200) / 86400 AS INTEGER) % 7 AS dow,
+                  COUNT(DISTINCT author_id) AS cnt
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY dow ORDER BY dow""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_map = {r["dow"]: r["cnt"] for r in dow_rows}
+    day_of_week = [
+        {"day": dow_names[i], "avg_dau": round(dow_map.get(i, 0) / 4.3, 1)}
+        for i in range(7)
+    ]
+
+    badge = _badge(
+        dau_mau,
+        [(10, "critical"), (20, "needs_work"), (30, "healthy"), (100, "excellent")],
+    )
+
+    return {
+        "dau": dau,
+        "wau": wau,
+        "mau": mau,
+        "dau_mau": dau_mau,
+        "wau_mau": wau_mau,
+        "badge": badge,
+        "sparkline": sparkline,
+        # The trend chart's actual window: may be shorter than `days` when
+        # the guild's message history doesn't reach back that far. The panel
+        # compares the two to tell "no activity" apart from "no data yet".
+        "trend_days": len(sparkline),
+        "trend_days_requested": days,
+        "funnel": funnel,
+        "composition": composition,
+        "lurker_activation": lurker_activation,
+        "day_of_week": day_of_week,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2. Activity heatmap
+# ---------------------------------------------------------------------------
+
+
+def compute_heatmap(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    utc_offset_hours: float = 0.0,
+    include_bots: bool = False,
+    resolver: ChannelResolver | None = None,
+) -> dict:
+    now = now or time.time()
+    thirty_days_ago = _ts(30, now=now)
+    offset_secs = int(utc_offset_hours * 3600)
+    bot_clause, bot_params = bot_filter_clause(guild_id, include_bots=include_bots)
+    # Only the per-channel breakdown needs this; the server-wide grid counts
+    # every message wherever it was posted, threads included.
+    if resolver is None:
+        resolver = build_resolver(conn, guild_id, live_channel_ids=None)
+
+    # 7x24 grid: day_of_week (0=Mon) x hour_of_day -> avg msgs/hr, bucketed in
+    # guild-local time (ts shifted by the guild's tz offset before bucketing).
+    rows = conn.execute(
+        f"""SELECT
+             CAST((((ts + ?) % 604800) + 259200) / 86400 AS INTEGER) % 7 AS dow,
+             ((ts + ?) % 86400) / 3600 AS hod,
+             COUNT(*) AS cnt
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY dow, hod""",
+        (offset_secs, offset_secs, guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+
+    weeks = 4.3  # ~30 days
+    grid = [[0.0] * 24 for _ in range(7)]
+    for r in rows:
+        grid[r["dow"]][r["hod"]] = round(r["cnt"] / weeks, 1)
+
+    # Find peak and quiet slots
+    peak_val: float = 0
+    peak_dow, peak_hod = 0, 0
+    quiet_val, quiet_dow, quiet_hod = float("inf"), 0, 0
+    dead_hours = 0
+    for d in range(7):
+        for h in range(24):
+            v = grid[d][h]
+            if v > peak_val:
+                peak_val, peak_dow, peak_hod = v, d, h
+            if v < quiet_val:
+                quiet_val, quiet_dow, quiet_hod = v, d, h
+            if v < 1:
+                dead_hours += 1
+
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def _slot_label(dow, hod):
+        h = hod % 12 or 12
+        ap = "am" if hod < 12 else "pm"
+        return f"{dow_names[dow]} {h}{ap}"
+
+    # Per-channel mini heatmaps (top 10 channels by volume). Thread traffic is
+    # folded into the parent's grid, so a channel's busiest hours include the
+    # hours its threads were busy (services/channel_rollup).
+    ch_rows = conn.execute(
+        f"""SELECT channel_id,
+             CAST((((ts + ?) % 604800) + 259200) / 86400 AS INTEGER) % 7 AS dow,
+             ((ts + ?) % 86400) / 3600 AS hod,
+             COUNT(*) AS cnt
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY channel_id, dow, hod
+           ORDER BY cnt DESC""",
+        (offset_secs, offset_secs, guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+
+    # Raw counts first, averaged per week only once the channel's own messages
+    # and its threads' have been added together — rounding each contribution
+    # separately and summing those would drift low.
+    ch_totals: dict[int, int] = defaultdict(int)
+    ch_slots: dict[int, list[list[int]]] = {}
+    for r in ch_rows:
+        cid = resolver.resolve(r["channel_id"])
+        if cid is None:
+            continue
+        ch_totals[cid] += r["cnt"]
+        if cid not in ch_slots:
+            ch_slots[cid] = [[0] * 24 for _ in range(7)]
+        ch_slots[cid][r["dow"]][r["hod"]] += r["cnt"]
+
+    top_channels = sorted(ch_totals, key=lambda c: ch_totals[c], reverse=True)[:10]
+    per_channel = [
+        {
+            "channel_id": str(cid),
+            "grid": [
+                [round(cnt / weeks, 1) for cnt in row] for row in ch_slots[cid]
+            ],
+        }
+        for cid in top_channels
+    ]
+
+    return {
+        "grid": grid,
+        "peak_slot": _slot_label(peak_dow, peak_hod),
+        "peak_value": peak_val,
+        "quiet_slot": _slot_label(quiet_dow, quiet_hod),
+        "quiet_value": quiet_val,
+        "dead_hours": dead_hours,
+        "per_channel": per_channel,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. Channel health
+# ---------------------------------------------------------------------------
+
+
+def compute_channel_health(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    nsfw_channel_ids: list[int] | None = None,
+    include_bots: bool = False,
+    resolver: ChannelResolver | None = None,
+) -> dict:
+    """30-day status and score for each channel.
+
+    *resolver* folds thread activity onto the channel the thread was started
+    from and drops ids that aren't channels — throwaway pen-pals/voice/jail
+    rooms, and anything the guild no longer has (services/channel_rollup).
+    Without it a busy thread scored as a channel of its own, and its parent
+    read as quieter than it really was.
+    """
+    now = now or time.time()
+    thirty_days_ago = _ts(30, now=now)
+    nsfw_ids = set(nsfw_channel_ids or [])
+    bot_clause, bot_params = bot_filter_clause(guild_id, include_bots=include_bots)
+    if resolver is None:
+        resolver = build_resolver(conn, guild_id, live_channel_ids=None)
+
+    # Per-channel volume. unique_users is recomputed from the per-author rows
+    # below instead of taken from here — a member active in both a thread and
+    # its parent is one unique user of the merged channel, not two.
+    ch_rows = conn.execute(
+        f"""SELECT channel_id, COUNT(*) AS msg_count
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY channel_id""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    msg_counts: dict[int, int] = defaultdict(int)
+    for r in ch_rows:
+        target = resolver.resolve(r["channel_id"])
+        if target is not None:
+            msg_counts[target] += r["msg_count"]
+
+    # Conversation depth: replies per replied-to message. Summed rather than
+    # averaged in SQL so a thread's replies can be weighted into the parent's
+    # average by volume instead of as one more equal data point.
+    depth_rows = conn.execute(
+        f"""SELECT m.channel_id,
+                  SUM(reply_cnt) AS total_replies,
+                  COUNT(*) AS starters
+           FROM (
+               SELECT channel_id, reply_to_id, COUNT(*) AS reply_cnt
+               FROM messages
+               WHERE guild_id=? AND ts>=? AND reply_to_id IS NOT NULL{bot_clause}
+               GROUP BY channel_id, reply_to_id
+           ) m
+           GROUP BY m.channel_id""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    depth_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+    for r in depth_rows:
+        target = resolver.resolve(r["channel_id"])
+        if target is not None:
+            depth_totals[target][0] += int(r["total_replies"] or 0)
+            depth_totals[target][1] += int(r["starters"] or 0)
+    depth_map = {
+        cid: round(replies / starters, 2)
+        for cid, (replies, starters) in depth_totals.items()
+        if starters
+    }
+
+    # Per-channel Gini (message distribution among authors)
+    author_counts_rows = conn.execute(
+        f"""SELECT channel_id, author_id, COUNT(*) AS cnt
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY channel_id, author_id""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    ch_author_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for r in author_counts_rows:
+        target = resolver.resolve(r["channel_id"])
+        if target is not None:
+            ch_author_counts[target][r["author_id"]] += r["cnt"]
+
+    # Last message per channel (for dormant detection). Bot-excluded too, so a
+    # channel kept "alive" only by bot posts reads as dormant — which is the
+    # point: #register's 2.9k messages are 99% our own bot.
+    last_msg_rows = conn.execute(
+        f"SELECT channel_id, MAX(ts) AS last_ts FROM messages "
+        f"WHERE guild_id=?{bot_clause} GROUP BY channel_id",
+        (guild_id, *bot_params),
+    ).fetchall()
+    # A channel is as recently active as the latest thing said anywhere in it,
+    # threads included — otherwise a channel whose life has moved into a thread
+    # reads as dormant while people are still talking.
+    last_msg_map: dict[int, float] = {}
+    for r in last_msg_rows:
+        target = resolver.resolve(r["channel_id"])
+        if target is not None:
+            last_msg_map[target] = max(last_msg_map.get(target, 0), r["last_ts"])
+
+    channels = []
+    active_count = 0
+    flagged_count = 0
+    dormant_count = 0
+    archive_count = 0
+
+    for cid, msg_count in msg_counts.items():
+        by_author = ch_author_counts.get(cid, {})
+        unique = len(by_author)
+        depth = depth_map.get(cid, 0)
+        gini = _gini(list(by_author.values()))
+        msgs_per_day = round(msg_count / 30, 1)
+
+        # Composite score: volume (30%) + unique users (25%) + depth (25%) + equity (20%)
+        vol_score = min(100, msgs_per_day * 5)  # 20 msgs/day = 100
+        user_score = min(100, unique * 10)  # 10 unique = 100
+        depth_score = min(100, depth * 25)  # depth 4 = 100
+        equity_score = max(0, (1 - gini) * 100)
+        composite = round(
+            vol_score * 0.3
+            + user_score * 0.25
+            + depth_score * 0.25
+            + equity_score * 0.2,
+            1,
+        )
+
+        last_ts = last_msg_map.get(cid, 0)
+        age = now - last_ts if last_ts else float("inf")
+
+        if age > 30 * _DAY:
+            status = "archive"
+            archive_count += 1
+        elif age > 14 * _DAY:
+            status = "dormant"
+            dormant_count += 1
+        elif composite < 50:
+            status = "flagged"
+            flagged_count += 1
+            active_count += 1
+        else:
+            status = "healthy"
+            active_count += 1
+
+        channels.append(
+            {
+                "channel_id": str(cid),
+                "score": composite,
+                "msgs_per_day": msgs_per_day,
+                "unique_weekly_users": unique,
+                "avg_thread_depth": depth,
+                "gini": round(gini, 3),
+                "status": status,
+                "is_nsfw": cid in nsfw_ids,
+            }
+        )
+
+    channels.sort(key=lambda c: c["score"], reverse=True)
+
+    return {
+        "active_count": active_count,
+        "flagged_count": flagged_count,
+        "dormant_count": dormant_count,
+        "archive_count": archive_count,
+        "channels": channels[:50],
+        "top5": channels[:5],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. Participation Gini coefficient
+# ---------------------------------------------------------------------------
+
+
+def compute_gini(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    include_bots: bool = False,
+) -> dict:
+    now = now or time.time()
+    thirty_days_ago = _ts(30, now=now)
+    bot_clause, bot_params = bot_filter_clause(guild_id, include_bots=include_bots)
+
+    # Message counts per user. Bots skew this metric harder than any other — a
+    # single high-volume bot reads as extreme participation inequality.
+    rows = conn.execute(
+        f"SELECT author_id, COUNT(*) AS cnt FROM messages "
+        f"WHERE guild_id=? AND ts>=?{bot_clause} GROUP BY author_id ORDER BY cnt",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    msg_counts = [r["cnt"] for r in rows]
+
+    gini_val = round(_gini(msg_counts), 3)
+    lorenz = _lorenz_points(msg_counts)
+
+    # Top 5% / 10% share
+    total_msgs = sum(msg_counts)
+    n = len(msg_counts)
+    top5_idx = max(0, n - max(1, int(n * 0.05)))
+    top10_idx = max(0, n - max(1, int(n * 0.10)))
+    bottom40_idx = max(1, int(n * 0.40))
+    top5_share = _pct(sum(msg_counts[top5_idx:]), total_msgs)
+    top10_share = _pct(sum(msg_counts[top10_idx:]), total_msgs)
+    bottom40_share = sum(msg_counts[:bottom40_idx])
+    top10_abs = sum(msg_counts[top10_idx:])
+    palma = round(top10_abs / bottom40_share, 2) if bottom40_share else 0
+
+    # Participation tiers. `rows` comes from a GROUP BY over messages, so every
+    # row has cnt >= 1 — a lurker, who posted nothing, is absent from it by
+    # construction and the old `wk == 0` branch could never be taken. Counting
+    # lurkers means reading membership and subtracting the people who posted.
+    # Members who have left (current_member=0) are not lurkers: they aren't
+    # here to be quiet.
+    poster_ids = {r["author_id"] for r in rows}
+    member_clause, member_params = bot_filter_clause(
+        guild_id, column="user_id", include_bots=include_bots
+    )
+    lurkers = sum(
+        1
+        for r in conn.execute(
+            f"SELECT user_id FROM known_users "
+            f"WHERE guild_id=? AND current_member=1{member_clause}",
+            (guild_id, *member_params),
+        )
+        if r["user_id"] not in poster_ids
+    )
+
+    user_counts_weekly = {}
+    for r in rows:
+        user_counts_weekly[r["author_id"]] = r["cnt"] / 4.3  # approximate weekly
+
+    power = active = moderate = light = 0
+    for wk in user_counts_weekly.values():
+        if wk <= 5:
+            light += 1
+        elif wk <= 20:
+            moderate += 1
+        elif wk <= 50:
+            active += 1
+        else:
+            power += 1
+
+    tiers = {
+        "lurker": lurkers,
+        "light": light,
+        "moderate": moderate,
+        "active": active,
+        "power": power,
+    }
+
+    # 30-day sparkline (weekly Gini)
+    sparkline = []
+    for w in range(3, -1, -1):
+        w_start = _ts((w + 1) * 7, now=now)
+        w_end = _ts(w * 7, now=now)
+        w_rows = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM messages "
+            f"WHERE guild_id=? AND ts>=? AND ts<?{bot_clause} "
+            f"GROUP BY author_id ORDER BY cnt",
+            (guild_id, w_start, w_end, *bot_params),
+        ).fetchall()
+        w_vals = [r["cnt"] for r in w_rows]
+        sparkline.append(round(_gini(w_vals), 3))
+
+    # Gini history (12 weekly snapshots, oldest → newest)
+    gini_history = []
+    for w in range(11, -1, -1):
+        w_start = _ts((w + 1) * 7, now=now)
+        w_end = _ts(w * 7, now=now)
+        h_rows = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM messages "
+            f"WHERE guild_id=? AND ts>=? AND ts<?{bot_clause} "
+            f"GROUP BY author_id ORDER BY cnt",
+            (guild_id, w_start, w_end, *bot_params),
+        ).fetchall()
+        h_vals = [r["cnt"] for r in h_rows]
+        # Aware UTC: this value is only ever strftime'd into a "Mon D" label,
+        # never compared against another datetime, so the tz-aware form renders
+        # identically to the deprecated naive ``utcfromtimestamp``.
+        dt = datetime.datetime.fromtimestamp(w_start, datetime.UTC)
+        label = dt.strftime("%b ") + str(dt.day)
+        gini_history.append({"label": label, "gini": round(_gini(h_vals), 3)})
+
+    # Per-channel Gini (top 10 channels)
+    ch_rows = conn.execute(
+        f"""SELECT channel_id, author_id, COUNT(*) AS cnt
+           FROM messages WHERE guild_id=? AND ts>=?{bot_clause}
+           GROUP BY channel_id, author_id""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    ch_counts: dict[int, list[int]] = defaultdict(list)
+    for r in ch_rows:
+        ch_counts[r["channel_id"]].append(r["cnt"])
+
+    ch_totals = {cid: sum(vals) for cid, vals in ch_counts.items()}
+    top_chs = sorted(ch_totals, key=lambda c: ch_totals[c], reverse=True)[:10]
+    per_channel = [
+        {
+            "channel_id": str(cid),
+            "gini": round(_gini(ch_counts[cid]), 3),
+            "msgs": ch_totals[cid],
+        }
+        for cid in top_chs
+    ]
+
+    # XP distribution Gini
+    xp_rows = conn.execute(
+        "SELECT user_id, SUM(amount) AS total_xp FROM xp_events "
+        "WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY total_xp",
+        (guild_id, thirty_days_ago),
+    ).fetchall()
+    xp_vals = [r["total_xp"] for r in xp_rows]
+    xp_gini = round(_gini(xp_vals), 3)
+
+    badge = _badge(
+        gini_val,
+        [(0.50, "excellent"), (0.70, "healthy"), (0.85, "warning"), (1.0, "critical")],
+    )
+
+    return {
+        "gini": gini_val,
+        "badge": badge,
+        # Distinct authors in the window. `tiers` is a five-key dict that is
+        # never empty, so it can't answer "did anyone post?" — this can, and
+        # the panel's empty state hangs off it.
+        "posters": n,
+        "total_messages": total_msgs,
+        "lorenz": lorenz,
+        "top5_share": top5_share,
+        "top10_share": top10_share,
+        "palma": palma,
+        "tiers": tiers,
+        "sparkline": sparkline,
+        "per_channel": per_channel,
+        "xp_gini": xp_gini,
+        "gini_history": gini_history,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. Sentiment & tone
+# ---------------------------------------------------------------------------
+
+
+def compute_sentiment(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    include_bots: bool = False,
+) -> dict:
+    now = now or time.time()
+    thirty_days_ago = _ts(30, now=now)
+    # Bot output is scored by VADER like any other text, so a chatty bot's tone
+    # lands in the guild's average sentiment. Filter on the *message* author.
+    bot_clause, bot_params = bot_filter_clause(
+        guild_id, column="m.author_id", include_bots=include_bots
+    )
+
+    # Overall stats — use message timestamp (m.ts) so backfilled scores
+    # are attributed to the day the message was actually sent, not the day
+    # the VADER score was computed.
+    #
+    # Every query below reads ``messages`` directly rather than joining the
+    # ``message_sentiment`` side table. The two are written by the same code
+    # paths (events_cog on ingest, sentiment_service on backfill) and carry
+    # identical values — verified read-only against prod before the switch:
+    # 502,051 rows on each side, zero orphans in either direction, zero
+    # sentiment or emotion mismatches — but only ``messages`` is indexed for
+    # this query shape (``idx_messages_sentiment (guild_id, sentiment)``).
+    #
+    # The join used to supply ``sentiment IS NOT NULL`` implicitly, since a
+    # ``message_sentiment`` row only exists for a scored message and its
+    # ``sentiment`` column is NOT NULL. Reading ``messages`` has to state it:
+    # ``AVG`` skips NULLs on its own, but ``COUNT(*)`` does not, so without the
+    # predicate every unscored message would inflate the counts (and, via the
+    # spike/per-channel ``HAVING``/``count`` outputs, change the results).
+    row = conn.execute(
+        f"SELECT AVG(m.sentiment) AS avg_s, COUNT(*) AS cnt "
+        f"FROM messages m "
+        f"WHERE m.guild_id=? AND m.ts>=? AND m.sentiment IS NOT NULL{bot_clause}",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchone()
+    avg_sentiment = round(row["avg_s"], 3) if row["avg_s"] is not None else 0
+    scored_count = row["cnt"]
+
+    # Emotion category breakdown
+    emotion_rows = conn.execute(
+        f"SELECT m.emotion, COUNT(*) AS cnt "
+        f"FROM messages m "
+        f"WHERE m.guild_id=? AND m.ts>=? AND m.sentiment IS NOT NULL "
+        f"AND m.emotion IS NOT NULL{bot_clause} "
+        f"GROUP BY m.emotion",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    emotions = {r["emotion"]: r["cnt"] for r in emotion_rows}
+    emotion_total = sum(emotions.values()) or 1
+    emotion_pcts = {k: round(v / emotion_total * 100, 1) for k, v in emotions.items()}
+
+    # Positive / negative ratio
+    # ``sentiment>0.05`` / ``<-0.05`` already exclude NULL on their own, so
+    # these two need no extra IS NOT NULL.
+    pos_count = conn.execute(
+        f"SELECT COUNT(*) FROM messages m "
+        f"WHERE m.guild_id=? AND m.ts>=? AND m.sentiment>0.05{bot_clause}",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchone()[0]
+    neg_count = conn.execute(
+        f"SELECT COUNT(*) FROM messages m "
+        f"WHERE m.guild_id=? AND m.ts>=? AND m.sentiment<-0.05{bot_clause}",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchone()[0]
+    pos_neg_ratio = round(pos_count / neg_count, 1) if neg_count else 0
+
+    # 30-day daily sentiment sparkline
+    sparkline = []
+    for d in range(29, -1, -1):
+        day_start = _ts(d + 1, now=now)
+        day_end = _ts(d, now=now)
+        r = conn.execute(
+            f"SELECT AVG(m.sentiment) AS avg_s "
+            f"FROM messages m "
+            f"WHERE m.guild_id=? AND m.ts>=? AND m.ts<? "
+            f"AND m.sentiment IS NOT NULL{bot_clause}",
+            (guild_id, day_start, day_end, *bot_params),
+        ).fetchone()
+        sparkline.append(round(r["avg_s"], 3) if r["avg_s"] is not None else 0)
+
+    # Negative spikes: 5-minute windows where avg sentiment < -0.3
+    spike_rows = conn.execute(
+        f"""SELECT CAST(m.ts / 300 AS INTEGER) * 300 AS window_start,
+                  AVG(m.sentiment) AS avg_s,
+                  COUNT(*) AS cnt
+           FROM messages m
+           WHERE m.guild_id=? AND m.ts>=? AND m.sentiment IS NOT NULL{bot_clause}
+           GROUP BY CAST(m.ts / 300 AS INTEGER)
+           HAVING avg_s < -0.3 AND cnt >= 3
+           ORDER BY window_start DESC
+           LIMIT 20""",
+        (guild_id, _ts(7, now=now), *bot_params),
+    ).fetchall()
+    spikes = [
+        {
+            "timestamp": r["window_start"],
+            "avg_sentiment": round(r["avg_s"], 3),
+            "msg_count": r["cnt"],
+        }
+        for r in spike_rows
+    ]
+
+    # Per-channel sentiment
+    ch_rows = conn.execute(
+        f"""SELECT m.channel_id, AVG(m.sentiment) AS avg_s, COUNT(*) AS cnt
+           FROM messages m
+           WHERE m.guild_id=? AND m.ts>=? AND m.sentiment IS NOT NULL{bot_clause}
+           GROUP BY m.channel_id
+           ORDER BY avg_s DESC""",
+        (guild_id, thirty_days_ago, *bot_params),
+    ).fetchall()
+    per_channel = [
+        {
+            "channel_id": str(r["channel_id"]),
+            "avg_sentiment": round(r["avg_s"], 3),
+            "count": r["cnt"],
+        }
+        for r in ch_rows[:20]
+    ]
+
+    badge = _badge(
+        avg_sentiment,
+        [(-0.1, "critical"), (0.0, "needs_work"), (0.2, "healthy"), (1.0, "excellent")],
+    )
+
+    return {
+        "avg_sentiment": avg_sentiment,
+        "badge": badge,
+        "scored_count": scored_count,
+        "emotions": emotion_pcts,
+        "pos_neg_ratio": pos_neg_ratio,
+        "sparkline": sparkline,
+        "spikes_7d": len(spikes),
+        "spike_log": spikes,
+        "per_channel": per_channel,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Newcomer activation funnel
+# ---------------------------------------------------------------------------
+
+
+def compute_newcomer_funnel(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    recent_join_ids: dict[int, float] | None = None,
+    include_bots: bool = False,
+) -> dict:
+    """*recent_join_ids* maps user_id -> join_timestamp for members who joined
+    in the last 90 days (sourced from guild cache by the caller)."""
+    now = now or time.time()
+    if not recent_join_ids:
+        recent_join_ids = {}
+    # The newcomer's own messages are scoped by author_id=uid (already bot-free
+    # once recent_join_ids is filtered below), so only the *replier* needs a
+    # clause.
+    replier_bot_clause, replier_bot_params = bot_filter_clause(
+        guild_id, column="m.author_id", include_bots=include_bots
+    )
+
+    # Also try invite_edges for join times
+    invite_rows = conn.execute(
+        "SELECT invitee_id, joined_at FROM invite_edges WHERE guild_id=? AND joined_at>=?",
+        (guild_id, _ts(90, now=now)),
+    ).fetchall()
+    for r in invite_rows:
+        if r["invitee_id"] not in recent_join_ids:
+            recent_join_ids[r["invitee_id"]] = r["joined_at"]
+
+    # A bot that joined in the window is not a "newcomer" to activate.
+    if not include_bots and recent_join_ids:
+        bot_ids = {
+            r[0] for r in conn.execute(bot_ids_subquery(), (guild_id,)).fetchall()
+        }
+        recent_join_ids = {
+            uid: ts for uid, ts in recent_join_ids.items() if uid not in bot_ids
+        }
+
+    if not recent_join_ids:
+        return {
+            "activation_rate": 0,
+            "badge": "no_data",
+            "funnel": {
+                "joined": 0,
+                "first_message": 0,
+                "first_reply": 0,
+                "three_channels": 0,
+                "d7_return": 0,
+            },
+            "time_to_first_msg": {"median_hours": 0, "distribution": []},
+            "first_response_latency": {"median_minutes": 0},
+            "cohorts": [],
+        }
+
+    joined = len(recent_join_ids)
+    first_message = 0
+    first_reply = 0
+    three_channels = 0
+    d7_return = 0
+    ttfm_hours = []
+    response_latencies = []
+
+    # Four queries per recent joiner — there's no set-based way to express
+    # "milestones since *this user's own* join time" in one query. Each one
+    # depends on idx_messages_author_ts / idx_messages_reply_to
+    # (201_newcomer_funnel_indexes.sql); without them this loop walked a
+    # guild-wide ts range per joiner and took 37s+ for ~200 recent joiners in
+    # prod. The 15-minute cache in the route (health.py) absorbs repeat
+    # loads; it does not make a slow first-load-after-invalidation fast.
+    for uid, join_ts in recent_join_ids.items():
+        # First message
+        first_msg = conn.execute(
+            "SELECT MIN(ts) AS first_ts FROM messages WHERE guild_id=? AND author_id=? AND ts>=?",
+            (guild_id, uid, int(join_ts)),
+        ).fetchone()
+        if not first_msg or first_msg["first_ts"] is None:
+            continue
+        first_message += 1
+        ttfm_hours.append((first_msg["first_ts"] - join_ts) / 3600)
+
+        # First reply received
+        # A welcome bot auto-replying is not the community responding, so the
+        # reply's author is bot-filtered even though the newcomer's own messages
+        # (scoped by author_id=uid above) need no filter.
+        first_reply_row = conn.execute(
+            f"""SELECT MIN(m.ts) AS reply_ts FROM messages m
+               WHERE m.guild_id=? AND m.reply_to_id IN (
+                   SELECT message_id FROM messages WHERE guild_id=? AND author_id=? AND ts>=?
+               ) AND m.author_id != ? AND m.ts>=?{replier_bot_clause}""",
+            (
+                guild_id,
+                guild_id,
+                uid,
+                int(join_ts),
+                uid,
+                int(join_ts),
+                *replier_bot_params,
+            ),
+        ).fetchone()
+        if first_reply_row and first_reply_row["reply_ts"] is not None:
+            first_reply += 1
+            latency = (first_reply_row["reply_ts"] - first_msg["first_ts"]) / 60
+            response_latencies.append(latency)
+
+        # 3+ channels visited
+        ch_count = conn.execute(
+            "SELECT COUNT(DISTINCT channel_id) FROM messages WHERE guild_id=? AND author_id=? AND ts>=?",
+            (guild_id, uid, int(join_ts)),
+        ).fetchone()[0]
+        if ch_count >= 3:
+            three_channels += 1
+
+        # D7 return: active 7+ days after joining
+        d7_ts = join_ts + 7 * _DAY
+        if d7_ts < now:
+            d7_active = conn.execute(
+                "SELECT 1 FROM messages WHERE guild_id=? AND author_id=? AND ts>=? AND ts<? LIMIT 1",
+                (guild_id, uid, int(d7_ts), int(d7_ts + 7 * _DAY)),
+            ).fetchone()
+            if d7_active:
+                d7_return += 1
+
+    # Only count users eligible for D7 (joined 14+ days ago)
+    d7_eligible = sum(1 for ts in recent_join_ids.values() if now - ts >= 14 * _DAY)
+    activation_rate = _pct(d7_return, d7_eligible) if d7_eligible else 0
+
+    funnel = {
+        "joined": joined,
+        "first_message": first_message,
+        "first_reply": first_reply,
+        "three_channels": three_channels,
+        "d7_return": d7_return,
+    }
+
+    median_ttfm = round(statistics.median(ttfm_hours), 1) if ttfm_hours else 0
+    median_latency = (
+        round(statistics.median(response_latencies), 1) if response_latencies else 0
+    )
+
+    # Time-to-first-message distribution
+    ttfm_dist = {"under_1h": 0, "1_4h": 0, "4_24h": 0, "24_48h": 0, "over_48h": 0}
+    for h in ttfm_hours:
+        if h < 1:
+            ttfm_dist["under_1h"] += 1
+        elif h < 4:
+            ttfm_dist["1_4h"] += 1
+        elif h < 24:
+            ttfm_dist["4_24h"] += 1
+        elif h < 48:
+            ttfm_dist["24_48h"] += 1
+        else:
+            ttfm_dist["over_48h"] += 1
+
+    badge = _badge(
+        activation_rate,
+        [(20, "critical"), (30, "needs_work"), (40, "healthy"), (100, "excellent")],
+    )
+
+    return {
+        "activation_rate": activation_rate,
+        "badge": badge,
+        "funnel": funnel,
+        "time_to_first_msg": {"median_hours": median_ttfm, "distribution": ttfm_dist},
+        "first_response_latency": {"median_minutes": median_latency},
+        "cohorts": [],  # populated in deep-dive endpoint
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Cohort retention curves
+# ---------------------------------------------------------------------------
+
+
+def compute_cohort_retention(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    join_times: dict[int, float] | None = None,
+    include_bots: bool = False,
+) -> dict:
+    now = now or time.time()
+    if not join_times:
+        join_times = {}
+    bot_clause, bot_params = bot_filter_clause(guild_id, include_bots=include_bots)
+    # Supplement from invite_edges
+    rows = conn.execute(
+        "SELECT invitee_id, joined_at FROM invite_edges WHERE guild_id=?",
+        (guild_id,),
+    ).fetchall()
+    for r in rows:
+        if r["invitee_id"] not in join_times:
+            join_times[r["invitee_id"]] = r["joined_at"]
+
+    # Fall back to first-message-ever as proxy for join date
+    first_msg_rows = conn.execute(
+        f"SELECT author_id, MIN(ts) AS first_ts FROM messages "
+        f"WHERE guild_id=?{bot_clause} GROUP BY author_id",
+        (guild_id, *bot_params),
+    ).fetchall()
+    for r in first_msg_rows:
+        if r["author_id"] not in join_times:
+            join_times[r["author_id"]] = r["first_ts"]
+
+    # invite_edges and the caller's guild-cache join_times can still carry bots,
+    # and a bot in a cohort inflates every retention curve it appears in.
+    if not include_bots and join_times:
+        bot_ids = {
+            r[0] for r in conn.execute(bot_ids_subquery(), (guild_id,)).fetchall()
+        }
+        join_times = {u: t for u, t in join_times.items() if u not in bot_ids}
+
+    if not join_times:
+        return {
+            "d7": 0,
+            "d30": 0,
+            "d90": 0,
+            "badge": "no_data",
+            "latest_cohort_size": 0,
+            "cohorts": [],
+            "heatmap": [],
+        }
+
+    # Group into weekly cohorts, keyed by week_start timestamp for stable ordering
+    cohorts: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for uid, jt in join_times.items():
+        week_start = int(jt) - (int(jt) % _WEEK)
+        cohorts[week_start].append((uid, jt))
+
+    # Compute retention for each cohort at D1, D7, D14, D30, D60, D90
+    checkpoints = [1, 7, 14, 30, 60, 90]
+    cohort_results = []
+    for week_start in sorted(cohorts.keys())[-12:]:  # last 12 weeks
+        members = cohorts[week_start]
+        size = len(members)
+        label = time.strftime("%Y-W%W", time.gmtime(week_start))
+        rates: dict[str, float | None] = {}
+        for d in checkpoints:
+            retained = 0
+            eligible = 0
+            for uid, jt in members:
+                target_start = jt + d * _DAY
+                target_end = target_start + 7 * _DAY
+                if target_start > now:
+                    continue
+                eligible += 1
+                active = conn.execute(
+                    "SELECT 1 FROM messages WHERE guild_id=? AND author_id=? "
+                    "AND ts>=? AND ts<? LIMIT 1",
+                    (guild_id, uid, int(target_start), int(target_end)),
+                ).fetchone()
+                if active:
+                    retained += 1
+            rates[f"d{d}"] = _pct(retained, eligible) if eligible else None
+        cohort_results.append({"label": label, "size": size, **rates})
+
+    # Headline metrics: most recent cohort that has actually reached each checkpoint
+    def _latest_reached(key: str) -> tuple[float | None, dict]:
+        for c in reversed(cohort_results):
+            val = c.get(key)
+            if val is not None:
+                return float(val), c  # type: ignore[arg-type]
+        return None, {}
+
+    d7, d7_cohort = _latest_reached("d7")
+    d30, _ = _latest_reached("d30")
+    d90, _ = _latest_reached("d90")
+
+    badge = _badge(
+        float(d7 if d7 is not None else 0),
+        [(40, "critical"), (50, "needs_work"), (60, "healthy"), (100, "excellent")],
+    ) if d7 is not None else "no_data"
+
+    latest = cohort_results[-1] if cohort_results else {}
+
+    return {
+        "d7": d7,
+        "d30": d30,
+        "d90": d90,
+        "d7_cohort_label": d7_cohort.get("label"),
+        "badge": badge,
+        "latest_cohort_size": latest.get("size", 0),
+        "cohorts": cohort_results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 9. Churn risk early warning
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 10. Moderator workload
+# ---------------------------------------------------------------------------
+
+
+def compute_mod_workload(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    now: float | None = None,
+    mod_ids: list[int] | None = None,
+) -> dict:
+    now = now or time.time()
+    seven_days_ago = _ts(7, now=now)
+    thirty_days_ago = _ts(30, now=now)
+
+    # Build mod filter clause
+    mod_set = set(mod_ids) if mod_ids else None
+    if mod_set:
+        placeholders = ",".join("?" for _ in mod_set)
+        mod_filter = f" AND actor_id IN ({placeholders})"
+        mod_filter_author = f" AND author_id IN ({placeholders})"
+        mod_params = tuple(mod_set)
+    else:
+        mod_filter = ""
+        mod_filter_author = ""
+        mod_params = ()
+
+    # Collect mod-related channel IDs: mod chat + ticket/jail/policy channels
+    from bot_modules.core.db_utils import get_config_value
+
+    mod_channel_ids: set[int] = set()
+    mc_raw = get_config_value(conn, "mod_channel_id", "0", guild_id)
+    if mc_raw and mc_raw != "0":
+        try:
+            mod_channel_ids.add(int(mc_raw))
+        except ValueError:
+            pass
+    # Active ticket channels
+    for r in conn.execute(
+        "SELECT channel_id FROM tickets WHERE guild_id=? AND channel_id>0",
+        (guild_id,),
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+    # Active jail channels
+    for r in conn.execute(
+        "SELECT channel_id FROM jails WHERE guild_id=? AND channel_id>0",
+        (guild_id,),
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+    # Policy ticket channels
+    for r in conn.execute(
+        "SELECT channel_id FROM policy_tickets WHERE guild_id=? AND channel_id>0",
+        (guild_id,),
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+
+    # Voice Control actions are self-service (a mod using their own voice
+    # channel), not moderation work — excluded from workload everywhere below.
+    # The shared predicate, so the audit page and this report agree on what
+    # counts as moderation. (The local copy used a bare `_`, which is a LIKE
+    # wildcard; the shared one escapes it.)
+    _not_vm = NOT_VOICE_CONTROL
+
+    # Total actions (7d) — mod-only when mod_ids provided
+    total_actions = conn.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE guild_id=? AND created_at>=?"
+        + _not_vm
+        + mod_filter,
+        (guild_id, seven_days_ago) + mod_params,
+    ).fetchone()[0]
+
+    # Per-mod action counts (7d)
+    mod_rows = conn.execute(
+        "SELECT actor_id, COUNT(*) AS cnt FROM audit_log "
+        "WHERE guild_id=? AND created_at>=?"
+        + _not_vm
+        + mod_filter
+        + " GROUP BY actor_id ORDER BY cnt DESC",
+        (guild_id, seven_days_ago) + mod_params,
+    ).fetchall()
+    action_by_mod: dict[int, int] = {r["actor_id"]: r["cnt"] for r in mod_rows}
+
+    # Per-mod message counts in mod channels (7d)
+    msg_by_mod: dict[int, int] = {}
+    if mod_channel_ids:
+        ch_placeholders = ",".join("?" for _ in mod_channel_ids)
+        msg_rows = conn.execute(
+            "SELECT author_id, COUNT(*) AS cnt FROM messages "
+            "WHERE guild_id=? AND ts>=? AND channel_id IN ("
+            + ch_placeholders
+            + ")"
+            + mod_filter_author
+            + " GROUP BY author_id",
+            (guild_id, seven_days_ago) + tuple(mod_channel_ids) + mod_params,
+        ).fetchall()
+        msg_by_mod = {r["author_id"]: r["cnt"] for r in msg_rows}
+
+    # Merge: total activity = audit actions + mod-channel messages
+    all_mod_ids = set(action_by_mod.keys()) | set(msg_by_mod.keys())
+    mod_actions = []
+    for mid in all_mod_ids:
+        acts = action_by_mod.get(mid, 0)
+        msgs = msg_by_mod.get(mid, 0)
+        mod_actions.append(
+            {
+                "user_id": str(mid),
+                "count": acts + msgs,
+                "actions": acts,
+                "messages": msgs,
+            }
+        )
+    mod_actions.sort(key=lambda m: m["count"], reverse=True)  # type: ignore[arg-type,return-value]
+
+    total_messages = sum(msg_by_mod.values())
+    total_activity = total_actions + total_messages
+
+    # Workload Gini
+    action_counts: list[float] = [m["count"] for m in mod_actions]  # type: ignore[misc]
+    workload_gini = round(_gini(action_counts), 3) if action_counts else 0
+
+    # Response times: time from ticket open to first mod action on it
+    ticket_rows = conn.execute(
+        """SELECT t.id, t.created_at AS open_ts,
+                  MIN(a.created_at) AS first_action_ts
+           FROM tickets t
+           LEFT JOIN audit_log a ON a.guild_id = t.guild_id
+               AND a.action LIKE 'ticket_%' AND a.created_at > t.created_at
+           WHERE t.guild_id=? AND t.created_at>=?
+           GROUP BY t.id""",
+        (guild_id, thirty_days_ago),
+    ).fetchall()
+    response_times = []
+    for r in ticket_rows:
+        if r["first_action_ts"] and r["open_ts"]:
+            rt = (r["first_action_ts"] - r["open_ts"]) / 60  # minutes
+            response_times.append(rt)
+
+    median_rt = round(statistics.median(response_times), 1) if response_times else 0
+    p95_rt = (
+        round(sorted(response_times)[int(len(response_times) * 0.95)], 1)
+        if len(response_times) >= 5
+        else median_rt
+    )
+
+    # Action type breakdown (mod-only when filtered)
+    type_rows = conn.execute(
+        "SELECT action, COUNT(*) AS cnt FROM audit_log "
+        "WHERE guild_id=? AND created_at>=?"
+        + _not_vm
+        + mod_filter
+        + " GROUP BY action ORDER BY cnt DESC",
+        (guild_id, seven_days_ago) + mod_params,
+    ).fetchall()
+    action_types = [{"action": r["action"], "count": r["cnt"]} for r in type_rows]
+
+    # Escalation rate: warnings that lead to jails within 14 days
+    warns_total = conn.execute(
+        "SELECT COUNT(*) FROM warnings WHERE guild_id=? AND created_at>=?",
+        (guild_id, thirty_days_ago),
+    ).fetchone()[0]
+    escalated = conn.execute(
+        """SELECT COUNT(*) FROM warnings w
+           WHERE w.guild_id=? AND w.created_at>=?
+           AND EXISTS (
+               SELECT 1 FROM jails j WHERE j.guild_id=w.guild_id
+               AND j.user_id=w.user_id AND j.created_at > w.created_at
+               AND j.created_at <= w.created_at + ?
+           )""",
+        (guild_id, thirty_days_ago, 14 * _DAY),
+    ).fetchone()[0]
+    escalation_rate = _pct(escalated, warns_total) if warns_total else 0
+
+    # Recidivism rate: warned users who get another warning within 14 days
+    recid = conn.execute(
+        """SELECT COUNT(DISTINCT w1.user_id) FROM warnings w1
+           WHERE w1.guild_id=? AND w1.created_at>=?
+           AND EXISTS (
+               SELECT 1 FROM warnings w2
+               WHERE w2.guild_id=w1.guild_id AND w2.user_id=w1.user_id
+               AND w2.created_at > w1.created_at
+               AND w2.created_at <= w1.created_at + ?
+           )""",
+        (guild_id, thirty_days_ago, 14 * _DAY),
+    ).fetchone()[0]
+    warned_users = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) FROM warnings WHERE guild_id=? AND created_at>=?",
+        (guild_id, thirty_days_ago),
+    ).fetchone()[0]
+    recidivism_rate = _pct(recid, warned_users) if warned_users else 0
+
+    badge = _badge(
+        median_rt,
+        [(3, "excellent"), (5, "healthy"), (10, "needs_work"), (9999, "critical")],
+    )
+
+    return {
+        "median_response_time": median_rt,
+        "p95_response_time": p95_rt,
+        "badge": badge,
+        "total_actions_7d": total_activity,
+        "total_audit_actions_7d": total_actions,
+        "total_messages_7d": total_messages,
+        "workload_gini": workload_gini,
+        "mod_actions": mod_actions,
+        "action_types": action_types,
+        "escalation_rate": escalation_rate,
+        "recidivism_rate": recidivism_rate,
+    }
+
+
+def compute_mod_engagement(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    *,
+    mod_ids: list[int] | None = None,
+    now: float | None = None,
+    days: int = 7,
+) -> dict:
+    """Per-moderator community engagement metrics.
+
+    Measures public-message volume, proactive posting, channel breadth and the
+    reactions those messages drew — all excluding mod/ticket/jail admin
+    channels that compute_mod_workload already covers. Member-to-member reach,
+    replies received and newcomer touchpoints were removed with the social
+    graph (docs/plans/remove-social-graph.md): they read stored reply/mention
+    edges that are no longer kept.
+    """
+    now = now or time.time()
+    window_ago = _ts(days, now=now)
+
+    mod_set = set(mod_ids) if mod_ids else set()
+    if not mod_set:
+        return {
+            "mods": [],
+            "days": days,
+            "total_public_messages": 0,
+        }
+
+    # Build mod_channel_ids to exclude (mirrors compute_mod_workload logic)
+    from bot_modules.core.db_utils import get_config_value
+
+    mod_channel_ids: set[int] = set()
+    mc_raw = get_config_value(conn, "mod_channel_id", "0", guild_id)
+    if mc_raw and mc_raw != "0":
+        try:
+            mod_channel_ids.add(int(mc_raw))
+        except ValueError:
+            pass
+    for r in conn.execute(
+        "SELECT channel_id FROM tickets WHERE guild_id=? AND channel_id>0", (guild_id,)
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+    for r in conn.execute(
+        "SELECT channel_id FROM jails WHERE guild_id=? AND channel_id>0", (guild_id,)
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+    for r in conn.execute(
+        "SELECT channel_id FROM policy_tickets WHERE guild_id=? AND channel_id>0",
+        (guild_id,),
+    ).fetchall():
+        mod_channel_ids.add(r["channel_id"])
+
+    mod_ph = ",".join("?" for _ in mod_set)
+    mod_params = tuple(mod_set)
+
+    def _not_in_mod_channels(col: str) -> tuple[str, tuple]:
+        if not mod_channel_ids:
+            return "", ()
+        ch_ph = ",".join("?" for _ in mod_channel_ids)
+        return f" AND {col} NOT IN ({ch_ph})", tuple(mod_channel_ids)
+
+    ch_clause, ch_params = _not_in_mod_channels("channel_id")
+
+    # Public message counts (window, excluding mod channels)
+    pub_msg_rows = conn.execute(
+        f"SELECT author_id, COUNT(*) AS cnt FROM messages "
+        f"WHERE guild_id=? AND ts>=? AND author_id IN ({mod_ph}){ch_clause} "
+        f"GROUP BY author_id",
+        (guild_id, window_ago) + mod_params + ch_params,
+    ).fetchall()
+    pub_msgs: dict[int, int] = {r["author_id"]: r["cnt"] for r in pub_msg_rows}
+
+    # Conversation initiations: public messages that are NOT replies (reply_to_id IS NULL)
+    init_rows = conn.execute(
+        f"SELECT author_id, COUNT(*) AS cnt FROM messages "
+        f"WHERE guild_id=? AND ts>=? AND author_id IN ({mod_ph}) "
+        f"AND reply_to_id IS NULL{ch_clause} "
+        f"GROUP BY author_id",
+        (guild_id, window_ago) + mod_params + ch_params,
+    ).fetchall()
+    initiations: dict[int, int] = {r["author_id"]: r["cnt"] for r in init_rows}
+
+    # Channel breadth: distinct public channels each mod posted in
+    breadth_rows = conn.execute(
+        f"SELECT author_id, COUNT(DISTINCT channel_id) AS cnt FROM messages "
+        f"WHERE guild_id=? AND ts>=? AND author_id IN ({mod_ph}){ch_clause} "
+        f"GROUP BY author_id",
+        (guild_id, window_ago) + mod_params + ch_params,
+    ).fetchall()
+    channel_breadth: dict[int, int] = {r["author_id"]: r["cnt"] for r in breadth_rows}
+
+    # Assemble per-mod rows, busiest public poster first
+    mods = []
+    for mid in mod_set:
+        mods.append(
+            {
+                "user_id": str(mid),
+                "user_name": "",
+                "public_messages": pub_msgs.get(mid, 0),
+                "initiations": initiations.get(mid, 0),
+                "channel_breadth": channel_breadth.get(mid, 0),
+            }
+        )
+    mods.sort(key=lambda m: m["public_messages"], reverse=True)  # type: ignore[arg-type,return-value]
+
+    total_pub = sum(m["public_messages"] for m in mods)
+
+    return {
+        "mods": mods,
+        "days": days,
+        "total_public_messages": total_pub,
+    }

@@ -1,0 +1,282 @@
+"""Typed fake objects for Dungeon Keeper tests (spec §9.4).
+
+Import these instead of building ad-hoc mocks in individual test files.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+
+from bot_modules.core.db_utils import open_db
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+
+
+@dataclass
+class FakeRole:
+    id: int
+    name: str = "Role"
+    position: int = 0
+    # What core.role_safety reads before any config-sourced grant: a plain
+    # role by default, so a fake grants unless a test says otherwise.
+    managed: bool = False
+    permissions: discord.Permissions = field(default_factory=discord.Permissions.none)
+    default: bool = False
+
+    def is_default(self) -> bool:
+        return self.default
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (FakeRole, discord.Role)):
+            return self.id == other.id
+        return NotImplemented
+
+    def __ge__(self, other: object) -> bool:
+        if isinstance(other, (FakeRole, discord.Role)):
+            return self.position >= other.position
+        return NotImplemented
+
+    def __lt__(self, other: object) -> bool:
+        if isinstance(other, (FakeRole, discord.Role)):
+            return self.position < other.position
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    @property
+    def mention(self) -> str:
+        return f"<@&{self.id}>"
+
+
+@dataclass
+class FakeUser:
+    id: int = 1001
+    name: str = "lorem_ipsum"
+    display_name: str = "Lorem Ipsum"
+    bot: bool = False
+    roles: list = field(default_factory=list)
+    guild_permissions: MagicMock = field(default_factory=lambda: MagicMock(administrator=False))
+
+    @property
+    def mention(self) -> str:
+        return f"<@{self.id}>"
+
+
+@dataclass
+class FakeMember(FakeUser):
+    """A FakeUser that also satisfies isinstance checks for discord.Member-like usage."""
+    joined_at: float | None = None
+    guild: object | None = None
+    #: Role-hierarchy position, compared against the bot's own by the duel
+    #: rename guards. Defaults low so a fake member is renameable.
+    top_role: int = 0
+    nick: str | None = None
+    add_roles: AsyncMock = field(default_factory=AsyncMock)
+    remove_roles: AsyncMock = field(default_factory=AsyncMock)
+
+    def __post_init__(self) -> None:
+        _dm_msg = MagicMock()
+        _dm_msg.edit = AsyncMock()
+        _dm_msg.content = ""
+        _dm_channel = MagicMock()
+        _dm_channel.fetch_message = AsyncMock(return_value=_dm_msg)
+        self.create_dm = AsyncMock(return_value=_dm_channel)
+
+    def has_role(self, role_id: int) -> bool:
+        return any(getattr(r, "id", r) == role_id for r in self.roles)
+
+
+@dataclass
+class FakeChannel:
+    id: int
+    name: str = "general"
+    type: str = "text"
+    parent_id: int | None = None
+    category: object | None = None
+
+    async def send(self, *args, **kwargs) -> MagicMock:
+        return MagicMock()
+
+    async def set_permissions(self, *args, **kwargs) -> None:
+        pass
+
+
+class _RoleMap(dict):
+    """Indexed by id like this fake always was, but **iterates like discord.py**.
+
+    Real ``guild.roles`` is a list of Role; this fake stored a dict, so
+    ``for r in guild.roles`` yielded bare ints and any code doing ``r.name``
+    blew up. Tests assign by id (``g.roles[5001] = FakeRole(...)``), so the
+    mapping has to stay — iterating values is what closes the gap.
+    """
+
+    def __iter__(self):
+        return iter(self.values())
+
+
+@dataclass
+class FakeGuild:
+    id: int = 9001
+    name: str = "Test Guild"
+    members: dict = field(default_factory=dict)
+    channels: dict = field(default_factory=dict)
+    roles: _RoleMap = field(default_factory=_RoleMap)
+
+    def __post_init__(self) -> None:
+        # Accept a plain dict from callers that build one directly.
+        if not isinstance(self.roles, _RoleMap):
+            self.roles = _RoleMap(self.roles)
+
+    async def create_role(self, *, name, **kwargs):
+        """Enough of the real thing for core.role_provision to run.
+
+        Without this, any test whose code path now provisions a feature role
+        dies on a missing attribute rather than exercising the behaviour.
+        """
+        # .keys() explicitly: iterating this mapping yields roles, not ids.
+        rid = max(self.roles.keys(), default=90_000) + 1
+        role = FakeRole(id=rid, name=name)
+        self.roles[rid] = role
+        return role
+
+    def get_member(self, uid: int):
+        return self.members.get(uid)
+
+    def get_channel(self, cid: int):
+        return self.channels.get(cid)
+
+    def get_channel_or_thread(self, cid: int):
+        """What ``core.sticky`` resolves panel ids through, so a panel that opts
+        into threads can find one. Same backing dict as ``get_channel``."""
+        return self.channels.get(cid)
+
+    def get_role(self, rid: int):
+        return self.roles.get(rid)
+
+
+class FakeSendChannel:
+    """Channel whose ``send`` returns a message with a real integer id, so
+    result posts that persist ``result_message_id`` can run against sqlite."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self._next_id = 7000
+
+    async def send(self, *args, **kwargs) -> SimpleNamespace:
+        self._next_id += 1
+        self.sent.append({"args": args, **kwargs})
+        return SimpleNamespace(id=self._next_id)
+
+    async def fetch_message(self, message_id: int):
+        raise discord.NotFound(MagicMock(status=404), "no message")
+
+
+class FakeMessageableChannel(discord.abc.Messageable):
+    """Channel that actually passes ``isinstance(x, discord.abc.Messageable)``.
+
+    The duel base narrows on that before posting elimination call-outs and pot
+    results, so a duck-typed fake makes those posts vanish and the assertion
+    pass for the wrong reason. Records what was sent and what was deleted, and
+    hands out partial messages so a delete-and-repost can be checked.
+    """
+
+    def __init__(self, channel_id: int = 100) -> None:
+        self.id = channel_id
+        self.sent: list[dict] = []
+        self.deleted: list[int] = []
+        self._next_id = 7000
+
+    async def _get_channel(self):  # type: ignore[override]
+        return self
+
+    async def send(self, content=None, **kwargs) -> SimpleNamespace:
+        self._next_id += 1
+        self.sent.append({"content": content, **kwargs})
+        return SimpleNamespace(id=self._next_id)
+
+    async def fetch_message(self, message_id: int):  # type: ignore[override]
+        raise discord.NotFound(MagicMock(status=404), "no message")
+
+    def get_partial_message(self, message_id: int):
+        recorder = self
+
+        class _Partial:
+            async def delete(self) -> None:
+                recorder.deleted.append(message_id)
+
+        return _Partial()
+
+    @property
+    def texts(self) -> list[str]:
+        """Just the message bodies, for substring assertions."""
+        return [str(s.get("content") or "") for s in self.sent]
+
+
+class FakeEconGamesBot:
+    """Bot fake for duel/economy payout tests: a real ``games_db``, a
+    ``ctx.db_path`` the economy layer can open, and a guild whose members
+    resolve (non-bot, non-booster). ``with_channel=True`` adds a
+    FakeSendChannel so resolution paths that post a result message work."""
+
+    def __init__(
+        self,
+        games_db,
+        db_path: Path,
+        member_ids,
+        *,
+        guild_id: int = 9001,
+        with_channel: bool = False,
+    ) -> None:
+        self.games_db = games_db
+        # ``open_db`` matches AppContext's: the wager escrow (and anything
+        # else on the economy side) opens its own transaction through it.
+        self.ctx = SimpleNamespace(
+            db_path=db_path,
+            open_db=lambda: open_db(db_path),
+        )
+        members = {
+            uid: SimpleNamespace(
+                id=uid, bot=False, premium_since=None,
+                display_name=f"U{uid}", mention=f"<@{uid}>",
+            )
+            for uid in member_ids
+        }
+        self.guild = FakeGuild(id=guild_id, members=members)
+        self.channel = FakeSendChannel() if with_channel else None
+
+    def add_view(self, *args, **kwargs) -> None:
+        pass
+
+    def get_guild(self, guild_id: int):
+        return self.guild if guild_id == self.guild.id else None
+
+    def get_channel(self, channel_id: int):
+        return self.channel
+
+
+def fake_interaction(
+    *,
+    user: FakeUser | None = None,
+    guild: FakeGuild | None = None,
+    **overrides,
+) -> MagicMock:
+    """Build a MagicMock that looks like a discord.Interaction."""
+    i = MagicMock(spec=discord.Interaction)
+    i.user = user or FakeUser()
+    i.guild = guild or FakeGuild()
+    i.response = MagicMock()
+    i.response.send_message = AsyncMock()
+    i.response.send_modal = AsyncMock()
+    i.response.defer = AsyncMock()
+    i.response.edit_message = AsyncMock()
+    i.response.is_done = MagicMock(return_value=False)
+    i.followup = MagicMock()
+    i.followup.send = AsyncMock()
+    i.edit_original_response = AsyncMock()
+    for k, v in overrides.items():
+        setattr(i, k, v)
+    return i

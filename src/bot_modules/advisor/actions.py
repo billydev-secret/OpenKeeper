@@ -1,0 +1,394 @@
+"""Admin-confirmed config changes proposed by the AI advisor.
+
+The advisor can *propose* a settings change via its ``propose_config_change``
+tool, but never applies one itself: the proposal is validated here, attached
+to the reply as an Apply button, and only written when an admin clicks it
+(``advisor_cog``). That human gate is the prompt-injection defence — channel
+topics, server docs, and announcements are all in the model's context, so
+model output alone must never mutate config.
+
+Scope comes from ``settings_registry``: a key is proposable only if it is listed
+there *and* flagged ``writable``. That is a deliberate narrowing of the old rule
+("any non-secret key that already has a row"), which let the model reach keys
+nobody had vetted — including ``admin_role_ids``.
+Feature-table settings (economy prices, voice control dials, …) have their own
+validated dashboard panels and stay read-only to the model.
+
+The registry also removes the old requirement that the key already exist. Shape
+now comes from the schema rather than from the stored value, so Billy-bot can
+set up a feature that has never been configured — the case adoption depends on.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+from dataclasses import dataclass
+
+from bot_modules.core.db_utils import open_db, set_config_value
+from bot_modules.onboarding.intake import service as intake_service
+from bot_modules.moderation.service import write_audit
+from bot_modules.core.settings_registry import (
+    Setting,
+    coerce_value,
+    feature_for_key,
+    get_setting,
+)
+
+log = logging.getLogger(__name__)
+
+# Same secret pattern as the read side (advisor_context) — never touch these.
+# The registry rejects secret-shaped keys at import; this is belt-and-braces for
+# a caller that reaches validate_config_change with something unexpected.
+_SECRET_KEY_RE = re.compile(
+    r"token|secret|refresh|password|passwd|api[_-]?key|webhook|oauth|credential",
+    re.I,
+)
+_MAX_VALUE_CHARS = 200
+_CLEAR_WORDS = {"none", "off", "clear", "unset", "0"}
+
+# Grant announcements are sent as plain content with mentions enabled (see
+# ``role_grant_commands._execute_grant``), so a mass mention in the template
+# fires on every future grant. Text the *model* wrote must not be able to arm
+# that; a human setting one from the dashboard still can, which is why the guard
+# lives here and not on the send side (the live "denizen" grant deliberately
+# ends with an @here).
+_MASS_MENTION_RE = re.compile(r"@everyone|@here|<@&\d+>")
+
+
+@dataclass(frozen=True)
+class ConfigProposal:
+    """A validated, not-yet-applied settings change.
+
+    ``target`` says where it lands: the shared ``config`` KV table, or the
+    ``grant_roles`` table (community/NSFW role grants, which have their own
+    per-grant row rather than a KV key). The surface renders both the same way
+    — one Apply button — and :func:`apply_config_change` dispatches on it.
+    """
+
+    key: str
+    value: str  # normalized, exactly as it would be stored
+    display: str  # human-readable, e.g. "Welcome channel → #welcome"
+    target: str = "config"  # "config" | "grant_role"
+    grant_name: str = ""  # which grant_roles row, when target == "grant_role"
+
+
+def _current_value(conn: sqlite3.Connection, guild_id: int, key: str) -> str | None:
+    """The key's stored value, honouring the same legacy guild-0 fallback reads use."""
+    for gid in (guild_id, 0):
+        row = conn.execute(
+            "SELECT value FROM config WHERE guild_id = ? AND key = ?", (gid, key)
+        ).fetchone()
+        if row is not None:
+            return str(row["value"])
+    return None
+
+
+def _resolve_channel(guild, raw: str) -> tuple[str, str]:
+    """'<#id>' / id / '#name' / name → (id-as-str, '#name'). Raises ValueError."""
+    s = raw.strip()
+    m = re.fullmatch(r"<#(\d+)>|#?(\d{5,})", s)
+    if m:
+        ch = guild.get_channel(int(m.group(1) or m.group(2)))
+        if ch is not None:
+            return str(ch.id), f"#{ch.name}"
+        raise ValueError(f"no channel with id {m.group(1) or m.group(2)} in this server")
+    name = s.lstrip("#").casefold()
+    for ch in getattr(guild, "text_channels", []):
+        if ch.name.casefold() == name:
+            return str(ch.id), f"#{ch.name}"
+    raise ValueError(f"no channel named '{s}' in this server")
+
+
+def _resolve_role(guild, raw: str) -> tuple[str, str]:
+    """'<@&id>' / id / '@name' / name → (id-as-str, '@name'). Raises ValueError."""
+    s = raw.strip()
+    m = re.fullmatch(r"<@&(\d+)>|@?(\d{5,})", s)
+    if m:
+        role = guild.get_role(int(m.group(1) or m.group(2)))
+        if role is not None:
+            return str(role.id), f"@{role.name}"
+        raise ValueError(f"no role with id {m.group(1) or m.group(2)} in this server")
+    name = s.lstrip("@").casefold()
+    for role in getattr(guild, "roles", []):
+        if getattr(role, "name", "").casefold() == name:
+            return str(role.id), f"@{role.name}"
+    raise ValueError(f"no role named '{s}' in this server")
+
+
+def _resolve_setting(key: str, *, is_admin: bool) -> Setting:
+    """The schema for a proposable key, or a ValueError explaining why not."""
+    setting = get_setting(key)
+    if setting is None:
+        raise ValueError(
+            f"'{key}' isn't a setting I can change. I can only change settings "
+            "on my vetted list — point the admin to the feature's dashboard "
+            "panel instead."
+        )
+    if not setting.writable:
+        feature = feature_for_key(key)
+        where = f" — set it from {feature.panel}" if feature else ""
+        raise ValueError(f"'{key}' has to be changed on the dashboard{where}.")
+    if setting.admin_only and not is_admin:
+        raise ValueError(
+            f"'{key}' grants access or authority, so it needs a full server "
+            "administrator — Manage Server isn't enough. Ask an admin, or set "
+            "it from the dashboard."
+        )
+    return setting
+
+
+def validate_config_change(
+    conn: sqlite3.Connection,
+    guild,
+    key: str,
+    raw_value: str,
+    *,
+    allow_noop: bool = False,
+    is_admin: bool = False,
+) -> ConfigProposal:
+    """Validate one proposed change; return the normalized proposal.
+
+    Shape comes from ``settings_registry``, so a key that has never been set on
+    this server is still proposable — that's how Billy-bot can stand up an
+    unconfigured feature. Raises ``ValueError`` with a model-readable reason on
+    anything off: unlisted or panel-only key, unresolvable channel/role, bad
+    boolean/number/choice, or a change that wouldn't change anything.
+
+    ``allow_noop`` skips the last check. Re-validation at apply time passes it,
+    so clicking a button whose value is already stored is a harmless rewrite
+    rather than a confusing "no change needed" failure.
+
+    ``is_admin`` is full ``administrator``, required for ``admin_only``
+    settings. It defaults to False so a caller that forgets to thread it
+    through fails closed, and it is re-checked at apply time against whoever
+    clicks — not just whoever asked.
+    """
+    key = (key or "").strip()
+    raw = (raw_value or "").strip()
+    if not key or not raw:
+        raise ValueError("both key and value are required")
+    if _SECRET_KEY_RE.search(key):
+        raise ValueError("that key can't be changed here")
+    if len(raw) > _MAX_VALUE_CHARS:
+        raise ValueError(f"value too long (max {_MAX_VALUE_CHARS} chars)")
+
+    setting = _resolve_setting(key, is_admin=is_admin)
+    label = setting.label
+    low_raw = raw.casefold()
+
+    if setting.kind in ("channel", "role") and low_raw in _CLEAR_WORDS:
+        value, shown = "0", "(cleared)"
+    elif setting.kind == "channel":
+        value, shown = _resolve_channel(guild, raw)
+    elif setting.kind == "role":
+        value, shown = _resolve_role(guild, raw)
+    else:
+        value = coerce_value(setting, raw)
+        shown = ("on" if value == "1" else "off") if setting.kind == "bool" else value
+
+    # Cross-key rule the shape checks above can't see: intake matches codes by
+    # containment, so a completion code containing a step's code would close
+    # the card (stamping the rest skipped) the moment a greeter pastes that
+    # step's canned message. The dashboard rejects this on save; enforce it
+    # here too, since this path writes the key directly.
+    if key == intake_service.CODE_KEY:
+        clash = intake_service.config_code_conflict(conn, guild.id, completion=value)
+        if clash is not None:
+            (outer_label, outer_code), (inner_label, inner_code) = clash
+            raise ValueError(
+                f"'{outer_code}' ({outer_label}) contains '{inner_code}' "
+                f"({inner_label}) — posting one would fire both. Pick a "
+                "completion code that doesn't overlap a step code."
+            )
+
+    if not allow_noop and _current_value(conn, guild.id, key) == value:
+        raise ValueError(f"{label} is already set to {shown} — no change needed.")
+    return ConfigProposal(key, value, f"{label} → {shown}")
+
+
+# ---------------------------------------------------------------------------
+# Grant roles (the grant_roles table, not the config KV)
+# ---------------------------------------------------------------------------
+
+# NSFW, Denizen, Veteran and any custom grants live here rather than in the KV
+# table, which is why the legacy *_role_id keys in `config` are dead rows the
+# code no longer reads. Every field below governs who gets a role or where the
+# grant is logged, so the whole surface is admin_only.
+GRANT_FIELDS: dict[str, tuple[str, str]] = {
+    # field -> (kind, human label)
+    "role_id": ("role", "granted role"),
+    "required_role_id": ("role", "role required before granting"),
+    "log_channel_id": ("channel", "grant log channel"),
+    "announce_channel_id": ("channel", "grant announcement channel"),
+    "grant_message": ("text", "grant message"),
+}
+
+
+def validate_grant_role_change(
+    conn: sqlite3.Connection,
+    guild,
+    grant_name: str,
+    field: str,
+    raw_value: str,
+    *,
+    is_admin: bool = False,
+    allow_noop: bool = False,
+) -> ConfigProposal:
+    """Validate a change to one field of one existing grant role.
+
+    Only grants that already exist for the guild can be edited: creating one is
+    a dashboard action, and letting the model invent grant names would let it
+    mint role-handing rows nobody asked for. Requires full ``administrator``
+    for the same reason the registry's ``admin_only`` tier does — every field
+    here decides who ends up with a role, NSFW access included.
+    """
+    from bot_modules.core.db_utils import get_grant_roles
+
+    if not is_admin:
+        raise ValueError(
+            "changing a role grant needs a full server administrator — "
+            "Manage Server isn't enough."
+        )
+    grant_name = (grant_name or "").strip().lower()
+    field = (field or "").strip().lower()
+    raw = (raw_value or "").strip()
+    if not grant_name or not field or not raw:
+        raise ValueError("grant name, field, and value are all required")
+    if len(raw) > _MAX_VALUE_CHARS:
+        raise ValueError(f"value too long (max {_MAX_VALUE_CHARS} chars)")
+    if field not in GRANT_FIELDS:
+        raise ValueError(
+            f"'{field}' isn't a grant field. Available: {', '.join(GRANT_FIELDS)}."
+        )
+
+    grants = get_grant_roles(conn, guild.id)
+    if grant_name not in grants:
+        known = ", ".join(sorted(grants)) or "none"
+        raise ValueError(
+            f"this server has no '{grant_name}' role grant. Existing grants: "
+            f"{known}. New ones are created from Moderation → Role Management."
+        )
+
+    kind, field_label = GRANT_FIELDS[field]
+    current = str(grants[grant_name].get(field, "") or "")
+    label = f"{grants[grant_name]['label']} {field_label}"
+
+    if kind in ("role", "channel") and raw.casefold() in _CLEAR_WORDS:
+        value, shown = "0", "(cleared)"
+    elif kind == "role":
+        value, shown = _resolve_role(guild, raw)
+    elif kind == "channel":
+        value, shown = _resolve_channel(guild, raw)
+    else:
+        if _MASS_MENTION_RE.search(raw):
+            raise ValueError(
+                "I can't put @everyone, @here, or a role mention in a grant "
+                "message — it would ping on every future grant. Write it "
+                "without one, or set it from Moderation → Role Management."
+            )
+        value = shown = raw
+
+    if not allow_noop and current == value:
+        raise ValueError(f"{label} is already {shown} — no change needed.")
+    return ConfigProposal(
+        key=field, value=value, display=f"{label} → {shown}",
+        target="grant_role", grant_name=grant_name,
+    )
+
+
+def _apply_grant_role(conn, guild, proposal: ConfigProposal) -> None:
+    """Read-modify-write one grant row (upsert_grant_role takes the whole row)."""
+    from bot_modules.core.db_utils import get_grant_roles, upsert_grant_role
+
+    grants = get_grant_roles(conn, guild.id)
+    row = grants.get(proposal.grant_name)
+    if row is None:
+        raise ValueError(f"the '{proposal.grant_name}' role grant no longer exists")
+    fields = {
+        "label": row["label"],
+        "role_id": int(row["role_id"] or 0),
+        "log_channel_id": int(row["log_channel_id"] or 0),
+        "announce_channel_id": int(row["announce_channel_id"] or 0),
+        "grant_message": row["grant_message"] or "",
+        "required_role_id": int(row["required_role_id"] or 0),
+    }
+    kind, _ = GRANT_FIELDS[proposal.key]
+    fields[proposal.key] = proposal.value if kind == "text" else int(proposal.value)
+    upsert_grant_role(conn, guild.id, proposal.grant_name, **fields)
+
+
+def _grant_field_value(conn, guild_id: int, grant_name: str, field: str) -> str:
+    """One grant field's stored value, for the before/after audit record."""
+    from bot_modules.core.db_utils import get_grant_roles
+
+    row = get_grant_roles(conn, guild_id).get(grant_name)
+    # Raw, not the validator's "" -for-unset normalization: an audit row should
+    # record that the field held 0, not that it held nothing in particular.
+    return "" if row is None else str(row.get(field, ""))
+
+
+def apply_config_change(
+    db_path, guild, proposal: ConfigProposal, *, is_admin: bool = False,
+    actor_id: int = 0,
+) -> str | None:
+    """Write one confirmed proposal.
+
+    Returns the slug of the feature the key belongs to (``None`` for a
+    grant-role write, which has no feature cog), so the caller can dispatch
+    ``<slug>_config_change`` the way a dashboard save does — a cog that
+    caches its config at boot would otherwise not see the change until a
+    restart.
+
+    Re-validates so a stale button can't apply a change that stopped making
+    sense (channel deleted, key removed) — and so ``admin_only`` is enforced
+    against the person who actually clicked, which may not be the person who
+    asked. Defaults to non-admin so a caller that forgets fails closed.
+
+    ``actor_id`` is whoever clicked Apply. It lands in ``audit_log`` alongside
+    the before/after values, in the same transaction as the write: this is the
+    one config path where a *model* chose the value, and ``log.txt`` is wiped on
+    every boot, so without the row an applied change leaves no history at all.
+    """
+    with open_db(db_path) as conn:
+        if proposal.target == "grant_role":
+            checked = validate_grant_role_change(
+                conn, guild, proposal.grant_name, proposal.key, proposal.value,
+                allow_noop=True, is_admin=is_admin,
+            )
+            before = _grant_field_value(
+                conn, guild.id, checked.grant_name, checked.key
+            )
+            _apply_grant_role(conn, guild, checked)
+        else:
+            checked = validate_config_change(
+                conn, guild, proposal.key, proposal.value,
+                allow_noop=True, is_admin=is_admin,
+            )
+            before = _current_value(conn, guild.id, checked.key) or ""
+            set_config_value(conn, checked.key, checked.value, guild.id)
+        write_audit(
+            conn,
+            guild_id=guild.id,
+            action="advisor_config_apply",
+            actor_id=actor_id,
+            extra={
+                "target": checked.target,
+                "grant_name": checked.grant_name,
+                "key": checked.key,
+                "old": before,
+                "new": checked.value,
+                "display": checked.display,
+            },
+        )
+    log.info(
+        "advisor applied %s change for guild %s: %s%s = %s",
+        proposal.target, guild.id,
+        f"{checked.grant_name}." if checked.grant_name else "",
+        checked.key, checked.value,
+    )
+    if checked.target == "grant_role":
+        return None
+    feature = feature_for_key(checked.key)
+    return feature.slug if feature is not None else None
